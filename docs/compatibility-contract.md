@@ -100,13 +100,17 @@ Known differences are public contract data. Each difference names the externally
 
 The Rust standard library and workspace-owned code are the default. An external dependency is admitted only when it provides a necessary interoperability boundary, a materially safer implementation than a local substitute, or a capability whose correct reimplementation is disproportionate to the project.
 
-Every admitted dependency must have a compatible license, minimal feature set, lockfile entry, maintained upstream, and security review appropriate to its role. A dependency used only for convenience is rejected. Direct dependencies are centralized in the workspace manifest. The current `serde` and `serde_json` dependencies are limited to the public JSON contract boundary; ntsql does not use them as a reason to introduce a broader framework dependency.
+Every admitted dependency must have a compatible license, minimal feature set, lockfile entry, maintained upstream, provenance record, and security review appropriate to its role. A dependency used only for convenience is rejected. Direct dependencies are centralized in the workspace manifest. The current `serde` and `serde_json` dependencies are limited to the public JSON contract boundary; ntsql does not use them as a reason to introduce a broader framework dependency. The complete admission and CI rules are defined in `docs/governance.md`.
 
 ## Machine-Readable Files
 
 - `contracts/compatibility/targets.json`: immutable oracle targets and expansion order
 - `contracts/compatibility/features.json`: classified feature inventory and current status
+- `contracts/compatibility/provenance.json`: source, artifact, dependency, lineage, digest, and intended-use inventory
+- `contracts/compatibility/legal-reviews.json`: qualified human legal decisions and unresolved gates
 - `contracts/schemas/conformance-record.schema.json`: one comparison record
+- `contracts/schemas/legal-review-ledger.schema.json`: legal-review ledger interchange schema
+- `contracts/schemas/provenance-ledger.schema.json`: provenance ledger interchange schema
 - `contracts/schemas/target-matrix.schema.json`: target matrix interchange schema
 - `contracts/schemas/feature-matrix.schema.json`: feature matrix interchange schema
 

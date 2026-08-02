@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anaregdesign/ntsql/contracts/schemas/legal-review-ledger.schema.json",
+  "title": "ntsql legal review ledger",
+  "description": "Human-owned legal decisions for governed provenance uses.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "reviews"],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "reviews": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/review" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "nullableString": {
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "null" }
+      ]
+    },
+    "nullableDate": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+        },
+        { "type": "null" }
+      ]
+    },
+    "use": {
+      "enum": [
+        "documentation-reference",
+        "implementation-input",
+        "dependency-inclusion",
+        "supply-chain-verification",
+        "project-licensing",
+        "contribution-policy",
+        "oracle-operation",
+        "conformance-evidence",
+        "fixture",
+        "release-claim"
+      ]
+    },
+    "uses": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/use" }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "subject",
+        "status",
+        "approved_uses",
+        "prohibited_uses",
+        "individual_review_uses",
+        "source_provenance_ids",
+        "reviewed_by",
+        "decided_on",
+        "rationale"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "subject": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "approved", "rejected"] },
+        "approved_uses": { "$ref": "#/$defs/uses" },
+        "prohibited_uses": { "$ref": "#/$defs/uses" },
+        "individual_review_uses": { "$ref": "#/$defs/uses" },
+        "source_provenance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "reviewed_by": { "$ref": "#/$defs/nullableString" },
+        "decided_on": { "$ref": "#/$defs/nullableDate" },
+        "rationale": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "pending" } } },
+          "then": {
+            "properties": {
+              "approved_uses": { "maxItems": 0 },
+              "prohibited_uses": { "maxItems": 0 },
+              "individual_review_uses": { "maxItems": 0 },
+              "reviewed_by": { "type": "null" },
+              "decided_on": { "type": "null" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "approved" } } },
+          "then": {
+            "properties": {
+              "approved_uses": { "minItems": 1 },
+              "reviewed_by": { "type": "string", "minLength": 1 },
+              "decided_on": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "status": { "const": "rejected" } } },
+          "then": {
+            "properties": {
+              "approved_uses": { "maxItems": 0 },
+              "reviewed_by": { "type": "string", "minLength": 1 },
+              "decided_on": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

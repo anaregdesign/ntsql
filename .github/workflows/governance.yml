@@ -1,0 +1,88 @@
+name: Governance
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  legal-review-gate:
+    name: Legal review required
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Block unapproved governed use
+        run: |
+          echo "::error::Third-party dependency and governance-tool use is pending qualified legal review."
+          exit 1
+
+  governance:
+    name: Contracts and supply chain
+    if: ${{ false }}
+    needs: legal-review-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.88.0
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
+
+      - name: Select Rust 1.88.0
+        run: rustup default 1.88.0
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Install governance tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Check dependency licenses and sources
+        run: cargo deny check
+
+      - name: Check dependency advisories
+        run: cargo audit --deny warnings
+
+      - name: Check fixture provenance
+        run: cargo run --locked -p ntsql-contract --bin ntsql-governance -- fixtures
+
+      - name: Generate CycloneDX SBOM
+        run: >-
+          cargo cyclonedx
+          --format json
+          --spec-version 1.5
+          --all
+          --all-features
+          --target all
+          --license-strict
+          --override-filename ntsql-contract.cdx
+
+      - name: Require and validate CycloneDX SBOM
+        run: |
+          test -s crates/ntsql-contract/ntsql-contract.cdx.json
+          cargo run --locked -p ntsql-contract --bin ntsql-governance -- \
+            sbom crates/ntsql-contract/ntsql-contract.cdx.json
+
+      - name: Upload CycloneDX SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ntsql-cyclonedx-sbom
+          path: crates/ntsql-contract/ntsql-contract.cdx.json
+          if-no-files-found: error
+          retention-days: 90

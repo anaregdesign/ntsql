@@ -1,0 +1,124 @@
+{
+  "schema_version": "1.0.0",
+  "reviews": [
+    {
+      "id": "legal-review-sql-documentation",
+      "subject": "Copyright and clean-room use of Microsoft SQL documentation",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": [
+        "prov-ms-sql-engine-overview-2022",
+        "prov-ms-sql-editions-2022",
+        "prov-ms-learn-terms-of-use"
+      ],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "Awaiting qualified human legal review. Inventory registration does not authorize implementation, reproduction, or derivative use."
+    },
+    {
+      "id": "legal-review-ms-tds",
+      "subject": "Implementation of MS-TDS under the Open Specification Promise and applicable copyright terms",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": [
+        "prov-ms-tds-42",
+        "prov-ms-open-specification-promise",
+        "prov-ms-learn-terms-of-use"
+      ],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "MS-TDS appears in the promise's Covered Specifications list, but the promise is limited to stated Microsoft patent claims and grants no implied copyright or third-party rights. Qualified human legal review remains required."
+    },
+    {
+      "id": "legal-review-oracle-sqlserver-2022-cu26",
+      "subject": "Operation of SQL Server 2022 Developer CU26 as a compatibility oracle",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": [
+        "prov-ms-sqlserver-2022-cu26-release",
+        "prov-ms-sql-container-terms",
+        "prov-oracle-sqlserver-2022-cu26"
+      ],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "Developer edition is limited to development and testing, and container startup requires acceptance of applicable license terms. Qualified human legal review must confirm the oracle workflow before execution."
+    },
+    {
+      "id": "legal-review-native-file-formats",
+      "subject": "Implementation of native MDF, NDF, LDF, and BAK compatibility",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": [
+        "prov-ms-sql-engine-overview-2022",
+        "prov-ms-learn-terms-of-use"
+      ],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "No implementation, format inference, fixture import, or compatibility claim may begin until qualified human legal review records an explicit decision."
+    },
+    {
+      "id": "legal-review-trademark-policy",
+      "subject": "Use of Microsoft and SQL Server names in compatibility statements",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": ["prov-ms-trademark-guidelines"],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "Project naming, release claims, attribution, and non-endorsement language require qualified human legal review. Microsoft logos and confusing branding are not project inputs."
+    },
+    {
+      "id": "legal-review-contribution-policy",
+      "subject": "Use of Developer Certificate of Origin 1.1 for contributions",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": ["prov-dco-1.1"],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "The repository can document the proposed sign-off process, but qualified human legal review must approve the contribution policy."
+    },
+    {
+      "id": "legal-review-project-license",
+      "subject": "Application of Apache License 2.0 to ntsql repository content and distributions",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": ["prov-apache-license-2.0"],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "The workspace manifest and repository LICENSE record Apache-2.0 as the selected project-license candidate. A qualified human reviewer must confirm ownership, contribution, notice, patent, and distribution implications before this gate can close."
+    },
+    {
+      "id": "legal-review-third-party-dependencies",
+      "subject": "Inclusion of third-party Rust crates and execution of supply-chain governance tools",
+      "status": "pending",
+      "approved_uses": [],
+      "prohibited_uses": [],
+      "individual_review_uses": [],
+      "source_provenance_ids": [
+        "prov-crates-serde-1.0.229",
+        "prov-crates-serde-json-1.0.151",
+        "prov-crates-cargo-deny-0.20.2",
+        "prov-crates-cargo-audit-0.22.2",
+        "prov-crates-cargo-cyclonedx-0.5.9",
+        "prov-github-actions-checkout-11bd7190",
+        "prov-github-actions-upload-artifact-043fb46d"
+      ],
+      "reviewed_by": null,
+      "decided_on": null,
+      "rationale": "Versions, source archives, digests, and declared licenses are technically inventoried. Automated license and advisory checks do not constitute legal approval; a qualified human reviewer must decide dependency inclusion and governance-tool use before the legal gate can close."
+    }
+  ]
+}

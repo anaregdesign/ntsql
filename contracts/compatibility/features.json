@@ -1,0 +1,214 @@
+{
+  "schema_version": "1.0.0",
+  "features": [
+    {
+      "id": "category.protocol-connectivity",
+      "title": "Protocol and connectivity inventory root",
+      "category": "protocol-connectivity",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-tds-42"],
+      "differences": [],
+      "owner_issue": 10,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.language",
+      "title": "T-SQL language inventory root",
+      "category": "language",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 8,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.data-types",
+      "title": "Data types and conversions inventory root",
+      "category": "data-types",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 6,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.collation",
+      "title": "Collation and locale inventory root",
+      "category": "collation",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 6,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.scalar-expressions",
+      "title": "Scalar expressions and built-ins inventory root",
+      "category": "scalar-expressions",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 11,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.query-processing",
+      "title": "Query processing inventory root",
+      "category": "query-processing",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 14,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.data-manipulation",
+      "title": "Data manipulation inventory root",
+      "category": "data-manipulation",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 15,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.data-definition",
+      "title": "Data definition inventory root",
+      "category": "data-definition",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 12,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.programmability",
+      "title": "Programmability inventory root",
+      "category": "programmability",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-sql-editions-2022"],
+      "differences": [],
+      "owner_issue": 13,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.transactions-concurrency",
+      "title": "Transactions and concurrency inventory root",
+      "category": "transactions-concurrency",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 7,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.security",
+      "title": "Security inventory root",
+      "category": "security",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-sql-editions-2022"],
+      "differences": [],
+      "owner_issue": 16,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.catalog-metadata",
+      "title": "Catalog and metadata inventory root",
+      "category": "catalog-metadata",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 18,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.administration",
+      "title": "Administration inventory root",
+      "category": "administration",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-sql-editions-2022"],
+      "differences": [],
+      "owner_issue": 17,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.storage-recovery",
+      "title": "Storage and recovery inventory root",
+      "category": "storage-recovery",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 9,
+      "legal_review_id": null
+    },
+    {
+      "id": "storage.native-file-formats",
+      "title": "Native MDF, NDF, LDF, and BAK format compatibility",
+      "category": "storage-recovery",
+      "status": "blocked-legal",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 3,
+      "legal_review_id": "legal-review-native-file-formats"
+    },
+    {
+      "id": "category.high-availability",
+      "title": "High availability inventory root",
+      "category": "high-availability",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-sql-editions-2022"],
+      "differences": [],
+      "owner_issue": 22,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.data-distribution",
+      "title": "Data distribution inventory root",
+      "category": "data-distribution",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-sql-editions-2022"],
+      "differences": [],
+      "owner_issue": 23,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.observability-diagnostics",
+      "title": "Observability and diagnostics inventory root",
+      "category": "observability-diagnostics",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-sql-editions-2022"],
+      "differences": [],
+      "owner_issue": 17,
+      "legal_review_id": null
+    },
+    {
+      "id": "category.external-integration",
+      "title": "Database Engine external integration inventory root",
+      "category": "external-integration",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022", "prov-ms-sql-editions-2022"],
+      "differences": [],
+      "owner_issue": 19,
+      "legal_review_id": null
+    }
+  ]
+}

@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anaregdesign/ntsql/contracts/schemas/conformance-record.schema.json",
+  "title": "ntsql conformance record",
+  "description": "One versioned comparison between an exact SQL Server oracle target and ntsql.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "case_id",
+    "target_id",
+    "observed_at",
+    "provenance_id",
+    "behavior_class",
+    "observations"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "case_id": { "$ref": "#/$defs/identifier" },
+    "target_id": { "$ref": "#/$defs/identifier" },
+    "observed_at": { "type": "string", "format": "date-time" },
+    "provenance_id": { "$ref": "#/$defs/identifier" },
+    "behavior_class": {
+      "enum": [
+        "documented",
+        "version-dependent",
+        "unspecified",
+        "implementation-dependent"
+      ]
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "syntax",
+        "wire",
+        "result",
+        "metadata",
+        "diagnostic",
+        "transactional_side_effect",
+        "operational"
+      ],
+      "properties": {
+        "syntax": { "$ref": "#/$defs/observation" },
+        "wire": { "$ref": "#/$defs/observation" },
+        "result": { "$ref": "#/$defs/observation" },
+        "metadata": { "$ref": "#/$defs/observation" },
+        "diagnostic": { "$ref": "#/$defs/observation" },
+        "transactional_side_effect": { "$ref": "#/$defs/observation" },
+        "operational": { "$ref": "#/$defs/observation" }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "comparison_status": {
+      "enum": ["compatible", "partial", "divergent"]
+    },
+    "observation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "oracle", "subject", "status"],
+          "properties": {
+            "state": { "const": "observed" },
+            "oracle": {},
+            "subject": {},
+            "status": { "$ref": "#/$defs/comparison_status" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "reason"],
+          "properties": {
+            "state": { "const": "not-observed" },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

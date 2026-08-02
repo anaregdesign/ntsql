@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anaregdesign/ntsql/contracts/schemas/feature-matrix.schema.json",
+  "title": "ntsql feature matrix",
+  "description": "Versioned, classified Database Engine compatibility inventory.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "features"],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "features": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/feature" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "feature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "category",
+        "status",
+        "oracle_targets",
+        "evidence",
+        "differences",
+        "owner_issue",
+        "legal_review_id"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "title": { "type": "string", "minLength": 1 },
+        "category": {
+          "enum": [
+            "protocol-connectivity",
+            "language",
+            "data-types",
+            "collation",
+            "scalar-expressions",
+            "query-processing",
+            "data-manipulation",
+            "data-definition",
+            "programmability",
+            "transactions-concurrency",
+            "security",
+            "catalog-metadata",
+            "administration",
+            "storage-recovery",
+            "high-availability",
+            "data-distribution",
+            "observability-diagnostics",
+            "external-integration"
+          ]
+        },
+        "status": {
+          "enum": [
+            "compatible",
+            "partial",
+            "divergent",
+            "blocked-legal",
+            "not-tested"
+          ]
+        },
+        "oracle_targets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "differences": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "owner_issue": { "type": "integer", "minimum": 1 },
+        "legal_review_id": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "compatible" } } },
+          "then": { "properties": { "differences": { "maxItems": 0 } } }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "enum": ["partial", "divergent"] }
+            }
+          },
+          "then": { "properties": { "differences": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "blocked-legal" } } },
+          "then": {
+            "properties": {
+              "legal_review_id": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

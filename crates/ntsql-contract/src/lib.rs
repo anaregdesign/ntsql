@@ -2,8 +2,16 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(deserializer)
+}
 
 /// Current version of the conformance record contract.
 pub const CONFORMANCE_SCHEMA_VERSION: &str = "1.0.0";
@@ -268,8 +276,10 @@ pub struct ProvenanceRecord {
     /// Human-readable source title.
     pub title: String,
     /// Canonical public URL, when the source is external.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub source_url: Option<String>,
     /// Repository-relative path, when the record describes an owned artifact.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub artifact_path: Option<String>,
     /// Published revision, version, commit, or retrieval snapshot identifier.
     pub revision: String,
@@ -280,6 +290,7 @@ pub struct ProvenanceRecord {
     /// Reproducible description of how this record was produced.
     pub generation_method: String,
     /// Relevant capture environment, or `None` for environment-neutral sources.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub environment: Option<String>,
     /// License or terms identifier governing the source.
     pub license: String,
@@ -331,10 +342,13 @@ pub struct LegalReviewRecord {
     /// Provenance records for terms and facts considered by the reviewer.
     pub source_provenance_ids: Vec<String>,
     /// Stable identity of the qualified human reviewer, present only after a decision.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub reviewed_by: Option<LegalReviewerIdentity>,
     /// ISO 8601 decision date, present only after a decision.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub decided_on: Option<String>,
     /// Immutable authenticated review evidence, present only after a decision.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub decision_evidence: Option<LegalDecisionEvidenceReference>,
     /// Scope, conditions, and rationale for the decision.
     pub rationale: String,
@@ -541,11 +555,10 @@ pub struct TargetMatrix {
 }
 
 impl TargetMatrix {
-    /// Validates target uniqueness, reproducibility, and baseline selection.
+    /// Validates constraints expressed by the published target-matrix schema.
     #[must_use]
-    pub fn validate(&self) -> Vec<ContractViolation> {
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
-        let mut target_ids = BTreeSet::new();
 
         if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
             violations.push(ContractViolation {
@@ -553,15 +566,27 @@ impl TargetMatrix {
                 message: format!("unsupported target schema version: {}", self.schema_version),
             });
         }
+        if !is_contract_identifier(&self.baseline_target_id) {
+            violations.push(ContractViolation {
+                code: "target.baseline.invalid",
+                message: "baseline target id is malformed".to_owned(),
+            });
+        }
+        if self.targets.is_empty() {
+            violations.push(ContractViolation {
+                code: "target.missing",
+                message: "target matrix requires at least one target".to_owned(),
+            });
+        }
 
         for target in &self.targets {
-            if !target_ids.insert(target.id.as_str()) {
+            if !is_contract_identifier(&target.id) || !is_contract_identifier(&target.provenance_id)
+            {
                 violations.push(ContractViolation {
-                    code: "target.id.duplicate",
-                    message: format!("duplicate target id: {}", target.id),
+                    code: "target.id.invalid",
+                    message: format!("target {} contains a malformed identifier", target.id),
                 });
             }
-
             if !is_sha256_digest(&target.container_digest) {
                 violations.push(ContractViolation {
                     code: "target.container-digest.invalid",
@@ -575,11 +600,77 @@ impl TargetMatrix {
                     message: format!("target {} must not use a latest tag", target.id),
                 });
             }
-
-            if target.session_settings.is_empty() {
+            if !has_four_numeric_components(&target.product_version) {
+                violations.push(ContractViolation {
+                    code: "target.product-version.invalid",
+                    message: format!("target {} has a malformed product version", target.id),
+                });
+            }
+            if [
+                &target.product_release,
+                &target.servicing_update,
+                &target.edition,
+                &target.operating_system,
+                &target.architecture,
+                &target.container_repository,
+                &target.container_tag,
+                &target.collation,
+                &target.language,
+                &target.timezone,
+            ]
+            .into_iter()
+            .any(|value| value.is_empty())
+            {
+                violations.push(ContractViolation {
+                    code: "target.metadata.empty",
+                    message: format!("target {} contains empty metadata", target.id),
+                });
+            }
+            if target.session_settings.is_empty()
+                || target.session_settings.iter().any(String::is_empty)
+            {
                 violations.push(ContractViolation {
                     code: "target.session-settings.empty",
                     message: format!("target {} requires explicit session settings", target.id),
+                });
+            }
+            if has_duplicates(&target.session_settings) {
+                violations.push(ContractViolation {
+                    code: "target.session-settings.duplicate",
+                    message: format!("target {} repeats a session setting", target.id),
+                });
+            }
+        }
+
+        for expansion in &self.expansion_order {
+            if expansion.sequence == 0 {
+                violations.push(ContractViolation {
+                    code: "target.expansion.sequence.invalid",
+                    message: "target expansion sequence must be positive".to_owned(),
+                });
+            }
+            if expansion.scope.is_empty() || expansion.admission_criteria.is_empty() {
+                violations.push(ContractViolation {
+                    code: "target.expansion.metadata.empty",
+                    message: "target expansion requires scope and admission criteria".to_owned(),
+                });
+            }
+        }
+
+        violations
+    }
+
+    /// Validates target uniqueness, reproducibility, and baseline selection.
+    #[must_use]
+    pub fn validate(&self) -> Vec<ContractViolation> {
+        let mut violations = self.validate_schema_semantics();
+        let mut target_ids = BTreeSet::new();
+
+        for target in &self.targets {
+            if !target_ids.insert(target.id.as_str()) {
+                violations.push(ContractViolation {
+                    code: "target.id.duplicate",
+                    message: format!("duplicate target id: {}", target.id),
                 });
             }
         }
@@ -624,6 +715,14 @@ fn is_sha256_digest(value: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn has_four_numeric_components(value: &str) -> bool {
+    let components = value.split('.').collect::<Vec<_>>();
+    components.len() == 4
+        && components.iter().all(|component| {
+            !component.is_empty() && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
 /// One entry in the Database Engine feature matrix.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -645,6 +744,7 @@ pub struct FeatureRecord {
     /// GitHub issue that owns the remaining work.
     pub owner_issue: u64,
     /// Legal review or gate identifier when the feature is legally blocked.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub legal_review_id: Option<String>,
 }
 
@@ -682,11 +782,9 @@ impl LegalDecisionEvidenceReference {
 }
 
 impl LegalDecisionAuthority {
-    fn validate(
-        &self,
-        candidate_repository: &str,
-        candidate_commit_sha: &str,
-    ) -> Vec<ContractViolation> {
+    /// Validates constraints expressed by the published legal-decision authority schema.
+    #[must_use]
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
 
         if self.schema_version != LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION {
@@ -701,15 +799,6 @@ impl LegalDecisionAuthority {
             violations.push(ContractViolation {
                 code: "legal-review.authority.candidate.malformed",
                 message: "legal-review authority contains a malformed candidate target".to_owned(),
-            });
-        }
-        if self.candidate_repository != candidate_repository
-            || self.candidate_commit_sha != candidate_commit_sha
-        {
-            violations.push(ContractViolation {
-                code: "legal-review.authority.candidate.mismatch",
-                message: "legal-review authority does not match the trusted candidate target"
-                    .to_owned(),
             });
         }
 
@@ -731,9 +820,6 @@ impl LegalDecisionAuthority {
             }
         }
 
-        let mut pull_requests = BTreeSet::new();
-        let mut review_ids = BTreeSet::new();
-        let mut attestation_keys = BTreeSet::new();
         if self.pull_requests.is_empty() {
             violations.push(ContractViolation {
                 code: "legal-review.authority.pull-request.missing",
@@ -741,17 +827,6 @@ impl LegalDecisionAuthority {
             });
         }
         for pull_request in &self.pull_requests {
-            if pull_request.repository != self.candidate_repository {
-                violations.push(ContractViolation {
-                    code: "legal-review.authority.pull-request.repository-mismatch",
-                    message: format!(
-                        "pull request {}/{} is outside candidate repository {}",
-                        pull_request.repository,
-                        pull_request.pull_request_number,
-                        self.candidate_repository
-                    ),
-                });
-            }
             if !is_github_repository(&pull_request.repository)
                 || pull_request.pull_request_number == 0
                 || pull_request.pull_request_author_account_id == 0
@@ -760,19 +835,6 @@ impl LegalDecisionAuthority {
                 violations.push(ContractViolation {
                     code: "legal-review.authority.pull-request.malformed",
                     message: "legal-review authority contains a malformed pull request".to_owned(),
-                });
-            }
-
-            if !pull_requests.insert((
-                pull_request.repository.as_str(),
-                pull_request.pull_request_number,
-            )) {
-                violations.push(ContractViolation {
-                    code: "legal-review.authority.pull-request.duplicate",
-                    message: format!(
-                        "legal-review authority repeats pull request {}/{}",
-                        pull_request.repository, pull_request.pull_request_number
-                    ),
                 });
             }
 
@@ -792,7 +854,75 @@ impl LegalDecisionAuthority {
                         ),
                     });
                 }
+                if has_equal_duplicates(&review.attestations) {
+                    violations.push(ContractViolation {
+                        code: "legal-review.evidence.attestation.malformed",
+                        message: format!(
+                            "authenticated review {} repeats an attestation item",
+                            review.review_id
+                        ),
+                    });
+                }
 
+                for attestation in &review.attestations {
+                    if !is_contract_identifier(&attestation.attestation_id)
+                        || !attestation.decision.validate_schema_semantics().is_empty()
+                        || attestation.provenance_records.is_empty()
+                        || has_equal_duplicates(&attestation.provenance_records)
+                        || attestation
+                            .provenance_records
+                            .iter()
+                            .any(|record| !record.validate_schema_semantics().is_empty())
+                    {
+                        violations.push(ContractViolation {
+                            code: "legal-review.evidence.attestation.malformed",
+                            message: format!(
+                                "authenticated review {} contains a malformed attestation",
+                                review.review_id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+
+    /// Validates cross-record constraints within one authority document.
+    #[must_use]
+    pub fn validate_document_semantics(&self) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        let mut pull_requests = BTreeSet::new();
+        let mut review_ids = BTreeSet::new();
+        let mut attestation_keys = BTreeSet::new();
+
+        for pull_request in &self.pull_requests {
+            if pull_request.repository != self.candidate_repository {
+                violations.push(ContractViolation {
+                    code: "legal-review.authority.pull-request.repository-mismatch",
+                    message: format!(
+                        "pull request {}/{} is outside candidate repository {}",
+                        pull_request.repository,
+                        pull_request.pull_request_number,
+                        self.candidate_repository
+                    ),
+                });
+            }
+            if !pull_requests.insert((
+                pull_request.repository.as_str(),
+                pull_request.pull_request_number,
+            )) {
+                violations.push(ContractViolation {
+                    code: "legal-review.authority.pull-request.duplicate",
+                    message: format!(
+                        "legal-review authority repeats pull request {}/{}",
+                        pull_request.repository, pull_request.pull_request_number
+                    ),
+                });
+            }
+
+            for review in &pull_request.authenticated_reviews {
                 if review.repository != pull_request.repository
                     || review.pull_request_number != pull_request.pull_request_number
                 {
@@ -804,7 +934,6 @@ impl LegalDecisionAuthority {
                         ),
                     });
                 }
-
                 if !review_ids.insert(review.review_id) {
                     violations.push(ContractViolation {
                         code: "legal-review.evidence.duplicate",
@@ -816,13 +945,8 @@ impl LegalDecisionAuthority {
                 }
 
                 for attestation in &review.attestations {
-                    if !is_contract_identifier(&attestation.attestation_id)
-                        || attestation.decision.status == LegalReviewStatus::Pending
-                        || !attestation.decision.validate().is_empty()
-                        || attestation
-                            .provenance_records
-                            .iter()
-                            .any(|record| !record.validate().is_empty())
+                    if attestation.decision.status == LegalReviewStatus::Pending
+                        || !attestation.decision.validate_cross_scope().is_empty()
                         || !is_complete_provenance_snapshot(
                             &attestation.decision,
                             &attestation.provenance_records,
@@ -859,25 +983,55 @@ impl LegalDecisionAuthority {
 
         violations
     }
+
+    /// Validates the authority audience against a trusted workflow event.
+    #[must_use]
+    pub fn validate_trusted_candidate(
+        &self,
+        candidate_repository: &str,
+        candidate_commit_sha: &str,
+    ) -> Vec<ContractViolation> {
+        if self.candidate_repository == candidate_repository
+            && self.candidate_commit_sha == candidate_commit_sha
+        {
+            Vec::new()
+        } else {
+            vec![ContractViolation {
+                code: "legal-review.authority.candidate.mismatch",
+                message: "legal-review authority does not match the trusted candidate target"
+                    .to_owned(),
+            }]
+        }
+    }
+
+    fn validate(
+        &self,
+        candidate_repository: &str,
+        candidate_commit_sha: &str,
+    ) -> Vec<ContractViolation> {
+        let mut violations = self.validate_schema_semantics();
+        violations.extend(self.validate_document_semantics());
+        violations
+            .extend(self.validate_trusted_candidate(candidate_repository, candidate_commit_sha));
+        violations
+    }
 }
 
 impl LegalReviewRecord {
-    fn validate(&self) -> Vec<ContractViolation> {
+    /// Validates constraints expressed by the published legal-review schema.
+    #[must_use]
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
 
-        if self.id.trim().is_empty() {
-            violations.push(ContractViolation {
-                code: "legal-review.id.empty",
-                message: "legal review id must not be empty".to_owned(),
-            });
-        } else if !is_contract_identifier(&self.id) {
+        if !is_contract_identifier(&self.id) {
             violations.push(ContractViolation {
                 code: "legal-review.id.invalid",
                 message: format!("legal review id is malformed: {}", self.id),
             });
         }
 
-        if self.subject.trim().is_empty() || self.rationale.trim().is_empty() {
+        if !has_schema_non_whitespace(&self.subject) || !has_schema_non_whitespace(&self.rationale)
+        {
             violations.push(ContractViolation {
                 code: "legal-review.description.empty",
                 message: format!("legal review {} requires a subject and rationale", self.id),
@@ -910,19 +1064,17 @@ impl LegalReviewRecord {
             }
         }
 
-        let mut decided_uses = BTreeSet::new();
-        for use_kind in self
-            .approved_uses
-            .iter()
-            .chain(&self.prohibited_uses)
-            .chain(&self.individual_review_uses)
-        {
-            if !decided_uses.insert(*use_kind) {
+        for (field, uses) in [
+            ("approved_uses", &self.approved_uses),
+            ("prohibited_uses", &self.prohibited_uses),
+            ("individual_review_uses", &self.individual_review_uses),
+        ] {
+            if has_duplicates(uses) {
                 violations.push(ContractViolation {
                     code: "legal-review.use.duplicate",
                     message: format!(
-                        "legal review {} contains a duplicate or conflicting use {use_kind:?}",
-                        self.id
+                        "legal review {} contains a duplicate use in {field}",
+                        self.id,
                     ),
                 });
             }
@@ -940,7 +1092,9 @@ impl LegalReviewRecord {
 
         match self.status {
             LegalReviewStatus::Pending => {
-                if !decided_uses.is_empty()
+                if !self.approved_uses.is_empty()
+                    || !self.prohibited_uses.is_empty()
+                    || !self.individual_review_uses.is_empty()
                     || self.reviewed_by.is_some()
                     || self.decided_on.is_some()
                     || self.decision_evidence.is_some()
@@ -995,14 +1149,35 @@ impl LegalReviewRecord {
 
         violations
     }
+
+    fn validate_cross_scope(&self) -> Vec<ContractViolation> {
+        let has_conflict = self.approved_uses.iter().any(|use_kind| {
+            self.prohibited_uses.contains(use_kind)
+                || self.individual_review_uses.contains(use_kind)
+        }) || self
+            .prohibited_uses
+            .iter()
+            .any(|use_kind| self.individual_review_uses.contains(use_kind));
+
+        if has_conflict {
+            vec![ContractViolation {
+                code: "legal-review.use.duplicate",
+                message: format!(
+                    "legal review {} assigns one use to conflicting scopes",
+                    self.id
+                ),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl LegalReviewLedger {
-    /// Validates legal-review structure without treating pending work as approval.
+    /// Validates constraints expressed by the published legal-review ledger schema.
     #[must_use]
-    pub fn validate(&self) -> Vec<ContractViolation> {
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
-        let mut review_ids = BTreeSet::new();
 
         if self.schema_version != LEGAL_REVIEW_SCHEMA_VERSION {
             violations.push(ContractViolation {
@@ -1021,7 +1196,20 @@ impl LegalReviewLedger {
         }
 
         for review in &self.reviews {
-            violations.extend(review.validate());
+            violations.extend(review.validate_schema_semantics());
+        }
+
+        violations
+    }
+
+    /// Validates legal-review structure without treating pending work as approval.
+    #[must_use]
+    pub fn validate(&self) -> Vec<ContractViolation> {
+        let mut violations = self.validate_schema_semantics();
+        let mut review_ids = BTreeSet::new();
+
+        for review in &self.reviews {
+            violations.extend(review.validate_cross_scope());
             if !review_ids.insert(review.id.as_str()) {
                 violations.push(ContractViolation {
                     code: "legal-review.id.duplicate",
@@ -1253,25 +1441,37 @@ impl LegalReviewLedger {
 }
 
 impl ProvenanceRecord {
-    fn validate(&self) -> Vec<ContractViolation> {
+    /// Validates constraints expressed by the published provenance record schema.
+    #[must_use]
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
 
-        if self.id.trim().is_empty() {
+        if !is_contract_identifier(&self.id) {
             violations.push(ContractViolation {
-                code: "provenance.id.empty",
-                message: "provenance id must not be empty".to_owned(),
+                code: "provenance.id.invalid",
+                message: "provenance id is malformed".to_owned(),
             });
         }
 
-        if self.title.trim().is_empty()
-            || self.revision.trim().is_empty()
-            || self.author.trim().is_empty()
-            || self.generation_method.trim().is_empty()
-            || self.license.trim().is_empty()
+        if !has_schema_non_whitespace(&self.title)
+            || !has_schema_non_whitespace(&self.revision)
+            || !has_schema_non_whitespace(&self.author)
+            || !has_schema_non_whitespace(&self.generation_method)
+            || !has_schema_non_whitespace(&self.license)
         {
             violations.push(ContractViolation {
                 code: "provenance.metadata.empty",
                 message: format!("provenance {} has incomplete source metadata", self.id),
+            });
+        }
+        if self
+            .environment
+            .as_deref()
+            .is_some_and(|environment| !has_schema_non_whitespace(environment))
+        {
+            violations.push(ContractViolation {
+                code: "provenance.environment.empty",
+                message: format!("provenance {} has an empty environment", self.id),
             });
         }
 
@@ -1346,10 +1546,29 @@ impl ProvenanceRecord {
             });
         }
 
-        if self.legal_review_id.trim().is_empty() {
+        let mut parent_ids = BTreeSet::new();
+        for parent_id in &self.parent_provenance_ids {
+            if !is_contract_identifier(parent_id) {
+                violations.push(ContractViolation {
+                    code: "provenance.parent.invalid",
+                    message: format!("provenance {} has malformed parent {parent_id}", self.id),
+                });
+            }
+            if !parent_ids.insert(parent_id.as_str()) {
+                violations.push(ContractViolation {
+                    code: "provenance.parent.duplicate",
+                    message: format!("provenance {} repeats parent {parent_id}", self.id),
+                });
+            }
+        }
+
+        if !is_contract_identifier(&self.legal_review_id) {
             violations.push(ContractViolation {
-                code: "provenance.legal-review.missing",
-                message: format!("provenance {} requires a legal review reference", self.id),
+                code: "provenance.legal-review.invalid",
+                message: format!(
+                    "provenance {} has a malformed legal review reference",
+                    self.id
+                ),
             });
         }
 
@@ -1372,16 +1591,10 @@ impl ProvenanceSourceKind {
 }
 
 impl ProvenanceLedger {
-    /// Validates provenance structure and every cross-ledger reference.
+    /// Validates constraints expressed by the published provenance-ledger schema.
     #[must_use]
-    pub fn validate(&self, legal_reviews: &LegalReviewLedger) -> Vec<ContractViolation> {
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
-        let mut provenance_ids = BTreeSet::new();
-        let legal_review_ids: BTreeSet<&str> = legal_reviews
-            .reviews
-            .iter()
-            .map(|review| review.id.as_str())
-            .collect();
 
         if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
             violations.push(ContractViolation {
@@ -1392,9 +1605,31 @@ impl ProvenanceLedger {
                 ),
             });
         }
+        if self.records.is_empty() {
+            violations.push(ContractViolation {
+                code: "provenance.record.missing",
+                message: "provenance ledger requires at least one record".to_owned(),
+            });
+        }
+        for record in &self.records {
+            violations.extend(record.validate_schema_semantics());
+        }
+
+        violations
+    }
+
+    /// Validates provenance structure and every cross-ledger reference.
+    #[must_use]
+    pub fn validate(&self, legal_reviews: &LegalReviewLedger) -> Vec<ContractViolation> {
+        let mut violations = self.validate_schema_semantics();
+        let mut provenance_ids = BTreeSet::new();
+        let legal_review_ids: BTreeSet<&str> = legal_reviews
+            .reviews
+            .iter()
+            .map(|review| review.id.as_str())
+            .collect();
 
         for record in &self.records {
-            violations.extend(record.validate());
             if !provenance_ids.insert(record.id.as_str()) {
                 violations.push(ContractViolation {
                     code: "provenance.id.duplicate",
@@ -1427,14 +1662,8 @@ impl ProvenanceLedger {
         }
 
         for record in &self.records {
-            let mut parent_ids = BTreeSet::new();
             for parent_id in &record.parent_provenance_ids {
-                if !parent_ids.insert(parent_id.as_str()) {
-                    violations.push(ContractViolation {
-                        code: "provenance.parent.duplicate",
-                        message: format!("provenance {} repeats parent {}", record.id, parent_id),
-                    });
-                } else if parent_id == &record.id {
+                if parent_id == &record.id {
                     violations.push(ContractViolation {
                         code: "provenance.parent.self-reference",
                         message: format!("provenance {} references itself", record.id),
@@ -1764,6 +1993,64 @@ pub fn validate_governance_references(
 }
 
 impl ConformanceRecord {
+    /// Validates constraints expressed by the published conformance-record schema.
+    #[must_use]
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+
+        if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
+            violations.push(ContractViolation {
+                code: "conformance.schema-version.unsupported",
+                message: format!(
+                    "unsupported conformance schema version: {}",
+                    self.schema_version
+                ),
+            });
+        }
+        for (field, identifier) in [
+            ("case_id", self.case_id.as_str()),
+            ("target_id", self.target_id.as_str()),
+            ("provenance_id", self.provenance_id.as_str()),
+        ] {
+            if !is_contract_identifier(identifier) {
+                violations.push(ContractViolation {
+                    code: "conformance.identifier.invalid",
+                    message: format!("conformance {field} is malformed: {identifier}"),
+                });
+            }
+        }
+        if !is_iso_utc_timestamp(&self.observed_at) {
+            violations.push(ContractViolation {
+                code: "conformance.observed-at.invalid",
+                message: "conformance observed_at must use UTC second precision".to_owned(),
+            });
+        }
+
+        for (dimension, observation) in [
+            ("syntax", &self.observations.syntax),
+            ("wire", &self.observations.wire),
+            ("result", &self.observations.result),
+            ("metadata", &self.observations.metadata),
+            ("diagnostic", &self.observations.diagnostic),
+            (
+                "transactional_side_effect",
+                &self.observations.transactional_side_effect,
+            ),
+            ("operational", &self.observations.operational),
+        ] {
+            if let DimensionObservation::NotObserved { reason } = observation
+                && !has_schema_non_whitespace(reason)
+            {
+                violations.push(ContractViolation {
+                    code: "conformance.observation.reason.empty",
+                    message: format!("conformance {dimension} requires a reason"),
+                });
+            }
+        }
+
+        violations
+    }
+
     /// Validates that a conformance run used an approved oracle and evidence source.
     #[must_use]
     pub fn validate_governance(
@@ -1843,9 +2130,16 @@ impl FeatureMatrix {
     }
 }
 
-fn has_duplicates<T: Copy + Ord>(values: &[T]) -> bool {
+fn has_duplicates<T: Ord>(values: &[T]) -> bool {
     let mut unique = BTreeSet::new();
-    values.iter().any(|value| !unique.insert(*value))
+    values.iter().any(|value| !unique.insert(value))
+}
+
+fn has_equal_duplicates<T: PartialEq>(values: &[T]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(index, value)| values[..index].contains(value))
 }
 
 fn is_iso_date(value: &str) -> bool {
@@ -1923,9 +2217,29 @@ fn is_github_name(value: &str) -> bool {
 
 fn is_repository_relative_path(value: &str) -> bool {
     !value.is_empty()
+        && has_schema_non_whitespace(value)
         && !value.starts_with('/')
         && !value.contains('\\')
         && !value.split('/').any(|component| component == "..")
+}
+
+fn has_schema_non_whitespace(value: &str) -> bool {
+    value.chars().any(|character| {
+        !matches!(
+            character,
+            '\u{0009}'..='\u{000D}'
+                | '\u{0020}'
+                | '\u{00A0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200A}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202F}'
+                | '\u{205F}'
+                | '\u{3000}'
+                | '\u{FEFF}'
+        )
+    })
 }
 
 fn provenance_lineage_has_cycle<'a>(
@@ -2015,18 +2329,23 @@ fn provenance_snapshot_matches(
 }
 
 impl FeatureRecord {
-    /// Validates evidence and ownership rules implied by the feature status.
+    /// Validates constraints expressed by the published feature record schema.
     #[must_use]
     pub fn validate(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
 
-        if self.id.trim().is_empty() {
+        if !is_contract_identifier(&self.id) {
             violations.push(ContractViolation {
-                code: "feature.id.empty",
-                message: "feature id must not be empty".to_owned(),
+                code: "feature.id.invalid",
+                message: "feature id is malformed".to_owned(),
             });
         }
-
+        if self.title.is_empty() {
+            violations.push(ContractViolation {
+                code: "feature.title.empty",
+                message: "feature title must not be empty".to_owned(),
+            });
+        }
         if self.owner_issue == 0 {
             violations.push(ContractViolation {
                 code: "feature.owner.missing",
@@ -2038,6 +2357,48 @@ impl FeatureRecord {
             violations.push(ContractViolation {
                 code: "feature.traceability.missing",
                 message: "features require evidence and oracle targets".to_owned(),
+            });
+        }
+        for (field, identifiers) in [
+            ("oracle_targets", &self.oracle_targets),
+            ("evidence", &self.evidence),
+        ] {
+            if identifiers
+                .iter()
+                .any(|identifier| !is_contract_identifier(identifier))
+            {
+                violations.push(ContractViolation {
+                    code: "feature.reference.invalid",
+                    message: format!("feature {} has a malformed {field} reference", self.id),
+                });
+            }
+            if has_duplicates(identifiers) {
+                violations.push(ContractViolation {
+                    code: "feature.reference.duplicate",
+                    message: format!("feature {} repeats a {field} reference", self.id),
+                });
+            }
+        }
+        if self.differences.iter().any(String::is_empty) {
+            violations.push(ContractViolation {
+                code: "feature.difference.empty",
+                message: format!("feature {} contains an empty difference", self.id),
+            });
+        }
+        if has_duplicates(&self.differences) {
+            violations.push(ContractViolation {
+                code: "feature.difference.duplicate",
+                message: format!("feature {} repeats a known difference", self.id),
+            });
+        }
+        if self
+            .legal_review_id
+            .as_deref()
+            .is_some_and(|identifier| !is_contract_identifier(identifier))
+        {
+            violations.push(ContractViolation {
+                code: "feature.legal-review.invalid",
+                message: format!("feature {} has a malformed legal review id", self.id),
             });
         }
 
@@ -2076,13 +2437,10 @@ impl FeatureRecord {
 }
 
 impl FeatureMatrix {
-    /// Validates every feature and all cross-record invariants.
+    /// Validates constraints expressed by the published feature-matrix schema.
     #[must_use]
-    pub fn validate(&self, targets: &TargetMatrix) -> Vec<ContractViolation> {
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
-        let mut feature_ids = BTreeSet::new();
-        let mut categories = BTreeSet::new();
-        let target_ids = targets.target_ids();
 
         if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
             violations.push(ContractViolation {
@@ -2093,9 +2451,28 @@ impl FeatureMatrix {
                 ),
             });
         }
-
+        if self.features.is_empty() {
+            violations.push(ContractViolation {
+                code: "feature.missing",
+                message: "feature matrix requires at least one feature".to_owned(),
+            });
+        }
         for feature in &self.features {
             violations.extend(feature.validate());
+        }
+
+        violations
+    }
+
+    /// Validates every feature and all cross-record invariants.
+    #[must_use]
+    pub fn validate(&self, targets: &TargetMatrix) -> Vec<ContractViolation> {
+        let mut violations = self.validate_schema_semantics();
+        let mut feature_ids = BTreeSet::new();
+        let mut categories = BTreeSet::new();
+        let target_ids = targets.target_ids();
+
+        for feature in &self.features {
             categories.insert(feature.category);
 
             if !feature_ids.insert(feature.id.as_str()) {

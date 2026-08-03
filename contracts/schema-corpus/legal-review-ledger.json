@@ -1,0 +1,276 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/legal-review-ledger.schema.json",
+  "base_document": {
+    "source": "../compatibility/legal-reviews.json"
+  },
+  "cases": [
+    {
+      "case_id": "legal-review.base.valid",
+      "constraint": "published legal-review ledger",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "legal-review.required.nullable-reviewer-missing",
+      "constraint": "required nullable property",
+      "patch": [
+        { "op": "remove", "path": "/reviews/0/reviewed_by" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        { "op": "add", "path": "/reviews/0/unexpected", "value": true }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.approved.u64-maximums-accepted",
+      "constraint": "approved conditional and u64 maximums",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/status", "value": "approved" },
+        { "op": "add", "path": "/reviews/0/approved_uses/-", "value": "documentation-reference" },
+        {
+          "op": "replace",
+          "path": "/reviews/0/reviewed_by",
+          "value": {
+            "github_account_id": 18446744073709551615,
+            "github_login": "schema-reviewer"
+          }
+        },
+        { "op": "replace", "path": "/reviews/0/decided_on", "value": "2025-01-01" },
+        {
+          "op": "replace",
+          "path": "/reviews/0/decision_evidence",
+          "value": {
+            "repository": "anaregdesign/ntsql",
+            "pull_request_number": 18446744073709551615,
+            "attestation_id": "attestation-schema-corpus"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "legal-review.reviewer-account.overflow",
+      "constraint": "u64 maximum",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/reviews/0/reviewed_by",
+          "value": {
+            "github_account_id": 18446744073709551616,
+            "github_login": "schema-reviewer"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.subject.whitespace",
+      "constraint": "non-whitespace subject",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/subject", "value": "   " }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.subject.next-line-whitespace",
+      "constraint": "U+0085 is not ECMAScript whitespace",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/subject", "value": "\u0085" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "legal-review.rationale.byte-order-mark-whitespace",
+      "constraint": "explicit U+FEFF whitespace",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/rationale", "value": "\ufeff" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.source.duplicate",
+      "constraint": "uniqueItems",
+      "patch": [
+        { "op": "copy", "from": "/reviews/0/source_provenance_ids/0", "path": "/reviews/0/source_provenance_ids/-" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.pending.has-decision",
+      "constraint": "pending status conditional",
+      "patch": [
+        { "op": "add", "path": "/reviews/0/approved_uses/-", "value": "documentation-reference" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.approved.metadata-missing",
+      "constraint": "approved status conditional",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/status", "value": "approved" },
+        { "op": "add", "path": "/reviews/0/approved_uses/-", "value": "documentation-reference" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.rejected.has-approved-use",
+      "constraint": "rejected status conditional",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/status", "value": "rejected" },
+        { "op": "add", "path": "/reviews/0/approved_uses/-", "value": "documentation-reference" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.decision-date.lexically-malformed",
+      "constraint": "YYYY-MM-DD lexical date",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/status", "value": "approved" },
+        { "op": "add", "path": "/reviews/0/approved_uses/-", "value": "documentation-reference" },
+        {
+          "op": "replace",
+          "path": "/reviews/0/reviewed_by",
+          "value": { "github_account_id": 1, "github_login": "schema-reviewer" }
+        },
+        { "op": "replace", "path": "/reviews/0/decided_on", "value": "2025/01/01" },
+        {
+          "op": "replace",
+          "path": "/reviews/0/decision_evidence",
+          "value": {
+            "repository": "anaregdesign/ntsql",
+            "pull_request_number": 1,
+            "attestation_id": "attestation-schema-corpus"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.id.duplicate-rust-only",
+      "constraint": "semantic identifier uniqueness",
+      "patch": [
+        { "op": "copy", "from": "/reviews/0", "path": "/reviews/-" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.scope.conflict-rust-only",
+      "constraint": "cross-scope disjointness",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/status", "value": "approved" },
+        { "op": "add", "path": "/reviews/0/approved_uses/-", "value": "documentation-reference" },
+        { "op": "add", "path": "/reviews/0/prohibited_uses/-", "value": "documentation-reference" },
+        {
+          "op": "replace",
+          "path": "/reviews/0/reviewed_by",
+          "value": { "github_account_id": 1, "github_login": "schema-reviewer" }
+        },
+        { "op": "replace", "path": "/reviews/0/decided_on", "value": "2025-01-01" },
+        {
+          "op": "replace",
+          "path": "/reviews/0/decision_evidence",
+          "value": {
+            "repository": "anaregdesign/ntsql",
+            "pull_request_number": 1,
+            "attestation_id": "attestation-schema-corpus"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "legal-review.source.unknown-rust-only",
+      "constraint": "provenance source reference",
+      "patch": [
+        { "op": "replace", "path": "/reviews/0/source_provenance_ids/0", "value": "prov-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

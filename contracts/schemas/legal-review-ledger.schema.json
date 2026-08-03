@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "reviews"],
   "properties": {
-    "schema_version": { "const": "1.0.0" },
+    "schema_version": { "const": "2.0.0" },
     "reviews": {
       "type": "array",
       "minItems": 1,
@@ -18,11 +18,26 @@
     "identifier": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
     },
-    "nullableString": {
+    "reviewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["github_account_id", "github_login"],
+      "properties": {
+        "github_account_id": { "type": "integer", "minimum": 1 },
+        "github_login": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 39,
+          "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9]|-(?!-))*[A-Za-z0-9]$|^[A-Za-z0-9]$"
+        }
+      }
+    },
+    "nullableReviewer": {
       "oneOf": [
-        { "type": "string", "minLength": 1 },
+        { "$ref": "#/$defs/reviewer" },
         { "type": "null" }
       ]
     },
@@ -54,6 +69,25 @@
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/use" }
     },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "pull_request_number", "attestation_id"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "pull_request_number": { "type": "integer", "minimum": 1 },
+        "attestation_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "nullableEvidence": {
+      "oneOf": [
+        { "$ref": "#/$defs/evidence" },
+        { "type": "null" }
+      ]
+    },
     "review": {
       "type": "object",
       "additionalProperties": false,
@@ -67,6 +101,7 @@
         "source_provenance_ids",
         "reviewed_by",
         "decided_on",
+        "decision_evidence",
         "rationale"
       ],
       "properties": {
@@ -82,8 +117,9 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/identifier" }
         },
-        "reviewed_by": { "$ref": "#/$defs/nullableString" },
+        "reviewed_by": { "$ref": "#/$defs/nullableReviewer" },
         "decided_on": { "$ref": "#/$defs/nullableDate" },
+        "decision_evidence": { "$ref": "#/$defs/nullableEvidence" },
         "rationale": { "type": "string", "minLength": 1 }
       },
       "allOf": [
@@ -95,7 +131,8 @@
               "prohibited_uses": { "maxItems": 0 },
               "individual_review_uses": { "maxItems": 0 },
               "reviewed_by": { "type": "null" },
-              "decided_on": { "type": "null" }
+              "decided_on": { "type": "null" },
+              "decision_evidence": { "type": "null" }
             }
           }
         },
@@ -104,11 +141,12 @@
           "then": {
             "properties": {
               "approved_uses": { "minItems": 1 },
-              "reviewed_by": { "type": "string", "minLength": 1 },
+              "reviewed_by": { "$ref": "#/$defs/reviewer" },
               "decided_on": {
                 "type": "string",
                 "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-              }
+              },
+              "decision_evidence": { "$ref": "#/$defs/evidence" }
             }
           }
         },
@@ -117,11 +155,12 @@
           "then": {
             "properties": {
               "approved_uses": { "maxItems": 0 },
-              "reviewed_by": { "type": "string", "minLength": 1 },
+              "reviewed_by": { "$ref": "#/$defs/reviewer" },
               "decided_on": {
                 "type": "string",
                 "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-              }
+              },
+              "decision_evidence": { "$ref": "#/$defs/evidence" }
             }
           }
         }

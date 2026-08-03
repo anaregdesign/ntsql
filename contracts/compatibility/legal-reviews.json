@@ -1,5 +1,5 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "2.0.0",
   "reviews": [
     {
       "id": "legal-review-sql-documentation",
@@ -15,6 +15,7 @@
       ],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "Awaiting qualified human legal review. Inventory registration does not authorize implementation, reproduction, or derivative use."
     },
     {
@@ -31,6 +32,7 @@
       ],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "MS-TDS appears in the promise's Covered Specifications list, but the promise is limited to stated Microsoft patent claims and grants no implied copyright or third-party rights. Qualified human legal review remains required."
     },
     {
@@ -47,6 +49,7 @@
       ],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "Developer edition is limited to development and testing, and container startup requires acceptance of applicable license terms. Qualified human legal review must confirm the oracle workflow before execution."
     },
     {
@@ -62,6 +65,7 @@
       ],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "No implementation, format inference, fixture import, or compatibility claim may begin until qualified human legal review records an explicit decision."
     },
     {
@@ -74,6 +78,7 @@
       "source_provenance_ids": ["prov-ms-trademark-guidelines"],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "Project naming, release claims, attribution, and non-endorsement language require qualified human legal review. Microsoft logos and confusing branding are not project inputs."
     },
     {
@@ -86,6 +91,7 @@
       "source_provenance_ids": ["prov-dco-1.1"],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "The repository can document the proposed sign-off process, but qualified human legal review must approve the contribution policy."
     },
     {
@@ -98,6 +104,7 @@
       "source_provenance_ids": ["prov-apache-license-2.0"],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "The workspace manifest and repository LICENSE record Apache-2.0 as the selected project-license candidate. A qualified human reviewer must confirm ownership, contribution, notice, patent, and distribution implications before this gate can close."
     },
     {
@@ -118,6 +125,7 @@
       ],
       "reviewed_by": null,
       "decided_on": null,
+      "decision_evidence": null,
       "rationale": "Versions, source archives, digests, and declared licenses are technically inventoried. Automated license and advisory checks do not constitute legal approval; a qualified human reviewer must decide dependency inclusion and governance-tool use before the legal gate can close."
     }
   ]

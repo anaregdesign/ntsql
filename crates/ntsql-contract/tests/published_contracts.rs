@@ -10,7 +10,7 @@ const FEATURES: &str = include_str!("../../../contracts/compatibility/features.j
 const LEGAL_REVIEWS: &str = include_str!("../../../contracts/compatibility/legal-reviews.json");
 const PROVENANCE: &str = include_str!("../../../contracts/compatibility/provenance.json");
 const TARGETS: &str = include_str!("../../../contracts/compatibility/targets.json");
-const SCHEMAS: [(&str, &str); 5] = [
+const SCHEMAS: [(&str, &str); 6] = [
     (
         "conformance-record",
         include_str!("../../../contracts/schemas/conformance-record.schema.json"),
@@ -18,6 +18,10 @@ const SCHEMAS: [(&str, &str); 5] = [
     (
         "feature-matrix",
         include_str!("../../../contracts/schemas/feature-matrix.schema.json"),
+    ),
+    (
+        "legal-decision-authority",
+        include_str!("../../../contracts/schemas/legal-decision-authority.schema.json"),
     ),
     (
         "legal-review-ledger",

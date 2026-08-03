@@ -8,6 +8,12 @@ use serde_json::Value;
 /// Current version of the conformance record contract.
 pub const CONFORMANCE_SCHEMA_VERSION: &str = "1.0.0";
 
+/// Current version of the legal-review ledger contract.
+pub const LEGAL_REVIEW_SCHEMA_VERSION: &str = "2.0.0";
+
+/// Current version of authenticated legal-decision authority input.
+pub const LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION: &str = "1.0.0";
+
 /// Compatibility dimensions that must be evaluated for every case.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -106,6 +112,119 @@ pub enum LegalReviewStatus {
     Approved,
     /// A qualified human reviewer rejected the recorded scope.
     Rejected,
+}
+
+/// Stable GitHub identity of the human who made a legal-review decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegalReviewerIdentity {
+    /// Stable numeric GitHub account identifier.
+    pub github_account_id: u64,
+    /// GitHub login recorded with the decision for audit readability.
+    pub github_login: String,
+}
+
+/// Immutable GitHub pull-request review referenced by a legal decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegalDecisionEvidenceReference {
+    /// Repository in `owner/name` form.
+    pub repository: String,
+    /// Pull request containing the reviewed legal-ledger decision.
+    pub pull_request_number: u64,
+    /// Identifier repeated in exactly one immutable authenticated review.
+    pub attestation_id: String,
+}
+
+/// One legal decision attested by an authenticated pull-request review.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegalDecisionAttestation {
+    /// Identifier chosen before review and recorded in the ledger decision.
+    pub attestation_id: String,
+    /// Complete legal-review decision parsed from the authenticated review body.
+    pub decision: LegalReviewRecord,
+    /// Complete provenance closure reviewed with the decision.
+    pub provenance_records: Vec<ProvenanceRecord>,
+}
+
+/// State returned by GitHub for an authenticated pull-request review.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthenticatedReviewState {
+    /// The reviewer approved the exact commit.
+    Approved,
+    /// The review was dismissed after submission.
+    Dismissed,
+    /// The reviewer requested changes.
+    ChangesRequested,
+    /// The review contains a non-approving comment.
+    Commented,
+}
+
+/// Pull-request review data obtained from an authenticated GitHub API response.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedPullRequestReview {
+    /// Repository in `owner/name` form.
+    pub repository: String,
+    /// Pull request containing the reviewed legal-ledger decision.
+    pub pull_request_number: u64,
+    /// Immutable GitHub pull-request review identifier.
+    pub review_id: u64,
+    /// Stable identity returned for the review author.
+    pub reviewer: LegalReviewerIdentity,
+    /// Exact commit associated with the review.
+    pub reviewed_commit_sha: String,
+    /// Current authenticated review state.
+    pub state: AuthenticatedReviewState,
+    /// UTC timestamp at which GitHub recorded the review.
+    pub submitted_at: String,
+    /// Legal decisions explicitly attested in the review body.
+    pub attestations: Vec<LegalDecisionAttestation>,
+}
+
+/// Authenticated context and reviews for one pull request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthenticatedPullRequest {
+    /// Repository in `owner/name` form.
+    pub repository: String,
+    /// Pull request containing reviewed legal-ledger decisions.
+    pub pull_request_number: u64,
+    /// Stable identity of the pull-request author.
+    pub pull_request_author_account_id: u64,
+    /// Current head commit of the pull request when evidence was collected.
+    pub candidate_commit_sha: String,
+    /// Reviews obtained from authenticated GitHub API responses.
+    pub authenticated_reviews: Vec<AuthenticatedPullRequestReview>,
+}
+
+/// Out-of-branch authority used to authenticate legal-ledger decisions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegalDecisionAuthority {
+    /// Contract version used to interpret this authority input.
+    pub schema_version: String,
+    /// Candidate repository for which this authority was generated.
+    pub candidate_repository: String,
+    /// Candidate commit for which this authority was generated.
+    pub candidate_commit_sha: String,
+    /// Stable account identifiers obtained from the protected trust anchor.
+    pub trusted_reviewer_account_ids: Vec<u64>,
+    /// Authenticated pull requests referenced by non-pending decisions.
+    pub pull_requests: Vec<AuthenticatedPullRequest>,
+}
+
+/// Trusted event context against which an authority document is verified.
+#[derive(Clone, Copy, Debug)]
+pub struct LegalDecisionVerificationContext<'a> {
+    /// Authority supplied outside the candidate checkout.
+    pub authority: &'a LegalDecisionAuthority,
+    /// Repository obtained from the trusted event context.
+    pub candidate_repository: &'a str,
+    /// Commit obtained from the trusted event context.
+    pub candidate_commit_sha: &'a str,
 }
 
 /// Classification of the source captured by a provenance record.
@@ -211,10 +330,12 @@ pub struct LegalReviewRecord {
     pub individual_review_uses: Vec<ProvenanceUse>,
     /// Provenance records for terms and facts considered by the reviewer.
     pub source_provenance_ids: Vec<String>,
-    /// Qualified human reviewer, present only after a decision.
-    pub reviewed_by: Option<String>,
+    /// Stable identity of the qualified human reviewer, present only after a decision.
+    pub reviewed_by: Option<LegalReviewerIdentity>,
     /// ISO 8601 decision date, present only after a decision.
     pub decided_on: Option<String>,
+    /// Immutable authenticated review evidence, present only after a decision.
+    pub decision_evidence: Option<LegalDecisionEvidenceReference>,
     /// Scope, conditions, and rationale for the decision.
     pub rationale: String,
 }
@@ -546,6 +667,200 @@ pub struct ContractViolation {
     pub message: String,
 }
 
+impl LegalReviewerIdentity {
+    fn is_well_formed(&self) -> bool {
+        self.github_account_id > 0 && is_github_login(&self.github_login)
+    }
+}
+
+impl LegalDecisionEvidenceReference {
+    fn is_well_formed(&self) -> bool {
+        is_github_repository(&self.repository)
+            && self.pull_request_number > 0
+            && is_contract_identifier(&self.attestation_id)
+    }
+}
+
+impl LegalDecisionAuthority {
+    fn validate(
+        &self,
+        candidate_repository: &str,
+        candidate_commit_sha: &str,
+    ) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+
+        if self.schema_version != LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION {
+            violations.push(ContractViolation {
+                code: "legal-review.authority.malformed",
+                message: "legal-review authority uses an unsupported schema version".to_owned(),
+            });
+        }
+        if !is_github_repository(&self.candidate_repository)
+            || !is_git_commit_sha(&self.candidate_commit_sha)
+        {
+            violations.push(ContractViolation {
+                code: "legal-review.authority.candidate.malformed",
+                message: "legal-review authority contains a malformed candidate target".to_owned(),
+            });
+        }
+        if self.candidate_repository != candidate_repository
+            || self.candidate_commit_sha != candidate_commit_sha
+        {
+            violations.push(ContractViolation {
+                code: "legal-review.authority.candidate.mismatch",
+                message: "legal-review authority does not match the trusted candidate target"
+                    .to_owned(),
+            });
+        }
+
+        let mut trusted_reviewers = BTreeSet::new();
+        if self.trusted_reviewer_account_ids.is_empty() {
+            violations.push(ContractViolation {
+                code: "legal-review.authority.trusted-reviewer.missing",
+                message: "legal-review authority requires a trusted reviewer".to_owned(),
+            });
+        }
+        for reviewer_id in &self.trusted_reviewer_account_ids {
+            if *reviewer_id == 0 || !trusted_reviewers.insert(*reviewer_id) {
+                violations.push(ContractViolation {
+                    code: "legal-review.authority.trusted-reviewer.invalid",
+                    message: format!(
+                        "trusted reviewer account identifiers must be nonzero and unique: {reviewer_id}"
+                    ),
+                });
+            }
+        }
+
+        let mut pull_requests = BTreeSet::new();
+        let mut review_ids = BTreeSet::new();
+        let mut attestation_keys = BTreeSet::new();
+        if self.pull_requests.is_empty() {
+            violations.push(ContractViolation {
+                code: "legal-review.authority.pull-request.missing",
+                message: "legal-review authority requires a pull-request context".to_owned(),
+            });
+        }
+        for pull_request in &self.pull_requests {
+            if pull_request.repository != self.candidate_repository {
+                violations.push(ContractViolation {
+                    code: "legal-review.authority.pull-request.repository-mismatch",
+                    message: format!(
+                        "pull request {}/{} is outside candidate repository {}",
+                        pull_request.repository,
+                        pull_request.pull_request_number,
+                        self.candidate_repository
+                    ),
+                });
+            }
+            if !is_github_repository(&pull_request.repository)
+                || pull_request.pull_request_number == 0
+                || pull_request.pull_request_author_account_id == 0
+                || !is_git_commit_sha(&pull_request.candidate_commit_sha)
+            {
+                violations.push(ContractViolation {
+                    code: "legal-review.authority.pull-request.malformed",
+                    message: "legal-review authority contains a malformed pull request".to_owned(),
+                });
+            }
+
+            if !pull_requests.insert((
+                pull_request.repository.as_str(),
+                pull_request.pull_request_number,
+            )) {
+                violations.push(ContractViolation {
+                    code: "legal-review.authority.pull-request.duplicate",
+                    message: format!(
+                        "legal-review authority repeats pull request {}/{}",
+                        pull_request.repository, pull_request.pull_request_number
+                    ),
+                });
+            }
+
+            for review in &pull_request.authenticated_reviews {
+                if !is_github_repository(&review.repository)
+                    || review.pull_request_number == 0
+                    || review.review_id == 0
+                    || !review.reviewer.is_well_formed()
+                    || !is_git_commit_sha(&review.reviewed_commit_sha)
+                    || !is_iso_utc_timestamp(&review.submitted_at)
+                {
+                    violations.push(ContractViolation {
+                        code: "legal-review.evidence.malformed",
+                        message: format!(
+                            "authenticated review {} contains malformed evidence",
+                            review.review_id
+                        ),
+                    });
+                }
+
+                if review.repository != pull_request.repository
+                    || review.pull_request_number != pull_request.pull_request_number
+                {
+                    violations.push(ContractViolation {
+                        code: "legal-review.evidence.pull-request-mismatch",
+                        message: format!(
+                            "authenticated review {} is not from its pull-request context",
+                            review.review_id
+                        ),
+                    });
+                }
+
+                if !review_ids.insert(review.review_id) {
+                    violations.push(ContractViolation {
+                        code: "legal-review.evidence.duplicate",
+                        message: format!(
+                            "authenticated review {} appears more than once",
+                            review.review_id
+                        ),
+                    });
+                }
+
+                for attestation in &review.attestations {
+                    if !is_contract_identifier(&attestation.attestation_id)
+                        || attestation.decision.status == LegalReviewStatus::Pending
+                        || !attestation.decision.validate().is_empty()
+                        || attestation
+                            .provenance_records
+                            .iter()
+                            .any(|record| !record.validate().is_empty())
+                        || !is_complete_provenance_snapshot(
+                            &attestation.decision,
+                            &attestation.provenance_records,
+                        )
+                    {
+                        violations.push(ContractViolation {
+                            code: "legal-review.evidence.attestation.malformed",
+                            message: format!(
+                                "authenticated review {} contains a malformed attestation",
+                                review.review_id
+                            ),
+                        });
+                    }
+                    if !attestation_keys.insert((
+                        review.repository.as_str(),
+                        review.pull_request_number,
+                        review.reviewed_commit_sha.as_str(),
+                        attestation.attestation_id.as_str(),
+                    )) {
+                        violations.push(ContractViolation {
+                            code: "legal-review.evidence.attestation.duplicate",
+                            message: format!(
+                                "pull request {}/{} repeats attestation {} for commit {}",
+                                review.repository,
+                                review.pull_request_number,
+                                attestation.attestation_id,
+                                review.reviewed_commit_sha
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+}
+
 impl LegalReviewRecord {
     fn validate(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
@@ -554,6 +869,11 @@ impl LegalReviewRecord {
             violations.push(ContractViolation {
                 code: "legal-review.id.empty",
                 message: "legal review id must not be empty".to_owned(),
+            });
+        } else if !is_contract_identifier(&self.id) {
+            violations.push(ContractViolation {
+                code: "legal-review.id.invalid",
+                message: format!("legal review id is malformed: {}", self.id),
             });
         }
 
@@ -572,6 +892,15 @@ impl LegalReviewRecord {
         } else {
             let mut source_ids = BTreeSet::new();
             for source_id in &self.source_provenance_ids {
+                if !is_contract_identifier(source_id) {
+                    violations.push(ContractViolation {
+                        code: "legal-review.source.invalid",
+                        message: format!(
+                            "legal review {} contains malformed source {}",
+                            self.id, source_id
+                        ),
+                    });
+                }
                 if !source_ids.insert(source_id.as_str()) {
                     violations.push(ContractViolation {
                         code: "legal-review.source.duplicate",
@@ -601,15 +930,20 @@ impl LegalReviewRecord {
 
         let has_decision_metadata = self
             .reviewed_by
-            .as_deref()
-            .is_some_and(|reviewer| !reviewer.trim().is_empty())
-            && self.decided_on.as_deref().is_some_and(is_iso_date);
+            .as_ref()
+            .is_some_and(LegalReviewerIdentity::is_well_formed)
+            && self.decided_on.as_deref().is_some_and(is_iso_date)
+            && self
+                .decision_evidence
+                .as_ref()
+                .is_some_and(LegalDecisionEvidenceReference::is_well_formed);
 
         match self.status {
             LegalReviewStatus::Pending => {
                 if !decided_uses.is_empty()
                     || self.reviewed_by.is_some()
                     || self.decided_on.is_some()
+                    || self.decision_evidence.is_some()
                 {
                     violations.push(ContractViolation {
                         code: "legal-review.pending.has-decision",
@@ -634,7 +968,7 @@ impl LegalReviewRecord {
                     violations.push(ContractViolation {
                         code: "legal-review.decision-metadata.missing",
                         message: format!(
-                            "approved legal review {} requires a human reviewer and decision date",
+                            "approved legal review {} requires a reviewer, decision date, and evidence",
                             self.id
                         ),
                     });
@@ -651,7 +985,7 @@ impl LegalReviewRecord {
                     violations.push(ContractViolation {
                         code: "legal-review.decision-metadata.missing",
                         message: format!(
-                            "rejected legal review {} requires a human reviewer and decision date",
+                            "rejected legal review {} requires a reviewer, decision date, and evidence",
                             self.id
                         ),
                     });
@@ -670,13 +1004,19 @@ impl LegalReviewLedger {
         let mut violations = Vec::new();
         let mut review_ids = BTreeSet::new();
 
-        if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
+        if self.schema_version != LEGAL_REVIEW_SCHEMA_VERSION {
             violations.push(ContractViolation {
                 code: "legal-review.schema-version.unsupported",
                 message: format!(
                     "unsupported legal review schema version: {}",
                     self.schema_version
                 ),
+            });
+        }
+        if self.reviews.is_empty() {
+            violations.push(ContractViolation {
+                code: "legal-review.record.missing",
+                message: "legal-review ledger requires at least one review".to_owned(),
             });
         }
 
@@ -686,6 +1026,224 @@ impl LegalReviewLedger {
                 violations.push(ContractViolation {
                     code: "legal-review.id.duplicate",
                     message: format!("duplicate legal review id: {}", review.id),
+                });
+            }
+        }
+
+        violations
+    }
+
+    /// Validates decisions at a governed-use boundary.
+    #[must_use]
+    pub fn validate_for_governed_use(
+        &self,
+        provenance: &ProvenanceLedger,
+        verification: Option<LegalDecisionVerificationContext<'_>>,
+    ) -> Vec<ContractViolation> {
+        if let Some(verification) = verification {
+            return self.validate_authenticated_decisions(provenance, verification);
+        }
+
+        let mut violations = self.validate();
+        if self
+            .reviews
+            .iter()
+            .any(|review| review.status != LegalReviewStatus::Pending)
+        {
+            violations.push(ContractViolation {
+                code: "legal-review.authority.required",
+                message: "non-pending legal decisions require out-of-branch authority".to_owned(),
+            });
+        }
+        violations
+    }
+
+    /// Validates every non-pending decision against out-of-branch GitHub evidence.
+    #[must_use]
+    pub fn validate_authenticated_decisions(
+        &self,
+        provenance: &ProvenanceLedger,
+        verification: LegalDecisionVerificationContext<'_>,
+    ) -> Vec<ContractViolation> {
+        let authority = verification.authority;
+        let mut violations = self.validate();
+        violations.extend(provenance.validate(self));
+        violations.extend(authority.validate(
+            verification.candidate_repository,
+            verification.candidate_commit_sha,
+        ));
+
+        for review in self
+            .reviews
+            .iter()
+            .filter(|review| review.status != LegalReviewStatus::Pending)
+        {
+            let (Some(reviewer), Some(reference), Some(decided_on)) = (
+                review.reviewed_by.as_ref(),
+                review.decision_evidence.as_ref(),
+                review.decided_on.as_deref(),
+            ) else {
+                continue;
+            };
+
+            let pull_requests = authority
+                .pull_requests
+                .iter()
+                .filter(|pull_request| {
+                    pull_request.repository == reference.repository
+                        && pull_request.pull_request_number == reference.pull_request_number
+                })
+                .collect::<Vec<_>>();
+            let [pull_request] = pull_requests.as_slice() else {
+                violations.push(ContractViolation {
+                    code: "legal-review.evidence.pull-request-mismatch",
+                    message: format!(
+                        "legal review {} does not reference one authenticated pull request",
+                        review.id
+                    ),
+                });
+                continue;
+            };
+
+            let evidence_matches = pull_request
+                .authenticated_reviews
+                .iter()
+                .filter(|evidence| {
+                    evidence.repository == pull_request.repository
+                        && evidence.pull_request_number == pull_request.pull_request_number
+                        && evidence.reviewed_commit_sha == pull_request.candidate_commit_sha
+                        && evidence.attestations.iter().any(|attestation| {
+                            attestation.attestation_id == reference.attestation_id
+                                && attestation.decision == *review
+                                && provenance_snapshot_matches(
+                                    provenance,
+                                    review,
+                                    &attestation.provenance_records,
+                                )
+                        })
+                })
+                .collect::<Vec<_>>();
+            let [evidence] = evidence_matches.as_slice() else {
+                let matching_pull_request = |evidence: &AuthenticatedPullRequestReview| {
+                    evidence.repository == pull_request.repository
+                        && evidence.pull_request_number == pull_request.pull_request_number
+                };
+                let code = if pull_request.authenticated_reviews.iter().any(|evidence| {
+                    matching_pull_request(evidence)
+                        && evidence.reviewed_commit_sha != pull_request.candidate_commit_sha
+                        && evidence.attestations.iter().any(|attestation| {
+                            attestation.attestation_id == reference.attestation_id
+                                && attestation.decision == *review
+                        })
+                }) {
+                    "legal-review.evidence.stale"
+                } else if pull_request.authenticated_reviews.iter().any(|evidence| {
+                    matching_pull_request(evidence)
+                        && evidence.reviewed_commit_sha == pull_request.candidate_commit_sha
+                        && evidence.attestations.iter().any(|attestation| {
+                            attestation.attestation_id == reference.attestation_id
+                                && attestation.decision == *review
+                                && !provenance_snapshot_matches(
+                                    provenance,
+                                    review,
+                                    &attestation.provenance_records,
+                                )
+                        })
+                }) {
+                    "legal-review.evidence.provenance-mismatch"
+                } else if pull_request.authenticated_reviews.iter().any(|evidence| {
+                    matching_pull_request(evidence)
+                        && evidence.attestations.iter().any(|attestation| {
+                            attestation.attestation_id == reference.attestation_id
+                                || attestation.decision.id == review.id
+                        })
+                }) {
+                    "legal-review.evidence.attestation-mismatch"
+                } else {
+                    "legal-review.evidence.untrusted"
+                };
+                violations.push(ContractViolation {
+                    code,
+                    message: format!(
+                        "legal review {} does not reference one authenticated review",
+                        review.id
+                    ),
+                });
+                continue;
+            };
+
+            if evidence.state != AuthenticatedReviewState::Approved {
+                violations.push(ContractViolation {
+                    code: "legal-review.evidence.not-approved",
+                    message: format!(
+                        "authenticated review {} is not approved",
+                        evidence.review_id
+                    ),
+                });
+            }
+
+            let latest_decisive_review = pull_request
+                .authenticated_reviews
+                .iter()
+                .filter(|candidate| {
+                    candidate.reviewer.github_account_id == evidence.reviewer.github_account_id
+                        && candidate.reviewed_commit_sha == pull_request.candidate_commit_sha
+                        && matches!(
+                            candidate.state,
+                            AuthenticatedReviewState::Approved
+                                | AuthenticatedReviewState::ChangesRequested
+                        )
+                        && (candidate.submitted_at.as_str(), candidate.review_id)
+                            > (evidence.submitted_at.as_str(), evidence.review_id)
+                })
+                .max_by_key(|candidate| (candidate.submitted_at.as_str(), candidate.review_id));
+            if latest_decisive_review.is_some() {
+                violations.push(ContractViolation {
+                    code: "legal-review.evidence.superseded",
+                    message: format!(
+                        "authenticated review {} is not the reviewer's latest decisive review for the candidate commit",
+                        evidence.review_id
+                    ),
+                });
+            }
+
+            if evidence.reviewer.github_account_id != reviewer.github_account_id {
+                violations.push(ContractViolation {
+                    code: "legal-review.reviewer.mismatch",
+                    message: format!(
+                        "legal review {} does not identify the authenticated reviewer",
+                        review.id
+                    ),
+                });
+            }
+
+            if !authority
+                .trusted_reviewer_account_ids
+                .contains(&reviewer.github_account_id)
+            {
+                violations.push(ContractViolation {
+                    code: "legal-review.reviewer.untrusted",
+                    message: format!("legal review {} was made by an unknown reviewer", review.id),
+                });
+            }
+
+            if pull_request.pull_request_author_account_id == reviewer.github_account_id {
+                violations.push(ContractViolation {
+                    code: "legal-review.reviewer.self-approval",
+                    message: format!(
+                        "legal review {} was self-approved by the pull-request author",
+                        review.id
+                    ),
+                });
+            }
+
+            if evidence.submitted_at.get(..10) != Some(decided_on) {
+                violations.push(ContractViolation {
+                    code: "legal-review.evidence.date-mismatch",
+                    message: format!(
+                        "legal review {} decision date does not match authenticated evidence",
+                        review.id
+                    ),
                 });
             }
         }
@@ -929,6 +1487,7 @@ impl ProvenanceLedger {
     pub fn validate_use(
         &self,
         legal_reviews: &LegalReviewLedger,
+        legal_verification: Option<LegalDecisionVerificationContext<'_>>,
         provenance_id: &str,
         requested_use: ProvenanceUse,
     ) -> Vec<ContractViolation> {
@@ -969,7 +1528,8 @@ impl ProvenanceLedger {
             }];
         };
 
-        let mut ledger_violations = legal_reviews.validate();
+        let mut ledger_violations =
+            legal_reviews.validate_for_governed_use(self, legal_verification);
         ledger_violations.extend(self.validate(legal_reviews));
         if !ledger_violations.is_empty() {
             return ledger_violations;
@@ -1000,18 +1560,6 @@ impl ProvenanceLedger {
                     review.id, provenance.id
                 ),
             }],
-            LegalReviewStatus::Approved
-                if review.reviewed_by.is_none()
-                    || !review.decided_on.as_deref().is_some_and(is_iso_date) =>
-            {
-                vec![ContractViolation {
-                    code: "legal-review.decision-metadata.missing",
-                    message: format!(
-                        "legal review {} lacks a human reviewer or decision date",
-                        review.id
-                    ),
-                }]
-            }
             LegalReviewStatus::Approved if review.approved_uses.contains(&requested_use) => {
                 Vec::new()
             }
@@ -1049,6 +1597,7 @@ impl ProvenanceLedger {
     pub fn validate_fixture_inventory(
         &self,
         legal_reviews: &LegalReviewLedger,
+        legal_verification: Option<LegalDecisionVerificationContext<'_>>,
         fixtures: &[FixtureArtifact],
     ) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
@@ -1125,7 +1674,12 @@ impl ProvenanceLedger {
                 });
             }
 
-            violations.extend(self.validate_use(legal_reviews, &record.id, ProvenanceUse::Fixture));
+            violations.extend(self.validate_use(
+                legal_reviews,
+                legal_verification,
+                &record.id,
+                ProvenanceUse::Fixture,
+            ));
         }
 
         for record in &self.records {
@@ -1217,6 +1771,7 @@ impl ConformanceRecord {
         targets: &TargetMatrix,
         provenance: &ProvenanceLedger,
         legal_reviews: &LegalReviewLedger,
+        legal_verification: Option<LegalDecisionVerificationContext<'_>>,
     ) -> Vec<ContractViolation> {
         let Some(target) = targets
             .targets
@@ -1231,11 +1786,13 @@ impl ConformanceRecord {
 
         let mut violations = provenance.validate_use(
             legal_reviews,
+            legal_verification,
             &target.provenance_id,
             ProvenanceUse::OracleOperation,
         );
         violations.extend(provenance.validate_use(
             legal_reviews,
+            legal_verification,
             &self.provenance_id,
             ProvenanceUse::ConformanceEvidence,
         ));
@@ -1251,6 +1808,7 @@ impl FeatureMatrix {
         feature_id: &str,
         provenance: &ProvenanceLedger,
         legal_reviews: &LegalReviewLedger,
+        legal_verification: Option<LegalDecisionVerificationContext<'_>>,
     ) -> Vec<ContractViolation> {
         let Some(feature) = self
             .features
@@ -1276,6 +1834,7 @@ impl FeatureMatrix {
             .flat_map(|provenance_id| {
                 provenance.validate_use(
                     legal_reviews,
+                    legal_verification,
                     provenance_id,
                     ProvenanceUse::ImplementationInput,
                 )
@@ -1297,6 +1856,69 @@ fn is_iso_date(value: &str) -> bool {
             .bytes()
             .enumerate()
             .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
+fn is_iso_utc_timestamp(value: &str) -> bool {
+    value.len() == 20
+        && value.as_bytes()[10] == b'T'
+        && value.as_bytes()[13] == b':'
+        && value.as_bytes()[16] == b':'
+        && value.as_bytes()[19] == b'Z'
+        && is_iso_date(&value[..10])
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+}
+
+fn is_git_commit_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn is_github_repository(value: &str) -> bool {
+    let mut components = value.split('/');
+    matches!(
+        (components.next(), components.next(), components.next()),
+        (Some(owner), Some(repository), None)
+            if is_github_name(owner) && is_github_name(repository)
+    )
+}
+
+fn is_contract_identifier(value: &str) -> bool {
+    value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn is_github_login(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 39
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .next_back()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !value.contains("--")
+}
+
+fn is_github_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn is_repository_relative_path(value: &str) -> bool {
@@ -1326,6 +1948,70 @@ fn provenance_lineage_has_cycle<'a>(
         });
     lineage.remove(provenance_id);
     has_cycle
+}
+
+fn provenance_closure_ids<'a>(
+    roots: &[String],
+    records: &'a [ProvenanceRecord],
+) -> Option<BTreeSet<&'a str>> {
+    let mut all_ids = BTreeSet::new();
+    if records
+        .iter()
+        .any(|record| !all_ids.insert(record.id.as_str()))
+    {
+        return None;
+    }
+
+    let mut closure = BTreeSet::new();
+    let mut pending = roots.iter().map(String::as_str).collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        let record = records.iter().find(|record| record.id == id)?;
+        if closure.insert(record.id.as_str()) {
+            pending.extend(record.parent_provenance_ids.iter().map(String::as_str));
+        }
+    }
+
+    for root in roots {
+        let mut lineage = BTreeSet::new();
+        if provenance_lineage_has_cycle(root, records, &mut lineage) {
+            return None;
+        }
+    }
+
+    Some(closure)
+}
+
+fn is_complete_provenance_snapshot(
+    decision: &LegalReviewRecord,
+    records: &[ProvenanceRecord],
+) -> bool {
+    provenance_closure_ids(&decision.source_provenance_ids, records)
+        .is_some_and(|closure| closure.len() == records.len())
+}
+
+fn provenance_snapshot_matches(
+    provenance: &ProvenanceLedger,
+    decision: &LegalReviewRecord,
+    snapshot: &[ProvenanceRecord],
+) -> bool {
+    let Some(current_ids) =
+        provenance_closure_ids(&decision.source_provenance_ids, &provenance.records)
+    else {
+        return false;
+    };
+    let Some(snapshot_ids) = provenance_closure_ids(&decision.source_provenance_ids, snapshot)
+    else {
+        return false;
+    };
+    if snapshot_ids.len() != snapshot.len() || current_ids != snapshot_ids {
+        return false;
+    }
+
+    current_ids.iter().all(|id| {
+        let current = provenance.records.iter().find(|record| record.id == *id);
+        let authenticated = snapshot.iter().find(|record| record.id == *id);
+        current == authenticated
+    })
 }
 
 impl FeatureRecord {
@@ -1448,8 +2134,11 @@ impl FeatureMatrix {
 #[cfg(test)]
 mod tests {
     use super::{
+        AuthenticatedPullRequest, AuthenticatedPullRequestReview, AuthenticatedReviewState,
         CompatibilityStatus, ConformanceRecord, FeatureCategory, FeatureMatrix, FeatureRecord,
-        FixtureArtifact, LegalReviewLedger, LegalReviewRecord, LegalReviewStatus, OracleTarget,
+        FixtureArtifact, LegalDecisionAttestation, LegalDecisionAuthority,
+        LegalDecisionEvidenceReference, LegalDecisionVerificationContext, LegalReviewLedger,
+        LegalReviewRecord, LegalReviewStatus, LegalReviewerIdentity, OracleTarget,
         ProvenanceLedger, ProvenanceRecord, ProvenanceSourceKind, ProvenanceUse, TargetMatrix,
         validate_governance_references,
     };
@@ -1562,6 +2251,7 @@ mod tests {
     fn governed_use_rejects_unknown_provenance() {
         let violations = provenance_ledger().validate_use(
             &pending_legal_reviews(),
+            None,
             "prov-unknown",
             ProvenanceUse::ImplementationInput,
         );
@@ -1574,12 +2264,50 @@ mod tests {
     fn governed_use_rejects_pending_legal_review() {
         let violations = provenance_ledger().validate_use(
             &pending_legal_reviews(),
+            None,
             "prov-public-specification",
             ProvenanceUse::ImplementationInput,
         );
 
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].code, "provenance.legal-review.pending");
+    }
+
+    #[test]
+    fn governed_use_rejects_in_branch_approval_without_authority() {
+        let violations = provenance_ledger().validate_use(
+            &approved_legal_reviews(),
+            None,
+            "prov-public-specification",
+            ProvenanceUse::ImplementationInput,
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "legal-review.authority.required")
+        );
+    }
+
+    #[test]
+    fn governed_use_authenticates_the_provenance_being_used() {
+        let legal_reviews = approved_legal_reviews();
+        let authority = legal_decision_authority();
+        let mut changed_provenance = provenance_ledger();
+        changed_provenance.records[0].title = "Unattested replacement".to_owned();
+
+        let violations = changed_provenance.validate_use(
+            &legal_reviews,
+            Some(legal_decision_verification(&authority)),
+            "prov-public-specification",
+            ProvenanceUse::ImplementationInput,
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.provenance-mismatch")
+        );
     }
 
     #[test]
@@ -1590,11 +2318,14 @@ mod tests {
         let review = &mut legal_reviews.reviews[0];
         review.status = LegalReviewStatus::Approved;
         review.approved_uses = vec![ProvenanceUse::ImplementationInput];
-        review.reviewed_by = Some("Qualified legal reviewer".to_owned());
+        review.reviewed_by = Some(reviewer_identity());
         review.decided_on = Some("2026-08-02".to_owned());
+        review.decision_evidence = Some(decision_evidence_reference());
 
+        let authority = legal_decision_authority();
         let violations = provenance.validate_use(
             &legal_reviews,
+            Some(legal_decision_verification(&authority)),
             "prov-public-specification",
             ProvenanceUse::ImplementationInput,
         );
@@ -1614,6 +2345,7 @@ mod tests {
 
         let violations = provenance.validate_use(
             &legal_reviews,
+            None,
             "prov-public-specification",
             ProvenanceUse::ImplementationInput,
         );
@@ -1631,9 +2363,11 @@ mod tests {
         let mut prohibited_reviews = approved_legal_reviews();
         prohibited_reviews.reviews[0].approved_uses = vec![ProvenanceUse::DocumentationReference];
         prohibited_reviews.reviews[0].prohibited_uses = vec![ProvenanceUse::ImplementationInput];
+        let prohibited_authority = legal_decision_authority_for(&prohibited_reviews.reviews[0]);
 
         let prohibited = provenance.validate_use(
             &prohibited_reviews,
+            Some(legal_decision_verification(&prohibited_authority)),
             "prov-public-specification",
             ProvenanceUse::ImplementationInput,
         );
@@ -1645,9 +2379,11 @@ mod tests {
         individual_reviews.reviews[0].approved_uses = vec![ProvenanceUse::DocumentationReference];
         individual_reviews.reviews[0].individual_review_uses =
             vec![ProvenanceUse::ImplementationInput];
+        let individual_authority = legal_decision_authority_for(&individual_reviews.reviews[0]);
 
         let individual = provenance.validate_use(
             &individual_reviews,
+            Some(legal_decision_verification(&individual_authority)),
             "prov-public-specification",
             ProvenanceUse::ImplementationInput,
         );
@@ -1662,7 +2398,7 @@ mod tests {
     #[test]
     fn legal_review_states_require_consistent_human_decisions() {
         let mut pending = pending_legal_reviews();
-        pending.reviews[0].reviewed_by = Some("Reviewer".to_owned());
+        pending.reviews[0].reviewed_by = Some(reviewer_identity());
         assert!(
             pending
                 .validate()
@@ -1687,6 +2423,543 @@ mod tests {
                 .validate()
                 .iter()
                 .any(|violation| violation.code == "legal-review.decision-metadata.missing")
+        );
+    }
+
+    #[test]
+    fn legal_review_rejects_empty_ledger_and_invalid_github_login() {
+        let empty = LegalReviewLedger {
+            schema_version: "2.0.0".to_owned(),
+            reviews: Vec::new(),
+        };
+        assert!(
+            empty
+                .validate()
+                .iter()
+                .any(|violation| violation.code == "legal-review.record.missing")
+        );
+
+        let mut invalid_login = approved_legal_reviews();
+        let mut invalid_reviewer = reviewer_identity();
+        invalid_reviewer.github_login = "invalid_login".to_owned();
+        invalid_login.reviews[0].reviewed_by = Some(invalid_reviewer);
+        assert!(
+            invalid_login
+                .validate()
+                .iter()
+                .any(|violation| violation.code == "legal-review.decision-metadata.missing")
+        );
+
+        let mut invalid_identifiers = pending_legal_reviews();
+        invalid_identifiers.reviews[0].id = "x".repeat(129);
+        invalid_identifiers.reviews[0].source_provenance_ids = vec!["invalid source".to_owned()];
+        let violations = invalid_identifiers.validate();
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "legal-review.id.invalid")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "legal-review.source.invalid")
+        );
+    }
+
+    #[test]
+    fn authenticated_legal_decision_requires_exact_trusted_review() {
+        let legal_reviews = approved_legal_reviews();
+        let provenance = provenance_ledger();
+        let authority = legal_decision_authority();
+
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .is_empty()
+        );
+
+        let mut renamed_reviewer = authority.clone();
+        renamed_reviewer.pull_requests[0].authenticated_reviews[0]
+            .reviewer
+            .github_login = "renamed-reviewer".to_owned();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&renamed_reviewer),
+                )
+                .is_empty()
+        );
+
+        let mut wrong_candidate = authority.clone();
+        wrong_candidate.candidate_commit_sha =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&wrong_candidate),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.authority.candidate.mismatch")
+        );
+
+        let mut stale = authority.clone();
+        stale.pull_requests[0].candidate_commit_sha =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(&provenance, legal_decision_verification(&stale),)
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.stale")
+        );
+
+        let mut unknown_reviewer = authority.clone();
+        unknown_reviewer.trusted_reviewer_account_ids.clear();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&unknown_reviewer),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.reviewer.untrusted")
+        );
+
+        let mut altered_evidence = legal_reviews.clone();
+        altered_evidence.reviews[0]
+            .rationale
+            .push_str(" Altered after attestation.");
+        assert!(
+            altered_evidence
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.evidence.attestation-mismatch"
+                })
+        );
+
+        let mut self_approval = authority;
+        self_approval.pull_requests[0].pull_request_author_account_id = 4242;
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&self_approval),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.reviewer.self-approval")
+        );
+    }
+
+    #[test]
+    fn authenticated_legal_decision_rejects_missing_or_malformed_evidence() {
+        let legal_reviews = approved_legal_reviews();
+        let provenance = provenance_ledger();
+
+        let mut missing_review = legal_decision_authority();
+        missing_review.pull_requests[0]
+            .authenticated_reviews
+            .clear();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&missing_review),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.untrusted")
+        );
+
+        let mut missing_reference = legal_reviews.clone();
+        missing_reference.reviews[0].decision_evidence = None;
+        let authority = legal_decision_authority();
+        assert!(
+            missing_reference
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.decision-metadata.missing")
+        );
+
+        let mut malformed = legal_decision_authority();
+        malformed.pull_requests[0].authenticated_reviews[0].review_id = 0;
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&malformed),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.malformed")
+        );
+    }
+
+    #[test]
+    fn authenticated_legal_decision_requires_exact_provenance_closure() {
+        let legal_reviews = approved_legal_reviews();
+        let current_provenance = provenance_ledger();
+
+        let mut changed_snapshot = legal_decision_authority();
+        changed_snapshot.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records[0]
+            .revision = "altered-after-review".to_owned();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &current_provenance,
+                    legal_decision_verification(&changed_snapshot),
+                )
+                .iter()
+                .any(|violation| { violation.code == "legal-review.evidence.provenance-mismatch" })
+        );
+
+        let mut changed_current = current_provenance.clone();
+        changed_current.records[0].source_url =
+            Some("https://example.com/changed-specification".to_owned());
+        let authority = legal_decision_authority();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &changed_current,
+                    legal_decision_verification(&authority),
+                )
+                .iter()
+                .any(|violation| { violation.code == "legal-review.evidence.provenance-mismatch" })
+        );
+
+        let mut missing = legal_decision_authority();
+        missing.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records
+            .clear();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &current_provenance,
+                    legal_decision_verification(&missing),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.evidence.attestation.malformed"
+                })
+        );
+
+        let mut extra = legal_decision_authority();
+        let mut unrelated = current_provenance.records[0].clone();
+        unrelated.id = "prov-unrelated".to_owned();
+        extra.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records
+            .push(unrelated);
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &current_provenance,
+                    legal_decision_verification(&extra),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.evidence.attestation.malformed"
+                })
+        );
+
+        let mut duplicate = legal_decision_authority();
+        let repeated = duplicate.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records[0]
+            .clone();
+        duplicate.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records
+            .push(repeated);
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &current_provenance,
+                    legal_decision_verification(&duplicate),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.evidence.attestation.malformed"
+                })
+        );
+
+        let mut lineage_provenance = current_provenance.clone();
+        let mut parent = lineage_provenance.records[0].clone();
+        parent.id = "prov-parent".to_owned();
+        parent.legal_review_id = "legal-review-public-specification".to_owned();
+        lineage_provenance.records[0].parent_provenance_ids = vec![parent.id.clone()];
+        lineage_provenance.records.push(parent);
+        let mut lineage_reviews = legal_reviews.clone();
+        lineage_reviews.reviews[0]
+            .source_provenance_ids
+            .push("prov-parent".to_owned());
+        let mut incomplete_lineage = legal_decision_authority_for(&lineage_reviews.reviews[0]);
+        incomplete_lineage.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records[0]
+            .parent_provenance_ids = vec!["prov-parent".to_owned()];
+        assert!(
+            lineage_reviews
+                .validate_authenticated_decisions(
+                    &lineage_provenance,
+                    legal_decision_verification(&incomplete_lineage),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.evidence.attestation.malformed"
+                })
+        );
+
+        let mut complete_lineage = incomplete_lineage;
+        complete_lineage.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records
+            .push(lineage_provenance.records[1].clone());
+        assert!(
+            lineage_reviews
+                .validate_authenticated_decisions(
+                    &lineage_provenance,
+                    legal_decision_verification(&complete_lineage),
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn authenticated_legal_decision_rejects_review_context_mismatches() {
+        let legal_reviews = approved_legal_reviews();
+        let provenance = provenance_ledger();
+
+        let mut cross_repository = legal_decision_authority();
+        cross_repository.pull_requests[0].repository = "anaregdesign/review-staging".to_owned();
+        cross_repository.pull_requests[0].authenticated_reviews[0].repository =
+            "anaregdesign/review-staging".to_owned();
+        if let Some(evidence) = cross_repository.pull_requests[0].authenticated_reviews[0]
+            .attestations[0]
+            .decision
+            .decision_evidence
+            .as_mut()
+        {
+            evidence.repository = "anaregdesign/review-staging".to_owned();
+        }
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&cross_repository),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.authority.pull-request.repository-mismatch"
+                })
+        );
+
+        let mut dismissed = legal_decision_authority();
+        dismissed.pull_requests[0].authenticated_reviews[0].state =
+            AuthenticatedReviewState::Dismissed;
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&dismissed),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.not-approved")
+        );
+
+        let mut superseded = legal_decision_authority();
+        let mut changes_requested = superseded.pull_requests[0].authenticated_reviews[0].clone();
+        changes_requested.review_id = 9002;
+        changes_requested.state = AuthenticatedReviewState::ChangesRequested;
+        changes_requested.submitted_at = "2026-08-02T12:35:56Z".to_owned();
+        changes_requested.attestations.clear();
+        superseded.pull_requests[0]
+            .authenticated_reviews
+            .push(changes_requested);
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&superseded),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.superseded")
+        );
+
+        let mut superseded_by_approval = legal_decision_authority();
+        let mut later_approval =
+            superseded_by_approval.pull_requests[0].authenticated_reviews[0].clone();
+        later_approval.review_id = 9002;
+        later_approval.submitted_at = "2026-08-02T12:35:56Z".to_owned();
+        later_approval.attestations.clear();
+        superseded_by_approval.pull_requests[0]
+            .authenticated_reviews
+            .push(later_approval);
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&superseded_by_approval),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.superseded")
+        );
+
+        let mut reviewer_mismatch = legal_decision_authority();
+        reviewer_mismatch.pull_requests[0].authenticated_reviews[0].reviewer =
+            LegalReviewerIdentity {
+                github_account_id: 8484,
+                github_login: "different-reviewer".to_owned(),
+            };
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&reviewer_mismatch),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.reviewer.mismatch")
+        );
+
+        let mut date_mismatch = legal_decision_authority();
+        date_mismatch.pull_requests[0].authenticated_reviews[0].submitted_at =
+            "2026-08-03T12:34:56Z".to_owned();
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&date_mismatch),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.date-mismatch")
+        );
+
+        let mut pull_request_mismatch = legal_reviews.clone();
+        if let Some(reference) = pull_request_mismatch.reviews[0].decision_evidence.as_mut() {
+            reference.pull_request_number = 31;
+        }
+        let authority = legal_decision_authority();
+        assert!(
+            pull_request_mismatch
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.evidence.pull-request-mismatch"
+                })
+        );
+    }
+
+    #[test]
+    fn authenticated_legal_decision_selects_current_review_before_uniqueness() {
+        let legal_reviews = approved_legal_reviews();
+        let provenance = provenance_ledger();
+        let mut authority = legal_decision_authority();
+        let mut stale_review = authority.pull_requests[0].authenticated_reviews[0].clone();
+        stale_review.review_id = 9002;
+        stale_review.reviewed_commit_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        authority.pull_requests[0]
+            .authenticated_reviews
+            .push(stale_review);
+
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn authenticated_legal_decisions_can_reference_distinct_pull_requests() {
+        let mut legal_reviews = approved_legal_reviews();
+        let provenance = provenance_ledger();
+        let mut second_decision = legal_reviews.reviews[0].clone();
+        second_decision.id = "legal-review-second-source".to_owned();
+        second_decision.decision_evidence = Some(LegalDecisionEvidenceReference {
+            repository: "anaregdesign/ntsql".to_owned(),
+            pull_request_number: 31,
+            attestation_id: "legal-review-second-source:v1".to_owned(),
+        });
+        legal_reviews.reviews.push(second_decision.clone());
+
+        let mut authority = legal_decision_authority();
+        let mut second_pull_request = authority.pull_requests[0].clone();
+        second_pull_request.pull_request_number = 31;
+        second_pull_request.pull_request_author_account_id = 8;
+        second_pull_request.candidate_commit_sha =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned();
+        let second_review = &mut second_pull_request.authenticated_reviews[0];
+        second_review.pull_request_number = 31;
+        second_review.review_id = 9002;
+        second_review.reviewed_commit_sha = second_pull_request.candidate_commit_sha.clone();
+        second_review.attestations = vec![LegalDecisionAttestation {
+            attestation_id: "legal-review-second-source:v1".to_owned(),
+            decision: second_decision,
+            provenance_records: provenance_ledger().records,
+        }];
+        authority.pull_requests.push(second_pull_request);
+
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn authenticated_authority_rejects_cross_pull_request_review_id_reuse() {
+        let legal_reviews = approved_legal_reviews();
+        let provenance = provenance_ledger();
+        let mut authority = legal_decision_authority();
+        let mut duplicate_review_context = authority.pull_requests[0].clone();
+        duplicate_review_context.pull_request_number = 31;
+        duplicate_review_context.authenticated_reviews[0].pull_request_number = 31;
+        authority.pull_requests.push(duplicate_review_context);
+
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .iter()
+                .any(|violation| violation.code == "legal-review.evidence.duplicate")
+        );
+    }
+
+    #[test]
+    fn authenticated_authority_rejects_attestation_reuse_on_one_head() {
+        let legal_reviews = approved_legal_reviews();
+        let provenance = provenance_ledger();
+        let mut authority = legal_decision_authority();
+        let mut duplicate_attestation = authority.pull_requests[0].authenticated_reviews[0].clone();
+        duplicate_attestation.review_id = 9002;
+        authority.pull_requests[0]
+            .authenticated_reviews
+            .push(duplicate_attestation);
+
+        assert!(
+            legal_reviews
+                .validate_authenticated_decisions(
+                    &provenance,
+                    legal_decision_verification(&authority),
+                )
+                .iter()
+                .any(|violation| {
+                    violation.code == "legal-review.evidence.attestation.duplicate"
+                })
         );
     }
 
@@ -1765,8 +3038,11 @@ mod tests {
                 "sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89".to_owned(),
         }];
 
-        let violations =
-            provenance_ledger().validate_fixture_inventory(&pending_legal_reviews(), &fixtures);
+        let violations = provenance_ledger().validate_fixture_inventory(
+            &pending_legal_reviews(),
+            None,
+            &fixtures,
+        );
 
         assert!(
             violations
@@ -1784,9 +3060,18 @@ mod tests {
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned(),
         }];
 
-        let mismatch_violations =
-            provenance.validate_fixture_inventory(&legal_reviews, &mismatched);
-        let missing_violations = provenance.validate_fixture_inventory(&legal_reviews, &[]);
+        let authority =
+            legal_decision_authority_for_provenance(&legal_reviews.reviews[0], &provenance);
+        let mismatch_violations = provenance.validate_fixture_inventory(
+            &legal_reviews,
+            Some(legal_decision_verification(&authority)),
+            &mismatched,
+        );
+        let missing_violations = provenance.validate_fixture_inventory(
+            &legal_reviews,
+            Some(legal_decision_verification(&authority)),
+            &[],
+        );
 
         assert!(
             mismatch_violations
@@ -1809,7 +3094,13 @@ mod tests {
                 "sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89".to_owned(),
         }];
 
-        let violations = provenance.validate_fixture_inventory(&legal_reviews, &fixtures);
+        let authority =
+            legal_decision_authority_for_provenance(&legal_reviews.reviews[0], &provenance);
+        let violations = provenance.validate_fixture_inventory(
+            &legal_reviews,
+            Some(legal_decision_verification(&authority)),
+            &fixtures,
+        );
 
         assert!(violations.is_empty(), "{violations:#?}");
     }
@@ -1879,6 +3170,7 @@ mod tests {
             "storage.native-file-formats",
             &provenance_ledger(),
             &pending_legal_reviews(),
+            None,
         );
 
         assert_eq!(violations.len(), 1);
@@ -1984,7 +3276,7 @@ mod tests {
 
     fn pending_legal_reviews() -> LegalReviewLedger {
         LegalReviewLedger {
-            schema_version: "1.0.0".to_owned(),
+            schema_version: "2.0.0".to_owned(),
             reviews: vec![LegalReviewRecord {
                 id: "legal-review-public-specification".to_owned(),
                 subject: "Use of the public specification".to_owned(),
@@ -1995,6 +3287,7 @@ mod tests {
                 source_provenance_ids: vec!["prov-public-specification".to_owned()],
                 reviewed_by: None,
                 decided_on: None,
+                decision_evidence: None,
                 rationale: "Awaiting qualified human legal review".to_owned(),
             }],
         }
@@ -2005,9 +3298,76 @@ mod tests {
         let review = &mut legal_reviews.reviews[0];
         review.status = LegalReviewStatus::Approved;
         review.approved_uses = vec![ProvenanceUse::ImplementationInput];
-        review.reviewed_by = Some("Qualified legal reviewer".to_owned());
+        review.reviewed_by = Some(reviewer_identity());
         review.decided_on = Some("2026-08-02".to_owned());
+        review.decision_evidence = Some(decision_evidence_reference());
         legal_reviews
+    }
+
+    fn reviewer_identity() -> LegalReviewerIdentity {
+        LegalReviewerIdentity {
+            github_account_id: 4242,
+            github_login: "qualified-reviewer".to_owned(),
+        }
+    }
+
+    fn decision_evidence_reference() -> LegalDecisionEvidenceReference {
+        LegalDecisionEvidenceReference {
+            repository: "anaregdesign/ntsql".to_owned(),
+            pull_request_number: 30,
+            attestation_id: "legal-review-public-specification:v1".to_owned(),
+        }
+    }
+
+    fn legal_decision_authority() -> LegalDecisionAuthority {
+        let decision = approved_legal_reviews().reviews[0].clone();
+        legal_decision_authority_for(&decision)
+    }
+
+    fn legal_decision_authority_for(decision: &LegalReviewRecord) -> LegalDecisionAuthority {
+        legal_decision_authority_for_provenance(decision, &provenance_ledger())
+    }
+
+    fn legal_decision_authority_for_provenance(
+        decision: &LegalReviewRecord,
+        provenance: &ProvenanceLedger,
+    ) -> LegalDecisionAuthority {
+        LegalDecisionAuthority {
+            schema_version: "1.0.0".to_owned(),
+            candidate_repository: "anaregdesign/ntsql".to_owned(),
+            candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            trusted_reviewer_account_ids: vec![4242],
+            pull_requests: vec![AuthenticatedPullRequest {
+                repository: "anaregdesign/ntsql".to_owned(),
+                pull_request_number: 30,
+                pull_request_author_account_id: 7,
+                candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                authenticated_reviews: vec![AuthenticatedPullRequestReview {
+                    repository: "anaregdesign/ntsql".to_owned(),
+                    pull_request_number: 30,
+                    review_id: 9001,
+                    reviewer: reviewer_identity(),
+                    reviewed_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                    state: AuthenticatedReviewState::Approved,
+                    submitted_at: "2026-08-02T12:34:56Z".to_owned(),
+                    attestations: vec![LegalDecisionAttestation {
+                        attestation_id: "legal-review-public-specification:v1".to_owned(),
+                        decision: decision.clone(),
+                        provenance_records: provenance.records.clone(),
+                    }],
+                }],
+            }],
+        }
+    }
+
+    fn legal_decision_verification(
+        authority: &LegalDecisionAuthority,
+    ) -> LegalDecisionVerificationContext<'_> {
+        LegalDecisionVerificationContext {
+            authority,
+            candidate_repository: "anaregdesign/ntsql",
+            candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
     }
 
     fn approved_fixture_governance() -> (ProvenanceLedger, LegalReviewLedger) {

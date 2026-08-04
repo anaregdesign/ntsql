@@ -56,6 +56,9 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Check first-party dependency boundaries
+        run: cargo run --locked -p ntsql-architecture-check
+
       - name: Install governance tools
         run: |
           cargo install cargo-deny --version 0.20.2 --locked

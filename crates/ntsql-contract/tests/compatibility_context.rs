@@ -42,10 +42,29 @@ fn validated_baseline_produces_the_exact_compatibility_context() -> Result<(), B
 #[test]
 fn invalid_target_matrix_cannot_produce_a_context() -> Result<(), Box<dyn Error>> {
     let mut matrix: TargetMatrix = serde_json::from_str(TARGETS)?;
-    matrix.baseline_target_id = "unknown-target".to_owned();
+    matrix.targets[0].product_version = "16.0.4265".to_owned();
 
     let error = match ValidatedTargetMatrix::try_from(matrix) {
         Ok(_) => return Err("invalid target matrix was accepted".into()),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .violations()
+            .iter()
+            .any(|violation| violation.code == "target.product-version.invalid")
+    );
+    Ok(())
+}
+
+#[test]
+fn unknown_baseline_cannot_produce_a_context() -> Result<(), Box<dyn Error>> {
+    let mut matrix: TargetMatrix = serde_json::from_str(TARGETS)?;
+    matrix.baseline_target_id = "unknown-target".to_owned();
+
+    let error = match ValidatedTargetMatrix::try_from(matrix) {
+        Ok(_) => return Err("unknown baseline target was accepted".into()),
         Err(error) => error,
     };
 

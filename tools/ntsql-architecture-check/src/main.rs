@@ -245,11 +245,14 @@ mod tests {
     }
 
     #[test]
-    fn reverse_domain_dependency_is_rejected() -> Result<(), ArchitectureCheckError> {
+    fn forbidden_domain_dependencies_are_rejected() -> Result<(), ArchitectureCheckError> {
         let graph = parse_dependency_tree(
             "0ntsql-architecture-check v0.1.0\n\
              0ntsql-compatibility v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             1ntsql-filesystem-adapter v0.1.0\n\
+             1ntsql-network-adapter v0.1.0\n\
+             1serde v1.0.0\n\
              0ntsql-contract v0.1.0\n\
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
@@ -260,6 +263,12 @@ mod tests {
 
         assert!(violations.iter().any(|violation| violation
             == "package ntsql-compatibility has forbidden direct dependency ntsql-contract"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-compatibility has forbidden direct dependency ntsql-filesystem-adapter"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-compatibility has forbidden direct dependency ntsql-network-adapter"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-compatibility has forbidden direct dependency serde"));
         Ok(())
     }
 

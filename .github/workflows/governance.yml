@@ -27,6 +27,15 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # This step must be replaced by a protected producer and prebuilt verifier
+      # in a separately reviewed activation change. It intentionally runs before
+      # checkout so removing only the static job condition cannot execute
+      # candidate-controlled code.
+      - name: Require protected authority producer and verifier
+        run: |
+          echo "::error::Protected legal-decision authority producer and prebuilt verifier are not installed."
+          exit 1
+
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -47,6 +56,9 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Check first-party dependency boundaries
+        run: cargo run --locked -p ntsql-architecture-check
+
       - name: Install governance tools
         run: |
           cargo install cargo-deny --version 0.20.2 --locked
@@ -60,7 +72,9 @@ jobs:
         run: cargo audit --deny warnings
 
       - name: Check fixture provenance
-        run: cargo run --locked -p ntsql-contract --bin ntsql-governance -- fixtures
+        run: >-
+          cargo run --locked -p ntsql-contract --bin ntsql-governance --
+          fixtures
 
       - name: Generate CycloneDX SBOM
         run: >-

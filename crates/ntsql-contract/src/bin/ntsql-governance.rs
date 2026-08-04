@@ -6,10 +6,19 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use ntsql_contract::{FixtureArtifact, LegalReviewLedger, ProvenanceLedger};
+use ntsql_contract::{
+    FixtureArtifact, LegalDecisionAuthority, LegalDecisionVerificationContext, LegalReviewLedger,
+    ProvenanceLedger,
+};
 use serde_json::Value;
 
 const CARGO_CYCLONEDX_VERSION: &str = "0.5.9";
+
+struct AuthorityInput {
+    path: PathBuf,
+    candidate_repository: String,
+    candidate_commit_sha: String,
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -23,14 +32,52 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
-    let command = arguments
-        .next()
-        .ok_or_else(|| invalid_data("expected `fixtures` or `sbom <path>`"))?;
+    let command = arguments.next().ok_or_else(|| {
+        invalid_data(
+            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, or `sbom <path>`",
+        )
+    })?;
 
     match command.as_str() {
         "fixtures" => {
+            let authority_path = arguments.next();
+            let candidate_repository = arguments.next();
+            let candidate_commit_sha = arguments.next();
             ensure_no_more_arguments(arguments)?;
-            validate_repository_fixtures()
+            let authority_input = match (authority_path, candidate_repository, candidate_commit_sha)
+            {
+                (None, None, None) => None,
+                (Some(path), Some(candidate_repository), Some(candidate_commit_sha)) => {
+                    Some(AuthorityInput {
+                        path: PathBuf::from(path),
+                        candidate_repository,
+                        candidate_commit_sha,
+                    })
+                }
+                _ => {
+                    return Err(invalid_data(
+                        "fixtures requires authority, repository, and commit together",
+                    ));
+                }
+            };
+            validate_repository_fixtures(authority_input.as_ref())
+        }
+        "legal-reviews" => {
+            let authority_path = arguments.next().ok_or_else(|| {
+                invalid_data("the legal-reviews command requires an authority path")
+            })?;
+            let candidate_repository = arguments.next().ok_or_else(|| {
+                invalid_data("the legal-reviews command requires a trusted repository")
+            })?;
+            let candidate_commit_sha = arguments.next().ok_or_else(|| {
+                invalid_data("the legal-reviews command requires a trusted commit")
+            })?;
+            ensure_no_more_arguments(arguments)?;
+            validate_legal_reviews(
+                Path::new(&authority_path),
+                &candidate_repository,
+                &candidate_commit_sha,
+            )
         }
         "sbom" => {
             let path = arguments
@@ -39,7 +86,9 @@ fn run() -> Result<(), Box<dyn Error>> {
             ensure_no_more_arguments(arguments)?;
             validate_sbom(Path::new(&path))
         }
-        _ => Err(invalid_data("expected `fixtures` or `sbom <path>`")),
+        _ => Err(invalid_data(
+            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, or `sbom <path>`",
+        )),
     }
 }
 
@@ -52,13 +101,25 @@ fn ensure_no_more_arguments(
     Ok(())
 }
 
-fn validate_repository_fixtures() -> Result<(), Box<dyn Error>> {
+fn validate_repository_fixtures(
+    authority_input: Option<&AuthorityInput>,
+) -> Result<(), Box<dyn Error>> {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let workspace_root = workspace_root.canonicalize()?;
     let provenance: ProvenanceLedger =
         read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
     let legal_reviews: LegalReviewLedger =
         read_json(&workspace_root.join("contracts/compatibility/legal-reviews.json"))?;
+    let authority = authority_input
+        .map(|input| read_external_authority(&workspace_root, &input.path))
+        .transpose()?;
+    let verification = authority_input
+        .zip(authority.as_ref())
+        .map(|(input, authority)| LegalDecisionVerificationContext {
+            authority,
+            candidate_repository: &input.candidate_repository,
+            candidate_commit_sha: &input.candidate_commit_sha,
+        });
     let fixture_paths = discover_fixture_files(&workspace_root)?;
     let fixtures = fixture_paths
         .iter()
@@ -71,10 +132,10 @@ fn validate_repository_fixtures() -> Result<(), Box<dyn Error>> {
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
 
     let violations = legal_reviews
-        .validate()
+        .validate_for_governed_use(&provenance, verification)
         .into_iter()
         .chain(provenance.validate(&legal_reviews))
-        .chain(provenance.validate_fixture_inventory(&legal_reviews, &fixtures))
+        .chain(provenance.validate_fixture_inventory(&legal_reviews, verification, &fixtures))
         .collect::<Vec<_>>();
 
     if !violations.is_empty() {
@@ -89,6 +150,90 @@ fn validate_repository_fixtures() -> Result<(), Box<dyn Error>> {
 
     println!("fixture governance ok ({} fixture files)", fixtures.len());
     Ok(())
+}
+
+fn validate_legal_reviews(
+    authority_path: &Path,
+    candidate_repository: &str,
+    candidate_commit_sha: &str,
+) -> Result<(), Box<dyn Error>> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let legal_reviews: LegalReviewLedger =
+        read_json(&workspace_root.join("contracts/compatibility/legal-reviews.json"))?;
+    let provenance: ProvenanceLedger =
+        read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
+    let authority = read_external_authority(&workspace_root, authority_path)?;
+    let violations = legal_reviews.validate_authenticated_decisions(
+        &provenance,
+        LegalDecisionVerificationContext {
+            authority: &authority,
+            candidate_repository,
+            candidate_commit_sha,
+        },
+    );
+
+    if !violations.is_empty() {
+        for violation in &violations {
+            eprintln!("{}: {}", violation.code, violation.message);
+        }
+        return Err(invalid_data(format!(
+            "authenticated legal-review governance found {} violation(s)",
+            violations.len()
+        )));
+    }
+
+    println!("authenticated legal-review governance ok");
+    Ok(())
+}
+
+fn read_external_authority(
+    workspace_root: &Path,
+    path: &Path,
+) -> Result<LegalDecisionAuthority, Box<dyn Error>> {
+    let supplied_path = normalize_absolute_path(path)?;
+    if supplied_path.starts_with(workspace_root) {
+        return Err(invalid_data(
+            "legal-decision authority path must originate outside the candidate checkout",
+        ));
+    }
+
+    let resolved_path = path.canonicalize()?;
+    if resolved_path.starts_with(workspace_root) {
+        return Err(invalid_data(
+            "legal-decision authority target must be outside the candidate checkout",
+        ));
+    }
+    if !fs::metadata(&resolved_path)?.is_file() {
+        return Err(invalid_data(
+            "legal-decision authority must be a regular file",
+        ));
+    }
+    read_json(&resolved_path)
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(invalid_data("authority path traverses above its root"));
+                }
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 fn discover_fixture_files(workspace_root: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
@@ -305,4 +450,47 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Box<dyn E
 
 fn invalid_data(message: impl Into<String>) -> Box<dyn Error> {
     Box::new(io::Error::new(io::ErrorKind::InvalidData, message.into()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn authority_path_rejects_symlinks_across_checkout_boundary() -> Result<(), Box<dyn Error>> {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let test_root = env::temp_dir().join(format!(
+            "ntsql-authority-path-{}-{nonce}",
+            std::process::id()
+        ));
+        let workspace_root = test_root.join("checkout");
+        fs::create_dir_all(&workspace_root)?;
+        let workspace_root = workspace_root.canonicalize()?;
+
+        let external_authority = test_root.join("external-authority.json");
+        fs::write(&external_authority, b"{}")?;
+        let inside_link = workspace_root.join("inside-link.json");
+        symlink(&external_authority, &inside_link)?;
+        let inside_error = read_external_authority(&workspace_root, &inside_link)
+            .err()
+            .ok_or_else(|| invalid_data("inside authority symlink was accepted"))?
+            .to_string();
+
+        let inside_authority = workspace_root.join("inside-authority.json");
+        fs::write(&inside_authority, b"{}")?;
+        let outside_link = test_root.join("outside-link.json");
+        symlink(&inside_authority, &outside_link)?;
+        let outside_error = read_external_authority(&workspace_root, &outside_link)
+            .err()
+            .ok_or_else(|| invalid_data("outside authority symlink target was accepted"))?
+            .to_string();
+
+        fs::remove_dir_all(&test_root)?;
+        assert!(inside_error.contains("path must originate outside"));
+        assert!(outside_error.contains("target must be outside"));
+        Ok(())
+    }
 }

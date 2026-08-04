@@ -1,0 +1,241 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/provenance-ledger.schema.json",
+  "base_document": {
+    "source": "../compatibility/provenance.json"
+  },
+  "cases": [
+    {
+      "case_id": "provenance.base.valid",
+      "constraint": "published provenance ledger",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "provenance.required.nullable-source-url-missing",
+      "constraint": "required nullable property",
+      "patch": [
+        { "op": "remove", "path": "/records/0/source_url" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        { "op": "add", "path": "/records/0/unexpected", "value": true }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.artifact-path.parent-component",
+      "constraint": "safe repository-relative path",
+      "patch": [
+        { "op": "replace", "path": "/records/7/artifact_path", "value": "contracts/../outside.json" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.metadata.whitespace",
+      "constraint": "non-whitespace metadata",
+      "patch": [
+        { "op": "replace", "path": "/records/0/title", "value": "   " }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.metadata.next-line-non-whitespace",
+      "constraint": "U+0085 is not ECMAScript whitespace",
+      "patch": [
+        { "op": "replace", "path": "/records/0/title", "value": "\u0085" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "provenance.artifact-path.whitespace",
+      "constraint": "non-whitespace repository path",
+      "patch": [
+        { "op": "replace", "path": "/records/7/artifact_path", "value": "   " }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.artifact-path.byte-order-mark-whitespace",
+      "constraint": "U+FEFF is ECMAScript whitespace",
+      "patch": [
+        { "op": "replace", "path": "/records/7/artifact_path", "value": "\ufeff" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.digest.malformed",
+      "constraint": "sha256 digest",
+      "patch": [
+        { "op": "replace", "path": "/records/0/content_digest", "value": "sha256:abc" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.date.lexically-malformed",
+      "constraint": "YYYY-MM-DD lexical date",
+      "patch": [
+        { "op": "replace", "path": "/records/0/retrieved_on", "value": "2025/01/01" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.intended-use.duplicate",
+      "constraint": "uniqueItems",
+      "patch": [
+        { "op": "copy", "from": "/records/0/intended_uses/0", "path": "/records/0/intended_uses/-" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.external.artifact-path-forbidden",
+      "constraint": "external source conditional",
+      "patch": [
+        { "op": "replace", "path": "/records/0/artifact_path", "value": "contracts/source.txt" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.repository.source-url-forbidden",
+      "constraint": "repository source conditional",
+      "patch": [
+        { "op": "replace", "path": "/records/7/source_url", "value": "https://example.invalid/source" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.id.duplicate-rust-only",
+      "constraint": "semantic identifier uniqueness",
+      "patch": [
+        { "op": "copy", "from": "/records/0", "path": "/records/-" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.parent.unknown-rust-only",
+      "constraint": "parent reference",
+      "patch": [
+        { "op": "add", "path": "/records/0/parent_provenance_ids/-", "value": "prov-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.parent.cycle-rust-only",
+      "constraint": "acyclic provenance graph",
+      "patch": [
+        { "op": "copy", "from": "/records/0/id", "path": "/records/0/parent_provenance_ids/-" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.legal-review.unknown-rust-only",
+      "constraint": "legal-review reference",
+      "patch": [
+        { "op": "replace", "path": "/records/0/legal_review_id", "value": "legal-review-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "provenance.legal-review.source-unlisted-rust-only",
+      "constraint": "legal-review source closure",
+      "patch": [
+        { "op": "replace", "path": "/records/0/legal_review_id", "value": "legal-review-ms-tds" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

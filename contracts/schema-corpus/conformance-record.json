@@ -1,0 +1,261 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/conformance-record.schema.json",
+  "base_document": {
+    "inline": {
+      "schema_version": "1.0.0",
+      "case_id": "case.schema-corpus",
+      "target_id": "sqlserver-2022-developer-cu26",
+      "observed_at": "2025-01-01T00:00:00Z",
+      "provenance_id": "prov-schema-corpus",
+      "behavior_class": "documented",
+      "observations": {
+        "syntax": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "wire": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "result": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "metadata": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "diagnostic": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "transactional_side_effect": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "operational": { "state": "not-observed", "reason": "Synthetic schema-boundary case." }
+      }
+    }
+  },
+  "cases": [
+    {
+      "case_id": "conformance.base.valid",
+      "constraint": "complete synthetic conformance record",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.required.dimension-missing",
+      "constraint": "seven required observation dimensions",
+      "patch": [
+        { "op": "remove", "path": "/observations/operational" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        { "op": "add", "path": "/unexpected", "value": true }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.identifier.maximum.accepted",
+      "constraint": "identifier maxLength 128",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/case_id",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.identifier.too-long",
+      "constraint": "identifier maxLength 128",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/case_id",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.timestamp.fractional-seconds-rejected",
+      "constraint": "UTC second-precision timestamp",
+      "patch": [
+        { "op": "replace", "path": "/observed_at", "value": "2025-01-01T00:00:00.000Z" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.timestamp.offset-rejected",
+      "constraint": "UTC Z suffix",
+      "patch": [
+        { "op": "replace", "path": "/observed_at", "value": "2025-01-01T00:00:00+00:00" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.timestamp.lexical-calendar-not-asserted",
+      "constraint": "format annotation with lexical timestamp pattern",
+      "patch": [
+        { "op": "replace", "path": "/observed_at", "value": "2025-99-99T99:99:99Z" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.behavior-class.enum-rejected",
+      "constraint": "behavior class enum",
+      "patch": [
+        { "op": "replace", "path": "/behavior_class", "value": "unknown" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.observed-valid",
+      "constraint": "observed union branch with arbitrary JSON payloads",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "oracle": [1, null, "value"],
+            "subject": { "rows": 1 },
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason-whitespace",
+      "constraint": "non-whitespace not-observed reason",
+      "patch": [
+        { "op": "replace", "path": "/observations/syntax/reason", "value": "   " }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason.next-line-non-whitespace",
+      "constraint": "U+0085 is not ECMAScript whitespace",
+      "patch": [
+        { "op": "replace", "path": "/observations/syntax/reason", "value": "\u0085" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason.byte-order-mark-whitespace",
+      "constraint": "U+FEFF is ECMAScript whitespace",
+      "patch": [
+        { "op": "replace", "path": "/observations/syntax/reason", "value": "\ufeff" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason-missing",
+      "constraint": "not-observed union branch required property",
+      "patch": [
+        { "op": "remove", "path": "/observations/syntax/reason" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.status-enum-rejected",
+      "constraint": "comparison status enum",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "oracle": null,
+            "subject": null,
+            "status": "unknown"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observations.additional-dimension-rejected",
+      "constraint": "closed seven-dimension object",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/observations/unexpected",
+          "value": { "state": "not-observed", "reason": "Unexpected dimension." }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

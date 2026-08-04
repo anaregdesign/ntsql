@@ -18,7 +18,11 @@
     "schema_version": { "const": "1.0.0" },
     "case_id": { "$ref": "#/$defs/identifier" },
     "target_id": { "$ref": "#/$defs/identifier" },
-    "observed_at": { "type": "string", "format": "date-time" },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
     "provenance_id": { "$ref": "#/$defs/identifier" },
     "behavior_class": {
       "enum": [
@@ -55,7 +59,13 @@
     "identifier": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "nonWhitespaceString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\u0009-\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]"
     },
     "comparison_status": {
       "enum": ["compatible", "partial", "divergent"]
@@ -79,7 +89,7 @@
           "required": ["state", "reason"],
           "properties": {
             "state": { "const": "not-observed" },
-            "reason": { "type": "string", "minLength": 1 }
+            "reason": { "$ref": "#/$defs/nonWhitespaceString" }
           }
         }
       ]

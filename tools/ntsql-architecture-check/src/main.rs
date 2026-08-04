@@ -19,6 +19,10 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
         allowed_dependencies: &[],
     },
     PackagePolicy {
+        package: "ntsql-diagnostics",
+        allowed_dependencies: &[],
+    },
+    PackagePolicy {
         package: "ntsql-contract",
         allowed_dependencies: &["ntsql-compatibility", "serde", "serde_json"],
     },
@@ -234,6 +238,7 @@ mod tests {
         let graph = parse_dependency_tree(
             "0ntsql-architecture-check v0.1.0\n\
              0ntsql-compatibility v0.1.0\n\
+             0ntsql-diagnostics v0.1.0\n\
              0ntsql-contract v0.1.0\n\
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
@@ -253,6 +258,12 @@ mod tests {
              1ntsql-filesystem-adapter v0.1.0\n\
              1ntsql-network-adapter v0.1.0\n\
              1serde v1.0.0\n\
+             0ntsql-diagnostics v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             1ntsql-filesystem-adapter v0.1.0\n\
+             1ntsql-network-adapter v0.1.0\n\
+             1ntsql-protocol-host v0.1.0\n\
+             1serde v1.0.0\n\
              0ntsql-contract v0.1.0\n\
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
@@ -269,6 +280,16 @@ mod tests {
             == "package ntsql-compatibility has forbidden direct dependency ntsql-network-adapter"));
         assert!(violations.iter().any(|violation| violation
             == "package ntsql-compatibility has forbidden direct dependency serde"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-diagnostics has forbidden direct dependency ntsql-contract"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-diagnostics has forbidden direct dependency ntsql-filesystem-adapter"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-diagnostics has forbidden direct dependency ntsql-network-adapter"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-diagnostics has forbidden direct dependency ntsql-protocol-host"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-diagnostics has forbidden direct dependency serde"));
         Ok(())
     }
 
@@ -277,6 +298,7 @@ mod tests {
         let graph = parse_dependency_tree(
             "0ntsql-architecture-check v0.1.0\n\
              0ntsql-compatibility v0.1.0\n\
+             0ntsql-diagnostics v0.1.0\n\
              0ntsql-contract v0.1.0\n\
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\

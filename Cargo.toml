@@ -2,6 +2,7 @@
 members = [
 	"crates/ntsql-compatibility",
 	"crates/ntsql-contract",
+	"crates/ntsql-diagnostics",
 	"tools/ntsql-architecture-check",
 ]
 resolver = "3"

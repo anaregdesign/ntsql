@@ -21,12 +21,21 @@
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
     },
+    "nonWhitespaceString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\u0009-\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]"
+    },
     "reviewer": {
       "type": "object",
       "additionalProperties": false,
       "required": ["github_account_id", "github_login"],
       "properties": {
-        "github_account_id": { "type": "integer", "minimum": 1 },
+        "github_account_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
         "github_login": {
           "type": "string",
           "minLength": 1,
@@ -78,7 +87,11 @@
           "type": "string",
           "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
         },
-        "pull_request_number": { "type": "integer", "minimum": 1 },
+        "pull_request_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
         "attestation_id": { "$ref": "#/$defs/identifier" }
       }
     },
@@ -106,7 +119,7 @@
       ],
       "properties": {
         "id": { "$ref": "#/$defs/identifier" },
-        "subject": { "type": "string", "minLength": 1 },
+        "subject": { "$ref": "#/$defs/nonWhitespaceString" },
         "status": { "enum": ["pending", "approved", "rejected"] },
         "approved_uses": { "$ref": "#/$defs/uses" },
         "prohibited_uses": { "$ref": "#/$defs/uses" },
@@ -120,7 +133,7 @@
         "reviewed_by": { "$ref": "#/$defs/nullableReviewer" },
         "decided_on": { "$ref": "#/$defs/nullableDate" },
         "decision_evidence": { "$ref": "#/$defs/nullableEvidence" },
-        "rationale": { "type": "string", "minLength": 1 }
+        "rationale": { "$ref": "#/$defs/nonWhitespaceString" }
       },
       "allOf": [
         {

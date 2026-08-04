@@ -28,6 +28,7 @@
     "identifier": {
       "type": "string",
       "minLength": 1,
+      "maxLength": 128,
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
     },
     "target": {
@@ -81,7 +82,7 @@
         },
         "collation": { "type": "string", "minLength": 1 },
         "language": { "type": "string", "minLength": 1 },
-        "lcid": { "type": "integer", "minimum": 0 },
+        "lcid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
         "timezone": { "type": "string", "minLength": 1 },
         "session_settings": {
           "type": "array",

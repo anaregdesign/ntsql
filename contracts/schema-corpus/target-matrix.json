@@ -1,0 +1,230 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/target-matrix.schema.json",
+  "base_document": {
+    "source": "../compatibility/targets.json"
+  },
+  "cases": [
+    {
+      "case_id": "target.base.valid",
+      "constraint": "published target matrix",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "target.required.baseline-missing",
+      "constraint": "required property",
+      "patch": [
+        { "op": "remove", "path": "/baseline_target_id" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        { "op": "add", "path": "/unexpected", "value": true }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.integer.maximums.accepted",
+      "constraint": "u16 and u32 maximums",
+      "patch": [
+        { "op": "replace", "path": "/targets/0/compatibility_level", "value": 65535 },
+        { "op": "replace", "path": "/targets/0/lcid", "value": 4294967295 },
+        { "op": "replace", "path": "/expansion_order/0/sequence", "value": 1 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "target.compatibility-level.overflow",
+      "constraint": "u16 maximum",
+      "patch": [
+        { "op": "replace", "path": "/targets/0/compatibility_level", "value": 65536 }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.compatibility-level.integral-decimal-prefilter",
+      "constraint": "JSON Schema integer accepts an integral decimal representation",
+      "patch": [
+        { "op": "replace", "path": "/targets/0/compatibility_level", "value": 160.0 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.lcid.overflow",
+      "constraint": "u32 maximum",
+      "patch": [
+        { "op": "replace", "path": "/targets/0/lcid", "value": 4294967296 }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.lcid.integral-exponent-prefilter",
+      "constraint": "JSON Schema integer accepts an integral exponent representation",
+      "patch": [
+        { "op": "replace", "path": "/targets/0/lcid", "value": 1e3 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.identifier.maximum.accepted",
+      "constraint": "identifier maxLength 128",
+      "patch": [
+        {
+          "op": "copy",
+          "from": "/targets/0",
+          "path": "/targets/-"
+        },
+        {
+          "op": "replace",
+          "path": "/targets/1/id",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "target.identifier.too-long",
+      "constraint": "identifier maxLength 128",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/baseline_target_id",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.session-settings.duplicate",
+      "constraint": "uniqueItems",
+      "patch": [
+        { "op": "copy", "from": "/targets/0/session_settings/0", "path": "/targets/0/session_settings/-" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.container-tag.latest",
+      "constraint": "immutable container tag",
+      "patch": [
+        { "op": "replace", "path": "/targets/0/container_tag", "value": "2022-latest" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.id.duplicate-rust-only",
+      "constraint": "semantic identifier uniqueness",
+      "patch": [
+        { "op": "copy", "from": "/targets/0", "path": "/targets/-" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.baseline.unknown-rust-only",
+      "constraint": "baseline reference",
+      "patch": [
+        { "op": "replace", "path": "/baseline_target_id", "value": "target.unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.expansion.noncontiguous-rust-only",
+      "constraint": "contiguous expansion order",
+      "patch": [
+        { "op": "replace", "path": "/expansion_order/1/sequence", "value": 3 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "target.provenance.unknown-rust-only",
+      "constraint": "provenance reference",
+      "patch": [
+        { "op": "replace", "path": "/targets/0/provenance_id", "value": "prov-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

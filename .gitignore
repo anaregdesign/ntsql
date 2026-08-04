@@ -1,3 +1,4 @@
 /target/
+*.cdx.json
 .DS_Store
 .vscode/

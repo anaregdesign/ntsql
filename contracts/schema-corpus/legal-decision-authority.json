@@ -1,0 +1,341 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/legal-decision-authority.schema.json",
+  "base_document": {
+    "inline": {
+      "schema_version": "1.0.0",
+      "candidate_repository": "anaregdesign/ntsql",
+      "candidate_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "trusted_reviewer_account_ids": [4242],
+      "pull_requests": [
+        {
+          "repository": "anaregdesign/ntsql",
+          "pull_request_number": 30,
+          "pull_request_author_account_id": 7,
+          "candidate_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "authenticated_reviews": [
+            {
+              "repository": "anaregdesign/ntsql",
+              "pull_request_number": 30,
+              "review_id": 9001,
+              "reviewer": {
+                "github_account_id": 4242,
+                "github_login": "qualified-reviewer"
+              },
+              "reviewed_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "state": "approved",
+              "submitted_at": "2026-08-02T12:34:56Z",
+              "attestations": [
+                {
+                  "attestation_id": "legal-review-public-specification:v1",
+                  "decision": {
+                    "id": "legal-review-public-specification",
+                    "subject": "Use of a synthetic public specification",
+                    "status": "approved",
+                    "approved_uses": ["implementation-input"],
+                    "prohibited_uses": [],
+                    "individual_review_uses": [],
+                    "source_provenance_ids": ["prov-public-specification"],
+                    "reviewed_by": {
+                      "github_account_id": 4242,
+                      "github_login": "qualified-reviewer"
+                    },
+                    "decided_on": "2026-08-02",
+                    "decision_evidence": {
+                      "repository": "anaregdesign/ntsql",
+                      "pull_request_number": 30,
+                      "attestation_id": "legal-review-public-specification:v1"
+                    },
+                    "rationale": "Synthetic schema-boundary decision; not a legal approval."
+                  },
+                  "provenance_records": [
+                    {
+                      "id": "prov-public-specification",
+                      "source_kind": "open-specification",
+                      "title": "Synthetic public specification",
+                      "source_url": "https://example.invalid/specification",
+                      "artifact_path": null,
+                      "revision": "1.0",
+                      "retrieved_on": "2026-08-02",
+                      "author": "Synthetic publisher",
+                      "generation_method": "Constructed as a schema-boundary instance.",
+                      "environment": null,
+                      "license": "Synthetic terms",
+                      "content_digest": "sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89",
+                      "intended_uses": ["implementation-input"],
+                      "parent_provenance_ids": [],
+                      "legal_review_id": "legal-review-public-specification"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "case_id": "authority.base.valid",
+      "constraint": "complete synthetic authority document",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "authority.required.candidate-commit-missing",
+      "constraint": "required property",
+      "patch": [
+        { "op": "remove", "path": "/candidate_commit_sha" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        { "op": "add", "path": "/unexpected", "value": true }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.u64.maximums-accepted",
+      "constraint": "u64 maximums across local and external references",
+      "patch": [
+        { "op": "replace", "path": "/trusted_reviewer_account_ids/0", "value": 18446744073709551615 },
+        { "op": "replace", "path": "/pull_requests/0/pull_request_number", "value": 18446744073709551615 },
+        { "op": "replace", "path": "/pull_requests/0/pull_request_author_account_id", "value": 18446744073709551615 },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/pull_request_number", "value": 18446744073709551615 },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/review_id", "value": 18446744073709551615 },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/reviewer/github_account_id", "value": 18446744073709551615 },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/reviewed_by/github_account_id", "value": 18446744073709551615 },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/decision_evidence/pull_request_number", "value": 18446744073709551615 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "authority.review-id.overflow",
+      "constraint": "u64 maximum",
+      "patch": [
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/review_id", "value": 18446744073709551616 }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.commit-sha.malformed",
+      "constraint": "lowercase 40-character commit SHA",
+      "patch": [
+        { "op": "replace", "path": "/candidate_commit_sha", "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.trusted-reviewer.duplicate",
+      "constraint": "uniqueItems",
+      "patch": [
+        { "op": "copy", "from": "/trusted_reviewer_account_ids/0", "path": "/trusted_reviewer_account_ids/-" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.review-timestamp.lexically-malformed",
+      "constraint": "UTC second-precision timestamp",
+      "patch": [
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/submitted_at", "value": "2026-08-02T12:34:56.000Z" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.attestation.duplicate",
+      "constraint": "uniqueItems for external-ref objects",
+      "patch": [
+        { "op": "copy", "from": "/pull_requests/0/authenticated_reviews/0/attestations/0", "path": "/pull_requests/0/authenticated_reviews/0/attestations/-" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.attested-provenance.duplicate",
+      "constraint": "uniqueItems for provenance external references",
+      "patch": [
+        { "op": "copy", "from": "/pull_requests/0/authenticated_reviews/0/attestations/0/provenance_records/0", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/provenance_records/-" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.pending-attestation-rust-only",
+      "constraint": "attested decision must be final",
+      "patch": [
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/status", "value": "pending" },
+        { "op": "remove", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/approved_uses/0" },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/reviewed_by", "value": null },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/decided_on", "value": null },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/decision_evidence", "value": null }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.attested-scope-conflict-rust-only",
+      "constraint": "attested decision scopes must be disjoint",
+      "patch": [
+        { "op": "add", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/prohibited_uses/-", "value": "implementation-input" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.snapshot.root-unknown-rust-only",
+      "constraint": "complete attested provenance closure",
+      "patch": [
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/source_provenance_ids/0", "value": "prov-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.snapshot.extra-record-rust-only",
+      "constraint": "exact attested provenance closure",
+      "patch": [
+        { "op": "copy", "from": "/pull_requests/0/authenticated_reviews/0/attestations/0/provenance_records/0", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/provenance_records/-" },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/provenance_records/1/id", "value": "prov-extra" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.pull-request.repository-mismatch-rust-only",
+      "constraint": "pull request must belong to candidate repository",
+      "patch": [
+        { "op": "replace", "path": "/pull_requests/0/repository", "value": "other/repository" },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/repository", "value": "other/repository" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.review.context-mismatch-rust-only",
+      "constraint": "review must belong to pull-request context",
+      "patch": [
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/pull_request_number", "value": 31 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.pull-request.duplicate-rust-only",
+      "constraint": "pull-request identity uniqueness",
+      "patch": [
+        { "op": "copy", "from": "/pull_requests/0", "path": "/pull_requests/-" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.attestation-key.duplicate-rust-only",
+      "constraint": "attestation key uniqueness within a reviewed commit",
+      "patch": [
+        { "op": "copy", "from": "/pull_requests/0/authenticated_reviews/0/attestations/0", "path": "/pull_requests/0/authenticated_reviews/0/attestations/-" },
+        { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/attestations/1/decision/rationale", "value": "Distinct object with the same attestation key." }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.trusted-candidate.mismatch-rust-only",
+      "constraint": "out-of-document trusted candidate binding",
+      "patch": [],
+      "trusted_candidate": {
+        "repository": "anaregdesign/ntsql",
+        "commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

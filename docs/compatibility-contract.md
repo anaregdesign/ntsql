@@ -100,14 +100,48 @@ Known differences are public contract data. Each difference names the externally
 
 The Rust standard library and workspace-owned code are the default. An external dependency is admitted only when it provides a necessary interoperability boundary, a materially safer implementation than a local substitute, or a capability whose correct reimplementation is disproportionate to the project.
 
-Every admitted dependency must have a compatible license, minimal feature set, lockfile entry, maintained upstream, and security review appropriate to its role. A dependency used only for convenience is rejected. Direct dependencies are centralized in the workspace manifest. The current `serde` and `serde_json` dependencies are limited to the public JSON contract boundary; ntsql does not use them as a reason to introduce a broader framework dependency.
+Every admitted dependency must have a compatible license, minimal feature set, lockfile entry, maintained upstream, provenance record, and security review appropriate to its role. A dependency used only for convenience is rejected. Direct dependencies are centralized in the workspace manifest. The current `serde` and `serde_json` dependencies are limited to the public JSON contract boundary; ntsql does not use them as a reason to introduce a broader framework dependency. The complete admission and CI rules are defined in `docs/governance.md`.
 
 ## Machine-Readable Files
 
 - `contracts/compatibility/targets.json`: immutable oracle targets and expansion order
 - `contracts/compatibility/features.json`: classified feature inventory and current status
+- `contracts/compatibility/provenance.json`: source, artifact, dependency, lineage, digest, and intended-use inventory
+- `contracts/compatibility/legal-reviews.json`: qualified human legal decisions and unresolved gates
 - `contracts/schemas/conformance-record.schema.json`: one comparison record
-- `contracts/schemas/target-matrix.schema.json`: target matrix interchange schema
 - `contracts/schemas/feature-matrix.schema.json`: feature matrix interchange schema
+- `contracts/schemas/legal-decision-authority.schema.json`: authenticated out-of-branch legal-decision evidence
+- `contracts/schemas/legal-review-ledger.schema.json`: legal-review ledger interchange schema
+- `contracts/schemas/provenance-ledger.schema.json`: provenance ledger interchange schema
+- `contracts/schemas/target-matrix.schema.json`: target matrix interchange schema
+- `contracts/schema-corpus/`: validator-neutral positive, negative, boundary, and Rust-only contract cases
 
-JSON Schema is the interoperability prefilter. The `ntsql-contract` Rust validator is authoritative for cross-record invariants such as unique identifiers, target references, complete category coverage, contiguous expansion order, and status-dependent evidence.
+Validation has four distinct boundaries. JSON deserialization checks the Rust
+wire shape. Draft 2020-12 JSON Schema is the interoperability prefilter.
+`validate_schema_semantics` is the matching first-party Rust boundary for
+constraints expressible by those schemas. Full Rust validation is authoritative
+for cross-record, graph, authenticated-context, and governed-use invariants such
+as unique identifiers, target and provenance references, complete category
+coverage, contiguous expansion order, exact provenance closure, and trusted
+candidate binding.
+
+The shared corpus records separate expectations for all four boundaries and
+requires JSON Schema and typed Rust schema-semantic expectations to agree for
+instances that deserialize. JSON Schema remains a prefilter: its `integer` type
+also accepts mathematically integral decimal or exponent representations, while
+the Rust wire types require JSON integer representations. The corpus records
+that deserialization boundary explicitly.
+
+The first-party runner currently exercises the Rust boundaries, binds corpus
+IDs to the published schema IDs, and verifies local and relative
+schema-reference reachability. It does not claim standards-level schema
+compilation or instance validation. Executing a third-party Draft 2020-12
+validator remains blocked by
+`legal-review-third-party-dependencies`; selecting or running one requires the
+dependency provenance, license, security, SBOM, and authenticated qualified
+legal-review controls in `docs/governance.md`.
+
+Draft 2020-12 `format` is annotation-only under the default meta-schema. The
+published schemas and shared corpus therefore assert the contract's lexical
+date and UTC timestamp forms but do not silently elevate calendar or timezone
+interpretation into a portable schema assertion.

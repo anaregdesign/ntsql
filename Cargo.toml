@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/ntsql-contract"]
+members = [
+	"crates/ntsql-compatibility",
+	"crates/ntsql-contract",
+	"tools/ntsql-architecture-check",
+]
 resolver = "3"
 
 [workspace.package]
@@ -9,6 +13,7 @@ repository = "https://github.com/anaregdesign/ntsql"
 rust-version = "1.88"
 
 [workspace.dependencies]
+ntsql-compatibility = { path = "crates/ntsql-compatibility" }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.142", default-features = false, features = ["std"] }
 

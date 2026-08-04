@@ -13,11 +13,15 @@ The workspace requires Rust 1.88 or later.
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo run --locked -p ntsql-architecture-check
 cargo deny check
 cargo audit --deny warnings
 cargo run --locked -p ntsql-contract --bin ntsql-governance -- fixtures
 ```
 
 External dependencies are exceptional. The current direct dependencies, `serde` and `serde_json`, are restricted to the public JSON contract boundary.
+The reviewed crate responsibilities and dependency direction are recorded in
+[ADR 0001](docs/adr/0001-compatibility-context-and-crate-boundaries.md) and
+enforced by `ntsql-architecture-check`.
 
 Apache-2.0 is the selected project-license candidate. The standard text is in `LICENSE`; adoption and the proposed DCO 1.1 contribution process remain pending qualified human legal review as recorded in the legal-review ledger.

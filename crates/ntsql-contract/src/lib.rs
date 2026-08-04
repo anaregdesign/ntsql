@@ -1,7 +1,8 @@
 //! Types and invariants for ntsql compatibility evidence.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, error::Error, fmt};
 
+use ntsql_compatibility::{CompatibilityContext, CompatibilityProfile, ObservationDimension};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -40,6 +41,34 @@ pub enum CompatibilityDimension {
     TransactionalSideEffect,
     /// Whether startup, configuration, and administration behavior is equivalent.
     Operational,
+}
+
+impl From<ObservationDimension> for CompatibilityDimension {
+    fn from(value: ObservationDimension) -> Self {
+        match value {
+            ObservationDimension::Syntax => Self::Syntax,
+            ObservationDimension::Wire => Self::Wire,
+            ObservationDimension::Result => Self::Result,
+            ObservationDimension::Metadata => Self::Metadata,
+            ObservationDimension::Diagnostic => Self::Diagnostic,
+            ObservationDimension::TransactionalSideEffect => Self::TransactionalSideEffect,
+            ObservationDimension::Operational => Self::Operational,
+        }
+    }
+}
+
+impl From<CompatibilityDimension> for ObservationDimension {
+    fn from(value: CompatibilityDimension) -> Self {
+        match value {
+            CompatibilityDimension::Syntax => Self::Syntax,
+            CompatibilityDimension::Wire => Self::Wire,
+            CompatibilityDimension::Result => Self::Result,
+            CompatibilityDimension::Metadata => Self::Metadata,
+            CompatibilityDimension::Diagnostic => Self::Diagnostic,
+            CompatibilityDimension::TransactionalSideEffect => Self::TransactionalSideEffect,
+            CompatibilityDimension::Operational => Self::Operational,
+        }
+    }
 }
 
 /// The comparison outcome for a feature or conformance case.
@@ -706,6 +735,159 @@ impl TargetMatrix {
             .collect()
     }
 }
+
+/// An owned target matrix that has passed every first-party target invariant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedTargetMatrix {
+    matrix: TargetMatrix,
+    contexts: Vec<CompatibilityContext>,
+    baseline_index: usize,
+}
+
+impl ValidatedTargetMatrix {
+    /// Returns the validated public target matrix without permitting mutation.
+    #[must_use]
+    pub fn matrix(&self) -> &TargetMatrix {
+        &self.matrix
+    }
+
+    /// Returns the immutable context for the validated baseline target.
+    #[must_use]
+    pub fn baseline_context(&self) -> &CompatibilityContext {
+        &self.contexts[self.baseline_index]
+    }
+
+    /// Selects an immutable context by exact target identifier.
+    pub fn select_context(
+        &self,
+        target_id: &str,
+    ) -> Result<&CompatibilityContext, TargetSelectionError> {
+        self.contexts
+            .iter()
+            .find(|context| context.target_id().as_str() == target_id)
+            .ok_or_else(|| TargetSelectionError {
+                target_id: target_id.to_owned(),
+            })
+    }
+}
+
+impl TryFrom<TargetMatrix> for ValidatedTargetMatrix {
+    type Error = TargetMatrixValidationError;
+
+    fn try_from(matrix: TargetMatrix) -> Result<Self, Self::Error> {
+        let violations = matrix.validate();
+        if !violations.is_empty() {
+            return Err(TargetMatrixValidationError { violations });
+        }
+
+        let Some(baseline_index) = matrix
+            .targets
+            .iter()
+            .position(|target| target.id == matrix.baseline_target_id)
+        else {
+            return Err(TargetMatrixValidationError {
+                violations: vec![ContractViolation {
+                    code: "target.baseline.unknown",
+                    message: format!(
+                        "baseline target is not present: {}",
+                        matrix.baseline_target_id
+                    ),
+                }],
+            });
+        };
+
+        let mut contexts = Vec::with_capacity(matrix.targets.len());
+        for target in &matrix.targets {
+            let profile = CompatibilityProfile {
+                target_id: target.id.clone(),
+                product_release: target.product_release.clone(),
+                servicing_update: target.servicing_update.clone(),
+                product_version: target.product_version.clone(),
+                edition: target.edition.clone(),
+                operating_system: target.operating_system.clone(),
+                architecture: target.architecture.clone(),
+                compatibility_level: target.compatibility_level,
+                collation: target.collation.clone(),
+                language: target.language.clone(),
+                lcid: target.lcid,
+                timezone: target.timezone.clone(),
+                session_defaults: target.session_settings.clone(),
+            };
+            match CompatibilityContext::try_new(profile) {
+                Ok(context) => contexts.push(context),
+                Err(error) => {
+                    return Err(TargetMatrixValidationError {
+                        violations: vec![ContractViolation {
+                            code: "target.context.invalid",
+                            message: format!(
+                                "target {} cannot form a compatibility context: {error}",
+                                target.id
+                            ),
+                        }],
+                    });
+                }
+            }
+        }
+
+        Ok(Self {
+            matrix,
+            contexts,
+            baseline_index,
+        })
+    }
+}
+
+/// Failure to promote a raw target matrix into a validated typestate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetMatrixValidationError {
+    violations: Vec<ContractViolation>,
+}
+
+impl TargetMatrixValidationError {
+    /// Returns every target invariant that prevented promotion.
+    #[must_use]
+    pub fn violations(&self) -> &[ContractViolation] {
+        &self.violations
+    }
+}
+
+impl fmt::Display for TargetMatrixValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "target matrix validation failed with {} violation(s)",
+            self.violations.len()
+        )
+    }
+}
+
+impl Error for TargetMatrixValidationError {}
+
+/// Failure to select an exact target from a validated matrix.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetSelectionError {
+    target_id: String,
+}
+
+impl TargetSelectionError {
+    /// Returns the unavailable target identifier.
+    #[must_use]
+    pub fn target_id(&self) -> &str {
+        &self.target_id
+    }
+}
+
+impl fmt::Display for TargetSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "target is not present in the validated matrix: {}",
+            self.target_id
+        )
+    }
+}
+
+impl Error for TargetSelectionError {}
 
 fn is_sha256_digest(value: &str) -> bool {
     let Some(hex) = value.strip_prefix("sha256:") else {

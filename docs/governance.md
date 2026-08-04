@@ -169,8 +169,8 @@ authenticate legal decisions.
 
 ### Activation Requirements and Current State
 
-Before the authenticated gate can become a required check, all of the following
-must be established and independently reviewed:
+Before the authenticated gate can be activated, all of the following must be
+established and independently reviewed:
 
 1. Qualified reviewers are actually designated, and their stable numeric IDs are stored in a protected trust anchor outside candidate-controlled files.
 2. The default branch requires pull requests and the governance check, dismisses stale approvals, requires approval after the latest push, and prevents unreviewed administrator bypass.
@@ -178,16 +178,19 @@ must be established and independently reviewed:
 4. The authority producer and pinned prebuilt verifier are loaded from protected sources, have only read permissions, bind the authority to the trusted event repository and commit, and complete before candidate checkout or execution.
 5. Attack-path tests cover forged ledger metadata, candidate-supplied authority, path and symlink boundary bypasses, target and repository mismatch, provenance replay, stale, dismissed, changes-requested, and superseded reviews, reviewer login changes, self-approval, duplicate attestations, and decisions distributed across pull requests.
 
-At the `2026-08-02T15:20:54Z` assessment point, the repository was private and
-used `main` as its default branch. GitHub returned HTTP 403 for both branch
-protection and repository ruleset inspection, so no enforceable protection was
-verified and the project treats it as unavailable. The repository had no
-environments and no `CODEOWNERS` file. Consequently the first-party
-`legal-review-gate` remains an unconditional failure, the full governance job
-remains statically disabled and blocked before checkout, no protected authority
-producer or prebuilt verifier is installed, and all legal decisions remain
-pending. Activation requires a later dedicated change after the settings above
-can be verified; weakening the failure to obtain a green check is prohibited.
+At the `2026-08-04` verification point, the repository was public and used
+`main` as its default branch. The default branch required pull requests, one
+approval, dismissal of stale approvals, approval by someone other than the
+latest pusher, conversation resolution, linear history, and the strict
+`Legal review required` check supplied by the GitHub Actions App. These rules
+applied to administrators, and force pushes and branch deletion were disabled.
+The repository still had no independently designated qualified reviewer,
+protected path ownership, reviewer trust anchor, environment, or `CODEOWNERS`
+file. Consequently the first-party `legal-review-gate` remains an unconditional
+failure, the full governance job remains statically disabled and blocked before
+checkout, no protected authority producer or prebuilt verifier is installed,
+and all legal decisions remain pending. Weakening the failure to obtain a green
+check is prohibited.
 
 ## Input Classes
 

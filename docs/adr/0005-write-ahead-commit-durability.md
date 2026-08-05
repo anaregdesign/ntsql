@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #50
 - Extends: ADR 0001
-- Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009, ADR 0010
+- Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009, ADR 0010, ADR 0011
 
 ## Context
 
@@ -23,8 +23,9 @@ until both operations succeed.
 
 `ntsql-wal` is an I/O-free domain crate with no direct dependencies. It owns:
 
-- `LogSequenceNumber`, an opaque ntsql-internal adapter-assigned position with
-  no SQL Server, wire, or persistent byte representation;
+- `LogSequenceNumber`, an opaque ntsql-internal adapter-assigned position bound
+  to one runtime lineage, with no SQL Server, wire, or persistent byte
+  representation;
 - `LogLineage`, an opaque runtime identity shared by ports for one logical log;
 - `CommitLog<Record>`, the inward port for appending a caller-owned record and
   flushing through a position, together with its lineage identity;
@@ -42,15 +43,20 @@ enqueueing, scheduling, or batching future I/O is not success. No fallback
 treats an append or flush failure as success.
 
 ADR 0009 uses `LogLineage` to reject a transaction coordinator paired with a
-different log before append. This runtime check complements epoch-qualified
-transaction identities; it does not persist or brand raw `LogSequenceNumber`
-values.
+different log before append. ADR 0011 additionally makes every
+`LogSequenceNumber` carry that runtime capability. Positions are non-`Copy`,
+created through `LogLineage::position`, and equal only when both lineage and
+numeric value match.
 
 ADR 0010 also requires an authoritative recovery lookup to return its lineage
 with the lookup result in one operation. The transaction coordinator accepts a
-recovered position only after that lineage matches the indeterminate token. This
-does not make a raw `LogSequenceNumber` independently transferable or
-authoritative.
+recovered position only after the source lineage, position lineage, and
+indeterminate token lineage all match.
+
+The durability fence snapshots the log lineage before append. It rejects both a
+position from another lineage and a log whose lineage changes during append,
+before calling flush or constructing an acknowledgement. This is fail-closed
+adapter validation, not proof that an arbitrary adapter is honest.
 
 The intended dependency direction is:
 
@@ -84,6 +90,8 @@ fault-injection decisions.
 - An in-memory fake records every port call and proves success is exactly
   append followed by flush of the returned position.
 - Append failure proves no flush occurs.
+- A foreign append position or append-time lineage rotation proves no flush or
+  acknowledgement occurs.
 - Append and flush failure prove the branded callback is not entered. Append
   failure does not assume whether the adapter changed physical state.
 - Flush failure preserves the exact appended position and original cause.
@@ -94,6 +102,8 @@ fault-injection decisions.
   called and retain the active token.
 - Recovery tests reject a durable-record lookup from another lineage and retain
   indeterminate state without accepting its position or absence result.
+- Compile-fail tests reject raw position construction and implicit position
+  copying.
 
 ## Consequences
 

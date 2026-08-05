@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #68
 - Extends: ADR 0001, ADR 0005, ADR 0007, ADR 0008, ADR 0009
+- Extended by: ADR 0011
 
 ## Context
 
@@ -70,11 +71,12 @@ separately observed from a rotating source. The coordinator compares the returne
 lineage with the token before accepting either presence or absence. A malicious
 source can still return a false pair; this is an adapter contract violation.
 
-`LogLineage` remains a runtime identity and `LogSequenceNumber` remains an
-unbranded numeric adapter value. This ADR does not persist either value across an
-operating-system process, reconstruct coordinator registries after process loss,
-define a recovery scan cutoff for a filesystem log, or validate production
-storage. Those require a persistent lineage and format design.
+ADR 0011 binds `LogSequenceNumber` to the runtime `LogLineage` and requires
+recovery presence to match both the source lineage and position lineage.
+Neither value is persisted across an operating-system process. This ADR does not
+reconstruct coordinator registries after process loss, define a recovery scan
+cutoff for a filesystem log, or validate production storage. Those require a
+persistent lineage and format design.
 
 ## Compatibility Boundary
 
@@ -94,6 +96,8 @@ diagnostic changes.
 - Duplicate records and source failures retain indeterminate state.
 - Foreign coordinators and lifecycle mismatches are rejected before lookup.
 - A lineage mismatch is rejected before registry mutation.
+- A source that reports the expected lineage but returns a foreign-lineage
+  position is also rejected before registry mutation.
 - Equal local sequences from different epochs cannot alias.
 - Compile-fail tests reject direct terminal-state construction and
   indeterminate commit retry.

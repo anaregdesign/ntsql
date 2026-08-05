@@ -45,7 +45,7 @@ pub trait TransactionRecoverySource {
 /// This adapter-provided value is data, not proof by itself. Only
 /// [`TransactionCoordinator::resolve`] can convert it into terminal transaction
 /// state after validating token ownership, lifecycle, and lineage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableCommitLookup {
     /// Exactly one durable commit record was found at this internal position.
     Found {
@@ -362,6 +362,14 @@ impl TransactionCoordinator {
                 failure: TransactionResolutionFailure::ForeignLogLineage,
             });
         }
+        if let DurableCommitLookup::Found { position } = &lookup
+            && !lineage.same_lineage(position.lineage())
+        {
+            return Err(TransactionResolutionError {
+                transaction,
+                failure: TransactionResolutionFailure::ForeignLogLineage,
+            });
+        }
 
         let Some(status) = self.lifecycles.get_mut(&transaction_id) else {
             return Err(TransactionResolutionError {
@@ -461,7 +469,7 @@ impl ActiveTransaction {
 
         match commit_durability(log, &record, |acknowledgement| CommittedTransaction {
             transaction_id,
-            log_position: acknowledgement.position(),
+            log_position: acknowledgement.position().clone(),
         }) {
             Ok(committed) => Ok(committed),
             Err(source) => Err(TransactionCommitError {
@@ -587,8 +595,8 @@ impl CommittedTransaction {
 
     /// Returns the exact internal log position confirmed durable.
     #[must_use]
-    pub const fn log_position(&self) -> LogSequenceNumber {
-        self.log_position
+    pub const fn log_position(&self) -> &LogSequenceNumber {
+        &self.log_position
     }
 }
 

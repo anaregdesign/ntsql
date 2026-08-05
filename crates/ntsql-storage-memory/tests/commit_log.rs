@@ -20,7 +20,7 @@ fn successful_commit_appends_and_flushes_exact_record() -> Result<(), Box<dyn Er
     let committed = coordinator.commit(active, &mut log)?;
 
     assert_eq!(committed.transaction_id(), transaction_id);
-    assert_eq!(committed.log_position(), LogSequenceNumber::new(1));
+    assert_eq!(committed.log_position(), &position(&log, 1));
     assert_eq!(log.records().len(), 1);
     assert_eq!(
         log.records()
@@ -30,10 +30,10 @@ fn successful_commit_appends_and_flushes_exact_record() -> Result<(), Box<dyn Er
         transaction_id
     );
     assert_eq!(
-        log.durable_records().copied().collect::<Vec<_>>(),
+        log.durable_records().cloned().collect::<Vec<_>>(),
         log.records()
     );
-    assert_eq!(log.durable_position(), Some(LogSequenceNumber::new(1)));
+    assert_eq!(log.durable_position(), Some(position(&log, 1)));
     assert_eq!(
         coordinator.status(transaction_id),
         Some(TransactionLifecycleStatus::Committed)
@@ -98,7 +98,7 @@ fn after_append_fault_leaves_volatile_record_and_later_flush_covers_it()
     let second_id = second.transaction_id();
     let committed = coordinator.commit(second, &mut log)?;
 
-    assert_eq!(committed.log_position(), LogSequenceNumber::new(2));
+    assert_eq!(committed.log_position(), &position(&log, 2));
     assert_eq!(log.durable_records().len(), 2);
     assert_eq!(
         coordinator.status(first_id),
@@ -118,7 +118,7 @@ fn before_flush_fault_stays_armed_through_append_and_restart_drops_suffix()
     let mut coordinator = TransactionCoordinator::open(&mut log)?;
     let first = coordinator.begin()?;
     let first_commit = coordinator.commit(first, &mut log)?;
-    assert_eq!(first_commit.log_position(), LogSequenceNumber::new(1));
+    assert_eq!(first_commit.log_position(), &position(&log, 1));
 
     log.arm_fault(FaultPoint::BeforeFlush)?;
     let second = coordinator.begin()?;
@@ -128,7 +128,7 @@ fn before_flush_fault_stays_armed_through_append_and_restart_drops_suffix()
     assert_eq!(
         second_cause,
         CommitError::Flush {
-            position: LogSequenceNumber::new(2),
+            position: position(&log, 2),
             source: InMemoryCommitLogError::InjectedFault(FaultPoint::BeforeFlush),
         }
     );
@@ -142,14 +142,11 @@ fn before_flush_fault_stays_armed_through_append_and_restart_drops_suffix()
 
     let mut restarted = log.restart();
     assert_eq!(restarted.records().len(), 1);
-    assert_eq!(
-        restarted.durable_position(),
-        Some(LogSequenceNumber::new(1))
-    );
+    assert_eq!(restarted.durable_position(), Some(position(&restarted, 1)));
 
     let third = coordinator.begin()?;
     let third_commit = coordinator.commit(third, &mut restarted)?;
-    assert_eq!(third_commit.log_position(), LogSequenceNumber::new(3));
+    assert_eq!(third_commit.log_position(), &position(&restarted, 3));
     assert_eq!(restarted.records().len(), 2);
     assert_eq!(restarted.durable_records().len(), 2);
     Ok(())
@@ -169,7 +166,7 @@ fn after_flush_fault_is_durable_but_transaction_remains_indeterminate() -> Resul
     assert_eq!(
         cause,
         CommitError::Flush {
-            position: LogSequenceNumber::new(1),
+            position: position(&log, 1),
             source: InMemoryCommitLogError::InjectedFault(FaultPoint::AfterFlush),
         }
     );
@@ -191,13 +188,12 @@ fn invalid_and_idempotent_flushes_preserve_unreached_faults() -> Result<(), Box<
     let mut log = InMemoryCommitLog::new();
     log.arm_fault(FaultPoint::BeforeFlush)?;
 
-    let error = log
-        .flush_through(LogSequenceNumber::new(0))
+    let error = flush_numeric(&mut log, 0)
         .err()
         .ok_or_else(|| io::Error::other("unknown position was accepted"))?;
     assert_eq!(
         error,
-        InMemoryCommitLogError::UnknownFlushPosition(LogSequenceNumber::new(0))
+        InMemoryCommitLogError::UnknownFlushPosition(position(&log, 0))
     );
     assert_eq!(log.armed_fault(), Some(FaultPoint::BeforeFlush));
 
@@ -207,14 +203,14 @@ fn invalid_and_idempotent_flushes_preserve_unreached_faults() -> Result<(), Box<
     assert_eq!(
         cause,
         CommitError::Flush {
-            position: LogSequenceNumber::new(1),
+            position: position(&log, 1),
             source: InMemoryCommitLogError::InjectedFault(FaultPoint::BeforeFlush),
         }
     );
 
-    log.flush_through(LogSequenceNumber::new(1))?;
+    flush_numeric(&mut log, 1)?;
     log.arm_fault(FaultPoint::BeforeFlush)?;
-    log.flush_through(LogSequenceNumber::new(1))?;
+    flush_numeric(&mut log, 1)?;
     assert_eq!(log.armed_fault(), Some(FaultPoint::BeforeFlush));
 
     let second = coordinator.begin()?;
@@ -222,14 +218,14 @@ fn invalid_and_idempotent_flushes_preserve_unreached_faults() -> Result<(), Box<
     assert_eq!(
         second_cause,
         CommitError::Flush {
-            position: LogSequenceNumber::new(2),
+            position: position(&log, 2),
             source: InMemoryCommitLogError::InjectedFault(FaultPoint::BeforeFlush),
         }
     );
-    log.flush_through(LogSequenceNumber::new(2))?;
+    flush_numeric(&mut log, 2)?;
 
     log.arm_fault(FaultPoint::AfterFlush)?;
-    log.flush_through(LogSequenceNumber::new(2))?;
+    flush_numeric(&mut log, 2)?;
     assert_eq!(log.armed_fault(), Some(FaultPoint::AfterFlush));
 
     let third = coordinator.begin()?;
@@ -237,11 +233,59 @@ fn invalid_and_idempotent_flushes_preserve_unreached_faults() -> Result<(), Box<
     assert_eq!(
         third_cause,
         CommitError::Flush {
-            position: LogSequenceNumber::new(3),
+            position: position(&log, 3),
             source: InMemoryCommitLogError::InjectedFault(FaultPoint::AfterFlush),
         }
     );
     assert_eq!(log.durable_records().len(), 3);
+    Ok(())
+}
+
+#[test]
+fn foreign_numeric_alias_is_rejected_before_fault_or_durability() -> Result<(), Box<dyn Error>> {
+    let mut owner_log = InMemoryCommitLog::new();
+    let mut owner = TransactionCoordinator::open(&mut owner_log)?;
+    let owner_active = owner.begin()?;
+    let owner_position = owner
+        .commit(owner_active, &mut owner_log)?
+        .log_position()
+        .clone();
+
+    let mut target_log = InMemoryCommitLog::new();
+    let mut target = TransactionCoordinator::open(&mut target_log)?;
+    target_log.arm_fault(FaultPoint::AfterAppend)?;
+    let target_active = target.begin()?;
+    let _ = indeterminate_parts(target.commit(target_active, &mut target_log))?;
+    let target_position = target_log
+        .records()
+        .first()
+        .ok_or_else(|| io::Error::other("target record is missing"))?
+        .position()
+        .clone();
+    assert_eq!(owner_position.get(), target_position.get());
+    assert_ne!(owner_position, target_position);
+
+    target_log.arm_fault(FaultPoint::BeforeFlush)?;
+    let error = target_log
+        .flush_through(&owner_position)
+        .err()
+        .ok_or_else(|| io::Error::other("foreign numeric alias was accepted"))?;
+
+    assert_eq!(
+        error,
+        InMemoryCommitLogError::ForeignFlushPosition(owner_position)
+    );
+    assert_eq!(target_log.armed_fault(), Some(FaultPoint::BeforeFlush));
+    assert_eq!(target_log.durable_position(), None);
+
+    let local_error = target_log
+        .flush_through(&target_position)
+        .err()
+        .ok_or_else(|| io::Error::other("preserved local fault did not fire"))?;
+    assert_eq!(
+        local_error,
+        InMemoryCommitLogError::InjectedFault(FaultPoint::BeforeFlush)
+    );
     Ok(())
 }
 
@@ -358,7 +402,7 @@ fn after_flush_failure_resolves_as_committed_at_exact_position() -> Result<(), B
         return Err(io::Error::other("durable record resolved as absent").into());
     };
     assert_eq!(committed.transaction_id(), transaction_id);
-    assert_eq!(committed.log_position(), LogSequenceNumber::new(1));
+    assert_eq!(committed.log_position(), &position(&log, 1));
     assert_eq!(
         coordinator.status(transaction_id),
         Some(TransactionLifecycleStatus::Committed)
@@ -421,7 +465,7 @@ fn later_flush_resolves_an_earlier_volatile_record_as_committed() -> Result<(), 
         return Err(io::Error::other("flushed record resolved as absent").into());
     };
     assert_eq!(committed.transaction_id(), first_id);
-    assert_eq!(committed.log_position(), LogSequenceNumber::new(1));
+    assert_eq!(committed.log_position(), &position(&log, 1));
     Ok(())
 }
 
@@ -496,4 +540,13 @@ fn indeterminate_parts(
             Err(io::Error::other("faulted commit was rejected before WAL").into())
         }
     }
+}
+
+fn position(log: &InMemoryCommitLog, value: u64) -> LogSequenceNumber {
+    log.lineage().position(value)
+}
+
+fn flush_numeric(log: &mut InMemoryCommitLog, value: u64) -> Result<(), InMemoryCommitLogError> {
+    let position = log.lineage().position(value);
+    log.flush_through(&position)
 }

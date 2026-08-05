@@ -22,6 +22,15 @@ impl LogLineage {
     pub fn same_lineage(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// Binds one adapter-assigned numeric position to this lineage.
+    #[must_use]
+    pub fn position(&self, value: u64) -> LogSequenceNumber {
+        LogSequenceNumber {
+            lineage: self.clone(),
+            value,
+        }
+    }
 }
 
 impl Default for LogLineage {
@@ -35,22 +44,48 @@ impl Default for LogLineage {
 /// This value defines no SQL Server, wire, or persistent byte representation.
 /// It is meaningful only for the log that assigned it; values from independent
 /// logs are not globally ordered or interchangeable.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LogSequenceNumber(u64);
+///
+/// ```compile_fail
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// let forged = LogSequenceNumber::new(1);
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_copy(position: LogSequenceNumber) {
+///     let first = position;
+///     let second = position;
+/// }
+/// ```
+#[derive(Clone, Debug)]
+pub struct LogSequenceNumber {
+    lineage: LogLineage,
+    value: u64,
+}
 
 impl LogSequenceNumber {
-    /// Preserves a position assigned by the commit-log implementation.
-    #[must_use]
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-
     /// Returns the opaque numeric position for adapter bookkeeping.
     #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
+    pub const fn get(&self) -> u64 {
+        self.value
+    }
+
+    /// Returns the runtime lineage capability bound to this position.
+    #[must_use]
+    pub const fn lineage(&self) -> &LogLineage {
+        &self.lineage
     }
 }
+
+impl PartialEq for LogSequenceNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value && self.lineage.same_lineage(&other.lineage)
+    }
+}
+
+impl Eq for LogSequenceNumber {}
 
 /// Persistence port needed to establish one commit durability fence.
 ///
@@ -69,7 +104,7 @@ pub trait CommitLog<Record: ?Sized> {
     /// Makes the log durable through at least `position`.
     ///
     /// `Ok(())` must mean durable completion, not queued or scheduled work.
-    fn flush_through(&mut self, position: LogSequenceNumber) -> Result<(), Self::Error>;
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error>;
 }
 
 /// Internal failure to establish commit durability.
@@ -82,6 +117,11 @@ pub enum CommitError<E> {
     Append {
         /// Unmodified adapter failure.
         source: E,
+    },
+    /// The adapter returned a position from another log lineage.
+    ForeignAppendPosition {
+        /// Position rejected before the flush port was called.
+        position: LogSequenceNumber,
     },
     /// The commit record was appended but not confirmed durable.
     Flush {
@@ -96,6 +136,11 @@ impl<E: fmt::Display> fmt::Display for CommitError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Append { source } => write!(formatter, "commit log append failed: {source}"),
+            Self::ForeignAppendPosition { position } => write!(
+                formatter,
+                "commit log append returned position {} from another lineage",
+                position.get()
+            ),
             Self::Flush { position, source } => write!(
                 formatter,
                 "commit log flush through {} failed: {source}",
@@ -112,6 +157,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Append { source } | Self::Flush { source, .. } => Some(source),
+            Self::ForeignAppendPosition { .. } => None,
         }
     }
 }
@@ -149,8 +195,8 @@ pub struct CommitAcknowledgement<'attempt> {
 impl CommitAcknowledgement<'_> {
     /// Returns the exact position confirmed by the durability fence.
     #[must_use]
-    pub const fn position(&self) -> LogSequenceNumber {
-        self.position
+    pub const fn position(&self) -> &LogSequenceNumber {
+        &self.position
     }
 }
 
@@ -182,11 +228,18 @@ where
     Record: ?Sized,
     OnDurable: for<'attempt> FnOnce(CommitAcknowledgement<'attempt>) -> Output,
 {
+    let expected_lineage = log.lineage().clone();
     let position = log
         .append_commit(record)
         .map_err(|source| CommitError::Append { source })?;
-    log.flush_through(position)
-        .map_err(|source| CommitError::Flush { position, source })?;
+    if !position.lineage().same_lineage(&expected_lineage)
+        || !expected_lineage.same_lineage(log.lineage())
+    {
+        return Err(CommitError::ForeignAppendPosition { position });
+    }
+    if let Err(source) = log.flush_through(&position) {
+        return Err(CommitError::Flush { position, source });
+    }
     Ok(on_durable(CommitAcknowledgement {
         position,
         attempt_brand: PhantomData,

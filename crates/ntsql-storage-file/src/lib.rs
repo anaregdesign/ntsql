@@ -60,9 +60,23 @@
 //! incomplete snapshot group; complete malformed groups are rejected without
 //! truncation.
 //!
+//! ## Format v3
+//!
+//! Version 3 preserves the v2 header body and kinds `1..5`, then adds
+//! transaction-owned full-image pages. Kind `6` is an owned-page header with
+//! payload `(position, page_number, page_version)`. It is followed immediately
+//! by exactly one kind `7` owner frame with payload
+//! `(position, transaction_epoch, transaction_sequence)`, then by the existing
+//! kind `5` page-data frames.
+//!
+//! The distinct owned-page header prevents a missing owner frame from silently
+//! turning transaction-owned data into a valid nontransactional page record.
+//! Open recovery truncates an incomplete final owned-page group to its kind `6`
+//! offset; a complete malformed or interrupted group is corruption.
+//!
 //! ## Checksum
 //!
-//! The v1/v2 checksum is an ntsql-owned, deterministic, non-cryptographic
+//! The v1/v2/v3 checksum is an ntsql-owned, deterministic, non-cryptographic
 //! function. It starts from `0x4e5453514c434b31` and, for each protected byte in
 //! order, applies:
 //!
@@ -89,7 +103,7 @@ use ntsql_page::{
 };
 use ntsql_transaction::{
     DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
-    TransactionRecoverySource,
+    TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -97,6 +111,7 @@ const HEADER_MAGIC: [u8; 8] = *b"NTSQLOG1";
 const FRAME_MAGIC: [u8; 4] = *b"NTSQ";
 const FORMAT_VERSION_V1: u16 = 1;
 const FORMAT_VERSION_V2: u16 = 2;
+const FORMAT_VERSION_V3: u16 = 3;
 const HEADER_LENGTH: usize = 64;
 const HEADER_LENGTH_U16: u16 = 64;
 const HEADER_LENGTH_U64: u64 = 64;
@@ -118,6 +133,7 @@ const PAGE_CHUNK_WIDTH: usize = 8;
 enum LogFormat {
     V1,
     V2,
+    V3,
 }
 
 impl LogFormat {
@@ -125,14 +141,19 @@ impl LogFormat {
         match self {
             Self::V1 => FORMAT_VERSION_V1,
             Self::V2 => FORMAT_VERSION_V2,
+            Self::V3 => FORMAT_VERSION_V3,
         }
     }
 
     const fn supports_pages(self) -> bool {
         match self {
             Self::V1 => false,
-            Self::V2 => true,
+            Self::V2 | Self::V3 => true,
         }
+    }
+
+    const fn supports_transaction_pages(self) -> bool {
+        matches!(self, Self::V3)
     }
 }
 
@@ -273,6 +294,8 @@ pub enum FileIoStage {
     SyncEpochFrame,
     WriteCommitFrame,
     WritePageHeaderFrame,
+    WriteTransactionPageHeaderFrame,
+    WriteTransactionPageOwnerFrame,
     WritePageDataFrame,
     SyncCommitPrefix,
     WriteDurableMarker,
@@ -304,6 +327,12 @@ impl fmt::Display for FileIoStage {
             Self::SyncEpochFrame => formatter.write_str("synchronizing an epoch-allocation frame"),
             Self::WriteCommitFrame => formatter.write_str("writing a commit frame"),
             Self::WritePageHeaderFrame => formatter.write_str("writing a page-header frame"),
+            Self::WriteTransactionPageHeaderFrame => {
+                formatter.write_str("writing a transaction-page-header frame")
+            }
+            Self::WriteTransactionPageOwnerFrame => {
+                formatter.write_str("writing a transaction-page-owner frame")
+            }
             Self::WritePageDataFrame => formatter.write_str("writing a page-data frame"),
             Self::SyncCommitPrefix => {
                 formatter.write_str("synchronizing the requested durable prefix")
@@ -402,6 +431,15 @@ pub enum FileFormatErrorReason {
     PageHeaderPositionOutOfSequence { expected: u64, actual: u64 },
     PageHeaderPositionSpaceExhausted,
     PageNumberZero,
+    TransactionPageOwnerWithoutHeader,
+    TransactionPageOwnerInterruptedByFrameKind { actual: u16 },
+    TransactionPageOwnerDuplicate,
+    TransactionPageOwnerParentPositionZero,
+    TransactionPageOwnerParentMismatch { expected: u64, actual: u64 },
+    TransactionPageOwnerEpochZero,
+    TransactionPageOwnerEpochUnallocated { actual: u64, highest_allocated: u64 },
+    TransactionPageOwnerSequenceZero,
+    TransactionPageOwnerMissing,
     PageDataWithoutHeader,
     PageDataParentPositionZero,
     PageDataParentMismatch { expected: u64, actual: u64 },
@@ -511,6 +549,38 @@ impl fmt::Display for FileFormatErrorReason {
                 "found another page record after the maximum persisted position was already used",
             ),
             Self::PageNumberZero => formatter.write_str("page header page number is zero"),
+            Self::TransactionPageOwnerWithoutHeader => formatter
+                .write_str("transaction-page owner frame has no pending transaction-page header"),
+            Self::TransactionPageOwnerInterruptedByFrameKind { actual } => write!(
+                formatter,
+                "transaction-page record expected an owner frame but found frame kind {actual}"
+            ),
+            Self::TransactionPageOwnerDuplicate => {
+                formatter.write_str("transaction-page record has more than one owner frame")
+            }
+            Self::TransactionPageOwnerParentPositionZero => {
+                formatter.write_str("transaction-page owner parent position is zero")
+            }
+            Self::TransactionPageOwnerParentMismatch { expected, actual } => write!(
+                formatter,
+                "transaction-page owner parent position {actual} does not match pending page position {expected}"
+            ),
+            Self::TransactionPageOwnerEpochZero => {
+                formatter.write_str("transaction-page owner epoch is zero")
+            }
+            Self::TransactionPageOwnerEpochUnallocated {
+                actual,
+                highest_allocated,
+            } => write!(
+                formatter,
+                "transaction-page owner epoch {actual} was never allocated; highest allocated epoch is {highest_allocated}"
+            ),
+            Self::TransactionPageOwnerSequenceZero => {
+                formatter.write_str("transaction-page owner sequence is zero")
+            }
+            Self::TransactionPageOwnerMissing => {
+                formatter.write_str("transaction-page record is missing its owner")
+            }
             Self::PageDataWithoutHeader => {
                 formatter.write_str("page data frame has no pending page header")
             }
@@ -642,6 +712,7 @@ pub enum FileCommitLogError {
     InjectedFault(FaultPoint),
     PageWidth(FilePageWidthError),
     PageSupportUnavailable,
+    TransactionPageSupportUnavailable,
     PageWidthMismatch { expected: usize, actual: usize },
     ForeignPageLineage(PageNumber),
     Io(FileIoError),
@@ -660,6 +731,9 @@ impl fmt::Display for FileCommitLogError {
             Self::PageSupportUnavailable => {
                 formatter.write_str("this file commit-log format does not support page records")
             }
+            Self::TransactionPageSupportUnavailable => formatter.write_str(
+                "this file commit-log format does not support transaction-owned page records",
+            ),
             Self::PageWidthMismatch { expected, actual } => write!(
                 formatter,
                 "page width {actual} does not match log page width {expected}"
@@ -699,6 +773,7 @@ impl Error for FileCommitLogError {
             Self::Io(source) => Some(source),
             Self::InjectedFault(_)
             | Self::PageSupportUnavailable
+            | Self::TransactionPageSupportUnavailable
             | Self::PageWidthMismatch { .. }
             | Self::ForeignPageLineage(_)
             | Self::PoisonedWriter
@@ -824,6 +899,58 @@ impl<const N: usize> FilePageWriteRecord<N> {
     }
 }
 
+/// Immutable snapshot of one physically appended transaction-owned page image.
+///
+/// The persisted owner remains an inspectable epoch/sequence pair rather than a
+/// reconstructible domain token. This type has no public constructor.
+///
+/// ```compile_fail
+/// use ntsql_storage_file::{
+///     FilePageWriteRecord, FileTransactionPageWriteRecord,
+/// };
+///
+/// fn cannot_construct(page: FilePageWriteRecord<1>) {
+///     let _forged = FileTransactionPageWriteRecord {
+///         transaction_epoch: 1,
+///         transaction_sequence: 1,
+///         page,
+///     };
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileTransactionPageWriteRecord<const N: usize = 0> {
+    transaction_epoch: u64,
+    transaction_sequence: u64,
+    page: FilePageWriteRecord<N>,
+}
+
+impl<const N: usize> FileTransactionPageWriteRecord<N> {
+    /// Returns the persisted owner epoch.
+    #[must_use]
+    pub const fn transaction_epoch(&self) -> u64 {
+        self.transaction_epoch
+    }
+
+    /// Returns the persisted owner sequence.
+    #[must_use]
+    pub const fn transaction_sequence(&self) -> u64 {
+        self.transaction_sequence
+    }
+
+    /// Returns whether the persisted owner matches the complete domain identity.
+    #[must_use]
+    pub fn matches_transaction_id(&self, transaction_id: TransactionId) -> bool {
+        self.transaction_epoch == transaction_id.epoch().get()
+            && self.transaction_sequence == transaction_id.sequence()
+    }
+
+    /// Returns the copied full page-image payload.
+    #[must_use]
+    pub const fn page_write(&self) -> &FilePageWriteRecord<N> {
+        &self.page
+    }
+}
+
 /// Safely inspectable payload of one physically appended file-log record.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileLogRecordKind<const N: usize = 0> {
@@ -834,6 +961,8 @@ pub enum FileLogRecordKind<const N: usize = 0> {
     },
     /// One complete page-image write.
     PageWrite(FilePageWriteRecord<N>),
+    /// One complete transaction-owned page-image write.
+    TransactionPageWrite(FileTransactionPageWriteRecord<N>),
 }
 
 impl<const N: usize> FileLogRecordKind<N> {
@@ -844,7 +973,7 @@ impl<const N: usize> FileLogRecordKind<N> {
             Self::TransactionCommit {
                 transaction_epoch, ..
             } => Some(*transaction_epoch),
-            Self::PageWrite(_) => None,
+            Self::PageWrite(_) | Self::TransactionPageWrite(_) => None,
         }
     }
 
@@ -856,7 +985,7 @@ impl<const N: usize> FileLogRecordKind<N> {
                 transaction_sequence,
                 ..
             } => Some(*transaction_sequence),
-            Self::PageWrite(_) => None,
+            Self::PageWrite(_) | Self::TransactionPageWrite(_) => None,
         }
     }
 
@@ -866,6 +995,34 @@ impl<const N: usize> FileLogRecordKind<N> {
         match self {
             Self::TransactionCommit { .. } => None,
             Self::PageWrite(record) => Some(record),
+            Self::TransactionPageWrite(record) => Some(record.page_write()),
+        }
+    }
+
+    /// Returns the typed transaction-owned page record when present.
+    #[must_use]
+    pub const fn transaction_page_write(&self) -> Option<&FileTransactionPageWriteRecord<N>> {
+        match self {
+            Self::TransactionCommit { .. } | Self::PageWrite(_) => None,
+            Self::TransactionPageWrite(record) => Some(record),
+        }
+    }
+
+    /// Returns the persisted page-owner epoch only for an owned page record.
+    #[must_use]
+    pub const fn page_owner_transaction_epoch(&self) -> Option<u64> {
+        match self {
+            Self::TransactionCommit { .. } | Self::PageWrite(_) => None,
+            Self::TransactionPageWrite(record) => Some(record.transaction_epoch()),
+        }
+    }
+
+    /// Returns the persisted page-owner sequence only for an owned page record.
+    #[must_use]
+    pub const fn page_owner_transaction_sequence(&self) -> Option<u64> {
+        match self {
+            Self::TransactionCommit { .. } | Self::PageWrite(_) => None,
+            Self::TransactionPageWrite(record) => Some(record.transaction_sequence()),
         }
     }
 }
@@ -887,7 +1044,7 @@ impl<const N: usize> FileLogRecord<N> {
                 transaction_epoch,
                 transaction_sequence,
             )),
-            FileLogRecordKind::PageWrite(_) => None,
+            FileLogRecordKind::PageWrite(_) | FileLogRecordKind::TransactionPageWrite(_) => None,
         }
     }
 
@@ -930,6 +1087,33 @@ impl<const N: usize> FileLogRecord<N> {
         self.kind.page_write()
     }
 
+    /// Returns the typed transaction-owned page record when present.
+    #[must_use]
+    pub const fn transaction_page_write(&self) -> Option<&FileTransactionPageWriteRecord<N>> {
+        self.kind.transaction_page_write()
+    }
+
+    /// Returns the persisted page-owner epoch only for an owned page record.
+    #[must_use]
+    pub const fn page_owner_transaction_epoch(&self) -> Option<u64> {
+        self.kind.page_owner_transaction_epoch()
+    }
+
+    /// Returns the persisted page-owner sequence only for an owned page record.
+    #[must_use]
+    pub const fn page_owner_transaction_sequence(&self) -> Option<u64> {
+        self.kind.page_owner_transaction_sequence()
+    }
+
+    /// Returns whether this record is an owned page for the complete identity.
+    #[must_use]
+    pub fn page_owner_matches_transaction_id(&self, transaction_id: TransactionId) -> bool {
+        match self.transaction_page_write() {
+            Some(record) => record.matches_transaction_id(transaction_id),
+            None => false,
+        }
+    }
+
     /// Projects a page record into adapter-neutral recovery evidence.
     ///
     /// Callers must select records from a commit log's durable prefix before
@@ -951,10 +1135,11 @@ impl<const N: usize> FileLogRecord<N> {
 }
 
 /// Inspectable filesystem-backed implementation of the transaction commit-log
-/// port and, in v2, the page WAL port.
+/// port, the v2/v3 page WAL port, and the v3 transaction-page WAL port.
 #[derive(Debug)]
 pub struct FileCommitLog<const N: usize = 0> {
     file: File,
+    format: LogFormat,
     lineage: LogLineage,
     persistent_id: PersistentLogId,
     records: Vec<FileLogRecord<N>>,
@@ -971,7 +1156,12 @@ impl FileCommitLog<0> {
     where
         P: AsRef<Path>,
     {
-        Self::create_new_internal(path.as_ref(), persistent_id, build_header_v1(persistent_id))
+        Self::create_new_internal(
+            path.as_ref(),
+            persistent_id,
+            LogFormat::V1,
+            build_header_v1(persistent_id),
+        )
     }
 
     /// Opens an existing v1 file, synchronizes it, validates the complete prefix,
@@ -997,6 +1187,7 @@ impl<const N: usize> FileCommitLog<N> {
         Self::create_new_internal(
             path.as_ref(),
             persistent_id,
+            LogFormat::V2,
             build_header_v2(persistent_id, layout.width_u64),
         )
     }
@@ -1010,9 +1201,36 @@ impl<const N: usize> FileCommitLog<N> {
         Self::open_internal(path.as_ref(), HeaderExpectation::V2(layout))
     }
 
+    /// Creates a new empty v3 transaction-page-capable file.
+    pub fn create_new_transaction_page_capable<P>(
+        path: P,
+        persistent_id: PersistentLogId,
+    ) -> Result<Self, FileCreateError>
+    where
+        P: AsRef<Path>,
+    {
+        let layout = PageLayout::for_const::<N>().map_err(FileCreateError::PageWidth)?;
+        Self::create_new_internal(
+            path.as_ref(),
+            persistent_id,
+            LogFormat::V3,
+            build_header_v3(persistent_id, layout.width_u64),
+        )
+    }
+
+    /// Opens an existing v3 transaction-page-capable file.
+    pub fn open_transaction_page_capable<P>(path: P) -> Result<Self, FileOpenError>
+    where
+        P: AsRef<Path>,
+    {
+        let layout = PageLayout::for_const::<N>().map_err(FileOpenError::PageWidth)?;
+        Self::open_internal(path.as_ref(), HeaderExpectation::V3(layout))
+    }
+
     fn create_new_internal(
         path: &Path,
         persistent_id: PersistentLogId,
+        format: LogFormat,
         header: [u8; HEADER_LENGTH],
     ) -> Result<Self, FileCreateError> {
         let mut file = OpenOptions::new()
@@ -1043,6 +1261,7 @@ impl<const N: usize> FileCommitLog<N> {
 
         Ok(Self {
             file,
+            format,
             lineage: LogLineage::persistent(persistent_id),
             persistent_id,
             records: Vec::new(),
@@ -1055,6 +1274,7 @@ impl<const N: usize> FileCommitLog<N> {
     }
 
     fn open_internal(path: &Path, expectation: HeaderExpectation) -> Result<Self, FileOpenError> {
+        let format = expectation.log_format();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1101,8 +1321,7 @@ impl<const N: usize> FileCommitLog<N> {
                 FileOpenError::Io(FileIoError::new(FileIoStage::ReadFrame, source))
             })?;
             let offset = HEADER_LENGTH_U64 + frame_index * FRAME_LENGTH_U64;
-            let decoded = parse_frame(&frame, offset, expectation.log_format())
-                .map_err(FileOpenError::Format)?;
+            let decoded = parse_frame(&frame, offset, format).map_err(FileOpenError::Format)?;
             open_state.apply_frame(decoded, offset)?;
         }
 
@@ -1129,6 +1348,7 @@ impl<const N: usize> FileCommitLog<N> {
 
         Ok(Self {
             file,
+            format,
             lineage,
             persistent_id,
             records: open_state.records,
@@ -1231,10 +1451,33 @@ impl<const N: usize> FileCommitLog<N> {
         &mut self,
         page: &UnloggedPage<PAGE_N>,
     ) -> Result<LogSequenceNumber, FileCommitLogError> {
+        self.append_page_group(page, None)
+    }
+
+    fn append_transaction_page_internal<const PAGE_N: usize>(
+        &mut self,
+        record: &TransactionPageWriteRecord<'_, PAGE_N>,
+    ) -> Result<LogSequenceNumber, FileCommitLogError> {
+        if !self.format.supports_transaction_pages() {
+            return Err(FileCommitLogError::TransactionPageSupportUnavailable);
+        }
+        self.append_page_group(
+            record.page(),
+            Some(StoredTransactionIdentity::from_transaction_id(
+                record.transaction_id(),
+            )),
+        )
+    }
+
+    fn append_page_group<const PAGE_N: usize>(
+        &mut self,
+        page: &UnloggedPage<PAGE_N>,
+        owner: Option<StoredTransactionIdentity>,
+    ) -> Result<LogSequenceNumber, FileCommitLogError> {
         if self.poisoned {
             return Err(FileCommitLogError::PoisonedWriter);
         }
-        if N == 0 {
+        if !self.format.supports_pages() {
             return Err(FileCommitLogError::PageSupportUnavailable);
         }
         if N != PAGE_N {
@@ -1259,15 +1502,38 @@ impl<const N: usize> FileCommitLog<N> {
             .try_reserve(1)
             .map_err(|_| FileCommitLogError::RecordCapacityExhausted)?;
 
+        let (header_kind, header_stage) = match owner {
+            Some(_) => (
+                FrameKind::TransactionPageHeader,
+                FileIoStage::WriteTransactionPageHeaderFrame,
+            ),
+            None => (FrameKind::PageHeader, FileIoStage::WritePageHeaderFrame),
+        };
         let header = build_frame(
-            LogFormat::V2,
-            FrameKind::PageHeader,
+            self.format,
+            header_kind,
             position_value,
             page.address().number().get(),
             page.version().get(),
         );
-        self.write_frame(&header, FileIoStage::WritePageHeaderFrame, true)
+        self.write_frame(&header, header_stage, true)
             .map_err(FileCommitLogError::Io)?;
+
+        if let Some(owner) = owner {
+            let owner_frame = build_frame(
+                self.format,
+                FrameKind::TransactionPageOwner,
+                position_value,
+                owner.epoch,
+                owner.sequence,
+            );
+            self.write_frame(
+                &owner_frame,
+                FileIoStage::WriteTransactionPageOwnerFrame,
+                true,
+            )
+            .map_err(FileCommitLogError::Io)?;
+        }
 
         let page_bytes = page.image().bytes();
         for chunk_index in 0..layout.chunk_count {
@@ -1282,7 +1548,7 @@ impl<const N: usize> FileCommitLog<N> {
                 *destination = *source;
             }
             let data = build_frame_with_payload2_bytes(
-                LogFormat::V2,
+                self.format,
                 FrameKind::PageData,
                 position_value,
                 u64::try_from(chunk_index)
@@ -1298,13 +1564,24 @@ impl<const N: usize> FileCommitLog<N> {
             *destination = *source;
         }
         let position = self.lineage.position(position_value);
+        let page_record = FilePageWriteRecord {
+            page_number: page.address().number(),
+            page_version: page.version(),
+            bytes: stored_bytes,
+        };
+        let kind = match owner {
+            Some(owner) => {
+                FileLogRecordKind::TransactionPageWrite(FileTransactionPageWriteRecord {
+                    transaction_epoch: owner.epoch,
+                    transaction_sequence: owner.sequence,
+                    page: page_record,
+                })
+            }
+            None => FileLogRecordKind::PageWrite(page_record),
+        };
         self.records.push(FileLogRecord {
             position: position.clone(),
-            kind: FileLogRecordKind::PageWrite(FilePageWriteRecord {
-                page_number: page.address().number(),
-                page_version: page.version(),
-                bytes: stored_bytes,
-            }),
+            kind,
         });
         self.next_position = position_value.checked_add(1);
 
@@ -1326,13 +1603,7 @@ impl<const N: usize> TransactionEpochSource for FileCommitLog<N> {
         let epoch = self
             .next_epoch
             .ok_or(FileTransactionEpochError::EpochSpaceExhausted)?;
-        let frame = build_frame(
-            log_format_for_width::<N>(),
-            FrameKind::EpochAllocation,
-            epoch.get(),
-            0,
-            0,
-        );
+        let frame = build_frame(self.format, FrameKind::EpochAllocation, epoch.get(), 0, 0);
         self.write_frame(&frame, FileIoStage::WriteEpochFrame, true)
             .map_err(FileTransactionEpochError::Io)?;
         self.sync_file(FileIoStage::SyncEpochFrame, true)
@@ -1408,13 +1679,7 @@ impl<const N: usize> LogDurability for FileCommitLog<N> {
 
         self.sync_file(FileIoStage::SyncCommitPrefix, false)
             .map_err(FileCommitLogError::Io)?;
-        let marker = build_frame(
-            log_format_for_width::<N>(),
-            FrameKind::DurableThrough,
-            position.get(),
-            0,
-            0,
-        );
+        let marker = build_frame(self.format, FrameKind::DurableThrough, position.get(), 0, 0);
         self.write_frame(&marker, FileIoStage::WriteDurableMarker, true)
             .map_err(FileCommitLogError::Io)?;
         self.sync_file(FileIoStage::SyncDurableMarker, true)
@@ -1449,7 +1714,7 @@ impl<const N: usize> CommitLog<TransactionCommitRecord> for FileCommitLog<N> {
 
         let transaction = StoredTransactionIdentity::from_transaction_id(record.transaction_id());
         let frame = build_frame(
-            log_format_for_width::<N>(),
+            self.format,
             FrameKind::CommitRecord,
             position_value,
             transaction.epoch,
@@ -1485,8 +1750,13 @@ impl<const LOG_N: usize, const PAGE_N: usize> PageLog<PAGE_N> for FileCommitLog<
     }
 }
 
-const fn log_format_for_width<const N: usize>() -> LogFormat {
-    if N == 0 { LogFormat::V1 } else { LogFormat::V2 }
+impl<const LOG_N: usize, const PAGE_N: usize> TransactionPageLog<PAGE_N> for FileCommitLog<LOG_N> {
+    fn append_transaction_page(
+        &mut self,
+        record: &TransactionPageWriteRecord<'_, PAGE_N>,
+    ) -> Result<LogSequenceNumber, Self::Error> {
+        self.append_transaction_page_internal(record)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1497,6 +1767,8 @@ enum FrameKind {
     DurableThrough = 3,
     PageHeader = 4,
     PageData = 5,
+    TransactionPageHeader = 6,
+    TransactionPageOwner = 7,
 }
 
 impl FrameKind {
@@ -1507,6 +1779,8 @@ impl FrameKind {
             3 => Some(Self::DurableThrough),
             4 if format.supports_pages() => Some(Self::PageHeader),
             5 if format.supports_pages() => Some(Self::PageData),
+            6 if format.supports_transaction_pages() => Some(Self::TransactionPageHeader),
+            7 if format.supports_transaction_pages() => Some(Self::TransactionPageOwner),
             _ => None,
         }
     }
@@ -1518,6 +1792,8 @@ impl FrameKind {
             Self::DurableThrough => 3,
             Self::PageHeader => 4,
             Self::PageData => 5,
+            Self::TransactionPageHeader => 6,
+            Self::TransactionPageOwner => 7,
         }
     }
 }
@@ -1574,7 +1850,16 @@ impl<const N: usize> OpenState<N> {
             FrameKind::EpochAllocation => self.apply_epoch_frame(frame, offset),
             FrameKind::CommitRecord => self.apply_commit_frame(frame, offset),
             FrameKind::DurableThrough => self.apply_marker_frame(frame, offset),
-            FrameKind::PageHeader => self.apply_page_header_frame(frame, offset),
+            FrameKind::PageHeader => {
+                self.apply_page_header_frame(frame, offset, PendingPageOwnership::Raw)
+            }
+            FrameKind::TransactionPageHeader => {
+                self.apply_page_header_frame(frame, offset, PendingPageOwnership::AwaitingOwner)
+            }
+            FrameKind::TransactionPageOwner => Err(FileOpenError::Format(FileFormatError::new(
+                offset + 4,
+                FileFormatErrorReason::TransactionPageOwnerWithoutHeader,
+            ))),
             FrameKind::PageData => Err(FileOpenError::Format(FileFormatError::new(
                 offset + 4,
                 FileFormatErrorReason::PageDataWithoutHeader,
@@ -1583,6 +1868,113 @@ impl<const N: usize> OpenState<N> {
     }
 
     fn apply_pending_page_frame(
+        &mut self,
+        frame: DecodedFrame,
+        offset: u64,
+    ) -> Result<(), FileOpenError> {
+        let ownership = match self.pending_page.as_ref() {
+            Some(pending) => pending.ownership(),
+            None => {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    offset + 4,
+                    FileFormatErrorReason::PageDataWithoutHeader,
+                )));
+            }
+        };
+        match ownership {
+            PendingPageOwnership::AwaitingOwner => {
+                self.apply_pending_transaction_page_owner(frame, offset)
+            }
+            PendingPageOwnership::Raw if frame.kind == FrameKind::TransactionPageOwner => {
+                Err(FileOpenError::Format(FileFormatError::new(
+                    offset + 4,
+                    FileFormatErrorReason::TransactionPageOwnerWithoutHeader,
+                )))
+            }
+            PendingPageOwnership::Owned(_) if frame.kind == FrameKind::TransactionPageOwner => {
+                Err(FileOpenError::Format(FileFormatError::new(
+                    offset + 4,
+                    FileFormatErrorReason::TransactionPageOwnerDuplicate,
+                )))
+            }
+            PendingPageOwnership::Raw | PendingPageOwnership::Owned(_) => {
+                self.apply_pending_page_data_frame(frame, offset)
+            }
+        }
+    }
+
+    fn apply_pending_transaction_page_owner(
+        &mut self,
+        frame: DecodedFrame,
+        offset: u64,
+    ) -> Result<(), FileOpenError> {
+        if frame.kind != FrameKind::TransactionPageOwner {
+            return Err(FileOpenError::Format(FileFormatError::new(
+                offset + 4,
+                FileFormatErrorReason::TransactionPageOwnerInterruptedByFrameKind {
+                    actual: frame.kind.code(),
+                },
+            )));
+        }
+        let pending_position = match self.pending_page.as_ref() {
+            Some(pending) => pending.position(),
+            None => {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    offset + 4,
+                    FileFormatErrorReason::TransactionPageOwnerWithoutHeader,
+                )));
+            }
+        };
+        if frame.payload0 == 0 {
+            return Err(FileOpenError::Format(FileFormatError::new(
+                offset + 16,
+                FileFormatErrorReason::TransactionPageOwnerParentPositionZero,
+            )));
+        }
+        if frame.payload0 != pending_position {
+            return Err(FileOpenError::Format(FileFormatError::new(
+                offset + 16,
+                FileFormatErrorReason::TransactionPageOwnerParentMismatch {
+                    expected: pending_position,
+                    actual: frame.payload0,
+                },
+            )));
+        }
+        if frame.payload1 == 0 {
+            return Err(FileOpenError::Format(FileFormatError::new(
+                offset + 24,
+                FileFormatErrorReason::TransactionPageOwnerEpochZero,
+            )));
+        }
+        if frame.payload1 > self.highest_allocated_epoch {
+            return Err(FileOpenError::Format(FileFormatError::new(
+                offset + 24,
+                FileFormatErrorReason::TransactionPageOwnerEpochUnallocated {
+                    actual: frame.payload1,
+                    highest_allocated: self.highest_allocated_epoch,
+                },
+            )));
+        }
+        if frame.payload2 == 0 {
+            return Err(FileOpenError::Format(FileFormatError::new(
+                offset + 32,
+                FileFormatErrorReason::TransactionPageOwnerSequenceZero,
+            )));
+        }
+        let owner = StoredTransactionIdentity::from_epoch_sequence(frame.payload1, frame.payload2);
+        match self.pending_page.as_mut() {
+            Some(pending) => pending.set_owner(owner),
+            None => {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    offset + 4,
+                    FileFormatErrorReason::TransactionPageOwnerWithoutHeader,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_pending_page_data_frame(
         &mut self,
         frame: DecodedFrame,
         offset: u64,
@@ -1682,7 +2074,7 @@ impl<const N: usize> OpenState<N> {
             self.records
                 .try_reserve(1)
                 .map_err(|_| FileOpenError::RecordCapacityExhausted)?;
-            let record = pending.into_record(&self.lineage);
+            let record = pending.into_record(&self.lineage)?;
             self.last_completed_position = record.position().get();
             self.next_position = self.last_completed_position.checked_add(1);
             self.records.push(record);
@@ -1887,6 +2279,7 @@ impl<const N: usize> OpenState<N> {
         &mut self,
         frame: DecodedFrame,
         offset: u64,
+        ownership: PendingPageOwnership,
     ) -> Result<(), FileOpenError> {
         if frame.payload0 == 0 {
             return Err(FileOpenError::Format(FileFormatError::new(
@@ -1926,10 +2319,18 @@ impl<const N: usize> OpenState<N> {
             frame.payload0,
             page_number,
             PageVersion::new(frame.payload2),
+            ownership,
             layout,
         ));
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingPageOwnership {
+    Raw,
+    AwaitingOwner,
+    Owned(StoredTransactionIdentity),
 }
 
 #[derive(Debug)]
@@ -1938,6 +2339,7 @@ struct PendingPageRecord<const N: usize> {
     position: u64,
     page_number: PageNumber,
     page_version: PageVersion,
+    ownership: PendingPageOwnership,
     bytes: [u8; N],
     next_chunk_index: usize,
     expected_chunk_count: usize,
@@ -1949,6 +2351,7 @@ impl<const N: usize> PendingPageRecord<N> {
         position: u64,
         page_number: PageNumber,
         page_version: PageVersion,
+        ownership: PendingPageOwnership,
         layout: PageLayout,
     ) -> Self {
         Self {
@@ -1956,6 +2359,7 @@ impl<const N: usize> PendingPageRecord<N> {
             position,
             page_number,
             page_version,
+            ownership,
             bytes: [0_u8; N],
             next_chunk_index: 0,
             expected_chunk_count: layout.chunk_count,
@@ -1968,6 +2372,14 @@ impl<const N: usize> PendingPageRecord<N> {
 
     const fn position(&self) -> u64 {
         self.position
+    }
+
+    const fn ownership(&self) -> PendingPageOwnership {
+        self.ownership
+    }
+
+    fn set_owner(&mut self, owner: StoredTransactionIdentity) {
+        self.ownership = PendingPageOwnership::Owned(owner);
     }
 
     const fn next_chunk_index(&self) -> usize {
@@ -1998,15 +2410,32 @@ impl<const N: usize> PendingPageRecord<N> {
         self.next_chunk_index == layout.chunk_count
     }
 
-    fn into_record(self, lineage: &LogLineage) -> FileLogRecord<N> {
-        FileLogRecord {
+    fn into_record(self, lineage: &LogLineage) -> Result<FileLogRecord<N>, FileOpenError> {
+        let page = FilePageWriteRecord {
+            page_number: self.page_number,
+            page_version: self.page_version,
+            bytes: self.bytes,
+        };
+        let kind = match self.ownership {
+            PendingPageOwnership::Raw => FileLogRecordKind::PageWrite(page),
+            PendingPageOwnership::Owned(owner) => {
+                FileLogRecordKind::TransactionPageWrite(FileTransactionPageWriteRecord {
+                    transaction_epoch: owner.epoch,
+                    transaction_sequence: owner.sequence,
+                    page,
+                })
+            }
+            PendingPageOwnership::AwaitingOwner => {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    self.header_offset + 4,
+                    FileFormatErrorReason::TransactionPageOwnerMissing,
+                )));
+            }
+        };
+        Ok(FileLogRecord {
             position: lineage.position(self.position),
-            kind: FileLogRecordKind::PageWrite(FilePageWriteRecord {
-                page_number: self.page_number,
-                page_version: self.page_version,
-                bytes: self.bytes,
-            }),
-        }
+            kind,
+        })
     }
 }
 
@@ -2028,6 +2457,7 @@ fn sync_parent_directory(path: &Path) -> Result<(), FileCreateError> {
 enum HeaderExpectation {
     V1,
     V2(PageLayout),
+    V3(PageLayout),
 }
 
 impl HeaderExpectation {
@@ -2035,13 +2465,14 @@ impl HeaderExpectation {
         match self {
             Self::V1 => LogFormat::V1,
             Self::V2(_) => LogFormat::V2,
+            Self::V3(_) => LogFormat::V3,
         }
     }
 
     const fn page_layout(self) -> Option<PageLayout> {
         match self {
             Self::V1 => None,
-            Self::V2(layout) => Some(layout),
+            Self::V2(layout) | Self::V3(layout) => Some(layout),
         }
     }
 }
@@ -2094,7 +2525,7 @@ fn parse_header(
                 ));
             }
         }
-        HeaderExpectation::V2(layout) => {
+        HeaderExpectation::V2(layout) | HeaderExpectation::V3(layout) => {
             let page_width = read_u64(header, HEADER_V2_PAGE_WIDTH_OFFSET);
             if page_width == 0 {
                 return Err(FileFormatError::new(
@@ -2212,6 +2643,10 @@ fn build_header_v2(persistent_id: PersistentLogId, page_width: u64) -> [u8; HEAD
     build_header(LogFormat::V2, persistent_id, page_width)
 }
 
+fn build_header_v3(persistent_id: PersistentLogId, page_width: u64) -> [u8; HEADER_LENGTH] {
+    build_header(LogFormat::V3, persistent_id, page_width)
+}
+
 fn build_header(
     format: LogFormat,
     persistent_id: PersistentLogId,
@@ -2223,7 +2658,7 @@ fn build_header(
     write_u16(&mut header, 10, HEADER_LENGTH_U16);
     write_u32(&mut header, 12, 0);
     write_u128(&mut header, 16, persistent_id.get());
-    if format == LogFormat::V2 {
+    if format.supports_pages() {
         write_u64(&mut header, HEADER_V2_PAGE_WIDTH_OFFSET, page_width);
     }
     let checksum = checksum_v1(&header[..HEADER_CHECKSUM_OFFSET]);
@@ -3871,7 +4306,8 @@ mod tests {
     };
     use ntsql_transaction::{
         CoordinatedCommitError, IndeterminateTransaction, TransactionCommitResolution,
-        TransactionCoordinator, TransactionLifecycleStatus, TransactionResolutionFailure,
+        TransactionCommittedFlushError, TransactionCoordinator, TransactionLifecycleStatus,
+        TransactionPageStageError, TransactionResolutionFailure, flush_committed_page,
     };
     use ntsql_wal::{CommitError, LogDurability, LogLineage, PersistentLogId};
 
@@ -5401,6 +5837,1071 @@ mod tests {
         assert_eq!(log.records().len(), 1);
         assert_eq!(log.records()[0].position().get(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn v3_golden_bytes_cover_owned_page_owner_data_commit_and_marker() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TestDirectory::new("v3-golden-bytes")?;
+        let path = directory.path().join("commit-log.bin");
+        let mut log =
+            FileCommitLog::<10>::create_new_transaction_page_capable(&path, persistent_id(271)?)?;
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let active = coordinator.begin()?;
+        let owner = active.transaction_id();
+        let page = unlogged_page(log.lineage(), 7, 9, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+        let (active, dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+        let committed = coordinator.commit(active, &mut log)?;
+        assert_eq!(dirty.required_position().get(), 1);
+        assert_eq!(committed.log_position().get(), 2);
+        drop(log);
+
+        let bytes = fs::read(&path)?;
+        assert_eq!(bytes.len(), HEADER_LENGTH + FRAME_LENGTH * 7);
+        let mut header = [0_u8; HEADER_LENGTH];
+        header.copy_from_slice(&bytes[..HEADER_LENGTH]);
+        assert_eq!(
+            parse_header(
+                &header,
+                HeaderExpectation::V3(PageLayout::for_const::<10>()?)
+            )?,
+            persistent_id(271)?
+        );
+        assert_eq!(read_u16(&header, 8), FORMAT_VERSION_V3);
+        assert_eq!(read_u64(&header, HEADER_V2_PAGE_WIDTH_OFFSET), 10);
+        assert_eq!(
+            read_u64(&header, HEADER_CHECKSUM_OFFSET),
+            0xb458_6dc8_06be_b448
+        );
+
+        let epoch_frame = wal_frame(&bytes, 0)?;
+        assert_eq!(
+            parse_frame(&epoch_frame, wal_frame_offset(0)?, LogFormat::V3)?,
+            DecodedFrame {
+                kind: FrameKind::EpochAllocation,
+                payload0: 1,
+                payload1: 0,
+                payload2: 0,
+                payload2_bytes: 0_u64.to_be_bytes(),
+            }
+        );
+        assert_eq!(
+            read_u64(&epoch_frame, FRAME_CHECKSUM_OFFSET),
+            0x73f5_86d9_0b90_6091
+        );
+
+        let owned_header_frame = wal_frame(&bytes, 1)?;
+        assert_eq!(
+            parse_frame(&owned_header_frame, wal_frame_offset(1)?, LogFormat::V3)?,
+            DecodedFrame {
+                kind: FrameKind::TransactionPageHeader,
+                payload0: 1,
+                payload1: 7,
+                payload2: 9,
+                payload2_bytes: 9_u64.to_be_bytes(),
+            }
+        );
+        assert_eq!(
+            read_u64(&owned_header_frame, FRAME_CHECKSUM_OFFSET),
+            0x55e6_ed5c_e0e4_afb3
+        );
+
+        let owner_frame = wal_frame(&bytes, 2)?;
+        assert_eq!(
+            parse_frame(&owner_frame, wal_frame_offset(2)?, LogFormat::V3)?,
+            DecodedFrame {
+                kind: FrameKind::TransactionPageOwner,
+                payload0: 1,
+                payload1: owner.epoch().get(),
+                payload2: owner.sequence(),
+                payload2_bytes: owner.sequence().to_be_bytes(),
+            }
+        );
+        assert_eq!(
+            read_u64(&owner_frame, FRAME_CHECKSUM_OFFSET),
+            0xcf49_d22b_674e_bff7
+        );
+
+        let first_data_frame = wal_frame(&bytes, 3)?;
+        let first_data = parse_frame(&first_data_frame, wal_frame_offset(3)?, LogFormat::V3)?;
+        assert_eq!(first_data.kind, FrameKind::PageData);
+        assert_eq!(first_data.payload0, 1);
+        assert_eq!(first_data.payload1, 0);
+        assert_eq!(first_data.payload2_bytes, [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            read_u64(&first_data_frame, FRAME_CHECKSUM_OFFSET),
+            0x7a1e_fe7d_8c1b_1e37
+        );
+
+        let final_data_frame = wal_frame(&bytes, 4)?;
+        let final_data = parse_frame(&final_data_frame, wal_frame_offset(4)?, LogFormat::V3)?;
+        assert_eq!(final_data.kind, FrameKind::PageData);
+        assert_eq!(final_data.payload0, 1);
+        assert_eq!(final_data.payload1, 1);
+        assert_eq!(final_data.payload2_bytes, [9, 10, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            read_u64(&final_data_frame, FRAME_CHECKSUM_OFFSET),
+            0x9f91_16f8_ede9_80cf
+        );
+
+        let commit_frame = wal_frame(&bytes, 5)?;
+        assert_eq!(
+            parse_frame(&commit_frame, wal_frame_offset(5)?, LogFormat::V3)?,
+            DecodedFrame {
+                kind: FrameKind::CommitRecord,
+                payload0: 2,
+                payload1: owner.epoch().get(),
+                payload2: owner.sequence(),
+                payload2_bytes: owner.sequence().to_be_bytes(),
+            }
+        );
+        assert_eq!(
+            read_u64(&commit_frame, FRAME_CHECKSUM_OFFSET),
+            0x1f43_b64d_8069_8d46
+        );
+
+        let marker_frame = wal_frame(&bytes, 6)?;
+        assert_eq!(
+            parse_frame(&marker_frame, wal_frame_offset(6)?, LogFormat::V3)?,
+            DecodedFrame {
+                kind: FrameKind::DurableThrough,
+                payload0: 2,
+                payload1: 0,
+                payload2: 0,
+                payload2_bytes: 0_u64.to_be_bytes(),
+            }
+        );
+        assert_eq!(
+            read_u64(&marker_frame, FRAME_CHECKSUM_OFFSET),
+            0xb28e_1b5b_447e_a1a4
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_owned_page_and_commit_keep_owner_lookup_and_store_authority_separate()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-owned-lifecycle")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let persistent_id = persistent_id(277)?;
+        let mut log =
+            FileCommitLog::<4>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+        let mut store = FilePageStore::<4>::create_new(&store_path, persistent_id)?;
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let active = coordinator.begin()?;
+        let owner = active.transaction_id();
+        let page = unlogged_page(log.lineage(), 15, 5, [7, 8, 9, 10])?;
+
+        let (active, dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+        log.flush_through(dirty.required_position())?;
+        let (_, lookup_before_commit) = log.lookup_durable_commit(owner)?;
+        assert_eq!(lookup_before_commit, DurableCommitLookup::Absent);
+        assert!(store.pages().is_empty());
+
+        let owned_record = &log.records()[0];
+        assert_eq!(owned_record.transaction_epoch(), None);
+        assert_eq!(owned_record.transaction_sequence(), None);
+        assert_eq!(
+            owned_record.page_owner_transaction_epoch(),
+            Some(owner.epoch().get())
+        );
+        assert_eq!(
+            owned_record.page_owner_transaction_sequence(),
+            Some(owner.sequence())
+        );
+        assert!(owned_record.page_owner_matches_transaction_id(owner));
+        let owned = owned_record
+            .transaction_page_write()
+            .ok_or_else(|| io::Error::other("owned v3 record is missing"))?;
+        assert!(owned.matches_transaction_id(owner));
+        assert_eq!(owned.page_write().page_number().get(), 15);
+        assert_eq!(owned.page_write().page_version().get(), 5);
+        assert_eq!(owned.page_write().bytes(), &[7, 8, 9, 10]);
+        let observation = owned_record
+            .page_recovery_observation()?
+            .ok_or_else(|| io::Error::other("owned page lost its recovery projection"))?;
+        assert_eq!(observation.position(), dirty.required_position());
+        assert_eq!(observation.image().bytes(), &[7, 8, 9, 10]);
+
+        drop(log);
+        let mut log = FileCommitLog::<4>::open_transaction_page_capable(&log_path)?;
+        assert_eq!(log.records().len(), 1);
+        assert_eq!(log.durable_records().len(), 1);
+        assert!(log.records()[0].page_owner_matches_transaction_id(owner));
+        let (_, reopened_lookup_before_commit) = log.lookup_durable_commit(owner)?;
+        assert_eq!(reopened_lookup_before_commit, DurableCommitLookup::Absent);
+
+        let committed = coordinator.commit(active, &mut log)?;
+        assert_eq!(dirty.required_position().get(), 1);
+        assert_eq!(committed.log_position().get(), 2);
+        assert_eq!(log.durable_records().len(), 2);
+        let (_, lookup_after_commit) = log.lookup_durable_commit(owner)?;
+        assert_eq!(
+            lookup_after_commit,
+            DurableCommitLookup::Found {
+                position: log.lineage().position(2),
+            }
+        );
+
+        let clean = flush_committed_page(&committed, &mut log, &mut store, dirty)?;
+        assert_eq!(clean.transaction_id(), owner);
+        assert_eq!(clean.required_position().get(), 1);
+        let stored = store
+            .page(page_number(15)?)
+            .ok_or_else(|| io::Error::other("committed v3 page was not stored"))?;
+        assert_eq!(stored.page_version().get(), 5);
+        assert_eq!(stored.bytes(), &[7, 8, 9, 10]);
+        drop(store);
+        drop(log);
+
+        let mut reopened = FileCommitLog::<4>::open_transaction_page_capable(&log_path)?;
+        let reopened_store = FilePageStore::<4>::open(&store_path)?;
+        assert_eq!(reopened.records().len(), 2);
+        assert_eq!(reopened.durable_records().len(), 2);
+        assert!(reopened.records()[0].page_owner_matches_transaction_id(owner));
+        assert!(reopened.records()[1].matches_transaction_id(owner));
+        let (_, reopened_lookup) = reopened.lookup_durable_commit(owner)?;
+        assert_eq!(
+            reopened_lookup,
+            DurableCommitLookup::Found {
+                position: reopened.lineage().position(2),
+            }
+        );
+        assert_eq!(
+            reopened_store
+                .page(page_number(15)?)
+                .ok_or_else(|| io::Error::other("reopened store lost committed page"))?
+                .bytes(),
+            &[7, 8, 9, 10]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v1_and_v2_reject_transaction_pages_before_fault_or_position_effect()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("transaction-page-version-rejection")?;
+
+        let v1_path = directory.path().join("v1.bin");
+        let mut v1 = FileCommitLog::<0>::create_new(&v1_path, persistent_id(281)?)?;
+        let mut v1_coordinator = TransactionCoordinator::open(&mut v1)?;
+        v1.arm_fault(FaultPoint::AfterAppend)?;
+        let v1_active = v1_coordinator.begin()?;
+        let v1_page = unlogged_page(v1.lineage(), 1, 1, [1_u8])?;
+        let v1_error = v1_coordinator
+            .stage_page_write(v1_active, v1_page, &mut v1)
+            .err()
+            .ok_or_else(|| io::Error::other("v1 accepted a transaction page"))?;
+        let TransactionPageStageError::Append(v1_error) = v1_error else {
+            return Err(io::Error::other("v1 rejection returned the wrong error shape").into());
+        };
+        assert_eq!(
+            v1_error.cause(),
+            &FileCommitLogError::TransactionPageSupportUnavailable
+        );
+        assert!(v1.records().is_empty());
+        assert_eq!(v1.armed_fault(), Some(FaultPoint::AfterAppend));
+
+        let v2_path = directory.path().join("v2.bin");
+        let mut v2 = FileCommitLog::<2>::create_new_page_capable(&v2_path, persistent_id(283)?)?;
+        let mut v2_coordinator = TransactionCoordinator::open(&mut v2)?;
+        v2.arm_fault(FaultPoint::AfterAppend)?;
+        let v2_active = v2_coordinator.begin()?;
+        let v2_page = unlogged_page(v2.lineage(), 2, 2, [2_u8, 3])?;
+        let v2_error = v2_coordinator
+            .stage_page_write(v2_active, v2_page, &mut v2)
+            .err()
+            .ok_or_else(|| io::Error::other("v2 accepted a transaction page"))?;
+        let TransactionPageStageError::Append(v2_error) = v2_error else {
+            return Err(io::Error::other("v2 rejection returned the wrong error shape").into());
+        };
+        assert_eq!(
+            v2_error.cause(),
+            &FileCommitLogError::TransactionPageSupportUnavailable
+        );
+        assert!(v2.records().is_empty());
+        assert_eq!(v2.armed_fault(), Some(FaultPoint::AfterAppend));
+
+        let raw_page = unlogged_page(v2.lineage(), 3, 3, [4_u8, 5])?;
+        let raw_error = stage_page_write(&mut v2, raw_page)
+            .err()
+            .ok_or_else(|| io::Error::other("preserved v2 fault unexpectedly disappeared"))?;
+        let StagePageWriteError::Append(raw_error) = raw_error else {
+            return Err(io::Error::other("raw v2 fault returned the wrong error shape").into());
+        };
+        assert_eq!(
+            raw_error.cause(),
+            &FileCommitLogError::InjectedFault(FaultPoint::AfterAppend)
+        );
+        assert_eq!(v2.records().len(), 1);
+        assert_eq!(v2.records()[0].position().get(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn v3_transaction_page_append_faults_have_exact_file_and_position_effects()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-append-faults")?;
+
+        let before_path = directory.path().join("before.bin");
+        let mut before = FileCommitLog::<2>::create_new_transaction_page_capable(
+            &before_path,
+            persistent_id(287)?,
+        )?;
+        let mut before_coordinator = TransactionCoordinator::open(&mut before)?;
+        before.arm_fault(FaultPoint::BeforeAppend)?;
+        let before_active = before_coordinator.begin()?;
+        let before_page = unlogged_page(before.lineage(), 4, 1, [1_u8, 2])?;
+        let before_error = before_coordinator
+            .stage_page_write(before_active, before_page, &mut before)
+            .err()
+            .ok_or_else(|| io::Error::other("v3 before-append fault succeeded"))?;
+        let TransactionPageStageError::Append(before_error) = before_error else {
+            return Err(io::Error::other("before fault returned wrong error shape").into());
+        };
+        assert_eq!(
+            before_error.cause(),
+            &FileCommitLogError::InjectedFault(FaultPoint::BeforeAppend)
+        );
+        assert!(before.records().is_empty());
+        assert_eq!(
+            fs::metadata(&before_path)?.len(),
+            HEADER_LENGTH_U64 + FRAME_LENGTH_U64
+        );
+        let raw = unlogged_page(before.lineage(), 5, 2, [3_u8, 4])?;
+        let raw_dirty = stage_page_write(&mut before, raw)?;
+        assert_eq!(raw_dirty.required_position().get(), 1);
+        drop(before);
+        let reopened_before = FileCommitLog::<2>::open_transaction_page_capable(&before_path)?;
+        assert_eq!(reopened_before.records().len(), 1);
+        assert_eq!(reopened_before.records()[0].position().get(), 1);
+
+        let after_path = directory.path().join("after.bin");
+        let mut after = FileCommitLog::<2>::create_new_transaction_page_capable(
+            &after_path,
+            persistent_id(289)?,
+        )?;
+        let mut after_coordinator = TransactionCoordinator::open(&mut after)?;
+        after.arm_fault(FaultPoint::AfterAppend)?;
+        let after_active = after_coordinator.begin()?;
+        let owner = after_active.transaction_id();
+        let after_page = unlogged_page(after.lineage(), 6, 3, [5_u8, 6])?;
+        let after_error = after_coordinator
+            .stage_page_write(after_active, after_page, &mut after)
+            .err()
+            .ok_or_else(|| io::Error::other("v3 after-append fault succeeded"))?;
+        let TransactionPageStageError::Append(after_error) = after_error else {
+            return Err(io::Error::other("after fault returned wrong error shape").into());
+        };
+        assert_eq!(
+            after_error.cause(),
+            &FileCommitLogError::InjectedFault(FaultPoint::AfterAppend)
+        );
+        assert_eq!(after.records().len(), 1);
+        assert_eq!(after.records()[0].position().get(), 1);
+        assert!(after.records()[0].page_owner_matches_transaction_id(owner));
+        assert_eq!(after.durable_records().len(), 0);
+        assert_eq!(
+            fs::metadata(&after_path)?.len(),
+            HEADER_LENGTH_U64 + FRAME_LENGTH_U64 * 4
+        );
+        drop(after);
+
+        let mut reopened_after = FileCommitLog::<2>::open_transaction_page_capable(&after_path)?;
+        assert_eq!(reopened_after.records().len(), 1);
+        assert_eq!(reopened_after.durable_records().len(), 0);
+        assert!(reopened_after.records()[0].page_owner_matches_transaction_id(owner));
+        let next_page = unlogged_page(reopened_after.lineage(), 7, 4, [7_u8, 8])?;
+        let next_dirty = stage_page_write(&mut reopened_after, next_page)?;
+        assert_eq!(next_dirty.required_position().get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn v3_raw_owned_and_commit_records_share_order_and_reopen() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-mixed-order")?;
+        let path = directory.path().join("commit-log.bin");
+        let mut log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&path, persistent_id(293)?)?;
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+
+        let raw_page = unlogged_page(log.lineage(), 8, 1, [1_u8, 2])?;
+        let raw_dirty = stage_page_write(&mut log, raw_page)?;
+        let active = coordinator.begin()?;
+        let owner = active.transaction_id();
+        let owned_page = unlogged_page(log.lineage(), 9, 2, [3_u8, 4])?;
+        let (active, owned_dirty) = coordinator.stage_page_write(active, owned_page, &mut log)?;
+        let committed = coordinator.commit(active, &mut log)?;
+
+        assert_eq!(raw_dirty.required_position().get(), 1);
+        assert_eq!(owned_dirty.required_position().get(), 2);
+        assert_eq!(committed.log_position().get(), 3);
+        assert_eq!(log.records().len(), 3);
+        assert_eq!(log.durable_records().len(), 3);
+        assert!(log.records()[0].page_write().is_some());
+        assert!(log.records()[0].transaction_page_write().is_none());
+        assert!(log.records()[1].page_owner_matches_transaction_id(owner));
+        assert!(log.records()[2].matches_transaction_id(owner));
+        drop(log);
+
+        let reopened = FileCommitLog::<2>::open_transaction_page_capable(&path)?;
+        assert_eq!(reopened.records().len(), 3);
+        assert_eq!(reopened.durable_records().len(), 3);
+        assert_eq!(
+            reopened.durable_position(),
+            Some(reopened.lineage().position(3))
+        );
+        assert!(reopened.records()[0].transaction_page_write().is_none());
+        assert!(reopened.records()[1].page_owner_matches_transaction_id(owner));
+        assert!(reopened.records()[2].matches_transaction_id(owner));
+        Ok(())
+    }
+
+    #[test]
+    fn v3_before_flush_keeps_owned_page_and_commit_volatile_across_reopen()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-before-flush")?;
+        let path = directory.path().join("commit-log.bin");
+        let mut log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&path, persistent_id(299)?)?;
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let active = coordinator.begin()?;
+        let owner = active.transaction_id();
+        let page = unlogged_page(log.lineage(), 10, 3, [8_u8, 9])?;
+        let (active, _dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+        log.arm_fault(FaultPoint::BeforeFlush)?;
+
+        let (_indeterminate, cause) = indeterminate_parts(coordinator.commit(active, &mut log))?;
+        let CommitError::Flush { position, source } = cause else {
+            return Err(io::Error::other("v3 before-flush returned a non-flush error").into());
+        };
+        assert_eq!(position.get(), 2);
+        assert_eq!(
+            source,
+            FileCommitLogError::InjectedFault(FaultPoint::BeforeFlush)
+        );
+        assert_eq!(log.records().len(), 2);
+        assert_eq!(log.durable_records().len(), 0);
+        drop(log);
+
+        let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&path)?;
+        assert_eq!(reopened.records().len(), 2);
+        assert_eq!(reopened.durable_records().len(), 0);
+        assert!(reopened.records()[0].page_owner_matches_transaction_id(owner));
+        assert!(reopened.records()[1].matches_transaction_id(owner));
+        assert_eq!(
+            reopened.lookup_durable_commit(owner).err(),
+            Some(FileTransactionRecoveryError::VolatileCommitRecord(owner))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_scanner_allows_repeated_owned_images_as_format_validity() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-owned-repeat")?;
+        let path = directory.path().join("commit-log.bin");
+        create_v3_with_allocated_epoch::<2>(&path, persistent_id(303)?)?;
+
+        for (position, bytes) in [(1_u64, [1_u8, 2]), (2_u64, [3_u8, 4])] {
+            append_bytes(
+                &path,
+                &build_frame(
+                    LogFormat::V3,
+                    FrameKind::TransactionPageHeader,
+                    position,
+                    12,
+                    position,
+                ),
+            )?;
+            append_bytes(
+                &path,
+                &build_frame(
+                    LogFormat::V3,
+                    FrameKind::TransactionPageOwner,
+                    position,
+                    1,
+                    1,
+                ),
+            )?;
+            append_bytes(
+                &path,
+                &build_frame_with_payload2_bytes(
+                    LogFormat::V3,
+                    FrameKind::PageData,
+                    position,
+                    0,
+                    [bytes[0], bytes[1], 0, 0, 0, 0, 0, 0],
+                ),
+            )?;
+        }
+
+        let reopened = FileCommitLog::<2>::open_transaction_page_capable(&path)?;
+        assert_eq!(reopened.records().len(), 2);
+        assert_eq!(reopened.records()[0].position().get(), 1);
+        assert_eq!(reopened.records()[1].position().get(), 2);
+        assert_eq!(
+            reopened.records()[0]
+                .page_write()
+                .ok_or_else(|| io::Error::other("first repeated page is missing"))?
+                .bytes(),
+            &[1, 2]
+        );
+        assert_eq!(
+            reopened.records()[1]
+                .page_write()
+                .ok_or_else(|| io::Error::other("second repeated page is missing"))?
+                .bytes(),
+            &[3, 4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_incomplete_owned_groups_repair_to_the_owned_header() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-owned-tail-repair")?;
+        let owned_header = build_frame(LogFormat::V3, FrameKind::TransactionPageHeader, 1, 4, 6);
+        let owner = build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 1, 1, 1);
+        let first_data = build_frame_with_payload2_bytes(
+            LogFormat::V3,
+            FrameKind::PageData,
+            1,
+            0,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+        );
+        let final_data = build_frame_with_payload2_bytes(
+            LogFormat::V3,
+            FrameKind::PageData,
+            1,
+            1,
+            [9, 10, 0, 0, 0, 0, 0, 0],
+        );
+        let cases = [
+            ("header-only", vec![owned_header], Vec::new()),
+            ("owner-no-data", vec![owned_header, owner], Vec::new()),
+            (
+                "one-data-chunk",
+                vec![owned_header, owner, first_data],
+                Vec::new(),
+            ),
+            (
+                "partial-owner",
+                vec![owned_header],
+                owner[..FRAME_LENGTH - 3].to_vec(),
+            ),
+            (
+                "partial-final-data",
+                vec![owned_header, owner, first_data],
+                final_data[..FRAME_LENGTH - 5].to_vec(),
+            ),
+        ];
+
+        for (index, (name, frames, partial)) in cases.into_iter().enumerate() {
+            let path = directory.path().join(format!("{name}.bin"));
+            create_v3_with_allocated_epoch::<10>(
+                &path,
+                persistent_id(307 + u128::try_from(index)?)?,
+            )?;
+            let intact_prefix = fs::metadata(&path)?.len();
+            for frame in frames {
+                append_bytes(&path, &frame)?;
+            }
+            if !partial.is_empty() {
+                append_bytes(&path, &partial)?;
+            }
+            assert!(fs::metadata(&path)?.len() > intact_prefix);
+
+            let mut repaired = FileCommitLog::<10>::open_transaction_page_capable(&path)?;
+            assert!(repaired.records().is_empty());
+            assert_eq!(repaired.durable_records().len(), 0);
+            assert_eq!(fs::metadata(&path)?.len(), intact_prefix);
+            let raw_page = unlogged_page(repaired.lineage(), 5, 7, [9, 8, 7, 6, 5, 4, 3, 2, 1, 0])?;
+            let raw_dirty = stage_page_write(&mut repaired, raw_page)?;
+            assert_eq!(raw_dirty.required_position().get(), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn v3_owner_validation_corruption_never_truncates() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-owner-corruption")?;
+        let owned_header = build_frame(LogFormat::V3, FrameKind::TransactionPageHeader, 1, 4, 6);
+        let valid_owner = build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 1, 1, 1);
+
+        let orphan_path = directory.path().join("orphan-owner.bin");
+        create_v3_with_allocated_epoch::<10>(&orphan_path, persistent_id(313)?)?;
+        append_bytes(&orphan_path, &valid_owner)?;
+        assert_v3_open_error_without_truncation::<10>(
+            &orphan_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(1)? + 4,
+                FileFormatErrorReason::TransactionPageOwnerWithoutHeader,
+            )),
+        )?;
+
+        let missing_path = directory.path().join("missing-owner.bin");
+        create_v3_with_allocated_epoch::<10>(&missing_path, persistent_id(317)?)?;
+        append_bytes(&missing_path, &owned_header)?;
+        append_bytes(
+            &missing_path,
+            &build_frame_with_payload2_bytes(
+                LogFormat::V3,
+                FrameKind::PageData,
+                1,
+                0,
+                [1, 2, 3, 4, 5, 6, 7, 8],
+            ),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &missing_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(2)? + 4,
+                FileFormatErrorReason::TransactionPageOwnerInterruptedByFrameKind { actual: 5 },
+            )),
+        )?;
+
+        let wrong_parent_path = directory.path().join("wrong-parent.bin");
+        create_v3_with_allocated_epoch::<10>(&wrong_parent_path, persistent_id(319)?)?;
+        append_bytes(&wrong_parent_path, &owned_header)?;
+        append_bytes(
+            &wrong_parent_path,
+            &build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 2, 1, 1),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &wrong_parent_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(2)? + 16,
+                FileFormatErrorReason::TransactionPageOwnerParentMismatch {
+                    expected: 1,
+                    actual: 2,
+                },
+            )),
+        )?;
+
+        let zero_parent_path = directory.path().join("zero-parent.bin");
+        create_v3_with_allocated_epoch::<10>(&zero_parent_path, persistent_id(327)?)?;
+        append_bytes(&zero_parent_path, &owned_header)?;
+        append_bytes(
+            &zero_parent_path,
+            &build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 0, 1, 1),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &zero_parent_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(2)? + 16,
+                FileFormatErrorReason::TransactionPageOwnerParentPositionZero,
+            )),
+        )?;
+
+        let zero_epoch_path = directory.path().join("zero-epoch.bin");
+        create_v3_with_allocated_epoch::<10>(&zero_epoch_path, persistent_id(331)?)?;
+        append_bytes(&zero_epoch_path, &owned_header)?;
+        append_bytes(
+            &zero_epoch_path,
+            &build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 1, 0, 1),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &zero_epoch_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(2)? + 24,
+                FileFormatErrorReason::TransactionPageOwnerEpochZero,
+            )),
+        )?;
+
+        let unallocated_epoch_path = directory.path().join("unallocated-epoch.bin");
+        create_v3_with_allocated_epoch::<10>(&unallocated_epoch_path, persistent_id(337)?)?;
+        append_bytes(&unallocated_epoch_path, &owned_header)?;
+        append_bytes(
+            &unallocated_epoch_path,
+            &build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 1, 2, 1),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &unallocated_epoch_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(2)? + 24,
+                FileFormatErrorReason::TransactionPageOwnerEpochUnallocated {
+                    actual: 2,
+                    highest_allocated: 1,
+                },
+            )),
+        )?;
+
+        let zero_sequence_path = directory.path().join("zero-sequence.bin");
+        create_v3_with_allocated_epoch::<10>(&zero_sequence_path, persistent_id(347)?)?;
+        append_bytes(&zero_sequence_path, &owned_header)?;
+        append_bytes(
+            &zero_sequence_path,
+            &build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 1, 1, 0),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &zero_sequence_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(2)? + 32,
+                FileFormatErrorReason::TransactionPageOwnerSequenceZero,
+            )),
+        )?;
+
+        let duplicate_path = directory.path().join("duplicate-owner.bin");
+        create_v3_with_allocated_epoch::<10>(&duplicate_path, persistent_id(349)?)?;
+        append_bytes(&duplicate_path, &owned_header)?;
+        append_bytes(&duplicate_path, &valid_owner)?;
+        append_bytes(&duplicate_path, &valid_owner)?;
+        assert_v3_open_error_without_truncation::<10>(
+            &duplicate_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(3)? + 4,
+                FileFormatErrorReason::TransactionPageOwnerDuplicate,
+            )),
+        )?;
+
+        let raw_owner_path = directory.path().join("raw-owner.bin");
+        create_v3_with_allocated_epoch::<10>(&raw_owner_path, persistent_id(353)?)?;
+        append_bytes(
+            &raw_owner_path,
+            &build_frame(LogFormat::V3, FrameKind::PageHeader, 1, 4, 6),
+        )?;
+        append_bytes(&raw_owner_path, &valid_owner)?;
+        assert_v3_open_error_without_truncation::<10>(
+            &raw_owner_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(2)? + 4,
+                FileFormatErrorReason::TransactionPageOwnerWithoutHeader,
+            )),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn v3_owned_data_corruption_never_truncates() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-owned-data-corruption")?;
+        let owned_header = build_frame(LogFormat::V3, FrameKind::TransactionPageHeader, 1, 4, 6);
+        let owner = build_frame(LogFormat::V3, FrameKind::TransactionPageOwner, 1, 1, 1);
+        let first_data = build_frame_with_payload2_bytes(
+            LogFormat::V3,
+            FrameKind::PageData,
+            1,
+            0,
+            [1, 2, 3, 4, 5, 6, 7, 8],
+        );
+
+        let interrupted_path = directory.path().join("interrupted.bin");
+        create_v3_with_allocated_epoch::<10>(&interrupted_path, persistent_id(359)?)?;
+        append_bytes(&interrupted_path, &owned_header)?;
+        append_bytes(&interrupted_path, &owner)?;
+        append_bytes(
+            &interrupted_path,
+            &build_frame(LogFormat::V3, FrameKind::TransactionPageHeader, 2, 5, 7),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &interrupted_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(3)? + 4,
+                FileFormatErrorReason::PageDataInterruptedByFrameKind { actual: 6 },
+            )),
+        )?;
+
+        let padding_path = directory.path().join("padding.bin");
+        create_v3_with_allocated_epoch::<10>(&padding_path, persistent_id(367)?)?;
+        append_bytes(&padding_path, &owned_header)?;
+        append_bytes(&padding_path, &owner)?;
+        append_bytes(&padding_path, &first_data)?;
+        append_bytes(
+            &padding_path,
+            &build_frame_with_payload2_bytes(
+                LogFormat::V3,
+                FrameKind::PageData,
+                1,
+                1,
+                [9, 10, 1, 0, 0, 0, 0, 0],
+            ),
+        )?;
+        assert_v3_open_error_without_truncation::<10>(
+            &padding_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(4)? + 32,
+                FileFormatErrorReason::PageDataFinalPaddingNonzero,
+            )),
+        )?;
+
+        let checksum_path = directory.path().join("checksum.bin");
+        create_v3_with_allocated_epoch::<10>(&checksum_path, persistent_id(373)?)?;
+        append_bytes(&checksum_path, &owned_header)?;
+        append_bytes(&checksum_path, &owner)?;
+        let mut corrupted_data = first_data;
+        corrupted_data[FRAME_CHECKSUM_OFFSET] ^= 0xff;
+        let expected_checksum = checksum_v1(&corrupted_data[..FRAME_CHECKSUM_OFFSET]);
+        let actual_checksum = read_u64(&corrupted_data, FRAME_CHECKSUM_OFFSET);
+        append_bytes(&checksum_path, &corrupted_data)?;
+        assert_v3_open_error_without_truncation::<10>(
+            &checksum_path,
+            FileOpenError::Format(FileFormatError::new(
+                wal_frame_offset(3)? + FRAME_CHECKSUM_OFFSET_U64,
+                FileFormatErrorReason::FrameChecksum {
+                    expected: expected_checksum,
+                    actual: actual_checksum,
+                },
+            )),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn v3_version_and_lock_checks_precede_scan_or_repair() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-version-boundary")?;
+        let v3_path = directory.path().join("v3.bin");
+        let v3 =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&v3_path, persistent_id(379)?)?;
+        append_bytes(&v3_path, &[1, 2, 3])?;
+        let v3_len = fs::metadata(&v3_path)?.len();
+
+        let locked = FileCommitLog::<2>::open_transaction_page_capable(&v3_path)
+            .err()
+            .ok_or_else(|| io::Error::other("second v3 writer acquired the lock"))?;
+        let FileOpenError::Io(locked) = locked else {
+            return Err(io::Error::other("v3 lock contention was not I/O").into());
+        };
+        assert_eq!(locked.stage(), FileIoStage::AcquireExclusiveLock);
+        assert_eq!(locked.io_source().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::metadata(&v3_path)?.len(), v3_len);
+        drop(v3);
+
+        assert_eq!(
+            FileCommitLog::<2>::open_page_capable(&v3_path).err(),
+            Some(FileOpenError::Format(FileFormatError::new(
+                8,
+                FileFormatErrorReason::HeaderVersion { actual: 3 },
+            )))
+        );
+        assert_eq!(
+            FileCommitLog::<0>::open(&v3_path).err(),
+            Some(FileOpenError::Format(FileFormatError::new(
+                8,
+                FileFormatErrorReason::HeaderVersion { actual: 3 },
+            )))
+        );
+        assert_eq!(
+            FileCommitLog::<3>::open_transaction_page_capable(&v3_path).err(),
+            Some(FileOpenError::Format(FileFormatError::new(
+                HEADER_V2_PAGE_WIDTH_OFFSET as u64,
+                FileFormatErrorReason::HeaderPageWidthMismatch {
+                    expected: 3,
+                    actual: 2,
+                },
+            )))
+        );
+        assert_eq!(fs::metadata(&v3_path)?.len(), v3_len);
+        let repaired = FileCommitLog::<2>::open_transaction_page_capable(&v3_path)?;
+        assert_eq!(fs::metadata(&v3_path)?.len(), HEADER_LENGTH_U64);
+        drop(repaired);
+
+        let v2_path = directory.path().join("v2.bin");
+        let v2 = FileCommitLog::<2>::create_new_page_capable(&v2_path, persistent_id(383)?)?;
+        drop(v2);
+        append_bytes(&v2_path, &[4, 5, 6])?;
+        let v2_len = fs::metadata(&v2_path)?.len();
+        assert_eq!(
+            FileCommitLog::<2>::open_transaction_page_capable(&v2_path).err(),
+            Some(FileOpenError::Format(FileFormatError::new(
+                8,
+                FileFormatErrorReason::HeaderVersion { actual: 2 },
+            )))
+        );
+        assert_eq!(fs::metadata(&v2_path)?.len(), v2_len);
+        let repaired_v2 = FileCommitLog::<2>::open_page_capable(&v2_path)?;
+        assert_eq!(fs::metadata(&v2_path)?.len(), HEADER_LENGTH_U64);
+        drop(repaired_v2);
+        assert_eq!(
+            FileCommitLog::<0>::create_new_transaction_page_capable(
+                directory.path().join("zero-v3.bin"),
+                persistent_id(387)?,
+            )
+            .err(),
+            Some(FileCreateError::PageWidth(FilePageWidthError::Zero))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_after_flush_commit_resolution_can_store_the_owned_page() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-after-flush-resolution")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let persistent_id = persistent_id(389)?;
+        let mut log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, persistent_id)?;
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let active = coordinator.begin()?;
+        let owner = active.transaction_id();
+        let page = unlogged_page(log.lineage(), 11, 3, [2_u8, 4])?;
+        let (active, dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+        log.arm_fault(FaultPoint::AfterFlush)?;
+
+        let error = coordinator
+            .commit(active, &mut log)
+            .err()
+            .ok_or_else(|| io::Error::other("v3 after-flush commit succeeded"))?;
+        let CoordinatedCommitError::Indeterminate(error) = error else {
+            return Err(io::Error::other("v3 after-flush commit was rejected").into());
+        };
+        let (indeterminate, cause) = error.into_parts();
+        let CommitError::Flush { position, source } = cause else {
+            return Err(io::Error::other("v3 after-flush returned a non-flush error").into());
+        };
+        assert_eq!(position.get(), 2);
+        assert_eq!(
+            source,
+            FileCommitLogError::InjectedFault(FaultPoint::AfterFlush)
+        );
+        assert_eq!(log.durable_records().len(), 2);
+
+        let resolution = coordinator.resolve(indeterminate, &mut log)?;
+        let TransactionCommitResolution::Committed(committed) = resolution else {
+            return Err(io::Error::other("durable v3 commit resolved as absent").into());
+        };
+        assert_eq!(committed.transaction_id(), owner);
+        let clean = flush_committed_page(&committed, &mut log, &mut store, dirty)?;
+        assert_eq!(clean.transaction_id(), owner);
+        assert_eq!(
+            store
+                .page(page_number(11)?)
+                .ok_or_else(|| io::Error::other("resolved v3 page was not stored"))?
+                .bytes(),
+            &[2, 4]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v3_committed_page_store_faults_preserve_terminal_physical_effects()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("v3-store-faults")?;
+
+        let before_log_path = directory.path().join("before-log.bin");
+        let before_store_path = directory.path().join("before-pages.bin");
+        let before_id = persistent_id(397)?;
+        let mut before_log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&before_log_path, before_id)?;
+        let mut before_store = FilePageStore::<2>::create_new(&before_store_path, before_id)?;
+        let mut before_coordinator = TransactionCoordinator::open(&mut before_log)?;
+        let before_active = before_coordinator.begin()?;
+        let before_owner = before_active.transaction_id();
+        let before_page = unlogged_page(before_log.lineage(), 12, 4, [1_u8, 3])?;
+        let (before_active, before_dirty) =
+            before_coordinator.stage_page_write(before_active, before_page, &mut before_log)?;
+        let before_committed = before_coordinator.commit(before_active, &mut before_log)?;
+        before_store.arm_fault(PageStoreFaultPoint::BeforeWrite)?;
+        let before_error = flush_committed_page(
+            &before_committed,
+            &mut before_log,
+            &mut before_store,
+            before_dirty,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("v3 before-write store fault succeeded"))?;
+        let TransactionCommittedFlushError::StoreWrite(before_error) = before_error else {
+            return Err(io::Error::other("v3 before-write returned wrong error shape").into());
+        };
+        assert_eq!(before_error.transaction_id(), before_owner);
+        assert_eq!(
+            before_error.cause(),
+            &FilePageStoreError::InjectedFault(PageStoreFaultPoint::BeforeWrite)
+        );
+        assert!(before_store.pages().is_empty());
+
+        let after_log_path = directory.path().join("after-log.bin");
+        let after_store_path = directory.path().join("after-pages.bin");
+        let after_id = persistent_id(401)?;
+        let mut after_log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&after_log_path, after_id)?;
+        let mut after_store = FilePageStore::<2>::create_new(&after_store_path, after_id)?;
+        let mut after_coordinator = TransactionCoordinator::open(&mut after_log)?;
+        let after_active = after_coordinator.begin()?;
+        let after_owner = after_active.transaction_id();
+        let after_page = unlogged_page(after_log.lineage(), 13, 5, [2_u8, 8])?;
+        let (after_active, after_dirty) =
+            after_coordinator.stage_page_write(after_active, after_page, &mut after_log)?;
+        let after_committed = after_coordinator.commit(after_active, &mut after_log)?;
+        after_store.arm_fault(PageStoreFaultPoint::AfterWrite)?;
+        let after_error = flush_committed_page(
+            &after_committed,
+            &mut after_log,
+            &mut after_store,
+            after_dirty,
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("v3 after-write store fault succeeded"))?;
+        let TransactionCommittedFlushError::StoreWrite(after_error) = after_error else {
+            return Err(io::Error::other("v3 after-write returned wrong error shape").into());
+        };
+        assert_eq!(after_error.transaction_id(), after_owner);
+        assert_eq!(
+            after_error.cause(),
+            &FilePageStoreError::InjectedFault(PageStoreFaultPoint::AfterWrite)
+        );
+        assert_eq!(
+            after_store
+                .page(page_number(13)?)
+                .ok_or_else(|| io::Error::other("v3 after-write lost the page"))?
+                .bytes(),
+            &[2, 8]
+        );
+        Ok(())
+    }
+
+    fn create_v3_with_allocated_epoch<const N: usize>(
+        path: &Path,
+        persistent_id: PersistentLogId,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut log = FileCommitLog::<N>::create_new_transaction_page_capable(path, persistent_id)?;
+        let coordinator = TransactionCoordinator::open(&mut log)?;
+        drop(coordinator);
+        drop(log);
+        Ok(())
+    }
+
+    fn assert_v3_open_error_without_truncation<const N: usize>(
+        path: &Path,
+        expected: FileOpenError,
+    ) -> Result<(), Box<dyn Error>> {
+        let len_before = fs::metadata(path)?.len();
+        let actual = FileCommitLog::<N>::open_transaction_page_capable(path)
+            .err()
+            .ok_or_else(|| io::Error::other("corrupted v3 file unexpectedly opened"))?;
+        assert_eq!(actual, expected);
+        assert_eq!(fs::metadata(path)?.len(), len_before);
+        Ok(())
+    }
+
+    fn wal_frame(bytes: &[u8], index: usize) -> Result<[u8; FRAME_LENGTH], io::Error> {
+        let start = HEADER_LENGTH
+            .checked_add(
+                index
+                    .checked_mul(FRAME_LENGTH)
+                    .ok_or_else(|| io::Error::other("frame index overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("frame offset overflow"))?;
+        let end = start
+            .checked_add(FRAME_LENGTH)
+            .ok_or_else(|| io::Error::other("frame end overflow"))?;
+        let source = bytes
+            .get(start..end)
+            .ok_or_else(|| io::Error::other("frame is outside the file bytes"))?;
+        let mut frame = [0_u8; FRAME_LENGTH];
+        frame.copy_from_slice(source);
+        Ok(frame)
+    }
+
+    fn wal_frame_offset(index: usize) -> Result<u64, io::Error> {
+        let index =
+            u64::try_from(index).map_err(|_| io::Error::other("frame index does not fit u64"))?;
+        HEADER_LENGTH_U64
+            .checked_add(
+                index
+                    .checked_mul(FRAME_LENGTH_U64)
+                    .ok_or_else(|| io::Error::other("frame offset overflow"))?,
+            )
+            .ok_or_else(|| io::Error::other("frame offset overflow"))
     }
 
     fn page_number(value: u64) -> Result<PageNumber, io::Error> {

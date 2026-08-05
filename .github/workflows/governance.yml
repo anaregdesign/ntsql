@@ -59,6 +59,16 @@ jobs:
       - name: Check first-party dependency boundaries
         run: cargo run --locked -p ntsql-architecture-check
 
+      - name: Check offline provenance
+        run: >-
+          cargo run --locked -p ntsql-contract --bin ntsql-governance --
+          provenance-offline
+
+      - name: Revalidate remote supply-chain archives
+        run: >-
+          cargo run --locked -p ntsql-contract --bin ntsql-governance --
+          provenance-online
+
       - name: Install governance tools
         run: |
           cargo install cargo-deny --version 0.20.2 --locked

@@ -15,6 +15,8 @@ rustup run 1.88.0 cargo test --workspace --all-features --locked
 rustup run 1.88.0 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 rustup run 1.88.0 cargo run --locked -p ntsql-architecture-check
 rustup run 1.88.0 cargo run --locked -p ntsql-contract --bin ntsql-governance -- fixtures
+rustup run 1.88.0 cargo run --locked -p ntsql-contract --bin ntsql-governance -- provenance-offline
+rustup run 1.88.0 cargo run --locked -p ntsql-contract --bin ntsql-governance -- provenance-online
 git diff --check
 ```
 

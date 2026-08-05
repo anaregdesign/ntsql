@@ -50,6 +50,8 @@ ntsql-contract --------> ntsql-compatibility
       |                           |
       +--> serde, serde_json      +--> standard library only
 
+ntsql-testkit ----------> ntsql-contract
+
 ntsql-architecture-check -------> standard library only
 ```
 
@@ -57,6 +59,13 @@ Dependencies point toward policy. Domain crates must not depend on contract,
 serialization, filesystem, network, oracle, protocol-host, or persistence
 adapters. An outer adapter may depend on a domain port; the domain must never
 depend on that adapter.
+
+`ntsql-testkit` owns only deterministic orchestration for synthetic conformance
+cases. It accepts two in-memory observation sources and input-digest
+verification through injected ports, requires a plan for all seven dimensions,
+and returns only locally validated `ConformanceRecord` values. It does not own a
+real product oracle, cryptographic implementation, filesystem or network
+access, an ambient clock, or external fixtures.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and
@@ -86,6 +95,8 @@ catch-all package solely to avoid an explicit dependency.
   and verify policy without JSON or I/O.
 - `ntsql-contract` integration tests verify full validation, exact mapping, and
   target selection at the adapter boundary.
+- `ntsql-testkit` tests use repository-authored in-memory sources and explicit
+  timestamps, input identities, and normalization plans.
 - External conformance tests may enter later only through approved, sanitized,
   provenance-linked behavior specifications.
 - The architecture checker runs in local verification and CI before engine

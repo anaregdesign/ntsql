@@ -26,6 +26,10 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
         package: "ntsql-contract",
         allowed_dependencies: &["ntsql-compatibility", "serde", "serde_json"],
     },
+    PackagePolicy {
+        package: "ntsql-testkit",
+        allowed_dependencies: &["ntsql-contract"],
+    },
 ];
 
 const CARGO_TREE_ARGS: &[&str] = &[
@@ -242,7 +246,9 @@ mod tests {
              0ntsql-contract v0.1.0\n\
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
-             1serde_json v1.0.0\n",
+             1serde_json v1.0.0\n\
+             0ntsql-testkit v0.1.0\n\
+             1ntsql-contract v0.1.0\n",
         )?;
 
         assert!(validate_graph(&graph, PACKAGE_POLICIES).is_empty());
@@ -267,7 +273,9 @@ mod tests {
              0ntsql-contract v0.1.0\n\
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
-             1serde_json v1.0.0\n",
+             1serde_json v1.0.0\n\
+             0ntsql-testkit v0.1.0\n\
+             1ntsql-contract v0.1.0\n",
         )?;
 
         let violations = validate_graph(&graph, PACKAGE_POLICIES);
@@ -303,6 +311,8 @@ mod tests {
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
              1serde_json v1.0.0\n\
+             0ntsql-testkit v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
              0ntsql-unreviewed v0.1.0\n",
         )?;
 
@@ -310,6 +320,31 @@ mod tests {
 
         assert!(violations.iter().any(|violation| violation
             == "workspace package ntsql-unreviewed has no reviewed dependency policy"));
+        Ok(())
+    }
+
+    #[test]
+    fn testkit_adapter_dependencies_are_enforced() -> Result<(), ArchitectureCheckError> {
+        let graph = parse_dependency_tree(
+            "0ntsql-architecture-check v0.1.0\n\
+             0ntsql-compatibility v0.1.0\n\
+             0ntsql-diagnostics v0.1.0\n\
+             0ntsql-contract v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
+             1serde v1.0.0\n\
+             1serde_json v1.0.0\n\
+             0ntsql-testkit v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             1ntsql-server v0.1.0\n\
+             1serde_json v1.0.0\n",
+        )?;
+
+        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-testkit has forbidden direct dependency ntsql-server"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-testkit has forbidden direct dependency serde_json"));
         Ok(())
     }
 }

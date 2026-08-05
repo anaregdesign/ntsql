@@ -1,0 +1,14 @@
+[package]
+name = "ntsql-testkit"
+version = "0.1.0"
+description = "Oracle-free synthetic conformance orchestration for ntsql"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ntsql-contract.workspace = true
+
+[lints]
+workspace = true

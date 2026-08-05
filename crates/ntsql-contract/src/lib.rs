@@ -6,6 +6,9 @@ use ntsql_compatibility::{CompatibilityContext, CompatibilityProfile, Observatio
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+/// Lossless JSON value used by conformance evidence.
+pub use serde_json::Value as JsonValue;
+
 fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
@@ -2897,7 +2900,12 @@ fn raw_evidence_is_identity(raw: &RawEvidence, normalized: &Value) -> bool {
     )
 }
 
-fn json_values_are_identical(left: &Value, right: &Value) -> bool {
+/// Compares conformance JSON values without numeric coercion.
+///
+/// Numeric lexical representations remain significant so integer and float
+/// kinds, arbitrary-width integers, and signed zero cannot collapse.
+#[must_use]
+pub fn json_values_are_identical(left: &JsonValue, right: &JsonValue) -> bool {
     match (left, right) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(left), Value::Bool(right)) => left == right,

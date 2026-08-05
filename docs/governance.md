@@ -315,6 +315,27 @@ must pass. New or changed dependencies require:
 6. a regenerated and validated CycloneDX 1.5 SBOM
 7. required license text and attribution updates
 
+The reproducible `provenance-offline` check re-hashes every provenance record
+that names a repository `artifact_path`, rejecting traversal, symlinks, missing
+or non-regular files, and digest mismatches. The same check uses locked, offline
+Cargo metadata to derive every workspace member's direct registry dependencies,
+requires one exact crates.io package and checksum in `Cargo.lock`, and
+reconciles that checksum with one immutable static.crates.io archive URL and
+provenance record. Missing, duplicate, unknown, and unsupported-source direct
+dependencies fail the check.
+
+The explicitly networked `provenance-online` check derives its complete archive
+inventory from the governance workflow. Governance tools must use an exact
+crate version with `--locked`, and third-party Actions must use a lowercase
+40-character commit SHA. Their provenance records must use the corresponding
+immutable static.crates.io or codeload.github.com URL. The verifier requires
+HTTPS, rejects all redirects and unexpected effective URLs, downloads only to a
+unique system temporary directory outside the checkout, re-hashes the returned
+bytes, and removes the directory before returning. Missing tools or records,
+unknown records, HTTP or network failures, absent bytes, cleanup failures, and
+digest mismatches fail closed. Downloaded archives are never retained as
+repository evidence.
+
 CI tools are installed at exact versions with their own lockfiles. Third-party
 actions are pinned to full commit SHAs. The workflow validates that the SBOM is
 nonempty, identifies the pinned generator, and gives every component a name,

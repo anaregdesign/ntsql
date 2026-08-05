@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -5,19 +6,82 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ntsql_contract::{
     FixtureArtifact, LegalDecisionAuthority, LegalDecisionVerificationContext, LegalReviewLedger,
-    ProvenanceLedger,
+    ProvenanceLedger, ProvenanceSourceKind, ProvenanceUse,
 };
 use serde_json::Value;
 
 const CARGO_CYCLONEDX_VERSION: &str = "0.5.9";
+const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 struct AuthorityInput {
     path: PathBuf,
     candidate_repository: String,
     candidate_commit_sha: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RemoteArchiveKind {
+    GovernanceTool,
+    GitHubAction,
+}
+
+impl RemoteArchiveKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::GovernanceTool => "governance tool",
+            Self::GitHubAction => "GitHub Action",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExpectedRemoteArchive {
+    kind: RemoteArchiveKind,
+    description: String,
+    source_url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RemoteArchive {
+    kind: RemoteArchiveKind,
+    record_id: String,
+    source_url: String,
+    content_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LockedPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+    checksum: Option<String>,
+}
+
+#[derive(Default)]
+struct LockedPackageBuilder {
+    name: Option<String>,
+    version: Option<String>,
+    source: Option<String>,
+    checksum: Option<String>,
+}
+
+impl LockedPackageBuilder {
+    fn finish(self) -> Result<LockedPackage, Box<dyn Error>> {
+        Ok(LockedPackage {
+            name: self
+                .name
+                .ok_or_else(|| invalid_data("Cargo.lock package is missing its name"))?,
+            version: self
+                .version
+                .ok_or_else(|| invalid_data("Cargo.lock package is missing its version"))?,
+            source: self.source,
+            checksum: self.checksum,
+        })
+    }
 }
 
 fn main() -> ExitCode {
@@ -34,7 +98,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().ok_or_else(|| {
         invalid_data(
-            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, or `sbom <path>`",
+            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
         )
     })?;
 
@@ -79,6 +143,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &candidate_commit_sha,
             )
         }
+        "provenance-offline" => {
+            ensure_no_more_arguments(arguments)?;
+            validate_offline_provenance()
+        }
+        "provenance-online" => {
+            ensure_no_more_arguments(arguments)?;
+            validate_online_provenance()
+        }
         "sbom" => {
             let path = arguments
                 .next()
@@ -87,7 +159,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             validate_sbom(Path::new(&path))
         }
         _ => Err(invalid_data(
-            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, or `sbom <path>`",
+            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
         )),
     }
 }
@@ -186,6 +258,771 @@ fn validate_legal_reviews(
 
     println!("authenticated legal-review governance ok");
     Ok(())
+}
+
+fn validate_offline_provenance() -> Result<(), Box<dyn Error>> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let provenance: ProvenanceLedger =
+        read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
+    let repository_artifacts = verify_repository_artifacts(&workspace_root, &provenance)?;
+    let direct_dependencies = verify_direct_dependency_provenance(&workspace_root, &provenance)?;
+
+    println!(
+        "offline provenance ok ({repository_artifacts} repository artifacts, {direct_dependencies} direct dependencies)"
+    );
+    Ok(())
+}
+
+fn verify_repository_artifacts(
+    workspace_root: &Path,
+    provenance: &ProvenanceLedger,
+) -> Result<usize, Box<dyn Error>> {
+    let mut verified = 0;
+    for record in &provenance.records {
+        let Some(artifact_path) = record.artifact_path.as_deref() else {
+            continue;
+        };
+        verify_repository_artifact(workspace_root, artifact_path, &record.content_digest)
+            .map_err(|error| invalid_data(format!("provenance {}: {error}", record.id)))?;
+        verified += 1;
+    }
+    Ok(verified)
+}
+
+fn verify_repository_artifact(
+    workspace_root: &Path,
+    artifact_path: &str,
+    expected_digest: &str,
+) -> Result<(), Box<dyn Error>> {
+    let resolved_path = resolve_repository_artifact(workspace_root, artifact_path)?;
+    let actual_digest = sha256_digest(&resolved_path)?;
+    if !actual_digest.eq_ignore_ascii_case(expected_digest) {
+        return Err(invalid_data(format!(
+            "repository artifact {artifact_path} digest mismatch: expected {expected_digest}, found {actual_digest}"
+        )));
+    }
+    Ok(())
+}
+
+fn resolve_repository_artifact(
+    workspace_root: &Path,
+    artifact_path: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let relative_path = Path::new(artifact_path);
+    if artifact_path.is_empty()
+        || artifact_path.contains('\\')
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid_data(format!(
+            "repository artifact path must contain only relative normal components: {artifact_path}"
+        )));
+    }
+
+    let workspace_root = workspace_root.canonicalize()?;
+    let mut resolved_path = workspace_root.clone();
+    for component in relative_path.components() {
+        let Component::Normal(name) = component else {
+            return Err(invalid_data(
+                "repository artifact path changed during validation",
+            ));
+        };
+        resolved_path.push(name);
+        let metadata = fs::symlink_metadata(&resolved_path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "repository artifact {artifact_path} cannot be inspected at {}: {error}",
+                    resolved_path.display()
+                ),
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(invalid_data(format!(
+                "repository artifact path must not contain symlinks: {artifact_path}"
+            )));
+        }
+    }
+
+    let metadata = fs::metadata(&resolved_path)?;
+    if !metadata.is_file() {
+        return Err(invalid_data(format!(
+            "repository artifact must be a regular file: {artifact_path}"
+        )));
+    }
+    let resolved_path = resolved_path.canonicalize()?;
+    if !resolved_path.starts_with(&workspace_root) {
+        return Err(invalid_data(format!(
+            "repository artifact resolves outside the workspace: {artifact_path}"
+        )));
+    }
+    Ok(resolved_path)
+}
+
+fn verify_direct_dependency_provenance(
+    workspace_root: &Path,
+    provenance: &ProvenanceLedger,
+) -> Result<usize, Box<dyn Error>> {
+    let metadata = read_cargo_metadata(workspace_root)?;
+    let lockfile = fs::read_to_string(workspace_root.join("Cargo.lock"))?;
+    verify_direct_dependency_records(&metadata, &lockfile, provenance)
+}
+
+fn verify_direct_dependency_records(
+    cargo_metadata: &Value,
+    lockfile: &str,
+    provenance: &ProvenanceLedger,
+) -> Result<usize, Box<dyn Error>> {
+    let direct_dependencies = direct_registry_dependencies(cargo_metadata)?;
+    let locked_packages = parse_locked_packages(lockfile)?;
+    let provenance_records = provenance
+        .records
+        .iter()
+        .filter(|record| {
+            record
+                .intended_uses
+                .contains(&ProvenanceUse::DependencyInclusion)
+        })
+        .collect::<Vec<_>>();
+    let mut matched_record_ids = BTreeSet::new();
+
+    for dependency in &direct_dependencies {
+        let matching_packages = locked_packages
+            .iter()
+            .filter(|package| {
+                package.name == *dependency
+                    && package.source.as_deref() == Some(CRATES_IO_REGISTRY_SOURCE)
+            })
+            .collect::<Vec<_>>();
+        let package = match matching_packages.as_slice() {
+            [package] => *package,
+            [] => {
+                return Err(invalid_data(format!(
+                    "direct dependency {dependency} has no exact crates.io package in Cargo.lock"
+                )));
+            }
+            _ => {
+                return Err(invalid_data(format!(
+                    "direct dependency {dependency} resolves to multiple crates.io packages in Cargo.lock"
+                )));
+            }
+        };
+        let checksum = package.checksum.as_deref().ok_or_else(|| {
+            invalid_data(format!(
+                "direct dependency {dependency} has no Cargo.lock checksum"
+            ))
+        })?;
+        if !is_sha256_hex(checksum) {
+            return Err(invalid_data(format!(
+                "direct dependency {dependency} has an invalid Cargo.lock checksum"
+            )));
+        }
+
+        let expected_url = crates_io_archive_url(&package.name, &package.version)?;
+        let matching_records = provenance_records
+            .iter()
+            .copied()
+            .filter(|record| record.source_url.as_deref() == Some(expected_url.as_str()))
+            .collect::<Vec<_>>();
+        let record = match matching_records.as_slice() {
+            [record] => *record,
+            [] => {
+                return Err(invalid_data(format!(
+                    "direct dependency {} {} has no provenance record for {expected_url}",
+                    package.name, package.version
+                )));
+            }
+            _ => {
+                return Err(invalid_data(format!(
+                    "direct dependency {} {} has multiple provenance records",
+                    package.name, package.version
+                )));
+            }
+        };
+
+        if record.source_kind != ProvenanceSourceKind::Dependency {
+            return Err(invalid_data(format!(
+                "direct dependency provenance {} must use the dependency source kind",
+                record.id
+            )));
+        }
+        let expected_digest = format!("sha256:{checksum}");
+        if !record.content_digest.eq_ignore_ascii_case(&expected_digest) {
+            return Err(invalid_data(format!(
+                "direct dependency provenance {} does not match the Cargo.lock checksum for {} {}",
+                record.id, package.name, package.version
+            )));
+        }
+        if !matched_record_ids.insert(record.id.as_str()) {
+            return Err(invalid_data(format!(
+                "direct dependency provenance {} was matched more than once",
+                record.id
+            )));
+        }
+    }
+
+    if let Some(record) = provenance_records
+        .iter()
+        .find(|record| !matched_record_ids.contains(record.id.as_str()))
+    {
+        return Err(invalid_data(format!(
+            "unknown direct dependency provenance record: {}",
+            record.id
+        )));
+    }
+
+    Ok(direct_dependencies.len())
+}
+
+fn read_cargo_metadata(workspace_root: &Path) -> Result<Value, Box<dyn Error>> {
+    let cargo_program = option_env!("CARGO")
+        .ok_or_else(|| invalid_data("the Cargo executable path is unavailable"))?;
+    let output = Command::new(cargo_program)
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--locked",
+            "--offline",
+            "--manifest-path",
+        ])
+        .arg(workspace_root.join("Cargo.toml"))
+        .output()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                invalid_data(format!(
+                    "required Cargo metadata tool is unavailable: {cargo_program}"
+                ))
+            } else {
+                Box::new(error) as Box<dyn Error>
+            }
+        })?;
+    if !output.status.success() {
+        return Err(invalid_data(format!(
+            "cargo metadata failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+fn direct_registry_dependencies(metadata: &Value) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let workspace_members = metadata
+        .get("workspace_members")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_data("cargo metadata requires workspace_members"))?
+        .iter()
+        .map(|member| {
+            member
+                .as_str()
+                .ok_or_else(|| invalid_data("cargo metadata workspace member must be a string"))
+        })
+        .collect::<Result<BTreeSet<_>, Box<dyn Error>>>()?;
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_data("cargo metadata requires packages"))?;
+    let mut dependencies = BTreeSet::new();
+
+    for package in packages {
+        let package_id = package
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid_data("cargo metadata package requires an id"))?;
+        if !workspace_members.contains(package_id) {
+            continue;
+        }
+        let package_dependencies = package
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "cargo metadata workspace package {package_id} requires dependencies"
+                ))
+            })?;
+        for dependency in package_dependencies {
+            let source = dependency
+                .get("source")
+                .ok_or_else(|| invalid_data("cargo metadata dependency requires source"))?;
+            match source {
+                Value::Null => {}
+                Value::String(source) if source == CRATES_IO_REGISTRY_SOURCE => {
+                    let name = dependency
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            invalid_data("cargo metadata registry dependency requires a name")
+                        })?;
+                    validate_crate_name(name)?;
+                    dependencies.insert(name.to_owned());
+                }
+                Value::String(source) => {
+                    return Err(invalid_data(format!(
+                        "direct dependency uses unsupported external source: {source}"
+                    )));
+                }
+                _ => {
+                    return Err(invalid_data(
+                        "cargo metadata dependency source must be a string or null",
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(dependencies)
+}
+
+fn parse_toml_string(value: &str, description: &str) -> Result<String, Box<dyn Error>> {
+    let literal = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .ok_or_else(|| invalid_data(format!("{description} must be a literal string")))?;
+    if literal.is_empty() || literal.contains('\\') {
+        return Err(invalid_data(format!(
+            "{description} must be a non-empty literal string"
+        )));
+    }
+    Ok(literal.to_owned())
+}
+
+fn parse_locked_packages(lockfile: &str) -> Result<Vec<LockedPackage>, Box<dyn Error>> {
+    let mut packages = Vec::new();
+    let mut current: Option<LockedPackageBuilder> = None;
+
+    for line in lockfile.lines().map(str::trim) {
+        if line == "[[package]]" {
+            if let Some(builder) = current.take() {
+                packages.push(builder.finish()?);
+            }
+            current = Some(LockedPackageBuilder::default());
+            continue;
+        }
+        let Some(builder) = current.as_mut() else {
+            continue;
+        };
+        if let Some(value) = lockfile_string_field(line, "name")? {
+            builder.name = Some(value);
+        } else if let Some(value) = lockfile_string_field(line, "version")? {
+            builder.version = Some(value);
+        } else if let Some(value) = lockfile_string_field(line, "source")? {
+            builder.source = Some(value);
+        } else if let Some(value) = lockfile_string_field(line, "checksum")? {
+            builder.checksum = Some(value);
+        }
+    }
+    if let Some(builder) = current {
+        packages.push(builder.finish()?);
+    }
+    if packages.is_empty() {
+        return Err(invalid_data("Cargo.lock contains no package records"));
+    }
+    Ok(packages)
+}
+
+fn lockfile_string_field(line: &str, field: &str) -> Result<Option<String>, Box<dyn Error>> {
+    let prefix = format!("{field} = ");
+    let Some(value) = line.strip_prefix(&prefix) else {
+        return Ok(None);
+    };
+    Ok(Some(parse_toml_string(
+        value,
+        &format!("Cargo.lock {field}"),
+    )?))
+}
+
+fn crates_io_archive_url(name: &str, version: &str) -> Result<String, Box<dyn Error>> {
+    validate_crate_name(name)?;
+    if version.is_empty()
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+    {
+        return Err(invalid_data(format!(
+            "crate {name} has an invalid locked version: {version}"
+        )));
+    }
+    Ok(format!(
+        "https://static.crates.io/crates/{name}/{name}-{version}.crate"
+    ))
+}
+
+fn validate_crate_name(name: &str) -> Result<(), Box<dyn Error>> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(invalid_data(format!("invalid crate package name: {name}")));
+    }
+    Ok(())
+}
+
+fn validate_online_provenance() -> Result<(), Box<dyn Error>> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let provenance: ProvenanceLedger =
+        read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
+    let workflow = fs::read_to_string(workspace_root.join(".github/workflows/governance.yml"))?;
+    let archives = resolve_remote_archive_records(&workflow, &provenance)?;
+
+    verify_remote_archives(OsStr::new("curl"), &archives)?;
+    println!("online provenance ok ({} remote archives)", archives.len());
+    Ok(())
+}
+
+fn resolve_remote_archive_records(
+    workflow: &str,
+    provenance: &ProvenanceLedger,
+) -> Result<Vec<RemoteArchive>, Box<dyn Error>> {
+    let expected_archives = discover_workflow_archives(workflow)?;
+    let provenance_records = provenance
+        .records
+        .iter()
+        .filter(|record| {
+            record
+                .intended_uses
+                .contains(&ProvenanceUse::SupplyChainVerification)
+        })
+        .collect::<Vec<_>>();
+    let mut matched_record_ids = BTreeSet::new();
+    let mut archives = Vec::new();
+
+    for expected in expected_archives {
+        let matching_records = provenance_records
+            .iter()
+            .copied()
+            .filter(|record| record.source_url.as_deref() == Some(expected.source_url.as_str()))
+            .collect::<Vec<_>>();
+        let record = match matching_records.as_slice() {
+            [record] => *record,
+            [] => {
+                return Err(invalid_data(format!(
+                    "{} {} has no provenance record for {}",
+                    expected.kind.description(),
+                    expected.description,
+                    expected.source_url
+                )));
+            }
+            _ => {
+                return Err(invalid_data(format!(
+                    "{} {} has multiple provenance records",
+                    expected.kind.description(),
+                    expected.description
+                )));
+            }
+        };
+        if record.source_kind != ProvenanceSourceKind::Dependency {
+            return Err(invalid_data(format!(
+                "remote archive provenance {} must use the dependency source kind",
+                record.id
+            )));
+        }
+        if !is_prefixed_sha256(&record.content_digest) {
+            return Err(invalid_data(format!(
+                "remote archive provenance {} has an invalid SHA-256 digest",
+                record.id
+            )));
+        }
+        if !matched_record_ids.insert(record.id.as_str()) {
+            return Err(invalid_data(format!(
+                "remote archive provenance {} was matched more than once",
+                record.id
+            )));
+        }
+        archives.push(RemoteArchive {
+            kind: expected.kind,
+            record_id: record.id.clone(),
+            source_url: expected.source_url,
+            content_digest: record.content_digest.clone(),
+        });
+    }
+
+    if let Some(record) = provenance_records
+        .iter()
+        .find(|record| !matched_record_ids.contains(record.id.as_str()))
+    {
+        return Err(invalid_data(format!(
+            "unknown supply-chain provenance record: {}",
+            record.id
+        )));
+    }
+
+    Ok(archives)
+}
+
+fn discover_workflow_archives(
+    workflow: &str,
+) -> Result<Vec<ExpectedRemoteArchive>, Box<dyn Error>> {
+    let mut archives = Vec::new();
+    let mut action_count = 0;
+    let mut tool_count = 0;
+
+    for (line_index, source_line) in workflow.lines().enumerate() {
+        let line = source_line.trim();
+        let line = match line.strip_prefix("- ") {
+            Some(value) => value,
+            None => line,
+        };
+        if let Some(reference) = line.strip_prefix("uses:") {
+            archives.push(github_action_archive(reference.trim()).map_err(|error| {
+                invalid_data(format!(
+                    "governance workflow line {}: {error}",
+                    line_index + 1
+                ))
+            })?);
+            action_count += 1;
+            continue;
+        }
+        let command_line = match line.strip_prefix("run:") {
+            Some(value) => value.trim(),
+            None => line,
+        };
+        if let Some(command) = command_line.strip_prefix("cargo install ") {
+            archives.push(governance_tool_archive(command).map_err(|error| {
+                invalid_data(format!(
+                    "governance workflow line {}: {error}",
+                    line_index + 1
+                ))
+            })?);
+            tool_count += 1;
+        }
+    }
+
+    if action_count == 0 || tool_count == 0 {
+        return Err(invalid_data(
+            "governance workflow must contain pinned third-party Actions and governance tools",
+        ));
+    }
+    let mut urls = BTreeSet::new();
+    for archive in &archives {
+        if !urls.insert(archive.source_url.as_str()) {
+            return Err(invalid_data(format!(
+                "governance workflow repeats remote archive {}",
+                archive.source_url
+            )));
+        }
+    }
+    Ok(archives)
+}
+
+fn github_action_archive(reference: &str) -> Result<ExpectedRemoteArchive, Box<dyn Error>> {
+    let (repository, revision) = reference
+        .split_once('@')
+        .filter(|(_, revision)| !revision.contains('@'))
+        .ok_or_else(|| invalid_data("GitHub Action must use owner/repository@commit syntax"))?;
+    let (owner, name) = repository
+        .split_once('/')
+        .filter(|(_, name)| !name.contains('/'))
+        .ok_or_else(|| invalid_data("GitHub Action must name one owner and repository"))?;
+    validate_github_component(owner)?;
+    validate_github_component(name)?;
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(invalid_data(format!(
+            "GitHub Action {repository} must be pinned to a lowercase 40-character commit SHA"
+        )));
+    }
+
+    Ok(ExpectedRemoteArchive {
+        kind: RemoteArchiveKind::GitHubAction,
+        description: reference.to_owned(),
+        source_url: format!("https://codeload.github.com/{repository}/tar.gz/{revision}"),
+    })
+}
+
+fn validate_github_component(value: &str) -> Result<(), Box<dyn Error>> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_data(format!(
+            "invalid GitHub repository component: {value}"
+        )));
+    }
+    Ok(())
+}
+
+fn governance_tool_archive(command: &str) -> Result<ExpectedRemoteArchive, Box<dyn Error>> {
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let [package, version_flag, version, locked_flag] = tokens.as_slice() else {
+        return Err(invalid_data(
+            "governance tool installation must use `<crate> --version <exact> --locked`",
+        ));
+    };
+    if *version_flag != "--version" || *locked_flag != "--locked" {
+        return Err(invalid_data(
+            "governance tool installation must use `<crate> --version <exact> --locked`",
+        ));
+    }
+    let source_url = crates_io_archive_url(package, version)?;
+    Ok(ExpectedRemoteArchive {
+        kind: RemoteArchiveKind::GovernanceTool,
+        description: format!("{package} {version}"),
+        source_url,
+    })
+}
+
+fn verify_remote_archives(
+    curl_program: &OsStr,
+    archives: &[RemoteArchive],
+) -> Result<(), Box<dyn Error>> {
+    let download_root = create_temporary_directory("ntsql-provenance-downloads")?;
+    let verification = archives
+        .iter()
+        .enumerate()
+        .try_for_each(|(index, archive)| {
+            let output_path = download_root.join(format!("archive-{index}"));
+            download_and_verify_archive(curl_program, archive, &output_path)
+        });
+    let cleanup = fs::remove_dir_all(&download_root);
+
+    if let Err(error) = verification {
+        if let Err(cleanup_error) = cleanup {
+            return Err(invalid_data(format!(
+                "{error}; failed to remove temporary downloads at {}: {cleanup_error}",
+                download_root.display()
+            )));
+        }
+        return Err(error);
+    }
+    cleanup.map_err(|error| {
+        invalid_data(format!(
+            "failed to remove temporary downloads at {}: {error}",
+            download_root.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn download_and_verify_archive(
+    curl_program: &OsStr,
+    archive: &RemoteArchive,
+    output_path: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let output = Command::new(curl_program)
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "120",
+            "--write-out",
+            "%{http_code}\n%{url_effective}",
+            "--output",
+        ])
+        .arg(output_path)
+        .arg("--url")
+        .arg(&archive.source_url)
+        .output()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                invalid_data(format!(
+                    "required download tool {} is unavailable",
+                    Path::new(curl_program).display()
+                ))
+            } else {
+                Box::new(error) as Box<dyn Error>
+            }
+        })?;
+    if !output.status.success() {
+        return Err(invalid_data(format!(
+            "{} provenance {} download failed: {}",
+            archive.kind.description(),
+            archive.record_id,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let response = String::from_utf8(output.stdout)?;
+    let mut lines = response.lines();
+    let status = lines
+        .next()
+        .ok_or_else(|| invalid_data("curl returned no HTTP status"))?;
+    let effective_url = lines
+        .next()
+        .ok_or_else(|| invalid_data("curl returned no effective URL"))?;
+    if lines.next().is_some() {
+        return Err(invalid_data("curl returned unexpected response metadata"));
+    }
+    if status != "200" {
+        let reason = if status.starts_with('3') {
+            "redirects are not permitted"
+        } else {
+            "expected HTTP 200"
+        };
+        return Err(invalid_data(format!(
+            "{} provenance {} returned HTTP {status}; {reason}",
+            archive.kind.description(),
+            archive.record_id
+        )));
+    }
+    if effective_url != archive.source_url {
+        return Err(invalid_data(format!(
+            "{} provenance {} resolved to unexpected origin or URL: {effective_url}",
+            archive.kind.description(),
+            archive.record_id
+        )));
+    }
+    let metadata = fs::symlink_metadata(output_path)?;
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return Err(invalid_data(format!(
+            "{} provenance {} returned no regular archive bytes",
+            archive.kind.description(),
+            archive.record_id
+        )));
+    }
+    let actual_digest = sha256_digest(output_path)?;
+    if !actual_digest.eq_ignore_ascii_case(&archive.content_digest) {
+        return Err(invalid_data(format!(
+            "{} provenance {} digest mismatch: expected {}, found {actual_digest}",
+            archive.kind.description(),
+            archive.record_id,
+            archive.content_digest
+        )));
+    }
+    Ok(())
+}
+
+fn create_temporary_directory(prefix: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    for attempt in 0..100 {
+        let path =
+            env::temp_dir().join(format!("{prefix}-{}-{nonce}-{attempt}", std::process::id()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(Box::new(error)),
+        }
+    }
+    Err(invalid_data(format!(
+        "could not create a unique temporary directory for {prefix}"
+    )))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_prefixed_sha256(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(is_sha256_hex)
 }
 
 fn read_external_authority(
@@ -301,7 +1138,7 @@ fn sha256_digest(path: &Path) -> Result<String, Box<dyn Error>> {
     if let Some(digest) = run_digest_command("shasum", &["-a", "256", "--"], path)? {
         return Ok(digest);
     }
-    Err(invalid_data("fixture hashing requires sha256sum or shasum"))
+    Err(invalid_data("SHA-256 hashing requires sha256sum or shasum"))
 }
 
 fn run_digest_command(
@@ -454,18 +1291,410 @@ fn invalid_data(message: impl Into<String>) -> Box<dyn Error> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::os::unix::fs::symlink;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    use ntsql_contract::ProvenanceRecord;
 
     use super::*;
 
     #[test]
-    fn authority_path_rejects_symlinks_across_checkout_boundary() -> Result<(), Box<dyn Error>> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let test_root = env::temp_dir().join(format!(
-            "ntsql-authority-path-{}-{nonce}",
-            std::process::id()
+    fn repository_artifact_verification_accepts_valid_digest() -> Result<(), Box<dyn Error>> {
+        let test_root = temporary_test_root("valid-repository-artifact")?;
+        let artifact_path = test_root.join("contracts/artifact.json");
+        fs::create_dir_all(
+            artifact_path
+                .parent()
+                .ok_or_else(|| invalid_data("no parent"))?,
+        )?;
+        fs::write(&artifact_path, b"repository-authored artifact")?;
+        let digest = sha256_digest(&artifact_path)?;
+
+        verify_repository_artifact(&test_root, "contracts/artifact.json", &digest)?;
+
+        fs::remove_dir_all(&test_root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn repository_artifact_verification_rejects_unsafe_or_invalid_inputs()
+    -> Result<(), Box<dyn Error>> {
+        let test_root = temporary_test_root("invalid-repository-artifacts")?;
+        let artifact_path = test_root.join("artifact.json");
+        fs::write(&artifact_path, b"repository-authored artifact")?;
+        let link_path = test_root.join("artifact-link.json");
+        symlink(&artifact_path, &link_path)?;
+
+        let missing_error = verification_error(
+            &test_root,
+            "missing.json",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )?;
+        let mismatch_error = verification_error(
+            &test_root,
+            "artifact.json",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )?;
+        let traversal_error = verification_error(
+            &test_root,
+            "../artifact.json",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )?;
+        let symlink_error = verification_error(
+            &test_root,
+            "artifact-link.json",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        )?;
+
+        fs::remove_dir_all(&test_root)?;
+        assert!(missing_error.contains("cannot be inspected"));
+        assert!(mismatch_error.contains("digest mismatch"));
+        assert!(traversal_error.contains("relative normal components"));
+        assert!(symlink_error.contains("must not contain symlinks"));
+        Ok(())
+    }
+
+    #[test]
+    fn direct_dependency_verification_accepts_exact_lock_checksum() -> Result<(), Box<dyn Error>> {
+        let metadata = test_cargo_metadata()?;
+        let provenance = test_provenance_ledger(vec![test_dependency_record(
+            "prov-crates-serde-1.0.229",
+            "https://static.crates.io/crates/serde/serde-1.0.229.crate",
+            "sha256:4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+            ProvenanceUse::DependencyInclusion,
+        )]);
+
+        let verified = verify_direct_dependency_records(&metadata, test_lockfile(), &provenance)?;
+
+        assert_eq!(verified, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_dependency_verification_rejects_missing_mismatched_and_unknown_records()
+    -> Result<(), Box<dyn Error>> {
+        let metadata = test_cargo_metadata()?;
+        let valid_record = test_dependency_record(
+            "prov-crates-serde-1.0.229",
+            "https://static.crates.io/crates/serde/serde-1.0.229.crate",
+            "sha256:4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba",
+            ProvenanceUse::DependencyInclusion,
+        );
+        let missing_error = result_error(verify_direct_dependency_records(
+            &metadata,
+            test_lockfile(),
+            &test_provenance_ledger(Vec::new()),
+        ))?;
+
+        let mut mismatched_record = valid_record.clone();
+        mismatched_record.content_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".to_owned();
+        let mismatch_error = result_error(verify_direct_dependency_records(
+            &metadata,
+            test_lockfile(),
+            &test_provenance_ledger(vec![mismatched_record]),
+        ))?;
+
+        let missing_lock_error = result_error(verify_direct_dependency_records(
+            &metadata,
+            "version = 4\n\n[[package]]\nname = \"other\"\nversion = \"1.0.0\"\n",
+            &test_provenance_ledger(vec![valid_record.clone()]),
+        ))?;
+
+        let unknown_record = test_dependency_record(
+            "prov-crates-extra-1.0.0",
+            "https://static.crates.io/crates/extra/extra-1.0.0.crate",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ProvenanceUse::DependencyInclusion,
+        );
+        let unknown_error = result_error(verify_direct_dependency_records(
+            &metadata,
+            test_lockfile(),
+            &test_provenance_ledger(vec![valid_record, unknown_record]),
+        ))?;
+
+        let mut unsupported_source = test_cargo_metadata()?;
+        let dependency_source = unsupported_source
+            .pointer_mut("/packages/0/dependencies/1/source")
+            .ok_or_else(|| invalid_data("test cargo metadata dependency source is missing"))?;
+        *dependency_source = Value::String("git+https://example.invalid/dependency".to_owned());
+        let unsupported_source_error =
+            result_error(direct_registry_dependencies(&unsupported_source))?;
+
+        assert!(missing_error.contains("has no provenance record"));
+        assert!(mismatch_error.contains("does not match the Cargo.lock checksum"));
+        assert!(missing_lock_error.contains("has no exact crates.io package"));
+        assert!(unknown_error.contains("unknown direct dependency provenance record"));
+        assert!(unsupported_source_error.contains("unsupported external source"));
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_archive_inventory_accepts_exact_tools_and_actions() -> Result<(), Box<dyn Error>> {
+        let provenance = test_supply_chain_provenance();
+
+        let archives = resolve_remote_archive_records(test_governance_workflow(), &provenance)?;
+
+        assert_eq!(archives.len(), 2);
+        assert_eq!(archives[0].kind, RemoteArchiveKind::GitHubAction);
+        assert_eq!(archives[1].kind, RemoteArchiveKind::GovernanceTool);
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_archive_inventory_rejects_mutable_missing_and_unknown_entries()
+    -> Result<(), Box<dyn Error>> {
+        let mutable_action_error = result_error(resolve_remote_archive_records(
+            "steps:\n  - uses: actions/checkout@v4\n  - run: cargo install cargo-deny --version 0.20.2 --locked\n",
+            &test_supply_chain_provenance(),
+        ))?;
+        let mutable_tool_error = result_error(resolve_remote_archive_records(
+            "steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  - run: cargo install cargo-deny --locked\n",
+            &test_supply_chain_provenance(),
+        ))?;
+
+        let mut missing = test_supply_chain_provenance();
+        missing.records.remove(0);
+        let missing_error = result_error(resolve_remote_archive_records(
+            test_governance_workflow(),
+            &missing,
+        ))?;
+
+        let mut unknown = test_supply_chain_provenance();
+        unknown.records.push(test_dependency_record(
+            "prov-crates-unknown-1.0.0",
+            "https://static.crates.io/crates/unknown/unknown-1.0.0.crate",
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            ProvenanceUse::SupplyChainVerification,
         ));
+        let unknown_error = result_error(resolve_remote_archive_records(
+            test_governance_workflow(),
+            &unknown,
+        ))?;
+
+        assert!(mutable_action_error.contains("40-character commit SHA"));
+        assert!(mutable_tool_error.contains("--version <exact> --locked"));
+        assert!(missing_error.contains("has no provenance record"));
+        assert!(unknown_error.contains("unknown supply-chain provenance record"));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_archive_downloads_fail_closed() -> Result<(), Box<dyn Error>> {
+        let test_root = temporary_test_root("remote-archive-downloads")?;
+        let reference_path = test_root.join("reference");
+        fs::write(&reference_path, b"archive bytes")?;
+        let digest = sha256_digest(&reference_path)?;
+        let archives = vec![
+            test_remote_archive(
+                RemoteArchiveKind::GitHubAction,
+                "prov-action",
+                "https://codeload.github.com/actions/example/tar.gz/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &digest,
+            ),
+            test_remote_archive(
+                RemoteArchiveKind::GovernanceTool,
+                "prov-tool",
+                "https://static.crates.io/crates/example/example-1.0.0.crate",
+                &digest,
+            ),
+        ];
+        let successful_curl = write_fake_curl(
+            &test_root,
+            "curl-success",
+            "printf '%s' 'archive bytes' > \"$output\"\nprintf '200\\n%s' \"$url\"",
+        )?;
+        verify_remote_archives(successful_curl.as_os_str(), &archives)?;
+
+        let redirecting_curl = write_fake_curl(
+            &test_root,
+            "curl-redirect",
+            "printf '%s' 'redirect' > \"$output\"\nprintf '302\\n%s' 'https://evil.example/archive'",
+        )?;
+        let redirect_error = result_error(verify_remote_archives(
+            redirecting_curl.as_os_str(),
+            &archives[..1],
+        ))?;
+
+        let failing_curl = write_fake_curl(
+            &test_root,
+            "curl-network-failure",
+            "printf '%s' 'network failed' >&2\nexit 7",
+        )?;
+        let network_error = result_error(verify_remote_archives(
+            failing_curl.as_os_str(),
+            &archives[..1],
+        ))?;
+
+        let mismatching_curl = write_fake_curl(
+            &test_root,
+            "curl-mismatch",
+            "printf '%s' 'different bytes' > \"$output\"\nprintf '200\\n%s' \"$url\"",
+        )?;
+        let mismatch_error = result_error(verify_remote_archives(
+            mismatching_curl.as_os_str(),
+            &archives[..1],
+        ))?;
+
+        let missing_program = test_root.join("curl-missing");
+        let missing_tool_error = result_error(verify_remote_archives(
+            missing_program.as_os_str(),
+            &archives[..1],
+        ))?;
+
+        fs::remove_dir_all(&test_root)?;
+        assert!(redirect_error.contains("redirects are not permitted"));
+        assert!(network_error.contains("download failed"));
+        assert!(mismatch_error.contains("digest mismatch"));
+        assert!(missing_tool_error.contains("required download tool"));
+        Ok(())
+    }
+
+    fn verification_error(
+        workspace_root: &Path,
+        artifact_path: &str,
+        expected_digest: &str,
+    ) -> Result<String, Box<dyn Error>> {
+        verify_repository_artifact(workspace_root, artifact_path, expected_digest)
+            .err()
+            .map(|error| error.to_string())
+            .ok_or_else(|| {
+                invalid_data(format!("repository artifact {artifact_path} was accepted"))
+            })
+    }
+
+    fn result_error<T>(result: Result<T, Box<dyn Error>>) -> Result<String, Box<dyn Error>> {
+        result
+            .err()
+            .map(|error| error.to_string())
+            .ok_or_else(|| invalid_data("invalid input was accepted"))
+    }
+
+    fn temporary_test_root(name: &str) -> Result<PathBuf, Box<dyn Error>> {
+        create_temporary_directory(&format!("ntsql-{name}"))
+    }
+
+    fn test_cargo_metadata() -> Result<Value, Box<dyn Error>> {
+        Ok(serde_json::from_str(
+            r#"{
+  "workspace_members": [
+    "path+file:///workspace/crates/example#0.1.0"
+  ],
+  "packages": [
+    {
+      "id": "path+file:///workspace/crates/example#0.1.0",
+      "dependencies": [
+        {
+          "name": "local",
+          "source": null
+        },
+        {
+          "name": "serde",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    }
+  ]
+}"#,
+        )?)
+    }
+
+    fn test_lockfile() -> &'static str {
+        r#"version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+"#
+    }
+
+    fn test_governance_workflow() -> &'static str {
+        "steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  - run: cargo install cargo-deny --version 0.20.2 --locked\n"
+    }
+
+    fn test_supply_chain_provenance() -> ProvenanceLedger {
+        test_provenance_ledger(vec![
+            test_dependency_record(
+                "prov-action",
+                "https://codeload.github.com/actions/checkout/tar.gz/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ProvenanceUse::SupplyChainVerification,
+            ),
+            test_dependency_record(
+                "prov-tool",
+                "https://static.crates.io/crates/cargo-deny/cargo-deny-0.20.2.crate",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ProvenanceUse::SupplyChainVerification,
+            ),
+        ])
+    }
+
+    fn test_provenance_ledger(records: Vec<ProvenanceRecord>) -> ProvenanceLedger {
+        ProvenanceLedger {
+            schema_version: "1.0.0".to_owned(),
+            records,
+        }
+    }
+
+    fn test_dependency_record(
+        id: &str,
+        source_url: &str,
+        content_digest: &str,
+        intended_use: ProvenanceUse,
+    ) -> ProvenanceRecord {
+        ProvenanceRecord {
+            id: id.to_owned(),
+            source_kind: ProvenanceSourceKind::Dependency,
+            title: id.to_owned(),
+            source_url: Some(source_url.to_owned()),
+            artifact_path: None,
+            revision: "test revision".to_owned(),
+            retrieved_on: "2026-08-05".to_owned(),
+            author: "test".to_owned(),
+            generation_method: "test".to_owned(),
+            environment: None,
+            license: "MIT".to_owned(),
+            content_digest: content_digest.to_owned(),
+            intended_uses: vec![intended_use],
+            parent_provenance_ids: Vec::new(),
+            legal_review_id: "legal-review-test".to_owned(),
+        }
+    }
+
+    fn test_remote_archive(
+        kind: RemoteArchiveKind,
+        record_id: &str,
+        source_url: &str,
+        content_digest: &str,
+    ) -> RemoteArchive {
+        RemoteArchive {
+            kind,
+            record_id: record_id.to_owned(),
+            source_url: source_url.to_owned(),
+            content_digest: content_digest.to_owned(),
+        }
+    }
+
+    fn write_fake_curl(
+        test_root: &Path,
+        name: &str,
+        behavior: &str,
+    ) -> Result<PathBuf, Box<dyn Error>> {
+        let path = test_root.join(name);
+        let script = format!(
+            "#!/bin/sh\nset -eu\noutput=''\nurl=''\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --output) output=\"$2\"; shift 2 ;;\n    --url) url=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n{behavior}\n"
+        );
+        fs::write(&path, script)?;
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn authority_path_rejects_symlinks_across_checkout_boundary() -> Result<(), Box<dyn Error>> {
+        let test_root = temporary_test_root("authority-path")?;
         let workspace_root = test_root.join("checkout");
         fs::create_dir_all(&workspace_root)?;
         let workspace_root = workspace_root.canonicalize()?;

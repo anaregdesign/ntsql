@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #68
 - Extends: ADR 0001, ADR 0005, ADR 0007, ADR 0008, ADR 0009
-- Extended by: ADR 0011, ADR 0012
+- Extended by: ADR 0011, ADR 0012, ADR 0013
 
 ## Context
 
@@ -74,9 +74,10 @@ source can still return a false pair; this is an adapter contract violation.
 ADR 0011 binds `LogSequenceNumber` to the runtime `LogLineage` and requires
 recovery presence to match both the source lineage and position lineage.
 ADR 0012 allows those capabilities to be reconstructed from a trusted stable ID,
-but does not persist or encode it. This ADR does not reconstruct coordinator
-registries after process loss, define a recovery scan cutoff for a filesystem
-log, or validate production storage. Those require a persistent format design.
+and ADR 0013 persists that ID with a validated commit-record stream and explicit
+durable-through frontier. This ADR still does not reconstruct coordinator
+registries after process loss, define page-WAL/checkpoint recovery, or validate
+externally observable database outcomes.
 
 ## Compatibility Boundary
 
@@ -106,8 +107,8 @@ diagnostic changes.
 
 ## Consequences
 
-The in-memory model can now reconcile ambiguous commit-port failures without
-guessing from the original error. The resolution API remains deliberately
-terminal and internal. Persistent recovered-log views, process-restored
-transaction tables, checkpoint analysis, redo/undo, page state, external commit
-semantics, and client diagnostics remain later transaction and storage work.
+The in-memory model and ADR 0013 file adapter can reconcile ambiguous commit-port
+failures without guessing from the original error. The resolution API remains
+deliberately terminal and internal. Process-restored transaction tables,
+checkpoint analysis, redo/undo, page state, external commit semantics, and client
+diagnostics remain later transaction and storage work.

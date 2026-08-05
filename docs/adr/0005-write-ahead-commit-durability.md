@@ -5,7 +5,7 @@
 - Issue: #50
 - Extends: ADR 0001
 - Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009, ADR 0010, ADR 0011,
-  ADR 0012
+  ADR 0012, ADR 0013
 
 ## Context
 
@@ -66,18 +66,25 @@ same lineage capability. The WAL domain neither allocates nor encodes this ID;
 the outer adapter must durably store it and prevent reuse across independent
 logs.
 
+ADR 0013 adds the first concrete adapter. A successful file-log flush uses one
+barrier for the complete commit prefix followed by a checksummed durable-through
+marker and a second barrier. The marker is the recovered durable frontier; no
+adapter success is reported before both barriers complete.
+
 The intended dependency direction is:
 
 ```text
-future ntsql-transaction ------> ntsql-wal <------ future persistence adapter
-                                      |
-                                      v
-                              standard library only
+ntsql-storage-file ------> ntsql-wal <------ ntsql-storage-memory
+                               ^
+                               |
+                       ntsql-transaction
+
+ntsql-wal --------------> standard library only
 ```
 
-The transaction component will own its commit-record type and pass it to a
-generic `CommitLog<Record>` implementation. A concrete persistence adapter will
-depend on `ntsql-wal` to implement that port. `ntsql-wal` never depends on
+The transaction component owns its commit-record type and passes it to a generic
+`CommitLog<Record>` implementation. Concrete persistence adapters depend on
+`ntsql-wal` to implement that port. `ntsql-wal` never depends on
 transaction, filesystem, protocol, contract, serialization, or adapter crates.
 
 ## Evidence Boundary
@@ -88,10 +95,11 @@ does not claim a SQL Server commit point, LSN value, crash outcome, diagnostic,
 or compatibility status. The repository-authored call-order tests establish
 only this internal safety invariant.
 
-WAL/page formats, checksum coverage, flush/barrier semantics for a concrete
-platform, checkpoints, redo/undo, group commit, transaction lifecycle, and
-crash-recovery outcomes require their own behavior, format, provenance, and
-fault-injection decisions.
+Page formats, checkpoints, redo/undo, group commit, broader transaction
+lifecycle, and externally observable crash-recovery outcomes require their own
+behavior, format, provenance, and fault-injection decisions. ADR 0013 defines
+only the ntsql-internal transaction commit-log format and standard-library file
+barriers.
 
 ## Test Boundaries
 

@@ -52,6 +52,14 @@
 //! page-data frame payload is `(position, chunk_index, raw_8_bytes)`. The final
 //! chunk must zero-pad every unused byte.
 //!
+//! The separate page-store file reuses the same checksum and fixed-size framing
+//! discipline with its own header magic (`NTSQPGS1`) and frame magic (`NTSP`).
+//! Each durable snapshot is one contiguous group: snapshot-header,
+//! required-position, then exactly `ceil(page_width / 8)` page-data frames.
+//! Open recovery truncates only a final incomplete physical frame or final
+//! incomplete snapshot group; complete malformed groups are rejected without
+//! truncation.
+//!
 //! ## Checksum
 //!
 //! The v1/v2 checksum is an ntsql-owned, deterministic, non-cryptographic
@@ -2285,6 +2293,1536 @@ fn write_u128(bytes: &mut [u8], offset: usize, value: u128) {
     bytes[offset..offset + 16].copy_from_slice(&value.to_be_bytes());
 }
 
+// ---------------------------------------------------------------------------
+// FilePageStore – append-only page-image store backed by a separate file.
+//
+// ## Page-store format
+//
+// The file begins with one immutable 64-byte header followed by zero or more
+// groups of fixed-size 56-byte frames. Every multibyte field is big-endian.
+// The checksum algorithm and frame geometry are shared with the WAL format.
+//
+// Header bytes:
+//   0..8   – magic `NTSQPGS1`
+//   8..10  – u16 version (1)
+//   10..12 – u16 header length (64)
+//   12..16 – u32 flags (0)
+//   16..32 – nonzero u128 persistent lineage ID
+//   32..40 – nonzero page width N (big-endian u64)
+//   40..56 – reserved zeros
+//   56..64 – checksum of bytes 0..56
+//
+// Each group is: snapshot-header frame, required-position frame, then
+// exactly ceil(N/8) page-data frames. The store sequence is contiguous
+// from 1 and each rewrite appends a new group; the latest complete group
+// per PageNumber is the inspectable current value.
+//
+// Open recovery repairs only a final incomplete physical frame or final
+// incomplete logical group (truncating to the snapshot-header offset).
+// Any complete malformed group fails without truncation.
+// ---------------------------------------------------------------------------
+
+const PAGE_STORE_HEADER_MAGIC: [u8; 8] = *b"NTSQPGS1";
+const PAGE_STORE_FRAME_MAGIC: [u8; 4] = *b"NTSP";
+const PAGE_STORE_FORMAT_VERSION: u16 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+enum PageStoreFrameKind {
+    SnapshotHeader = 1,
+    RequiredPosition = 2,
+    PageData = 3,
+}
+
+impl PageStoreFrameKind {
+    fn from_u16(value: u16) -> Option<Self> {
+        match value {
+            1 => Some(Self::SnapshotHeader),
+            2 => Some(Self::RequiredPosition),
+            3 => Some(Self::PageData),
+            _ => None,
+        }
+    }
+
+    const fn code(self) -> u16 {
+        match self {
+            Self::SnapshotHeader => 1,
+            Self::RequiredPosition => 2,
+            Self::PageData => 3,
+        }
+    }
+}
+
+/// One-shot physical-effect boundary for the next page-store write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageStoreFaultPoint {
+    /// Fail before file/state mutation.
+    BeforeWrite,
+    /// Fire only after the entire group is written, sync succeeds, and state
+    /// is updated.
+    AfterWrite,
+}
+
+impl fmt::Display for PageStoreFaultPoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeWrite => formatter.write_str("before write"),
+            Self::AfterWrite => formatter.write_str("after write"),
+        }
+    }
+}
+
+/// Refusal to silently replace an already armed page-store fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PageStoreFaultAlreadyArmed {
+    armed: PageStoreFaultPoint,
+    requested: PageStoreFaultPoint,
+}
+
+impl PageStoreFaultAlreadyArmed {
+    /// Returns the fault that remains armed.
+    #[must_use]
+    pub const fn armed(&self) -> PageStoreFaultPoint {
+        self.armed
+    }
+
+    /// Returns the rejected replacement fault.
+    #[must_use]
+    pub const fn requested(&self) -> PageStoreFaultPoint {
+        self.requested
+    }
+}
+
+impl fmt::Display for PageStoreFaultAlreadyArmed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "page-store fault {} is already armed; cannot arm {}",
+            self.armed, self.requested
+        )
+    }
+}
+
+impl Error for PageStoreFaultAlreadyArmed {}
+
+/// I/O stage for page-store operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageStoreIoStage {
+    CreateFile,
+    OpenFile,
+    AcquireExclusiveLock,
+    OpenParentDirectory,
+    ReadMetadata,
+    ReadHeader,
+    ReadFrame,
+    WriteHeader,
+    SyncCreatedFile,
+    SyncOpenedFile,
+    SyncParentDirectory,
+    TruncateIncompleteTail,
+    SyncTruncatedTail,
+    SeekEnd,
+    WriteSnapshotHeaderFrame,
+    WriteRequiredPositionFrame,
+    WritePageDataFrame,
+    SyncPageGroup,
+}
+
+impl fmt::Display for PageStoreIoStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CreateFile => formatter.write_str("creating the page-store file"),
+            Self::OpenFile => formatter.write_str("opening the page-store file"),
+            Self::AcquireExclusiveLock => {
+                formatter.write_str("acquiring the exclusive page-store file lock")
+            }
+            Self::OpenParentDirectory => formatter.write_str("opening the parent directory"),
+            Self::ReadMetadata => formatter.write_str("reading page-store metadata"),
+            Self::ReadHeader => formatter.write_str("reading the page-store header"),
+            Self::ReadFrame => formatter.write_str("reading a page-store frame"),
+            Self::WriteHeader => formatter.write_str("writing the page-store header"),
+            Self::SyncCreatedFile => {
+                formatter.write_str("synchronizing the created page-store file")
+            }
+            Self::SyncOpenedFile => formatter.write_str("synchronizing the opened page-store file"),
+            Self::SyncParentDirectory => formatter.write_str("synchronizing the parent directory"),
+            Self::TruncateIncompleteTail => {
+                formatter.write_str("truncating an incomplete page-store tail")
+            }
+            Self::SyncTruncatedTail => {
+                formatter.write_str("synchronizing a repaired page-store tail")
+            }
+            Self::SeekEnd => formatter.write_str("seeking to the end of the page-store file"),
+            Self::WriteSnapshotHeaderFrame => {
+                formatter.write_str("writing a page-store snapshot-header frame")
+            }
+            Self::WriteRequiredPositionFrame => {
+                formatter.write_str("writing a page-store required-position frame")
+            }
+            Self::WritePageDataFrame => formatter.write_str("writing a page-store page-data frame"),
+            Self::SyncPageGroup => formatter.write_str("synchronizing a page-store group"),
+        }
+    }
+}
+
+/// I/O failure paired with the exact page-store stage.
+#[derive(Debug)]
+pub struct PageStoreIoError {
+    stage: PageStoreIoStage,
+    source: io::Error,
+}
+
+impl PageStoreIoError {
+    fn new(stage: PageStoreIoStage, source: io::Error) -> Self {
+        Self { stage, source }
+    }
+
+    /// Returns the adapter stage that reported the I/O error.
+    #[must_use]
+    pub const fn stage(&self) -> PageStoreIoStage {
+        self.stage
+    }
+
+    /// Returns the original `std::io::Error`.
+    #[must_use]
+    pub const fn io_source(&self) -> &io::Error {
+        &self.source
+    }
+}
+
+impl PartialEq for PageStoreIoError {
+    fn eq(&self, other: &Self) -> bool {
+        self.stage == other.stage
+            && self.source.kind() == other.source.kind()
+            && self.source.raw_os_error() == other.source.raw_os_error()
+    }
+}
+
+impl Eq for PageStoreIoError {}
+
+impl fmt::Display for PageStoreIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} failed: {}", self.stage, self.source)
+    }
+}
+
+impl Error for PageStoreIoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Exact malformed-format reason for the page store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PageStoreFormatErrorReason {
+    HeaderTooShort { actual: u64 },
+    HeaderMagic,
+    HeaderVersion { actual: u16 },
+    HeaderLength { actual: u16 },
+    HeaderFlags { actual: u32 },
+    HeaderPageWidthZero,
+    HeaderPageWidthMismatch { expected: u64, actual: u64 },
+    HeaderReserved,
+    HeaderChecksum { expected: u64, actual: u64 },
+    LineageIdZero,
+    FrameMagic,
+    FrameKind { actual: u16 },
+    FrameVersion { actual: u16 },
+    FrameLength { actual: u16 },
+    FrameFlags { actual: u32 },
+    FrameReserved,
+    FrameChecksum { expected: u64, actual: u64 },
+    SnapshotSequenceZero,
+    SnapshotSequenceOutOfOrder { expected: u64, actual: u64 },
+    SnapshotSequenceSpaceExhausted,
+    SnapshotPageNumberZero,
+    RequiredPositionZero,
+    RequiredPositionSequenceMismatch { expected: u64, actual: u64 },
+    RequiredPositionPayloadCNonzero { actual: u64 },
+    PageDataSequenceMismatch { expected: u64, actual: u64 },
+    PageDataChunkIndexOutOfSequence { expected: u64, actual: u64 },
+    PageDataFinalPaddingNonzero,
+    PageDataWithoutHeader,
+    UnexpectedKindAfterHeader { actual: u16 },
+    UnexpectedKindAfterRequiredPosition { actual: u16 },
+}
+
+impl fmt::Display for PageStoreFormatErrorReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HeaderTooShort { actual } => {
+                write!(
+                    formatter,
+                    "page-store header is shorter than 64 bytes: found {actual}"
+                )
+            }
+            Self::HeaderMagic => formatter.write_str("page-store header magic does not match"),
+            Self::HeaderVersion { actual } => {
+                write!(formatter, "unsupported page-store header version {actual}")
+            }
+            Self::HeaderLength { actual } => {
+                write!(
+                    formatter,
+                    "page-store header length {actual} does not equal 64"
+                )
+            }
+            Self::HeaderFlags { actual } => {
+                write!(formatter, "page-store header flags are nonzero: {actual}")
+            }
+            Self::HeaderPageWidthZero => {
+                formatter.write_str("page-store header page width is zero")
+            }
+            Self::HeaderPageWidthMismatch { expected, actual } => write!(
+                formatter,
+                "page-store header page width {actual} does not equal required width {expected}"
+            ),
+            Self::HeaderReserved => {
+                formatter.write_str("page-store header reserved bytes are nonzero")
+            }
+            Self::HeaderChecksum { expected, actual } => write!(
+                formatter,
+                "page-store header checksum mismatch: expected {expected:#018x}, found {actual:#018x}"
+            ),
+            Self::LineageIdZero => formatter.write_str("page-store persistent lineage ID is zero"),
+            Self::FrameMagic => formatter.write_str("page-store frame magic does not match"),
+            Self::FrameKind { actual } => {
+                write!(formatter, "unknown page-store frame kind {actual}")
+            }
+            Self::FrameVersion { actual } => {
+                write!(formatter, "unsupported page-store frame version {actual}")
+            }
+            Self::FrameLength { actual } => {
+                write!(
+                    formatter,
+                    "page-store frame length {actual} does not equal 56"
+                )
+            }
+            Self::FrameFlags { actual } => {
+                write!(formatter, "page-store frame flags are nonzero: {actual}")
+            }
+            Self::FrameReserved => {
+                formatter.write_str("page-store frame reserved bytes are nonzero")
+            }
+            Self::FrameChecksum { expected, actual } => write!(
+                formatter,
+                "page-store frame checksum mismatch: expected {expected:#018x}, found {actual:#018x}"
+            ),
+            Self::SnapshotSequenceZero => {
+                formatter.write_str("page-store snapshot sequence is zero")
+            }
+            Self::SnapshotSequenceOutOfOrder { expected, actual } => write!(
+                formatter,
+                "page-store snapshot sequence {actual} does not equal the next contiguous sequence {expected}"
+            ),
+            Self::SnapshotSequenceSpaceExhausted => {
+                formatter.write_str("page-store snapshot sequence space is exhausted")
+            }
+            Self::SnapshotPageNumberZero => {
+                formatter.write_str("page-store snapshot page number is zero")
+            }
+            Self::RequiredPositionZero => {
+                formatter.write_str("page-store required WAL position is zero")
+            }
+            Self::RequiredPositionSequenceMismatch { expected, actual } => write!(
+                formatter,
+                "page-store required-position sequence {actual} does not match pending snapshot sequence {expected}"
+            ),
+            Self::RequiredPositionPayloadCNonzero { actual } => write!(
+                formatter,
+                "page-store required-position payload C is nonzero: {actual}"
+            ),
+            Self::PageDataSequenceMismatch { expected, actual } => write!(
+                formatter,
+                "page-store page-data sequence {actual} does not match pending snapshot sequence {expected}"
+            ),
+            Self::PageDataChunkIndexOutOfSequence { expected, actual } => write!(
+                formatter,
+                "page-store page-data chunk index {actual} does not equal required contiguous chunk {expected}"
+            ),
+            Self::PageDataFinalPaddingNonzero => {
+                formatter.write_str("page-store page-data final-chunk padding bytes are nonzero")
+            }
+            Self::PageDataWithoutHeader => {
+                formatter.write_str("page-store page-data frame has no pending snapshot header")
+            }
+            Self::UnexpectedKindAfterHeader { actual } => write!(
+                formatter,
+                "page-store expected a required-position frame after snapshot header but found kind {actual}"
+            ),
+            Self::UnexpectedKindAfterRequiredPosition { actual } => write!(
+                formatter,
+                "page-store expected a page-data frame after required position but found kind {actual}"
+            ),
+        }
+    }
+}
+
+/// Malformed-format error for the page store, paired with byte offset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageStoreFormatError {
+    offset: u64,
+    reason: PageStoreFormatErrorReason,
+}
+
+impl PageStoreFormatError {
+    fn new(offset: u64, reason: PageStoreFormatErrorReason) -> Self {
+        Self { offset, reason }
+    }
+
+    /// Returns the byte offset that reported the format error.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Returns the exact malformed-format reason.
+    #[must_use]
+    pub const fn reason(&self) -> &PageStoreFormatErrorReason {
+        &self.reason
+    }
+}
+
+impl fmt::Display for PageStoreFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "page-store format error at byte {}: {}",
+            self.offset, self.reason
+        )
+    }
+}
+
+impl Error for PageStoreFormatError {}
+
+/// Failure while creating a new page store file.
+#[derive(Debug, Eq, PartialEq)]
+pub enum PageStoreCreateError {
+    MissingParentDirectory,
+    PageWidth(FilePageWidthError),
+    Io(PageStoreIoError),
+}
+
+impl fmt::Display for PageStoreCreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingParentDirectory => {
+                formatter.write_str("page-store path does not have an existing parent directory")
+            }
+            Self::PageWidth(source) => source.fmt(formatter),
+            Self::Io(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for PageStoreCreateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::MissingParentDirectory => None,
+            Self::PageWidth(source) => Some(source),
+            Self::Io(source) => Some(source),
+        }
+    }
+}
+
+/// Failure while opening an existing page store file.
+#[derive(Debug, Eq, PartialEq)]
+pub enum PageStoreOpenError {
+    PageWidth(FilePageWidthError),
+    Io(PageStoreIoError),
+    Format(PageStoreFormatError),
+    SnapshotCapacityExhausted,
+}
+
+impl fmt::Display for PageStoreOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PageWidth(source) => source.fmt(formatter),
+            Self::Io(source) => source.fmt(formatter),
+            Self::Format(source) => source.fmt(formatter),
+            Self::SnapshotCapacityExhausted => {
+                formatter.write_str("page-store snapshot capacity is exhausted")
+            }
+        }
+    }
+}
+
+impl Error for PageStoreOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PageWidth(source) => Some(source),
+            Self::Io(source) => Some(source),
+            Self::Format(source) => Some(source),
+            Self::SnapshotCapacityExhausted => None,
+        }
+    }
+}
+
+/// Failure while writing to the page store.
+#[derive(Debug)]
+pub enum FilePageStoreError {
+    InjectedFault(PageStoreFaultPoint),
+    PageWidth(FilePageWidthError),
+    PoisonedWriter,
+    ForeignPageLineage(PageNumber),
+    ForeignPermitLineage(LogSequenceNumber),
+    PermitPositionMismatch {
+        expected: LogSequenceNumber,
+        actual: LogSequenceNumber,
+    },
+    RequiredPositionZero(PageNumber),
+    SnapshotCapacityExhausted,
+    StoreSequenceSpaceExhausted,
+    Io(PageStoreIoError),
+}
+
+impl fmt::Display for FilePageStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InjectedFault(point) => {
+                write!(formatter, "injected page-store failure {point}")
+            }
+            Self::PageWidth(source) => source.fmt(formatter),
+            Self::PoisonedWriter => formatter
+                .write_str("page-store writer is poisoned; reopen the file before retrying"),
+            Self::ForeignPageLineage(page_number) => write!(
+                formatter,
+                "page-store page {} belongs to another lineage",
+                page_number.get()
+            ),
+            Self::ForeignPermitLineage(position) => write!(
+                formatter,
+                "page-store permit position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::PermitPositionMismatch { expected, actual } => write!(
+                formatter,
+                "page-store permit position {} does not equal required position {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::RequiredPositionZero(page_number) => write!(
+                formatter,
+                "page-store page {} has zero as its required WAL position",
+                page_number.get()
+            ),
+            Self::SnapshotCapacityExhausted => {
+                formatter.write_str("page-store snapshot capacity is exhausted")
+            }
+            Self::StoreSequenceSpaceExhausted => {
+                formatter.write_str("page-store sequence space is exhausted")
+            }
+            Self::Io(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl PartialEq for FilePageStoreError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::InjectedFault(a), Self::InjectedFault(b)) => a == b,
+            (Self::PageWidth(a), Self::PageWidth(b)) => a == b,
+            (Self::PoisonedWriter, Self::PoisonedWriter) => true,
+            (Self::ForeignPageLineage(a), Self::ForeignPageLineage(b)) => a == b,
+            (Self::ForeignPermitLineage(a), Self::ForeignPermitLineage(b)) => a == b,
+            (
+                Self::PermitPositionMismatch {
+                    expected: ea,
+                    actual: aa,
+                },
+                Self::PermitPositionMismatch {
+                    expected: eb,
+                    actual: ab,
+                },
+            ) => ea == eb && aa == ab,
+            (Self::RequiredPositionZero(a), Self::RequiredPositionZero(b)) => a == b,
+            (Self::SnapshotCapacityExhausted, Self::SnapshotCapacityExhausted) => true,
+            (Self::StoreSequenceSpaceExhausted, Self::StoreSequenceSpaceExhausted) => true,
+            (Self::Io(a), Self::Io(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for FilePageStoreError {}
+
+impl Error for FilePageStoreError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PageWidth(source) => Some(source),
+            Self::Io(source) => Some(source),
+            Self::InjectedFault(_)
+            | Self::PoisonedWriter
+            | Self::ForeignPageLineage(_)
+            | Self::ForeignPermitLineage(_)
+            | Self::PermitPositionMismatch { .. }
+            | Self::RequiredPositionZero(_)
+            | Self::SnapshotCapacityExhausted
+            | Self::StoreSequenceSpaceExhausted => None,
+        }
+    }
+}
+
+/// Safely inspectable latest snapshot of one stored page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileStoredPage<const N: usize> {
+    page_number: PageNumber,
+    page_version: PageVersion,
+    bytes: [u8; N],
+    required_position: LogSequenceNumber,
+    store_sequence: u64,
+}
+
+impl<const N: usize> FileStoredPage<N> {
+    /// Returns the page number.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.page_number
+    }
+
+    /// Returns the page version.
+    #[must_use]
+    pub const fn page_version(&self) -> PageVersion {
+        self.page_version
+    }
+
+    /// Returns the exact stored page bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; N] {
+        &self.bytes
+    }
+
+    /// Returns the exact required WAL position.
+    #[must_use]
+    pub const fn required_position(&self) -> &LogSequenceNumber {
+        &self.required_position
+    }
+
+    /// Returns the store-internal sequence number.
+    #[must_use]
+    pub const fn store_sequence(&self) -> u64 {
+        self.store_sequence
+    }
+}
+
+/// Append-only page image store backed by a separate file.
+#[derive(Debug)]
+pub struct FilePageStore<const N: usize> {
+    file: File,
+    lineage: LogLineage,
+    persistent_id: PersistentLogId,
+    pages: Vec<FileStoredPage<N>>,
+    next_sequence: Option<u64>,
+    armed_fault: Option<PageStoreFaultPoint>,
+    poisoned: bool,
+}
+
+impl<const N: usize> FilePageStore<N> {
+    /// Creates a new empty page store file.
+    pub fn create_new<P>(
+        path: P,
+        persistent_id: PersistentLogId,
+    ) -> Result<Self, PageStoreCreateError>
+    where
+        P: AsRef<Path>,
+    {
+        let layout = PageLayout::for_const::<N>().map_err(PageStoreCreateError::PageWidth)?;
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|source| {
+                PageStoreCreateError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::CreateFile,
+                    source,
+                ))
+            })?;
+        file.try_lock().map_err(|source| {
+            PageStoreCreateError::Io(PageStoreIoError::new(
+                PageStoreIoStage::AcquireExclusiveLock,
+                source.into(),
+            ))
+        })?;
+
+        let header = build_page_store_header(persistent_id, layout.width_u64);
+        file.write_all(&header).map_err(|source| {
+            PageStoreCreateError::Io(PageStoreIoError::new(PageStoreIoStage::WriteHeader, source))
+        })?;
+        file.sync_all().map_err(|source| {
+            PageStoreCreateError::Io(PageStoreIoError::new(
+                PageStoreIoStage::SyncCreatedFile,
+                source,
+            ))
+        })?;
+        sync_page_store_parent_directory(path)?;
+        file.seek(SeekFrom::End(0)).map_err(|source| {
+            PageStoreCreateError::Io(PageStoreIoError::new(PageStoreIoStage::SeekEnd, source))
+        })?;
+
+        Ok(Self {
+            file,
+            lineage: LogLineage::persistent(persistent_id),
+            persistent_id,
+            pages: Vec::new(),
+            next_sequence: Some(1),
+            armed_fault: None,
+            poisoned: false,
+        })
+    }
+
+    /// Opens an existing page store file, validates, scans, and repairs tail.
+    pub fn open<P>(path: P) -> Result<Self, PageStoreOpenError>
+    where
+        P: AsRef<Path>,
+    {
+        let layout = PageLayout::for_const::<N>().map_err(PageStoreOpenError::PageWidth)?;
+        let path = path.as_ref();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|source| {
+                PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::OpenFile, source))
+            })?;
+        file.try_lock().map_err(|source| {
+            PageStoreOpenError::Io(PageStoreIoError::new(
+                PageStoreIoStage::AcquireExclusiveLock,
+                source.into(),
+            ))
+        })?;
+        file.sync_all().map_err(|source| {
+            PageStoreOpenError::Io(PageStoreIoError::new(
+                PageStoreIoStage::SyncOpenedFile,
+                source,
+            ))
+        })?;
+
+        let file_len = file
+            .metadata()
+            .map_err(|source| {
+                PageStoreOpenError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::ReadMetadata,
+                    source,
+                ))
+            })?
+            .len();
+        if file_len < HEADER_LENGTH_U64 {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                0,
+                PageStoreFormatErrorReason::HeaderTooShort { actual: file_len },
+            )));
+        }
+
+        let mut header = [0_u8; HEADER_LENGTH];
+        file.read_exact(&mut header).map_err(|source| {
+            PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::ReadHeader, source))
+        })?;
+        let persistent_id =
+            parse_page_store_header(&header, layout).map_err(PageStoreOpenError::Format)?;
+        let lineage = LogLineage::persistent(persistent_id);
+
+        let mut open_state = PageStoreOpenState::<N>::new(layout, lineage.clone());
+
+        let frame_region_len = file_len - HEADER_LENGTH_U64;
+        let complete_frame_count = frame_region_len / FRAME_LENGTH_U64;
+        let incomplete_tail_len = frame_region_len % FRAME_LENGTH_U64;
+
+        for frame_index in 0..complete_frame_count {
+            let mut frame = [0_u8; FRAME_LENGTH];
+            file.read_exact(&mut frame).map_err(|source| {
+                PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::ReadFrame, source))
+            })?;
+            let offset = HEADER_LENGTH_U64 + frame_index * FRAME_LENGTH_U64;
+            let decoded =
+                parse_page_store_frame(&frame, offset).map_err(PageStoreOpenError::Format)?;
+            open_state.apply_frame(decoded, offset)?;
+        }
+
+        let repaired_len = match open_state.pending_group_header_offset() {
+            Some(offset) => Some(offset),
+            None if incomplete_tail_len > 0 => {
+                Some(HEADER_LENGTH_U64 + complete_frame_count * FRAME_LENGTH_U64)
+            }
+            None => None,
+        };
+        if let Some(repaired_len) = repaired_len {
+            file.set_len(repaired_len).map_err(|source| {
+                PageStoreOpenError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::TruncateIncompleteTail,
+                    source,
+                ))
+            })?;
+            file.sync_all().map_err(|source| {
+                PageStoreOpenError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::SyncTruncatedTail,
+                    source,
+                ))
+            })?;
+        }
+        file.seek(SeekFrom::End(0)).map_err(|source| {
+            PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::SeekEnd, source))
+        })?;
+
+        Ok(Self {
+            file,
+            lineage,
+            persistent_id,
+            pages: open_state.pages,
+            next_sequence: open_state.next_sequence,
+            armed_fault: None,
+            poisoned: false,
+        })
+    }
+
+    /// Returns the stable persistent lineage ID.
+    #[must_use]
+    pub const fn persistent_id(&self) -> PersistentLogId {
+        self.persistent_id
+    }
+
+    /// Arms one fault without replacing an existing plan.
+    pub fn arm_fault(
+        &mut self,
+        fault: PageStoreFaultPoint,
+    ) -> Result<(), PageStoreFaultAlreadyArmed> {
+        if let Some(armed) = self.armed_fault {
+            return Err(PageStoreFaultAlreadyArmed {
+                armed,
+                requested: fault,
+            });
+        }
+        self.armed_fault = Some(fault);
+        Ok(())
+    }
+
+    /// Returns the one-shot fault that has not yet reached its matching stage.
+    #[must_use]
+    pub const fn armed_fault(&self) -> Option<PageStoreFaultPoint> {
+        self.armed_fault
+    }
+
+    /// Returns whether this writer is poisoned.
+    #[must_use]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Returns the latest snapshots of all stored pages.
+    #[must_use]
+    pub fn pages(&self) -> &[FileStoredPage<N>] {
+        &self.pages
+    }
+
+    /// Looks up the latest snapshot for a specific page number.
+    #[must_use]
+    pub fn page(&self, page_number: PageNumber) -> Option<&FileStoredPage<N>> {
+        self.pages.iter().find(|p| p.page_number == page_number)
+    }
+
+    fn consume_fault(&mut self, point: PageStoreFaultPoint) -> bool {
+        if self.armed_fault == Some(point) {
+            self.armed_fault = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<const N: usize> ntsql_page::PageStore<N> for FilePageStore<N> {
+    type Error = FilePageStoreError;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    fn write_page(
+        &mut self,
+        page: &ntsql_page::DirtyPage<N>,
+        permit: ntsql_page::PageWritePermit<'_>,
+    ) -> Result<(), Self::Error> {
+        if self.poisoned {
+            return Err(FilePageStoreError::PoisonedWriter);
+        }
+        let layout = PageLayout::for_const::<N>().map_err(FilePageStoreError::PageWidth)?;
+        if !self.lineage.same_lineage(page.address().lineage()) {
+            return Err(FilePageStoreError::ForeignPageLineage(
+                page.address().number(),
+            ));
+        }
+        if !self
+            .lineage
+            .same_lineage(permit.durable_position().lineage())
+        {
+            return Err(FilePageStoreError::ForeignPermitLineage(
+                permit.durable_position().clone(),
+            ));
+        }
+        if permit.durable_position() != page.required_position() {
+            return Err(FilePageStoreError::PermitPositionMismatch {
+                expected: page.required_position().clone(),
+                actual: permit.durable_position().clone(),
+            });
+        }
+        if page.required_position().get() == 0 {
+            return Err(FilePageStoreError::RequiredPositionZero(
+                page.address().number(),
+            ));
+        }
+
+        let sequence = self
+            .next_sequence
+            .ok_or(FilePageStoreError::StoreSequenceSpaceExhausted)?;
+        let existing_index = self
+            .pages
+            .iter()
+            .position(|stored| stored.page_number == page.address().number());
+        if existing_index.is_none() && self.pages.try_reserve(1).is_err() {
+            return Err(FilePageStoreError::SnapshotCapacityExhausted);
+        }
+
+        let stored = FileStoredPage {
+            page_number: page.address().number(),
+            page_version: page.version(),
+            bytes: *page.image().bytes(),
+            required_position: page.required_position().clone(),
+            store_sequence: sequence,
+        };
+        if self.consume_fault(PageStoreFaultPoint::BeforeWrite) {
+            return Err(FilePageStoreError::InjectedFault(
+                PageStoreFaultPoint::BeforeWrite,
+            ));
+        }
+
+        let header_frame = build_page_store_frame(
+            PageStoreFrameKind::SnapshotHeader,
+            sequence,
+            stored.page_number().get(),
+            stored.page_version().get(),
+        );
+        self.file.write_all(&header_frame).map_err(|source| {
+            self.poisoned = true;
+            FilePageStoreError::Io(PageStoreIoError::new(
+                PageStoreIoStage::WriteSnapshotHeaderFrame,
+                source,
+            ))
+        })?;
+
+        let required_position_frame = build_page_store_frame(
+            PageStoreFrameKind::RequiredPosition,
+            sequence,
+            stored.required_position().get(),
+            0,
+        );
+        self.file
+            .write_all(&required_position_frame)
+            .map_err(|source| {
+                self.poisoned = true;
+                FilePageStoreError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::WriteRequiredPositionFrame,
+                    source,
+                ))
+            })?;
+
+        let page_bytes = stored.bytes();
+        for chunk_index in 0..layout.chunk_count {
+            let mut chunk = [0_u8; PAGE_CHUNK_WIDTH];
+            let start = chunk_index * PAGE_CHUNK_WIDTH;
+            let logical_len = layout.logical_bytes_for_chunk(chunk_index);
+            let end = start + logical_len;
+            chunk[..logical_len].copy_from_slice(&page_bytes[start..end]);
+            let chunk_index_u64 = u64::try_from(chunk_index).map_err(|_| {
+                FilePageStoreError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::WritePageDataFrame,
+                    io::Error::other("chunk index overflow"),
+                ))
+            })?;
+            let data_frame = build_page_store_frame_with_payload2_bytes(
+                PageStoreFrameKind::PageData,
+                sequence,
+                chunk_index_u64,
+                chunk,
+            );
+            self.file.write_all(&data_frame).map_err(|source| {
+                self.poisoned = true;
+                FilePageStoreError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::WritePageDataFrame,
+                    source,
+                ))
+            })?;
+        }
+
+        self.file.sync_all().map_err(|source| {
+            self.poisoned = true;
+            FilePageStoreError::Io(PageStoreIoError::new(
+                PageStoreIoStage::SyncPageGroup,
+                source,
+            ))
+        })?;
+
+        if let Some(index) = existing_index {
+            self.pages[index] = stored;
+        } else {
+            self.pages.push(stored);
+        }
+        self.next_sequence = sequence.checked_add(1);
+
+        if self.consume_fault(PageStoreFaultPoint::AfterWrite) {
+            Err(FilePageStoreError::InjectedFault(
+                PageStoreFaultPoint::AfterWrite,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn build_page_store_header(persistent_id: PersistentLogId, page_width: u64) -> [u8; HEADER_LENGTH] {
+    let mut header = [0_u8; HEADER_LENGTH];
+    header[..8].copy_from_slice(&PAGE_STORE_HEADER_MAGIC);
+    write_u16(&mut header, 8, PAGE_STORE_FORMAT_VERSION);
+    write_u16(&mut header, 10, HEADER_LENGTH_U16);
+    write_u32(&mut header, 12, 0);
+    write_u128(&mut header, 16, persistent_id.get());
+    write_u64(&mut header, 32, page_width);
+    // 40..56 reserved zero
+    let checksum = checksum_v1(&header[..HEADER_CHECKSUM_OFFSET]);
+    write_u64(&mut header, HEADER_CHECKSUM_OFFSET, checksum);
+    header
+}
+
+fn parse_page_store_header(
+    header: &[u8; HEADER_LENGTH],
+    layout: PageLayout,
+) -> Result<PersistentLogId, PageStoreFormatError> {
+    if header[..8] != PAGE_STORE_HEADER_MAGIC {
+        return Err(PageStoreFormatError::new(
+            0,
+            PageStoreFormatErrorReason::HeaderMagic,
+        ));
+    }
+    let version = read_u16(header, 8);
+    if version != PAGE_STORE_FORMAT_VERSION {
+        return Err(PageStoreFormatError::new(
+            8,
+            PageStoreFormatErrorReason::HeaderVersion { actual: version },
+        ));
+    }
+    let length = read_u16(header, 10);
+    if usize::from(length) != HEADER_LENGTH {
+        return Err(PageStoreFormatError::new(
+            10,
+            PageStoreFormatErrorReason::HeaderLength { actual: length },
+        ));
+    }
+    let flags = read_u32(header, 12);
+    if flags != 0 {
+        return Err(PageStoreFormatError::new(
+            12,
+            PageStoreFormatErrorReason::HeaderFlags { actual: flags },
+        ));
+    }
+    let lineage_raw = read_u128(header, 16);
+    let persistent_id = match PersistentLogId::new(lineage_raw) {
+        Some(id) => id,
+        None => {
+            return Err(PageStoreFormatError::new(
+                16,
+                PageStoreFormatErrorReason::LineageIdZero,
+            ));
+        }
+    };
+    let page_width = read_u64(header, 32);
+    if page_width == 0 {
+        return Err(PageStoreFormatError::new(
+            32,
+            PageStoreFormatErrorReason::HeaderPageWidthZero,
+        ));
+    }
+    if page_width != layout.width_u64 {
+        return Err(PageStoreFormatError::new(
+            32,
+            PageStoreFormatErrorReason::HeaderPageWidthMismatch {
+                expected: layout.width_u64,
+                actual: page_width,
+            },
+        ));
+    }
+    // 40..56 reserved
+    if header[40..56].iter().any(|byte| *byte != 0) {
+        return Err(PageStoreFormatError::new(
+            40,
+            PageStoreFormatErrorReason::HeaderReserved,
+        ));
+    }
+    let actual_checksum = read_u64(header, HEADER_CHECKSUM_OFFSET);
+    let expected_checksum = checksum_v1(&header[..HEADER_CHECKSUM_OFFSET]);
+    if actual_checksum != expected_checksum {
+        return Err(PageStoreFormatError::new(
+            56,
+            PageStoreFormatErrorReason::HeaderChecksum {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            },
+        ));
+    }
+    Ok(persistent_id)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecodedPageStoreFrame {
+    kind: PageStoreFrameKind,
+    payload_a: u64,
+    payload_b: u64,
+    payload_c: u64,
+    payload_c_bytes: [u8; PAGE_CHUNK_WIDTH],
+}
+
+fn parse_page_store_frame(
+    frame: &[u8; FRAME_LENGTH],
+    offset: u64,
+) -> Result<DecodedPageStoreFrame, PageStoreFormatError> {
+    if frame[..4] != PAGE_STORE_FRAME_MAGIC {
+        return Err(PageStoreFormatError::new(
+            offset,
+            PageStoreFormatErrorReason::FrameMagic,
+        ));
+    }
+    let kind_raw = read_u16(frame, 4);
+    let kind = PageStoreFrameKind::from_u16(kind_raw).ok_or_else(|| {
+        PageStoreFormatError::new(
+            offset + 4,
+            PageStoreFormatErrorReason::FrameKind { actual: kind_raw },
+        )
+    })?;
+    let version = read_u16(frame, 6);
+    if version != PAGE_STORE_FORMAT_VERSION {
+        return Err(PageStoreFormatError::new(
+            offset + 6,
+            PageStoreFormatErrorReason::FrameVersion { actual: version },
+        ));
+    }
+    let flags = read_u32(frame, 8);
+    if flags != 0 {
+        return Err(PageStoreFormatError::new(
+            offset + 8,
+            PageStoreFormatErrorReason::FrameFlags { actual: flags },
+        ));
+    }
+    let length = read_u16(frame, 12);
+    if usize::from(length) != FRAME_LENGTH {
+        return Err(PageStoreFormatError::new(
+            offset + 12,
+            PageStoreFormatErrorReason::FrameLength { actual: length },
+        ));
+    }
+    if read_u16(frame, 14) != 0 || frame[40..48].iter().any(|byte| *byte != 0) {
+        return Err(PageStoreFormatError::new(
+            offset + 14,
+            PageStoreFormatErrorReason::FrameReserved,
+        ));
+    }
+    let actual_checksum = read_u64(frame, FRAME_CHECKSUM_OFFSET);
+    let expected_checksum = checksum_v1(&frame[..FRAME_CHECKSUM_OFFSET]);
+    if actual_checksum != expected_checksum {
+        return Err(PageStoreFormatError::new(
+            offset + 48,
+            PageStoreFormatErrorReason::FrameChecksum {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            },
+        ));
+    }
+
+    let mut payload_c_bytes = [0_u8; PAGE_CHUNK_WIDTH];
+    payload_c_bytes.copy_from_slice(&frame[32..40]);
+    Ok(DecodedPageStoreFrame {
+        kind,
+        payload_a: read_u64(frame, 16),
+        payload_b: read_u64(frame, 24),
+        payload_c: read_u64(frame, 32),
+        payload_c_bytes,
+    })
+}
+
+fn build_page_store_frame(
+    kind: PageStoreFrameKind,
+    payload_a: u64,
+    payload_b: u64,
+    payload_c: u64,
+) -> [u8; FRAME_LENGTH] {
+    build_page_store_frame_with_payload2_bytes(kind, payload_a, payload_b, payload_c.to_be_bytes())
+}
+
+fn build_page_store_frame_with_payload2_bytes(
+    kind: PageStoreFrameKind,
+    payload_a: u64,
+    payload_b: u64,
+    payload_c_bytes: [u8; PAGE_CHUNK_WIDTH],
+) -> [u8; FRAME_LENGTH] {
+    let mut frame = [0_u8; FRAME_LENGTH];
+    frame[..4].copy_from_slice(&PAGE_STORE_FRAME_MAGIC);
+    write_u16(&mut frame, 4, kind.code());
+    write_u16(&mut frame, 6, PAGE_STORE_FORMAT_VERSION);
+    write_u32(&mut frame, 8, 0);
+    write_u16(&mut frame, 12, FRAME_LENGTH_U16);
+    write_u16(&mut frame, 14, 0);
+    write_u64(&mut frame, 16, payload_a);
+    write_u64(&mut frame, 24, payload_b);
+    frame[32..40].copy_from_slice(&payload_c_bytes);
+    let checksum = checksum_v1(&frame[..FRAME_CHECKSUM_OFFSET]);
+    write_u64(&mut frame, FRAME_CHECKSUM_OFFSET, checksum);
+    frame
+}
+
+fn sync_page_store_parent_directory(path: &Path) -> Result<(), PageStoreCreateError> {
+    let parent = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => return Err(PageStoreCreateError::MissingParentDirectory),
+    };
+    let directory = File::open(parent).map_err(|source| {
+        PageStoreCreateError::Io(PageStoreIoError::new(
+            PageStoreIoStage::OpenParentDirectory,
+            source,
+        ))
+    })?;
+    directory.sync_all().map_err(|source| {
+        PageStoreCreateError::Io(PageStoreIoError::new(
+            PageStoreIoStage::SyncParentDirectory,
+            source,
+        ))
+    })
+}
+
+// --- Open/scan state machine for page store ---
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageStoreGroupState {
+    /// Expecting snapshot header or end of file.
+    Idle,
+    /// Received snapshot header, expecting required-position frame.
+    AwaitingRequiredPosition {
+        header_offset: u64,
+        sequence: u64,
+        page_number: PageNumber,
+        page_version: PageVersion,
+    },
+    /// Received required-position, expecting page-data frames.
+    AwaitingPageData {
+        header_offset: u64,
+        sequence: u64,
+        page_number: PageNumber,
+        page_version: PageVersion,
+        required_position: u64,
+        next_chunk_index: usize,
+        chunk_count: usize,
+    },
+}
+
+struct PageStoreOpenState<const N: usize> {
+    layout: PageLayout,
+    lineage: LogLineage,
+    pages: Vec<FileStoredPage<N>>,
+    next_sequence: Option<u64>,
+    group_state: PageStoreGroupState,
+    pending_bytes: [u8; N],
+}
+
+impl<const N: usize> PageStoreOpenState<N> {
+    fn new(layout: PageLayout, lineage: LogLineage) -> Self {
+        Self {
+            layout,
+            lineage,
+            pages: Vec::new(),
+            next_sequence: Some(1),
+            group_state: PageStoreGroupState::Idle,
+            pending_bytes: [0_u8; N],
+        }
+    }
+
+    fn pending_group_header_offset(&self) -> Option<u64> {
+        match self.group_state {
+            PageStoreGroupState::Idle => None,
+            PageStoreGroupState::AwaitingRequiredPosition { header_offset, .. }
+            | PageStoreGroupState::AwaitingPageData { header_offset, .. } => Some(header_offset),
+        }
+    }
+
+    fn apply_frame(
+        &mut self,
+        frame: DecodedPageStoreFrame,
+        offset: u64,
+    ) -> Result<(), PageStoreOpenError> {
+        match self.group_state {
+            PageStoreGroupState::Idle => self.apply_idle_frame(frame, offset),
+            PageStoreGroupState::AwaitingRequiredPosition { .. } => {
+                self.apply_awaiting_required_position_frame(frame, offset)
+            }
+            PageStoreGroupState::AwaitingPageData { .. } => {
+                self.apply_awaiting_page_data_frame(frame, offset)
+            }
+        }
+    }
+
+    fn apply_idle_frame(
+        &mut self,
+        frame: DecodedPageStoreFrame,
+        offset: u64,
+    ) -> Result<(), PageStoreOpenError> {
+        if frame.kind != PageStoreFrameKind::SnapshotHeader {
+            match frame.kind {
+                PageStoreFrameKind::RequiredPosition | PageStoreFrameKind::PageData => {
+                    return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                        offset + 4,
+                        PageStoreFormatErrorReason::PageDataWithoutHeader,
+                    )));
+                }
+                PageStoreFrameKind::SnapshotHeader => {}
+            }
+        }
+        // Validate sequence
+        if frame.payload_a == 0 {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 16,
+                PageStoreFormatErrorReason::SnapshotSequenceZero,
+            )));
+        }
+        let expected_sequence =
+            self.next_sequence
+                .ok_or(PageStoreOpenError::Format(PageStoreFormatError::new(
+                    offset + 16,
+                    PageStoreFormatErrorReason::SnapshotSequenceSpaceExhausted,
+                )))?;
+        if frame.payload_a != expected_sequence {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 16,
+                PageStoreFormatErrorReason::SnapshotSequenceOutOfOrder {
+                    expected: expected_sequence,
+                    actual: frame.payload_a,
+                },
+            )));
+        }
+        // Validate page number nonzero
+        let page_number = PageNumber::new(frame.payload_b).ok_or_else(|| {
+            PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 24,
+                PageStoreFormatErrorReason::SnapshotPageNumberZero,
+            ))
+        })?;
+        let page_version = PageVersion::new(frame.payload_c);
+
+        self.pending_bytes = [0_u8; N];
+        self.group_state = PageStoreGroupState::AwaitingRequiredPosition {
+            header_offset: offset,
+            sequence: frame.payload_a,
+            page_number,
+            page_version,
+        };
+        Ok(())
+    }
+
+    fn apply_awaiting_required_position_frame(
+        &mut self,
+        frame: DecodedPageStoreFrame,
+        offset: u64,
+    ) -> Result<(), PageStoreOpenError> {
+        let (header_offset, sequence, page_number, page_version) = match self.group_state {
+            PageStoreGroupState::AwaitingRequiredPosition {
+                header_offset,
+                sequence,
+                page_number,
+                page_version,
+            } => (header_offset, sequence, page_number, page_version),
+            _ => {
+                return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                    offset + 4,
+                    PageStoreFormatErrorReason::PageDataWithoutHeader,
+                )));
+            }
+        };
+        if frame.kind != PageStoreFrameKind::RequiredPosition {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 4,
+                PageStoreFormatErrorReason::UnexpectedKindAfterHeader {
+                    actual: frame.kind.code(),
+                },
+            )));
+        }
+        if frame.payload_a != sequence {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 16,
+                PageStoreFormatErrorReason::RequiredPositionSequenceMismatch {
+                    expected: sequence,
+                    actual: frame.payload_a,
+                },
+            )));
+        }
+        if frame.payload_b == 0 {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 24,
+                PageStoreFormatErrorReason::RequiredPositionZero,
+            )));
+        }
+        if frame.payload_c != 0 {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 32,
+                PageStoreFormatErrorReason::RequiredPositionPayloadCNonzero {
+                    actual: frame.payload_c,
+                },
+            )));
+        }
+        self.group_state = PageStoreGroupState::AwaitingPageData {
+            header_offset,
+            sequence,
+            page_number,
+            page_version,
+            required_position: frame.payload_b,
+            next_chunk_index: 0,
+            chunk_count: self.layout.chunk_count,
+        };
+        Ok(())
+    }
+
+    fn apply_awaiting_page_data_frame(
+        &mut self,
+        frame: DecodedPageStoreFrame,
+        offset: u64,
+    ) -> Result<(), PageStoreOpenError> {
+        let (
+            header_offset,
+            sequence,
+            page_number,
+            page_version,
+            required_position,
+            next_chunk_index,
+            chunk_count,
+        ) = match self.group_state {
+            PageStoreGroupState::AwaitingPageData {
+                header_offset,
+                sequence,
+                page_number,
+                page_version,
+                required_position,
+                next_chunk_index,
+                chunk_count,
+            } => (
+                header_offset,
+                sequence,
+                page_number,
+                page_version,
+                required_position,
+                next_chunk_index,
+                chunk_count,
+            ),
+            _ => {
+                return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                    offset + 4,
+                    PageStoreFormatErrorReason::PageDataWithoutHeader,
+                )));
+            }
+        };
+        if frame.kind != PageStoreFrameKind::PageData {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 4,
+                PageStoreFormatErrorReason::UnexpectedKindAfterRequiredPosition {
+                    actual: frame.kind.code(),
+                },
+            )));
+        }
+        if frame.payload_a != sequence {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 16,
+                PageStoreFormatErrorReason::PageDataSequenceMismatch {
+                    expected: sequence,
+                    actual: frame.payload_a,
+                },
+            )));
+        }
+        let expected_chunk_u64 = u64::try_from(next_chunk_index).map_err(|_| {
+            PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 24,
+                PageStoreFormatErrorReason::PageDataChunkIndexOutOfSequence {
+                    expected: u64::MAX,
+                    actual: frame.payload_b,
+                },
+            ))
+        })?;
+        if frame.payload_b != expected_chunk_u64 {
+            return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                offset + 24,
+                PageStoreFormatErrorReason::PageDataChunkIndexOutOfSequence {
+                    expected: expected_chunk_u64,
+                    actual: frame.payload_b,
+                },
+            )));
+        }
+
+        // Copy chunk data
+        let start = next_chunk_index * PAGE_CHUNK_WIDTH;
+        let logical_len = self.layout.logical_bytes_for_chunk(next_chunk_index);
+        let end = start + logical_len;
+        for (destination, source_byte) in self.pending_bytes[start..end]
+            .iter_mut()
+            .zip(frame.payload_c_bytes[..logical_len].iter())
+        {
+            *destination = *source_byte;
+        }
+
+        let new_next = next_chunk_index + 1;
+
+        // Check final chunk padding
+        if new_next == chunk_count && self.layout.final_chunk_len < PAGE_CHUNK_WIDTH {
+            let pad_start = self.layout.final_chunk_len;
+            if frame.payload_c_bytes[pad_start..]
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                    offset + 32,
+                    PageStoreFormatErrorReason::PageDataFinalPaddingNonzero,
+                )));
+            }
+        }
+
+        if new_next == chunk_count {
+            let stored = FileStoredPage {
+                page_number,
+                page_version,
+                bytes: self.pending_bytes,
+                required_position: self.lineage.position(required_position),
+                store_sequence: sequence,
+            };
+            if let Some(index) = self
+                .pages
+                .iter()
+                .position(|page| page.page_number == page_number)
+            {
+                self.pages[index] = stored;
+            } else {
+                self.pages
+                    .try_reserve(1)
+                    .map_err(|_| PageStoreOpenError::SnapshotCapacityExhausted)?;
+                self.pages.push(stored);
+            }
+            self.next_sequence = sequence.checked_add(1);
+            self.group_state = PageStoreGroupState::Idle;
+        } else {
+            self.group_state = PageStoreGroupState::AwaitingPageData {
+                header_offset,
+                sequence,
+                page_number,
+                page_version,
+                required_position,
+                next_chunk_index: new_next,
+                chunk_count,
+            };
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -3936,5 +5474,1057 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FilePageStore tests
+    // -----------------------------------------------------------------------
+
+    use ntsql_page::{
+        CleanPage, DirtyPage, FlushDirtyPageError, FlushDirtyPageRejectionReason, flush_dirty_page,
+    };
+
+    fn write_page_through_flush<const N: usize>(
+        log: &mut FileCommitLog<N>,
+        store: &mut FilePageStore<N>,
+        dirty: DirtyPage<N>,
+    ) -> Result<CleanPage<N>, Box<dyn Error>> {
+        let clean = flush_dirty_page(log, store, dirty)
+            .map_err(|e| io::Error::other(format!("flush_dirty_page failed: {e}")))?;
+        Ok(clean)
+    }
+
+    struct ZeroPositionPageLog {
+        lineage: LogLineage,
+    }
+
+    impl LogDurability for ZeroPositionPageLog {
+        type Error = std::convert::Infallible;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn flush_through(&mut self, _position: &LogSequenceNumber) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    impl<const N: usize> PageLog<N> for ZeroPositionPageLog {
+        fn append_page(
+            &mut self,
+            _page: &UnloggedPage<N>,
+        ) -> Result<LogSequenceNumber, Self::Error> {
+            Ok(self.lineage.position(0))
+        }
+    }
+
+    #[test]
+    fn page_store_header_exact_bytes_and_checksum() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-header")?;
+        let path = directory.path().join("pages.bin");
+        let pid = persistent_id(200)?;
+
+        let store = FilePageStore::<10>::create_new(&path, pid)?;
+        assert_eq!(store.persistent_id(), pid);
+        assert!(store.pages().is_empty());
+        drop(store);
+
+        let bytes = fs::read(&path)?;
+        assert_eq!(bytes.len(), HEADER_LENGTH);
+        assert_eq!(&bytes[..8], b"NTSQPGS1");
+        assert_eq!(read_u16(&bytes, 8), 1); // version
+        assert_eq!(read_u16(&bytes, 10), 64); // header length
+        assert_eq!(read_u32(&bytes, 12), 0); // flags
+        assert_eq!(read_u128(&bytes, 16), pid.get()); // persistent ID
+        assert_eq!(read_u64(&bytes, 32), 10); // page width N=10
+        // 40..56 reserved zero
+        for byte in &bytes[40..56] {
+            assert_eq!(*byte, 0, "reserved byte should be zero");
+        }
+        assert_eq!(read_u64(&bytes, 56), 0xec25_2b5e_1c3d_f64d);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_integration_with_commit_log_v2() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-integration")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(201)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        // stage_page_write -> flush_dirty_page -> FilePageStore
+        let unlogged = unlogged_page(log.lineage(), 1, 5, [0xAA, 0xBB])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        let required_pos = dirty.required_position().get();
+        assert_eq!(required_pos, 1);
+
+        let clean = write_page_through_flush(&mut log, &mut store, dirty)?;
+        assert_eq!(clean.address().number().get(), 1);
+        assert_eq!(clean.version().get(), 5);
+        assert_eq!(*clean.image().bytes(), [0xAA, 0xBB]);
+        assert_eq!(clean.required_position().get(), 1);
+
+        // Inspect store
+        assert_eq!(store.pages().len(), 1);
+        let snapshot = store.page(page_number(1)?);
+        assert!(snapshot.is_some());
+        let snapshot = snapshot.ok_or_else(|| io::Error::other("missing page"))?;
+        assert_eq!(snapshot.page_number().get(), 1);
+        assert_eq!(snapshot.page_version().get(), 5);
+        assert_eq!(*snapshot.bytes(), [0xAA, 0xBB]);
+        assert_eq!(
+            snapshot.required_position(),
+            &log.lineage().position(required_pos)
+        );
+        assert_eq!(snapshot.store_sequence(), 1);
+
+        // Drop and reopen both
+        drop(store);
+        drop(log);
+
+        let mut log = FileCommitLog::<2>::open_page_capable(&log_path)?;
+        let mut store = FilePageStore::<2>::open(&store_path)?;
+        assert_eq!(store.pages().len(), 1);
+        let snapshot = store
+            .page(page_number(1)?)
+            .ok_or_else(|| io::Error::other("missing page after reopen"))?;
+        assert_eq!(*snapshot.bytes(), [0xAA, 0xBB]);
+        assert_eq!(
+            snapshot.required_position(),
+            &log.lineage().position(required_pos)
+        );
+        assert_eq!(snapshot.store_sequence(), 1);
+
+        // Append after reopen proving sequence high-water
+        let unlogged2 = unlogged_page(log.lineage(), 2, 10, [0xCC, 0xDD])?;
+        let dirty2 =
+            stage_page_write(&mut log, unlogged2).map_err(|e| io::Error::other(format!("{e}")))?;
+        let clean2 = write_page_through_flush(&mut log, &mut store, dirty2)?;
+        assert_eq!(clean2.required_position().get(), 2);
+        assert_eq!(store.pages().len(), 2);
+        let snapshot2 = store
+            .page(page_number(2)?)
+            .ok_or_else(|| io::Error::other("missing page 2"))?;
+        assert_eq!(snapshot2.store_sequence(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_rewrite_same_page_appends_and_latest_wins() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-rewrite")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(202)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        // Write page 1 version 1
+        let unlogged1 = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty1 =
+            stage_page_write(&mut log, unlogged1).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty1)?;
+
+        // Write page 1 version 2 (rewrite)
+        let unlogged2 = unlogged_page(log.lineage(), 1, 2, [0x03, 0x04])?;
+        let dirty2 =
+            stage_page_write(&mut log, unlogged2).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty2)?;
+
+        // Latest wins
+        assert_eq!(store.pages().len(), 1);
+        let snapshot = store
+            .page(page_number(1)?)
+            .ok_or_else(|| io::Error::other("missing page"))?;
+        assert_eq!(snapshot.page_version().get(), 2);
+        assert_eq!(*snapshot.bytes(), [0x03, 0x04]);
+        assert_eq!(snapshot.store_sequence(), 2);
+
+        // Reopen
+        drop(store);
+        let store = FilePageStore::<2>::open(&store_path)?;
+        assert_eq!(store.pages().len(), 1);
+        let snapshot = store
+            .page(page_number(1)?)
+            .ok_or_else(|| io::Error::other("missing page after reopen"))?;
+        assert_eq!(snapshot.page_version().get(), 2);
+        assert_eq!(*snapshot.bytes(), [0x03, 0x04]);
+        assert_eq!(snapshot.store_sequence(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_width_zero_rejects_before_mutation() -> Result<(), Box<dyn Error>> {
+        let pid = persistent_id(250)?;
+        let result = FilePageStore::<0>::create_new("should-not-exist.bin", pid);
+        assert!(
+            matches!(
+                result,
+                Err(PageStoreCreateError::PageWidth(FilePageWidthError::Zero))
+            ),
+            "expected PageWidth(Zero) error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_width_mismatch_rejects_before_mutation() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-width-mismatch")?;
+        let path = directory.path().join("pages.bin");
+        let pid = persistent_id(203)?;
+
+        let store = FilePageStore::<10>::create_new(&path, pid)?;
+        drop(store);
+        append_bytes(&path, &[1, 2, 3])?;
+        let len_before = fs::metadata(&path)?.len();
+
+        // Try to open with width 5 instead of 10
+        let error = FilePageStore::<5>::open(&path)
+            .err()
+            .ok_or_else(|| io::Error::other("width mismatch accepted"))?;
+        match error {
+            PageStoreOpenError::Format(ref e) => {
+                assert!(matches!(
+                    e.reason(),
+                    PageStoreFormatErrorReason::HeaderPageWidthMismatch {
+                        expected: 5,
+                        actual: 10
+                    }
+                ));
+            }
+            _ => return Err(io::Error::other("wrong error type for width mismatch").into()),
+        }
+        assert_eq!(fs::metadata(&path)?.len(), len_before);
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_foreign_page_lineage_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-foreign-page")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid1 = persistent_id(204)?;
+        let pid2 = persistent_id(205)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid1)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid2)?;
+        store.arm_fault(PageStoreFaultPoint::AfterWrite)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+
+        let error = flush_dirty_page(&mut log, &mut store, dirty)
+            .err()
+            .ok_or_else(|| io::Error::other("foreign store unexpectedly accepted the page"))?;
+        let FlushDirtyPageError::Rejected(rejection) = error else {
+            return Err(io::Error::other("foreign store reached the write port").into());
+        };
+        assert_eq!(
+            rejection.reason(),
+            FlushDirtyPageRejectionReason::ForeignStore
+        );
+        assert_eq!(store.armed_fault(), Some(PageStoreFaultPoint::AfterWrite));
+        assert!(store.pages().is_empty());
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_zero_required_position_rejects_before_mutation() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-zero-required-position")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(251)?;
+        let lineage = LogLineage::persistent(pid);
+        let mut log = ZeroPositionPageLog {
+            lineage: lineage.clone(),
+        };
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        store.arm_fault(PageStoreFaultPoint::AfterWrite)?;
+        let len_before = fs::metadata(&store_path)?.len();
+        let unlogged = unlogged_page(&lineage, 1, 1, [0x01, 0x02])?;
+        let dirty = stage_page_write(&mut log, unlogged)?;
+
+        let error = flush_dirty_page(&mut log, &mut store, dirty)
+            .err()
+            .ok_or_else(|| io::Error::other("zero required position unexpectedly persisted"))?;
+        let FlushDirtyPageError::StoreWrite(error) = error else {
+            return Err(io::Error::other("zero required position returned the wrong error").into());
+        };
+        assert_eq!(
+            error.cause(),
+            &FilePageStoreError::RequiredPositionZero(page_number(1)?)
+        );
+        assert_eq!(store.armed_fault(), Some(PageStoreFaultPoint::AfterWrite));
+        assert!(store.pages().is_empty());
+        assert!(!store.is_poisoned());
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        drop(store);
+        let reopened = FilePageStore::<2>::open(&store_path)?;
+        assert!(reopened.pages().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_before_write_fault_returns_before_mutation() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-before-write")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(206)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        store.arm_fault(PageStoreFaultPoint::BeforeWrite)?;
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+
+        let error = flush_dirty_page(&mut log, &mut store, dirty)
+            .err()
+            .ok_or_else(|| io::Error::other("before-write fault unexpectedly succeeded"))?;
+        let FlushDirtyPageError::StoreWrite(error) = error else {
+            return Err(io::Error::other("before-write fault returned the wrong error").into());
+        };
+        assert_eq!(
+            error.cause(),
+            &FilePageStoreError::InjectedFault(PageStoreFaultPoint::BeforeWrite)
+        );
+
+        assert!(store.pages().is_empty());
+        assert!(!store.is_poisoned());
+        assert_eq!(fs::metadata(&store_path)?.len(), HEADER_LENGTH_U64);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_after_write_fault_writes_and_updates_state_then_reports_error()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-after-write")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(207)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        store.arm_fault(PageStoreFaultPoint::AfterWrite)?;
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+
+        let error = flush_dirty_page(&mut log, &mut store, dirty)
+            .err()
+            .ok_or_else(|| io::Error::other("after-write fault unexpectedly succeeded"))?;
+        let FlushDirtyPageError::StoreWrite(error) = error else {
+            return Err(io::Error::other("after-write fault returned the wrong error").into());
+        };
+        assert_eq!(
+            error.cause(),
+            &FilePageStoreError::InjectedFault(PageStoreFaultPoint::AfterWrite)
+        );
+
+        assert_eq!(store.pages().len(), 1);
+        let snapshot = store
+            .page(page_number(1)?)
+            .ok_or_else(|| io::Error::other("missing page after AfterWrite"))?;
+        assert_eq!(*snapshot.bytes(), [0x01, 0x02]);
+        assert!(!store.is_poisoned());
+
+        // Reopen should work
+        drop(store);
+        let store = FilePageStore::<2>::open(&store_path)?;
+        assert_eq!(store.pages().len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_incomplete_physical_frame_repaired_on_open() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-incomplete-physical")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(208)?;
+
+        let store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        drop(store);
+
+        // Append partial frame bytes (less than 56)
+        append_bytes(&store_path, &[1, 2, 3])?;
+        let len_before = fs::metadata(&store_path)?.len();
+        assert_eq!(len_before, HEADER_LENGTH_U64 + 3);
+
+        // Reopen should repair back to header
+        let store = FilePageStore::<2>::open(&store_path)?;
+        assert!(store.pages().is_empty());
+        assert_eq!(fs::metadata(&store_path)?.len(), HEADER_LENGTH_U64);
+        drop(store);
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_incomplete_logical_group_at_header_repaired() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-incomplete-group-header")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(209)?;
+
+        // Write one complete page, then simulate interrupted second write
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty)?;
+
+        let len_after_first = fs::metadata(&store_path)?.len();
+        drop(store);
+
+        // Append just a snapshot-header frame for page 2 (incomplete group)
+        let header_frame = build_page_store_frame(
+            PageStoreFrameKind::SnapshotHeader,
+            2, // sequence
+            2, // page number
+            0, // version
+        );
+        append_bytes(&store_path, &header_frame)?;
+
+        // Reopen should truncate the incomplete group
+        let store = FilePageStore::<2>::open(&store_path)?;
+        assert_eq!(store.pages().len(), 1);
+        assert_eq!(fs::metadata(&store_path)?.len(), len_after_first);
+        let snapshot = store
+            .page(page_number(1)?)
+            .ok_or_else(|| io::Error::other("missing page after repair"))?;
+        assert_eq!(*snapshot.bytes(), [0x01, 0x02]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_incomplete_logical_group_after_required_position_repaired()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-incomplete-group-reqpos")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(210)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        // Write one complete page
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty)?;
+
+        let len_after_first = fs::metadata(&store_path)?.len();
+        drop(store);
+
+        // Append snapshot-header + required-position (but no data frames)
+        let header_frame = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 2, 2, 0);
+        let req_frame = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 2, 42, 0);
+        append_bytes(&store_path, &header_frame)?;
+        append_bytes(&store_path, &req_frame)?;
+
+        // Reopen should truncate back to end of first group
+        let store = FilePageStore::<2>::open(&store_path)?;
+        assert_eq!(store.pages().len(), 1);
+        assert_eq!(fs::metadata(&store_path)?.len(), len_after_first);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_wrong_kind_rejects_without_truncation() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-wrong-kind")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(211)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty)?;
+        drop(store);
+
+        // Write a complete valid snapshot-header, but follow with another snapshot-header
+        // instead of required-position (wrong kind)
+        let header_frame = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 2, 2, 0);
+        let wrong_frame = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 2, 3, 0);
+        append_bytes(&store_path, &header_frame)?;
+        append_bytes(&store_path, &wrong_frame)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("wrong kind accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_sequence_replay_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-replay")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(212)?;
+
+        let store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        drop(store);
+
+        // Write sequence 1 group completely
+        let hdr = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 1, 1, 0);
+        let req = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 1, 1, 0);
+        let data = build_page_store_frame(PageStoreFrameKind::PageData, 1, 0, 0);
+        append_bytes(&store_path, &hdr)?;
+        append_bytes(&store_path, &req)?;
+        append_bytes(&store_path, &data)?;
+
+        // Then replay sequence 1 again
+        append_bytes(&store_path, &hdr)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("sequence replay accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_sequence_exhaustion_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-sequence-exhausted")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(224)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        store.next_sequence = None;
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        let error = flush_dirty_page(&mut log, &mut store, dirty)
+            .err()
+            .ok_or_else(|| io::Error::other("sequence exhaustion unexpectedly wrote"))?;
+        let ntsql_page::FlushDirtyPageError::StoreWrite(store_error) = error else {
+            return Err(io::Error::other("expected store write failure").into());
+        };
+        assert_eq!(
+            store_error.cause(),
+            &FilePageStoreError::StoreSequenceSpaceExhausted
+        );
+        assert!(store.pages().is_empty());
+        assert_eq!(fs::metadata(&store_path)?.len(), HEADER_LENGTH_U64);
+        assert!(!store.is_poisoned());
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_sequence_exhaustion_on_open() -> Result<(), Box<dyn Error>> {
+        let pid = persistent_id(225)?;
+        let lineage = LogLineage::persistent(pid);
+        let layout = PageLayout::for_const::<2>().map_err(io::Error::other)?;
+        let mut state = PageStoreOpenState::<2>::new(layout, lineage.clone());
+        state.next_sequence = Some(u64::MAX);
+
+        let header_offset = HEADER_LENGTH_U64;
+        let header = parse_page_store_frame(
+            &build_page_store_frame(PageStoreFrameKind::SnapshotHeader, u64::MAX, 1, 7),
+            header_offset,
+        )
+        .map_err(io::Error::other)?;
+        state.apply_frame(header, header_offset)?;
+
+        let required_position_offset = header_offset + FRAME_LENGTH_U64;
+        let required_position = parse_page_store_frame(
+            &build_page_store_frame(PageStoreFrameKind::RequiredPosition, u64::MAX, 11, 0),
+            required_position_offset,
+        )
+        .map_err(io::Error::other)?;
+        state.apply_frame(required_position, required_position_offset)?;
+
+        let data_offset = required_position_offset + FRAME_LENGTH_U64;
+        let data = parse_page_store_frame(
+            &build_page_store_frame(
+                PageStoreFrameKind::PageData,
+                u64::MAX,
+                0,
+                0x0102_0000_0000_0000,
+            ),
+            data_offset,
+        )
+        .map_err(io::Error::other)?;
+        state.apply_frame(data, data_offset)?;
+
+        assert!(state.next_sequence.is_none());
+        assert_eq!(state.pages.len(), 1);
+        assert_eq!(state.pages[0].store_sequence(), u64::MAX);
+        assert_eq!(state.pages[0].required_position().get(), 11);
+        assert!(
+            state
+                .lineage
+                .same_lineage(state.pages[0].required_position().lineage())
+        );
+        let extra_offset = data_offset + FRAME_LENGTH_U64;
+        let extra_header = parse_page_store_frame(
+            &build_page_store_frame(PageStoreFrameKind::SnapshotHeader, u64::MAX, 2, 8),
+            extra_offset,
+        )
+        .map_err(io::Error::other)?;
+        let extra_error = state
+            .apply_frame(extra_header, extra_offset)
+            .err()
+            .ok_or_else(|| io::Error::other("sequence after u64::MAX unexpectedly opened"))?;
+        assert_eq!(
+            extra_error,
+            PageStoreOpenError::Format(PageStoreFormatError::new(
+                extra_offset + 16,
+                PageStoreFormatErrorReason::SnapshotSequenceSpaceExhausted,
+            ))
+        );
+
+        let directory = TestDirectory::new("ps-sequence-exhausted-open")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        store.next_sequence = state.next_sequence;
+
+        let unlogged = unlogged_page(log.lineage(), 2, 1, [0x03, 0x04])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        let error = flush_dirty_page(&mut log, &mut store, dirty)
+            .err()
+            .ok_or_else(|| io::Error::other("sequence exhaustion unexpectedly wrote"))?;
+        let ntsql_page::FlushDirtyPageError::StoreWrite(store_error) = error else {
+            return Err(io::Error::other("expected store write failure").into());
+        };
+        assert_eq!(
+            store_error.cause(),
+            &FilePageStoreError::StoreSequenceSpaceExhausted
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_parent_sequence_mismatch_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-parent-mismatch")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(213)?;
+
+        let store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        drop(store);
+
+        // Snapshot header with sequence 1, required-position with wrong sequence
+        let hdr = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 1, 1, 0);
+        let req = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 99, 1, 0);
+        append_bytes(&store_path, &hdr)?;
+        append_bytes(&store_path, &req)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("parent mismatch accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_data_chunk_index_mismatch_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-chunk-index")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(214)?;
+
+        let store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        drop(store);
+
+        let hdr = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 1, 1, 0);
+        let req = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 1, 1, 0);
+        // Data with chunk_index=1 instead of 0
+        let data = build_page_store_frame(PageStoreFrameKind::PageData, 1, 1, 0);
+        append_bytes(&store_path, &hdr)?;
+        append_bytes(&store_path, &req)?;
+        append_bytes(&store_path, &data)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("chunk index mismatch accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_nonzero_padding_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-nonzero-padding")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(215)?;
+
+        // N=3 => final chunk has 3 bytes, padding 5 bytes
+        let store = FilePageStore::<3>::create_new(&store_path, pid)?;
+        drop(store);
+
+        let hdr = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 1, 1, 0);
+        let req = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 1, 1, 0);
+        // Data with nonzero padding: byte[3..8] should be zero but we put nonzero
+        let bad_chunk: [u8; 8] = [0x01, 0x02, 0x03, 0xFF, 0x00, 0x00, 0x00, 0x00];
+        let data = build_page_store_frame_with_payload2_bytes(
+            PageStoreFrameKind::PageData,
+            1,
+            0,
+            bad_chunk,
+        );
+        append_bytes(&store_path, &hdr)?;
+        append_bytes(&store_path, &req)?;
+        append_bytes(&store_path, &data)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<3>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("nonzero padding accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_checksum_corruption_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-checksum")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(216)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [0x01, 0x02])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty)?;
+        drop(store);
+
+        // Corrupt a byte in the first frame (snapshot header)
+        let corrupt_offset = HEADER_LENGTH + 20; // inside payload
+        flip_byte(&store_path, corrupt_offset)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("checksum corruption accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_required_position_zero_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-reqpos-zero")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(217)?;
+
+        let store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        drop(store);
+
+        let hdr = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 1, 1, 0);
+        let req = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 1, 0, 0);
+        append_bytes(&store_path, &hdr)?;
+        append_bytes(&store_path, &req)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("required position zero accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_nonzero_reserved_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-nonzero-reserved")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(218)?;
+
+        let store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        drop(store);
+
+        // Build a frame manually with nonzero reserved bytes (40..48)
+        let mut frame = [0_u8; FRAME_LENGTH];
+        frame[..4].copy_from_slice(&PAGE_STORE_FRAME_MAGIC);
+        write_u16(&mut frame, 4, PageStoreFrameKind::SnapshotHeader.code());
+        write_u16(&mut frame, 6, PAGE_STORE_FORMAT_VERSION);
+        write_u32(&mut frame, 8, 0);
+        write_u16(&mut frame, 12, FRAME_LENGTH_U16);
+        write_u16(&mut frame, 14, 0);
+        write_u64(&mut frame, 16, 1); // sequence
+        write_u64(&mut frame, 24, 1); // page number
+        write_u64(&mut frame, 32, 0); // version
+        frame[40] = 0xFF; // nonzero reserved
+        let checksum = checksum_v1(&frame[..FRAME_CHECKSUM_OFFSET]);
+        write_u64(&mut frame, FRAME_CHECKSUM_OFFSET, checksum);
+
+        append_bytes(&store_path, &frame)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("nonzero reserved accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_exclusive_lock_blocks_reopen_and_releases_on_drop() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TestDirectory::new("ps-lock")?;
+        let path = directory.path().join("pages.bin");
+        let pid = persistent_id(219)?;
+
+        let store = FilePageStore::<2>::create_new(&path, pid)?;
+        append_bytes(&path, &[1, 2, 3])?;
+        let bytes_before_open = fs::read(&path)?;
+
+        let error = FilePageStore::<2>::open(&path)
+            .err()
+            .ok_or_else(|| io::Error::other("second writer acquired the file lock"))?;
+        let PageStoreOpenError::Io(source) = error else {
+            return Err(io::Error::other("lock contention not I/O").into());
+        };
+        assert_eq!(source.stage(), PageStoreIoStage::AcquireExclusiveLock);
+        assert_eq!(source.io_source().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&path)?, bytes_before_open);
+
+        drop(store);
+        let reopened = FilePageStore::<2>::open(&path)?;
+        assert_eq!(reopened.persistent_id(), pid);
+        assert_eq!(fs::metadata(&path)?.len(), HEADER_LENGTH_U64);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn page_store_hard_link_lock_exclusion() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-hard-link")?;
+        let path = directory.path().join("pages.bin");
+        let alias = directory.path().join("pages-alias.bin");
+        let pid = persistent_id(220)?;
+
+        let store = FilePageStore::<2>::create_new(&path, pid)?;
+        fs::hard_link(&path, &alias)?;
+
+        let error = FilePageStore::<2>::open(&alias)
+            .err()
+            .ok_or_else(|| io::Error::other("hard-link alias bypassed file lock"))?;
+        let PageStoreOpenError::Io(source) = error else {
+            return Err(io::Error::other("alias lock not I/O").into());
+        };
+        assert_eq!(source.stage(), PageStoreIoStage::AcquireExclusiveLock);
+        assert_eq!(source.io_source().kind(), io::ErrorKind::WouldBlock);
+
+        drop(store);
+        let reopened = FilePageStore::<2>::open(&alias)?;
+        assert_eq!(reopened.persistent_id(), pid);
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_snapshot_header_and_data_frame_golden_bytes() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-golden-bytes")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(221)?;
+
+        let mut log = FileCommitLog::<10>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<10>::create_new(&store_path, pid)?;
+
+        let unlogged = unlogged_page(
+            log.lineage(),
+            1,
+            5,
+            [0xAA, 0xBB, 1, 2, 3, 4, 5, 6, 0xCC, 0xDD],
+        )?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty)?;
+        drop(store);
+
+        let bytes = fs::read(&store_path)?;
+        assert_eq!(bytes.len(), HEADER_LENGTH + FRAME_LENGTH * 4);
+
+        let mut frame = [0_u8; FRAME_LENGTH];
+
+        let header_start = HEADER_LENGTH;
+        frame.copy_from_slice(&bytes[header_start..header_start + FRAME_LENGTH]);
+        assert_eq!(&frame[..4], b"NTSP");
+        assert_eq!(read_u16(&frame, 4), 1);
+        assert_eq!(read_u16(&frame, 6), 1);
+        assert_eq!(read_u64(&frame, 16), 1);
+        assert_eq!(read_u64(&frame, 24), 1);
+        assert_eq!(read_u64(&frame, 32), 5);
+        assert_eq!(
+            read_u64(&frame, FRAME_CHECKSUM_OFFSET),
+            0x410f_8838_f683_3c71
+        );
+
+        let required_position_start = HEADER_LENGTH + FRAME_LENGTH;
+        frame.copy_from_slice(
+            &bytes[required_position_start..required_position_start + FRAME_LENGTH],
+        );
+        assert_eq!(&frame[..4], b"NTSP");
+        assert_eq!(read_u16(&frame, 4), 2);
+        assert_eq!(read_u64(&frame, 16), 1);
+        assert_eq!(read_u64(&frame, 24), 1);
+        assert_eq!(read_u64(&frame, 32), 0);
+        assert_eq!(
+            read_u64(&frame, FRAME_CHECKSUM_OFFSET),
+            0x666a_2ca3_47af_4883
+        );
+
+        let first_data_start = HEADER_LENGTH + FRAME_LENGTH * 2;
+        let mut first_data_frame = [0_u8; FRAME_LENGTH];
+        first_data_frame.copy_from_slice(&bytes[first_data_start..first_data_start + FRAME_LENGTH]);
+        assert_eq!(&first_data_frame[..4], b"NTSP");
+        assert_eq!(read_u16(&first_data_frame, 4), 3);
+        assert_eq!(read_u64(&first_data_frame, 16), 1);
+        assert_eq!(read_u64(&first_data_frame, 24), 0);
+        assert_eq!(&first_data_frame[32..40], &[0xAA, 0xBB, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            read_u64(&first_data_frame, FRAME_CHECKSUM_OFFSET),
+            0xe9ea_8e28_a88d_17d7
+        );
+
+        let final_data_start = HEADER_LENGTH + FRAME_LENGTH * 3;
+        let mut final_data_frame = [0_u8; FRAME_LENGTH];
+        final_data_frame.copy_from_slice(&bytes[final_data_start..final_data_start + FRAME_LENGTH]);
+        assert_eq!(&final_data_frame[..4], b"NTSP");
+        assert_eq!(read_u16(&final_data_frame, 4), 3);
+        assert_eq!(read_u64(&final_data_frame, 16), 1);
+        assert_eq!(read_u64(&final_data_frame, 24), 1);
+        assert_eq!(&final_data_frame[32..40], &[0xCC, 0xDD, 0, 0, 0, 0, 0, 0]);
+        assert_ne!(first_data_frame, final_data_frame);
+        assert_eq!(
+            read_u64(&final_data_frame, FRAME_CHECKSUM_OFFSET),
+            0x2305_fa72_23d5_15db
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_incomplete_group_at_partial_data_repaired() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-incomplete-data")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(222)?;
+
+        // Use N=10 which needs ceil(10/8) = 2 data frames
+        let mut log = FileCommitLog::<10>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<10>::create_new(&store_path, pid)?;
+
+        let unlogged = unlogged_page(log.lineage(), 1, 1, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])?;
+        let dirty =
+            stage_page_write(&mut log, unlogged).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty)?;
+
+        let len_after_first = fs::metadata(&store_path)?.len();
+        drop(store);
+
+        // Write incomplete second group: header + required-position + 1 data frame (need 2)
+        let hdr = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 2, 2, 0);
+        let req = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 2, 42, 0);
+        let data = build_page_store_frame(PageStoreFrameKind::PageData, 2, 0, 0);
+        append_bytes(&store_path, &hdr)?;
+        append_bytes(&store_path, &req)?;
+        append_bytes(&store_path, &data)?;
+
+        // Reopen should truncate back to first group
+        let store = FilePageStore::<10>::open(&store_path)?;
+        assert_eq!(store.pages().len(), 1);
+        assert_eq!(fs::metadata(&store_path)?.len(), len_after_first);
+        let snapshot = store
+            .page(page_number(1)?)
+            .ok_or_else(|| io::Error::other("missing page after repair"))?;
+        assert_eq!(*snapshot.bytes(), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(snapshot.store_sequence(), 1);
+
+        // Verify high-water: next write should get sequence 2
+        drop(store);
+        drop(log);
+        let mut log = FileCommitLog::<10>::open_page_capable(&log_path)?;
+        let mut store = FilePageStore::<10>::open(&store_path)?;
+        let unlogged2 = unlogged_page(
+            log.lineage(),
+            3,
+            1,
+            [11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
+        )?;
+        let dirty2 =
+            stage_page_write(&mut log, unlogged2).map_err(|e| io::Error::other(format!("{e}")))?;
+        write_page_through_flush(&mut log, &mut store, dirty2)?;
+        let snapshot2 = store
+            .page(page_number(3)?)
+            .ok_or_else(|| io::Error::other("missing page 3"))?;
+        assert_eq!(snapshot2.store_sequence(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_required_position_payload_c_nonzero_rejects() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("ps-reqpos-c-nonzero")?;
+        let store_path = directory.path().join("pages.bin");
+        let pid = persistent_id(223)?;
+
+        let store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        drop(store);
+
+        let hdr = build_page_store_frame(PageStoreFrameKind::SnapshotHeader, 1, 1, 0);
+        // Required-position with nonzero payload C
+        let req = build_page_store_frame(PageStoreFrameKind::RequiredPosition, 1, 1, 42);
+        append_bytes(&store_path, &hdr)?;
+        append_bytes(&store_path, &req)?;
+        let len_before = fs::metadata(&store_path)?.len();
+
+        let error = FilePageStore::<2>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("payload C nonzero accepted"))?;
+        assert!(matches!(error, PageStoreOpenError::Format(_)));
+        assert_eq!(fs::metadata(&store_path)?.len(), len_before);
+
+        Ok(())
     }
 }

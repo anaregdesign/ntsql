@@ -18,6 +18,22 @@ fn context_preserves_a_complete_synthetic_profile() -> Result<(), Box<dyn Error>
 }
 
 #[test]
+fn request_scope_preserves_the_exact_context() -> Result<(), Box<dyn Error>> {
+    let context = CompatibilityContext::try_new(synthetic_profile())?;
+
+    context.with_scope(|scope| {
+        let copied_scope = scope;
+
+        assert!(std::ptr::eq(scope.context(), &context));
+        assert!(std::ptr::eq(copied_scope.context(), &context));
+        assert_eq!(scope.context(), &context);
+        assert_eq!(copied_scope.context().target_id().as_str(), "test-target-a");
+    });
+
+    Ok(())
+}
+
+#[test]
 fn context_rejects_invalid_identifiers_and_versions() {
     let mut invalid_id = synthetic_profile();
     invalid_id.target_id = "invalid target".to_owned();

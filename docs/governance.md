@@ -169,9 +169,9 @@ they do not make, infer, or validate the legal judgment itself.
 The repository-built CLI is a contract implementation and local defense in
 depth, not an activation trust anchor. A required check must run a pinned,
 prebuilt verifier from a protected source before checkout or execution of any
-candidate-controlled code. The current workflow therefore contains an
-unconditional pre-checkout blocker and does not use the candidate-built CLI to
-authenticate legal decisions.
+candidate-controlled code before authenticated legal decisions can authorize
+governed use. The ordinary CI workflow does not perform that activation and
+must not be interpreted as authenticating legal decisions.
 
 ### Activation Requirements and Current State
 
@@ -184,19 +184,21 @@ established and independently reviewed:
 4. The authority producer and pinned prebuilt verifier are loaded from protected sources, have only read permissions, bind the authority to the trusted event repository and commit, and complete before candidate checkout or execution.
 5. Attack-path tests cover forged ledger metadata, candidate-supplied authority, path and symlink boundary bypasses, target and repository mismatch, provenance replay, stale, dismissed, changes-requested, and superseded reviews, reviewer login changes, self-approval, duplicate attestations, and decisions distributed across pull requests.
 
-At the `2026-08-04` verification point, the repository was public and used
+At the `2026-08-05` verification point, the repository was public and used
 `main` as its default branch. The default branch required pull requests, one
 approval, dismissal of stale approvals, approval by someone other than the
-latest pusher, conversation resolution, linear history, and the strict
-`Legal review required` check supplied by the GitHub Actions App. These rules
-applied to administrators, and force pushes and branch deletion were disabled.
-The repository still had no independently designated qualified reviewer,
-protected path ownership, reviewer trust anchor, environment, or `CODEOWNERS`
-file. Consequently the first-party `legal-review-gate` remains an unconditional
-failure, the full governance job remains statically disabled and blocked before
-checkout, no protected authority producer or prebuilt verifier is installed,
-and all legal decisions remain pending. Weakening the failure to obtain a green
-check is prohibited.
+latest pusher, conversation resolution, linear history, and the technical
+`Contracts and supply chain` check supplied by the GitHub Actions App. These
+rules applied to administrators, and force pushes and branch deletion were
+disabled. The repository still had no independently designated qualified
+reviewer, protected path ownership, reviewer trust anchor, environment, or
+`CODEOWNERS` file. Issue #25 retains those activation requirements, no protected
+authority producer or prebuilt verifier is installed, and all legal decisions
+remain pending. The CI workflow now runs candidate-built technical, provenance,
+license, advisory, and SBOM checks without treating a green result as legal
+approval or authority. Any operation whose contract requires authenticated
+legal or specification-review authority continues to fail closed when that
+authority is absent.
 
 ## Pinned Rust Toolchain
 
@@ -427,18 +429,22 @@ repository evidence.
 CI tools are installed at exact versions with their own lockfiles. Third-party
 actions are pinned to full commit SHAs. The workflow validates that the SBOM is
 nonempty, identifies the pinned generator, and gives every component a name,
-version, license, and SHA-256 hash before uploading it as evidence. The SBOM is
-generated in CI and is not committed because UUID, timestamp, and environment
-metadata are run-specific.
+version, and license before uploading it as evidence. External archive
+components require a SHA-256 hash. Workspace path components have no Cargo
+archive checksum, so the verifier instead requires their exact package ID,
+name, version, and purl to match locked, offline Cargo metadata; it does not
+invent an archive hash. The SBOM is generated in CI and is not committed because
+UUID, timestamp, and environment metadata are run-specific.
 
-While `legal-review-third-party-dependencies` is pending, the workflow executes
-only a first-party blocking step and the full governance job is statically
-disabled. Enabling that job requires a dedicated, reviewed change that records
-qualified approval for `dependency-inclusion` and
-`supply-chain-verification`. The repository must also protect the legal ledger
-and workflow paths with trusted required reviewers before activation. A ledger
-edit, workflow success, or repository administrator action by itself is not
-evidence that the reviewer is qualified or that a decision is authentic.
+While `legal-review-third-party-dependencies` is pending, Issue #25 tracks the
+separate authenticated legal-gate activation. The ordinary workflow runs the
+technical contract and supply-chain checks but does not make or authenticate a
+legal decision. Activation still requires qualified approval for
+`dependency-inclusion` and `supply-chain-verification`, protected legal-ledger
+and workflow paths, trusted required reviewers, a protected authority producer,
+and a pinned prebuilt verifier. A ledger edit, workflow success, or repository
+administrator action by itself is not evidence that the reviewer is qualified
+or that a decision is authentic.
 
 ## Project License and Contributions
 

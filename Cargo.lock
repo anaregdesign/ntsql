@@ -43,6 +43,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntsql-transaction"
+version = "0.1.0"
+dependencies = [
+ "ntsql-wal",
+]
+
+[[package]]
 name = "ntsql-wal"
 version = "0.1.0"
 

@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #66
 - Extends: ADR 0001, ADR 0007, ADR 0008
-- Extended by: ADR 0010
+- Extended by: ADR 0010, ADR 0011
 
 ## Context
 
@@ -60,11 +60,11 @@ source have distinct complete transaction identities even when each sequence is
 one. A newly created independent log is a separate lineage and may start its
 epochs at one.
 
-`LogSequenceNumber` remains an unbranded adapter value with a public numeric
-constructor. The coordinator checks the log lineage at commit, but direct raw
-positions still must not be compared or substituted across logs. Persistent log
-branding, filesystem-persisted epoch state, and validation of a production epoch
-source remain explicit follow-up work.
+ADR 0011 closes the runtime raw-position gap: `LogSequenceNumber` now carries
+`LogLineage`, has no public raw constructor, and is non-`Copy`. This still does
+not define a persistent lineage representation. Filesystem-persisted lineage and
+epoch state plus validation of a production epoch source remain explicit
+follow-up work.
 
 ## Compatibility Boundary
 

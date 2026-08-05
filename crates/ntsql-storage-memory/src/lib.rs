@@ -33,7 +33,7 @@ impl fmt::Display for FaultPoint {
 }
 
 /// Immutable snapshot of one physically appended transaction commit record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InMemoryLogRecord {
     position: LogSequenceNumber,
     transaction_id: TransactionId,
@@ -42,8 +42,8 @@ pub struct InMemoryLogRecord {
 impl InMemoryLogRecord {
     /// Returns the adapter-assigned log position.
     #[must_use]
-    pub const fn position(&self) -> LogSequenceNumber {
-        self.position
+    pub const fn position(&self) -> &LogSequenceNumber {
+        &self.position
     }
 
     /// Returns the transaction identity copied from the caller-owned record.
@@ -54,12 +54,14 @@ impl InMemoryLogRecord {
 }
 
 /// Failure while executing an in-memory commit-log operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InMemoryCommitLogError {
     /// The armed fault fired at its exact physical-effect boundary.
     InjectedFault(FaultPoint),
     /// No appended record owns the requested flush position.
     UnknownFlushPosition(LogSequenceNumber),
+    /// The requested position belongs to another log lineage.
+    ForeignFlushPosition(LogSequenceNumber),
     /// The record snapshot could not reserve additional memory.
     RecordCapacityExhausted,
     /// The adapter has already assigned every `u64` position.
@@ -75,6 +77,11 @@ impl fmt::Display for InMemoryCommitLogError {
             Self::UnknownFlushPosition(position) => write!(
                 formatter,
                 "commit-log position {} was not appended",
+                position.get()
+            ),
+            Self::ForeignFlushPosition(position) => write!(
+                formatter,
+                "commit-log position {} belongs to another lineage",
                 position.get()
             ),
             Self::RecordCapacityExhausted => {
@@ -234,6 +241,7 @@ impl InMemoryCommitLog {
             .checked_sub(1)
             .and_then(|index| self.records.get(index))
             .map(InMemoryLogRecord::position)
+            .cloned()
     }
 
     /// Simulates loss of volatile state while preserving allocator identity.
@@ -294,7 +302,7 @@ impl TransactionRecoverySource for InMemoryCommitLog {
                     transaction_id,
                 ));
             }
-            matching_record = Some((record.position(), index < self.durable_len));
+            matching_record = Some((record.position().clone(), index < self.durable_len));
         }
 
         let lookup = match matching_record {
@@ -333,9 +341,9 @@ impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
             .try_reserve(1)
             .map_err(|_| InMemoryCommitLogError::RecordCapacityExhausted)?;
 
-        let position = LogSequenceNumber::new(position_value);
+        let position = self.lineage.position(position_value);
         self.records.push(InMemoryLogRecord {
-            position,
+            position: position.clone(),
             transaction_id: record.transaction_id(),
         });
         self.next_position = position_value.checked_add(1);
@@ -349,12 +357,17 @@ impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
         }
     }
 
-    fn flush_through(&mut self, position: LogSequenceNumber) -> Result<(), Self::Error> {
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
+        if !self.lineage.same_lineage(position.lineage()) {
+            return Err(InMemoryCommitLogError::ForeignFlushPosition(
+                position.clone(),
+            ));
+        }
         let record_index = self
             .records
             .iter()
             .position(|record| record.position() == position)
-            .ok_or(InMemoryCommitLogError::UnknownFlushPosition(position))?;
+            .ok_or_else(|| InMemoryCommitLogError::UnknownFlushPosition(position.clone()))?;
         let requested_durable_len = record_index + 1;
         if requested_durable_len <= self.durable_len {
             return Ok(());
@@ -397,7 +410,7 @@ mod tests {
 
         let last = coordinator.begin()?;
         let committed = coordinator.commit(last, &mut log)?;
-        assert_eq!(committed.log_position(), LogSequenceNumber::new(u64::MAX));
+        assert_eq!(committed.log_position().get(), u64::MAX);
 
         let exhausted = coordinator.begin()?;
         let error = coordinator
@@ -454,7 +467,7 @@ mod tests {
         let record = log
             .records
             .first()
-            .copied()
+            .cloned()
             .ok_or_else(|| io::Error::other("durable record is missing"))?;
         log.records.push(record);
         log.durable_len = 2;

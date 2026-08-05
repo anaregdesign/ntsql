@@ -79,9 +79,10 @@ struct FakeCommitLog {
 
 impl FakeCommitLog {
     fn succeeds_at(position: u64, lineage: LogLineage) -> Self {
+        let position = lineage.position(position);
         Self {
             lineage,
-            position: LogSequenceNumber::new(position),
+            position,
             append_fails: false,
             flush_fails: false,
             calls: Vec::new(),
@@ -104,12 +105,12 @@ impl CommitLog<TransactionCommitRecord> for FakeCommitLog {
         if self.append_fails {
             Err(FakeError::Append)
         } else {
-            Ok(self.position)
+            Ok(self.position.clone())
         }
     }
 
-    fn flush_through(&mut self, position: LogSequenceNumber) -> Result<(), Self::Error> {
-        self.calls.push(Call::Flush(position));
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
+        self.calls.push(Call::Flush(position.clone()));
         if self.flush_fails {
             Err(FakeError::Flush)
         } else {
@@ -142,7 +143,9 @@ impl TransactionRecoverySource for FakeRecoverySource {
         transaction_id: TransactionId,
     ) -> Result<(LogLineage, DurableCommitLookup), Self::Error> {
         self.calls.push(transaction_id);
-        self.result.map(|lookup| (self.lineage.clone(), lookup))
+        self.result
+            .clone()
+            .map(|lookup| (self.lineage.clone(), lookup))
     }
 }
 
@@ -152,23 +155,21 @@ fn durable_commit_consumes_active_state_and_preserves_identity() -> Result<(), B
     let mut epochs = FakeEpochSource::new(lineage.clone());
     let mut coordinator = TransactionCoordinator::open(&mut epochs)?;
     let mut log = FakeCommitLog::succeeds_at(41, lineage);
+    let expected_position = log.position.clone();
     let transaction = coordinator.begin()?;
     let transaction_id = transaction.transaction_id();
 
     let committed = coordinator.commit(transaction, &mut log)?;
 
     assert_eq!(committed.transaction_id(), transaction_id);
-    assert_eq!(committed.log_position(), LogSequenceNumber::new(41));
+    assert_eq!(committed.log_position(), &expected_position);
     assert_eq!(
         coordinator.status(transaction_id),
         Some(TransactionLifecycleStatus::Committed)
     );
     assert_eq!(
         log.calls,
-        [
-            Call::Append(transaction_id),
-            Call::Flush(LogSequenceNumber::new(41)),
-        ]
+        [Call::Append(transaction_id), Call::Flush(expected_position),]
     );
     Ok(())
 }
@@ -218,6 +219,7 @@ fn flush_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dy
         flush_fails: true,
         ..FakeCommitLog::succeeds_at(83, lineage)
     };
+    let expected_position = log.position.clone();
     let transaction = coordinator.begin()?;
     let transaction_id = transaction.transaction_id();
 
@@ -238,16 +240,13 @@ fn flush_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dy
     assert_eq!(
         cause,
         CommitError::Flush {
-            position: LogSequenceNumber::new(83),
+            position: expected_position.clone(),
             source: FakeError::Flush,
         }
     );
     assert_eq!(
         log.calls,
-        [
-            Call::Append(transaction_id),
-            Call::Flush(LogSequenceNumber::new(83)),
-        ]
+        [Call::Append(transaction_id), Call::Flush(expected_position),]
     );
     Ok(())
 }
@@ -375,10 +374,11 @@ fn durable_lookup_resolves_indeterminate_commit_and_updates_lifecycle() -> Resul
         return Err(invalid_data("flush failure was rejected before WAL").into());
     };
     let (indeterminate, _) = error.into_parts();
+    let expected_position = lineage.position(83);
     let mut recovery = FakeRecoverySource::new(
         lineage,
         Ok(DurableCommitLookup::Found {
-            position: LogSequenceNumber::new(83),
+            position: expected_position.clone(),
         }),
     );
 
@@ -388,7 +388,7 @@ fn durable_lookup_resolves_indeterminate_commit_and_updates_lifecycle() -> Resul
         return Err(invalid_data("durable record resolved as absent").into());
     };
     assert_eq!(committed.transaction_id(), transaction_id);
-    assert_eq!(committed.log_position(), LogSequenceNumber::new(83));
+    assert_eq!(committed.log_position(), &expected_position);
     assert_eq!(recovery.calls, [transaction_id]);
     assert_eq!(
         coordinator.status(transaction_id),
@@ -519,6 +519,53 @@ fn foreign_recovery_lineage_retains_indeterminate_token() -> Result<(), Box<dyn 
     );
 
     recovery.lineage = lineage;
+    let resolved = coordinator.resolve(error.into_transaction(), &mut recovery)?;
+    assert_eq!(resolved.transaction_id(), transaction_id);
+    Ok(())
+}
+
+#[test]
+fn foreign_recovered_position_lineage_retains_indeterminate_token() -> Result<(), Box<dyn Error>> {
+    let lineage = LogLineage::new();
+    let mut epochs = FakeEpochSource::new(lineage.clone());
+    let mut coordinator = TransactionCoordinator::open(&mut epochs)?;
+    let mut log = FakeCommitLog {
+        append_fails: true,
+        ..FakeCommitLog::succeeds_at(41, lineage.clone())
+    };
+    let active = coordinator.begin()?;
+    let transaction_id = active.transaction_id();
+    let error = coordinator
+        .commit(active, &mut log)
+        .err()
+        .ok_or_else(|| invalid_data("append failure unexpectedly committed"))?;
+    let CoordinatedCommitError::Indeterminate(error) = error else {
+        return Err(invalid_data("append failure was rejected before WAL").into());
+    };
+    let (indeterminate, _) = error.into_parts();
+    let foreign_position = LogLineage::new().position(41);
+    let mut recovery = FakeRecoverySource::new(
+        lineage,
+        Ok(DurableCommitLookup::Found {
+            position: foreign_position,
+        }),
+    );
+
+    let error = coordinator
+        .resolve(indeterminate, &mut recovery)
+        .err()
+        .ok_or_else(|| invalid_data("foreign recovered position resolved transaction"))?;
+
+    assert_eq!(
+        error.failure(),
+        &TransactionResolutionFailure::ForeignLogLineage
+    );
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::Indeterminate)
+    );
+
+    recovery.result = Ok(DurableCommitLookup::Absent);
     let resolved = coordinator.resolve(error.into_transaction(), &mut recovery)?;
     assert_eq!(resolved.transaction_id(), transaction_id);
     Ok(())

@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #59
 - Extends: ADR 0001, ADR 0005, ADR 0006
-- Extended by: ADR 0009, ADR 0010
+- Extended by: ADR 0009, ADR 0010, ADR 0011
 
 ## Context
 
@@ -57,6 +57,10 @@ changes the phase to committed; authoritative absence changes it to
 paths retain both the token and indeterminate phase. Neither terminal phase can
 be reconstructed as active.
 
+ADR 0011 makes the log position stored by `CommittedTransaction` lineage-bound
+and non-`Copy`. Recovery presence is accepted only when its position carries the
+same lineage atomically reported by the source and retained by the token.
+
 ## Dependency Direction
 
 The direct dependency graph is unchanged:
@@ -99,6 +103,8 @@ lineages may reuse epoch values; global uniqueness is not claimed.
   across coordinator and model-restart boundaries.
 - Recovery tests prove that only the issuing coordinator can resolve an
   indeterminate token and that lifecycle mismatches are rejected before lookup.
+- Recovery tests retain the token when a source reports the expected lineage but
+  returns a position carrying another lineage.
 
 ## Consequences
 

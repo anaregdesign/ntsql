@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #63
 - Extends: ADR 0001, ADR 0005, ADR 0006, ADR 0007
-- Extended by: ADR 0009, ADR 0010
+- Extended by: ADR 0009, ADR 0010, ADR 0011
 
 ## Context
 
@@ -34,7 +34,8 @@ added by ADR 0010. It copies only the opaque transaction identity into immutable
 record snapshots, assigns nonzero strictly increasing in-memory positions and
 coordinator epochs, owns one opaque runtime `LogLineage`, and tracks a durable
 prefix. It never constructs transaction identity, transaction terminal state, or
-a durability acknowledgement.
+a durability acknowledgement. Each assigned position is created through the
+adapter's lineage capability.
 
 One fault may be armed at a time. It is consumed exactly once when its matching
 stage is reached:
@@ -44,9 +45,10 @@ stage is reached:
 - `BeforeFlush` reports flush failure without advancing durability; and
 - `AfterFlush` advances the durable prefix and then reports flush failure.
 
-An invalid flush position is rejected before a fault is consumed. Flushing a
-known position already inside the durable prefix is an idempotent success,
-because the port promises durability through at least that position.
+An invalid or foreign-lineage flush position is rejected before a fault is
+consumed. Flushing a known position already inside the durable prefix is an
+idempotent success, because the port promises durability through at least that
+position.
 
 `restart` is a model transformation, not process or filesystem behavior. It
 retains exactly the marked durable prefix, discards the volatile suffix, and
@@ -95,6 +97,8 @@ remain blocked by the legal contract.
 - Restart keeps only the durable prefix and never reuses a discarded position.
 - Unknown positions do not consume a pending fault, while repeated valid flushes
   are idempotent.
+- Equal numeric positions from independent logs are unequal, and a foreign one
+  is rejected before record lookup, fault consumption, or durability mutation.
 - Position exhaustion and attempts to replace an armed fault return typed
   errors.
 - Resolution distinguishes the four fault boundaries, retains an indeterminate

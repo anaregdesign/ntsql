@@ -185,20 +185,22 @@ established and independently reviewed:
 5. Attack-path tests cover forged ledger metadata, candidate-supplied authority, path and symlink boundary bypasses, target and repository mismatch, provenance replay, stale, dismissed, changes-requested, and superseded reviews, reviewer login changes, self-approval, duplicate attestations, and decisions distributed across pull requests.
 
 At the `2026-08-05` verification point, the repository was public and used
-`main` as its default branch. The default branch required pull requests, one
-approval, dismissal of stale approvals, approval by someone other than the
-latest pusher, conversation resolution, linear history, and the technical
-`Contracts and supply chain` check supplied by the GitHub Actions App. These
-rules applied to administrators, and force pushes and branch deletion were
-disabled. The repository still had no independently designated qualified
-reviewer, protected path ownership, reviewer trust anchor, environment, or
-`CODEOWNERS` file. Issue #25 retains those activation requirements, no protected
-authority producer or prebuilt verifier is installed, and all legal decisions
-remain pending. The CI workflow now runs candidate-built technical, provenance,
-license, advisory, and SBOM checks without treating a green result as legal
-approval or authority. Any operation whose contract requires authenticated
-legal or specification-review authority continues to fail closed when that
-authority is absent.
+`main` as its default branch. The default branch required pull requests but zero
+approving reviews and no approval after the latest push. It required conversation
+resolution, linear history, and the strict technical `Contracts and supply
+chain` check supplied by the GitHub Actions App. These rules applied to
+administrators, and force pushes and branch deletion were disabled. The
+repository still had no independently designated qualified reviewer, protected
+path ownership, reviewer trust anchor, environment, or `CODEOWNERS` file. The
+owner-directed removal of repository approval requirements permits technical
+integration but does not satisfy the separate authenticated-gate activation
+requirements above. Issue #25 retains those requirements, no protected authority
+producer or prebuilt verifier is installed, and all legal decisions remain
+pending. The CI workflow runs candidate-built technical, provenance, license,
+advisory, and SBOM checks without treating a green result as legal approval or
+authority. Any operation whose contract requires authenticated legal or
+specification-review authority continues to fail closed when that authority is
+absent.
 
 ## Pinned Rust Toolchain
 

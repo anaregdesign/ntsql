@@ -83,7 +83,10 @@ use std::{
     path::Path,
 };
 
-use ntsql_page::{PageLog, PageNumber, PageVersion, UnloggedPage};
+use ntsql_page::{
+    DurablePageWalObservation, PageLog, PageNumber, PageRecoveryObservationBytesError, PageVersion,
+    StoredPageSnapshotObservation, UnloggedPage,
+};
 use ntsql_transaction::{
     DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
     TransactionRecoverySource,
@@ -925,6 +928,25 @@ impl<const N: usize> FileLogRecord<N> {
     #[must_use]
     pub const fn page_write(&self) -> Option<&FilePageWriteRecord<N>> {
         self.kind.page_write()
+    }
+
+    /// Projects a page record into adapter-neutral recovery evidence.
+    ///
+    /// Callers must select records from a commit log's durable prefix before
+    /// treating the result as durable. Transaction records return `Ok(None)`.
+    pub fn page_recovery_observation(
+        &self,
+    ) -> Result<Option<DurablePageWalObservation<N>>, PageRecoveryObservationBytesError<N>> {
+        match self.page_write() {
+            Some(record) => DurablePageWalObservation::from_bytes(
+                record.page_number(),
+                record.page_version(),
+                *record.bytes(),
+                self.position.clone(),
+            )
+            .map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -2897,6 +2919,18 @@ impl<const N: usize> FileStoredPage<N> {
         &self.required_position
     }
 
+    /// Projects this durable snapshot into adapter-neutral recovery evidence.
+    pub fn page_recovery_observation(
+        &self,
+    ) -> Result<StoredPageSnapshotObservation<N>, PageRecoveryObservationBytesError<N>> {
+        StoredPageSnapshotObservation::from_bytes(
+            self.page_number,
+            self.page_version,
+            self.bytes,
+            self.required_position.clone(),
+        )
+    }
+
     /// Returns the store-internal sequence number.
     #[must_use]
     pub const fn store_sequence(&self) -> u64 {
@@ -3832,8 +3866,8 @@ mod tests {
     };
 
     use ntsql_page::{
-        PageAddress, PageImage, PageLog, PageNumber, PageVersion, StagePageWriteError,
-        stage_page_write,
+        DurablePageReconciliation, PageAddress, PageImage, PageLog, PageNumber, PageVersion,
+        StagePageWriteError, reconcile_durable_page, stage_page_write,
     };
     use ntsql_transaction::{
         CoordinatedCommitError, IndeterminateTransaction, TransactionCommitResolution,
@@ -5613,6 +5647,114 @@ mod tests {
             .ok_or_else(|| io::Error::other("missing page 2"))?;
         assert_eq!(snapshot2.store_sequence(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn projected_file_evidence_reconciles_current_behind_and_missing() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TestDirectory::new("ps-reconciliation")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let empty_store_path = directory.path().join("empty-pages.bin");
+        let pid = persistent_id(252)?;
+        let number = page_number(7)?;
+
+        let mut log = FileCommitLog::<2>::create_new_page_capable(&log_path, pid)?;
+        let mut store = FilePageStore::<2>::create_new(&store_path, pid)?;
+        let first = unlogged_page(log.lineage(), 7, 11, [1_u8, 2])?;
+        let first_dirty = stage_page_write(&mut log, first)
+            .map_err(|error| io::Error::other(format!("{error}")))?;
+        write_page_through_flush(&mut log, &mut store, first_dirty)?;
+        drop(store);
+        drop(log);
+
+        let mut log = FileCommitLog::<2>::open_page_capable(&log_path)?;
+        let store = FilePageStore::<2>::open(&store_path)?;
+        let first_record = log
+            .durable_records()
+            .next()
+            .ok_or_else(|| io::Error::other("reopened first page record is missing"))?
+            .page_recovery_observation()?
+            .ok_or_else(|| io::Error::other("first page record projected as transaction"))?;
+        let first_snapshot = store
+            .page(number)
+            .ok_or_else(|| io::Error::other("reopened first snapshot is missing"))?
+            .page_recovery_observation()?;
+        assert_eq!(
+            reconcile_durable_page(
+                log.lineage(),
+                number,
+                Some(&first_snapshot),
+                std::iter::once(&first_record),
+            )?,
+            DurablePageReconciliation::ExactCurrent {
+                durable_position: log.lineage().position(1),
+            }
+        );
+
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let transaction = coordinator.begin()?;
+        let commit = coordinator.commit(transaction, &mut log)?;
+        assert_eq!(commit.log_position().get(), 2);
+        let second = unlogged_page(log.lineage(), 7, 4, [3_u8, 4])?;
+        let second_dirty = stage_page_write(&mut log, second)
+            .map_err(|error| io::Error::other(format!("{error}")))?;
+        log.flush_through(second_dirty.required_position())?;
+        assert_eq!(second_dirty.required_position().get(), 3);
+        drop(second_dirty);
+        drop(store);
+        drop(log);
+
+        let log = FileCommitLog::<2>::open_page_capable(&log_path)?;
+        let store = FilePageStore::<2>::open(&store_path)?;
+        assert_eq!(log.records().len(), 3);
+        let mut durable_records = log.durable_records();
+        let first_record = durable_records
+            .next()
+            .ok_or_else(|| io::Error::other("reopened durable prefix lost its first record"))?
+            .page_recovery_observation()?
+            .ok_or_else(|| io::Error::other("first reopened record lost page projection"))?;
+        let transaction_record = durable_records.next().ok_or_else(|| {
+            io::Error::other("reopened durable prefix lost its transaction record")
+        })?;
+        assert!(transaction_record.page_recovery_observation()?.is_none());
+        let second_record = durable_records
+            .next()
+            .ok_or_else(|| io::Error::other("reopened durable prefix lost its second page record"))?
+            .page_recovery_observation()?
+            .ok_or_else(|| io::Error::other("second reopened record lost page projection"))?;
+        assert!(durable_records.next().is_none());
+        let observations = [first_record, second_record];
+        let snapshot = store
+            .page(number)
+            .ok_or_else(|| io::Error::other("stored snapshot disappeared"))?
+            .page_recovery_observation()?;
+        assert_eq!(
+            reconcile_durable_page(log.lineage(), number, Some(&snapshot), observations.iter(),)?,
+            DurablePageReconciliation::StoreBehind {
+                stored_position: log.lineage().position(1),
+                latest_durable_position: log.lineage().position(3),
+            }
+        );
+
+        let empty_store = FilePageStore::<2>::create_new(&empty_store_path, pid)?;
+        let empty_snapshot = empty_store
+            .page(number)
+            .map(|page| page.page_recovery_observation())
+            .transpose()?;
+        assert!(empty_snapshot.is_none());
+        assert_eq!(
+            reconcile_durable_page(
+                log.lineage(),
+                number,
+                empty_snapshot.as_ref(),
+                observations.iter(),
+            )?,
+            DurablePageReconciliation::StoreMissing {
+                latest_durable_position: log.lineage().position(3),
+            }
+        );
         Ok(())
     }
 

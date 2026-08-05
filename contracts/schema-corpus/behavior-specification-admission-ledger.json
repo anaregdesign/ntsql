@@ -3,7 +3,7 @@
   "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/behavior-specification-admission-ledger.schema.json",
   "base_document": {
     "inline": {
-      "schema_version": "1.0.0",
+      "schema_version": "2.0.0",
       "admissions": [
         {
           "id": "admission.synthetic.select",
@@ -100,8 +100,9 @@
               },
               "decided_at": "2026-01-01T01:03:00Z",
               "decision_evidence": {
-                "repository": "synthetic/ntsql",
+                "repository": "anaregdesign/ntsql",
                 "pull_request_number": 1,
+                "reviewed_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "attestation_id": "attestation.synthetic.select"
               },
               "rationale": "Synthetic schema-boundary approval only."
@@ -141,6 +142,22 @@
       }
     },
     {
+      "case_id": "admission.review-evidence.reviewed-commit-required",
+      "constraint": "non-pending review evidence requires the exact reviewed subject commit",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/admissions/0/specification/technical_review/decision_evidence/reviewed_commit_sha"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
       "case_id": "admission.required.nullable-handoff-missing",
       "constraint": "required nullable implementation_handoff property",
       "patch": [
@@ -153,6 +170,23 @@
         "json_schema": false,
         "rust_deserialize": false,
         "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.derived-test.exact-parent-set-rust-only",
+      "constraint": "derived tests name exactly the sanitized specification as their direct parent",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/admissions/0/derived_tests/0/parent_provenance_ids/-",
+          "value": "prov-unrelated"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
         "rust_full_validation": false
       }
     },

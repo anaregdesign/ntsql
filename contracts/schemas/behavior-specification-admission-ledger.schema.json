@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "admissions"],
   "properties": {
-    "schema_version": { "const": "1.0.0" },
+    "schema_version": { "const": "2.0.0" },
     "admissions": {
       "type": "array",
       "items": { "$ref": "#/$defs/admission" }
@@ -279,7 +279,7 @@
     "reviewEvidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["repository", "pull_request_number", "attestation_id"],
+      "required": ["repository", "pull_request_number", "reviewed_commit_sha", "attestation_id"],
       "properties": {
         "repository": {
           "type": "string",
@@ -289,6 +289,10 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 18446744073709551615
+        },
+        "reviewed_commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
         },
         "attestation_id": { "$ref": "#/$defs/identifier" }
       }

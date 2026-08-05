@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anaregdesign/ntsql/contracts/schemas/specification-review-authority.schema.json",
+  "title": "ntsql authenticated specification-review authority",
+  "description": "Out-of-branch GitHub evidence and a protected technical trust anchor used to authenticate exact pre-decision behavior-specification subjects.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "candidate_repository",
+    "candidate_commit_sha",
+    "candidate_author_account_id",
+    "trusted_reviewer_account_ids",
+    "pull_requests"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "candidate_repository": { "$ref": "#/$defs/repository" },
+    "candidate_commit_sha": { "$ref": "#/$defs/commitSha" },
+    "candidate_author_account_id": { "$ref": "#/$defs/accountId" },
+    "trusted_reviewer_account_ids": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/accountId" }
+    },
+    "pull_requests": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/pullRequest" }
+    }
+  },
+  "$defs": {
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "commitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "accountId": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "subjectSpecification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance_id",
+        "artifact_path",
+        "content_digest",
+        "parent_provenance_ids"
+      ],
+      "properties": {
+        "provenance_id": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+        },
+        "artifact_path": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/repositoryPath"
+        },
+        "content_digest": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/sha256Digest"
+        },
+        "parent_provenance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+          }
+        }
+      }
+    },
+    "subject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "case_id",
+        "owner_issue",
+        "feature_ids",
+        "target_id",
+        "roles",
+        "source_provenance_ids",
+        "legal_review_ids",
+        "observation",
+        "raw_evidence",
+        "specification"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+        },
+        "case_id": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+        },
+        "owner_issue": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "feature_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+          }
+        },
+        "target_id": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+        },
+        "roles": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/roles"
+        },
+        "source_provenance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+          }
+        },
+        "legal_review_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+          }
+        },
+        "observation": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/observation"
+        },
+        "raw_evidence": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/rawEvidence"
+        },
+        "specification": { "$ref": "#/$defs/subjectSpecification" }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "rationale"],
+      "properties": {
+        "status": { "enum": ["approved", "rejected"] },
+        "rationale": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/nonWhitespaceString"
+        }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attestation_id",
+        "subject",
+        "decision",
+        "target_record",
+        "feature_records",
+        "provenance_records"
+      ],
+      "properties": {
+        "attestation_id": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/identifier"
+        },
+        "subject": { "$ref": "#/$defs/subject" },
+        "decision": { "$ref": "#/$defs/decision" },
+        "target_record": {
+          "$ref": "target-matrix.schema.json#/$defs/target"
+        },
+        "feature_records": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "feature-matrix.schema.json#/$defs/feature" }
+        },
+        "provenance_records": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "provenance-ledger.schema.json#/$defs/record" }
+        }
+      }
+    },
+    "authenticatedReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "pull_request_number",
+        "review_id",
+        "reviewer",
+        "reviewed_commit_sha",
+        "state",
+        "submitted_at",
+        "last_edited_at",
+        "attestations"
+      ],
+      "properties": {
+        "repository": { "$ref": "#/$defs/repository" },
+        "pull_request_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "review_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "reviewer": {
+          "$ref": "behavior-specification-admission-ledger.schema.json#/$defs/actor"
+        },
+        "reviewed_commit_sha": { "$ref": "#/$defs/commitSha" },
+        "state": {
+          "enum": ["approved", "dismissed", "changes-requested", "commented"]
+        },
+        "submitted_at": { "$ref": "#/$defs/timestamp" },
+        "last_edited_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "attestations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/attestation" }
+        }
+      }
+    },
+    "pullRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "pull_request_number",
+        "pull_request_author_account_id",
+        "candidate_commit_sha",
+        "authenticated_reviews"
+      ],
+      "properties": {
+        "repository": { "$ref": "#/$defs/repository" },
+        "pull_request_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "pull_request_author_account_id": { "$ref": "#/$defs/accountId" },
+        "candidate_commit_sha": { "$ref": "#/$defs/commitSha" },
+        "authenticated_reviews": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/authenticatedReview" }
+        }
+      }
+    }
+  }
+}

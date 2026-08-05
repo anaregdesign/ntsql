@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ntsql_contract::{
     BehaviorSpecificationAdmissionLedger, FeatureMatrix, FixtureArtifact,
     ImplementationAdmissionContext, LegalDecisionAuthority, LegalDecisionVerificationContext,
-    LegalReviewLedger, ProvenanceLedger, ProvenanceSourceKind, ProvenanceUse, TargetMatrix,
+    LegalReviewLedger, ProvenanceLedger, ProvenanceSourceKind, ProvenanceUse,
+    SpecificationReviewAuthority, SpecificationReviewVerificationContext, TargetMatrix,
 };
 use serde_json::Value;
 
@@ -23,6 +24,13 @@ const REQUIRED_TOOLCHAIN_PROFILE: &str = "minimal";
 
 struct AuthorityInput {
     path: PathBuf,
+    candidate_repository: String,
+    candidate_commit_sha: String,
+}
+
+struct ImplementationAuthorityInput {
+    legal_path: PathBuf,
+    specification_path: PathBuf,
     candidate_repository: String,
     candidate_commit_sha: String,
 }
@@ -111,7 +119,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().ok_or_else(|| {
         invalid_data(
-            "expected `fixtures [<authority> <repository> <commit>]`, `implementation-admission <feature> <target> [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
+            "expected `fixtures [<authority> <repository> <commit>]`, `implementation-admission <feature> <target> [<legal-authority> <specification-authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
         )
     })?;
 
@@ -144,7 +152,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let target_id = arguments.next().ok_or_else(|| {
                 invalid_data("implementation-admission requires an exact target id")
             })?;
-            let authority_input = parse_optional_authority(arguments, "implementation-admission")?;
+            let authority_input = parse_optional_implementation_authorities(arguments)?;
             validate_implementation_admission(&feature_id, &target_id, authority_input.as_ref())
         }
         "provenance-offline" => {
@@ -163,7 +171,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             validate_sbom(Path::new(&path))
         }
         _ => Err(invalid_data(
-            "expected `fixtures [<authority> <repository> <commit>]`, `implementation-admission <feature> <target> [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
+            "expected `fixtures [<authority> <repository> <commit>]`, `implementation-admission <feature> <target> [<legal-authority> <specification-authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
         )),
     }
 }
@@ -188,6 +196,38 @@ fn parse_optional_authority(
         _ => Err(invalid_data(format!(
             "{command} requires authority, repository, and commit together"
         ))),
+    }
+}
+
+fn parse_optional_implementation_authorities(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<Option<ImplementationAuthorityInput>, Box<dyn Error>> {
+    let legal_path = arguments.next();
+    let specification_path = arguments.next();
+    let candidate_repository = arguments.next();
+    let candidate_commit_sha = arguments.next();
+    ensure_no_more_arguments(arguments)?;
+    match (
+        legal_path,
+        specification_path,
+        candidate_repository,
+        candidate_commit_sha,
+    ) {
+        (None, None, None, None) => Ok(None),
+        (
+            Some(legal_path),
+            Some(specification_path),
+            Some(candidate_repository),
+            Some(candidate_commit_sha),
+        ) => Ok(Some(ImplementationAuthorityInput {
+            legal_path: PathBuf::from(legal_path),
+            specification_path: PathBuf::from(specification_path),
+            candidate_repository,
+            candidate_commit_sha,
+        })),
+        _ => Err(invalid_data(
+            "implementation-admission requires legal authority, specification authority, repository, and commit together",
+        )),
     }
 }
 
@@ -290,7 +330,7 @@ fn validate_legal_reviews(
 fn validate_implementation_admission(
     feature_id: &str,
     target_id: &str,
-    authority_input: Option<&AuthorityInput>,
+    authority_input: Option<&ImplementationAuthorityInput>,
 ) -> Result<(), Box<dyn Error>> {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -306,16 +346,31 @@ fn validate_implementation_admission(
         read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
     let legal_reviews: LegalReviewLedger =
         read_json(&workspace_root.join("contracts/compatibility/legal-reviews.json"))?;
-    let authority = authority_input
-        .map(|input| read_external_authority(&workspace_root, &input.path))
+    let legal_authority = authority_input
+        .map(|input| read_external_authority(&workspace_root, &input.legal_path))
         .transpose()?;
-    let verification = authority_input
-        .zip(authority.as_ref())
-        .map(|(input, authority)| LegalDecisionVerificationContext {
-            authority,
-            candidate_repository: &input.candidate_repository,
-            candidate_commit_sha: &input.candidate_commit_sha,
-        });
+    let specification_authority = authority_input
+        .map(|input| {
+            read_external_specification_authority(&workspace_root, &input.specification_path)
+        })
+        .transpose()?;
+    let legal_verification =
+        authority_input
+            .zip(legal_authority.as_ref())
+            .map(|(input, authority)| LegalDecisionVerificationContext {
+                authority,
+                candidate_repository: &input.candidate_repository,
+                candidate_commit_sha: &input.candidate_commit_sha,
+            });
+    let specification_review_verification = authority_input
+        .zip(specification_authority.as_ref())
+        .map(
+            |(input, authority)| SpecificationReviewVerificationContext {
+                authority,
+                candidate_repository: &input.candidate_repository,
+                candidate_commit_sha: &input.candidate_commit_sha,
+            },
+        );
     let violations = features.validate_implementation_inputs(
         feature_id,
         target_id,
@@ -324,7 +379,8 @@ fn validate_implementation_admission(
             admissions: &admissions,
             provenance: &provenance,
             legal_reviews: &legal_reviews,
-            legal_verification: verification,
+            legal_verification,
+            specification_review_verification,
         },
     );
 
@@ -1321,23 +1377,37 @@ fn read_external_authority(
     workspace_root: &Path,
     path: &Path,
 ) -> Result<LegalDecisionAuthority, Box<dyn Error>> {
+    read_external_json_authority(workspace_root, path, "legal-decision")
+}
+
+fn read_external_specification_authority(
+    workspace_root: &Path,
+    path: &Path,
+) -> Result<SpecificationReviewAuthority, Box<dyn Error>> {
+    read_external_json_authority(workspace_root, path, "specification-review")
+}
+
+fn read_external_json_authority<T: serde::de::DeserializeOwned>(
+    workspace_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<T, Box<dyn Error>> {
     let supplied_path = normalize_absolute_path(path)?;
     if supplied_path.starts_with(workspace_root) {
-        return Err(invalid_data(
-            "legal-decision authority path must originate outside the candidate checkout",
-        ));
+        return Err(invalid_data(format!(
+            "{label} authority path must originate outside the candidate checkout"
+        )));
     }
-
     let resolved_path = path.canonicalize()?;
     if resolved_path.starts_with(workspace_root) {
-        return Err(invalid_data(
-            "legal-decision authority target must be outside the candidate checkout",
-        ));
+        return Err(invalid_data(format!(
+            "{label} authority target must be outside the candidate checkout"
+        )));
     }
     if !fs::metadata(&resolved_path)?.is_file() {
-        return Err(invalid_data(
-            "legal-decision authority must be a regular file",
-        ));
+        return Err(invalid_data(format!(
+            "{label} authority must be a regular file"
+        )));
     }
     read_json(&resolved_path)
 }
@@ -1588,6 +1658,20 @@ mod tests {
     use ntsql_contract::ProvenanceRecord;
 
     use super::*;
+
+    #[test]
+    fn implementation_authority_arguments_are_all_or_nothing() -> Result<(), Box<dyn Error>> {
+        assert!(parse_optional_implementation_authorities(std::iter::empty()).is_ok());
+        let complete = ["legal.json", "technical.json", "anaregdesign/ntsql", "abc"]
+            .into_iter()
+            .map(str::to_owned);
+        assert!(parse_optional_implementation_authorities(complete).is_ok());
+        let incomplete = ["legal.json", "technical.json", "anaregdesign/ntsql"]
+            .into_iter()
+            .map(str::to_owned);
+        assert!(parse_optional_implementation_authorities(incomplete).is_err());
+        Ok(())
+    }
 
     #[test]
     fn repository_artifact_verification_accepts_valid_digest() -> Result<(), Box<dyn Error>> {

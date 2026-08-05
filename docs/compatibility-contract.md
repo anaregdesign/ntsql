@@ -156,6 +156,7 @@ Every admitted dependency must have a compatible license, minimal feature set, l
 - `contracts/schemas/legal-decision-authority.schema.json`: authenticated out-of-branch legal-decision evidence
 - `contracts/schemas/legal-review-ledger.schema.json`: legal-review ledger interchange schema
 - `contracts/schemas/provenance-ledger.schema.json`: provenance ledger interchange schema
+- `contracts/schemas/specification-review-authority.schema.json`: authenticated out-of-branch technical specification-review evidence
 - `contracts/schemas/target-matrix.schema.json`: target matrix interchange schema
 - `contracts/schema-corpus/`: validator-neutral positive, negative, boundary, and Rust-only contract cases
 
@@ -168,12 +169,21 @@ as unique identifiers, target and provenance references, complete category
 coverage, contiguous expansion order, exact provenance closure, and trusted
 candidate binding.
 
-The behavior-specification admission ledger is intentionally empty until the
-clean-room procedure produces a real case. Structural `approved` metadata is not
-an authority: implementation admission still requires authenticated legal
-authorization and the protected specification-review authority tracked by
-Issue #55. Exact feature and target IDs are mandatory, so neither feature-only
-approval nor baseline fallback can authorize semantic work.
+The behavior-specification admission ledger uses schema version `2.0.0`; version
+2 requires the candidate review reference to name the exact reviewed subject
+commit. The ledger remains intentionally empty until the clean-room procedure
+produces a real case. Structural `approved` metadata is not authority:
+implementation admission independently requires authenticated legal and
+technical documents. A reviewer attests the exact pre-decision admission
+projection on an earlier subject commit; a later candidate commit records the
+authenticated decision and controlled handoff. Exact projection, target,
+feature-set, and complete provenance-closure comparison replaces reviewed-head
+equality and invalidates relevant drift. The technical producer must provide
+current review state and last-edit timestamps. Legal and technical authorities
+cannot substitute for each other, and activation remains blocked until Issue
+#55 supplies the protected producer and trust anchor. Exact feature and target
+IDs are mandatory, so neither feature-only approval nor baseline fallback can
+authorize semantic work.
 
 Conformance records currently use schema version `2.0.0`. Version 2 makes raw
 evidence, normalization rules, feature ownership, and reproduction metadata

@@ -30,7 +30,10 @@ pub const LEGAL_REVIEW_SCHEMA_VERSION: &str = "2.0.0";
 pub const LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION: &str = "2.0.0";
 
 /// Current version of the clean-room behavior-specification admission ledger.
-pub const BEHAVIOR_SPECIFICATION_ADMISSION_SCHEMA_VERSION: &str = "1.0.0";
+pub const BEHAVIOR_SPECIFICATION_ADMISSION_SCHEMA_VERSION: &str = "2.0.0";
+
+/// Current version of authenticated technical specification-review authority input.
+pub const SPECIFICATION_REVIEW_AUTHORITY_SCHEMA_VERSION: &str = "1.0.0";
 
 const SHA256_EMPTY_CONTENT: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -550,8 +553,175 @@ pub struct SpecificationReviewEvidenceReference {
     pub repository: String,
     /// Pull request containing the reviewed specification and admission.
     pub pull_request_number: u64,
+    /// Exact earlier candidate commit containing the attested pre-decision subject.
+    pub reviewed_commit_sha: String,
     /// Identifier repeated in authenticated review evidence.
     pub attestation_id: String,
+}
+
+/// Exact specification identity included in a pre-decision review subject.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationReviewSubjectSpecification {
+    /// Behavior-specification provenance record.
+    pub provenance_id: String,
+    /// Repository-relative specification path.
+    pub artifact_path: String,
+    /// SHA-256 digest of the specification bytes.
+    pub content_digest: String,
+    /// Exact direct provenance parents used to derive the specification.
+    pub parent_provenance_ids: Vec<String>,
+}
+
+/// Exact pre-decision complement of one behavior-specification admission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationReviewSubject {
+    /// Stable admission identifier.
+    pub id: String,
+    /// Stable behavior-case identifier.
+    pub case_id: String,
+    /// GitHub issue that owns the case.
+    pub owner_issue: u64,
+    /// Exact covered feature identifiers.
+    pub feature_ids: Vec<String>,
+    /// Exact observed target identifier.
+    pub target_id: String,
+    /// All preassigned clean-room roles.
+    pub roles: CleanRoomRoles,
+    /// Direct source provenance identifiers.
+    pub source_provenance_ids: Vec<String>,
+    /// Complete legal-review identifier set.
+    pub legal_review_ids: Vec<String>,
+    /// Reproducible observation audit.
+    pub observation: BehaviorObservationAudit,
+    /// Raw-evidence digest, disposition, and cleanup audit.
+    pub raw_evidence: RawEvidenceAudit,
+    /// Sanitized specification identity without its review decision.
+    pub specification: SpecificationReviewSubjectSpecification,
+}
+
+impl SpecificationReviewSubject {
+    /// Projects the exact admission fields that must exist before a review decision.
+    #[must_use]
+    pub fn from_admission(admission: &BehaviorSpecificationAdmissionRecord) -> Self {
+        Self {
+            id: admission.id.clone(),
+            case_id: admission.case_id.clone(),
+            owner_issue: admission.owner_issue,
+            feature_ids: admission.feature_ids.clone(),
+            target_id: admission.target_id.clone(),
+            roles: admission.roles.clone(),
+            source_provenance_ids: admission.source_provenance_ids.clone(),
+            legal_review_ids: admission.legal_review_ids.clone(),
+            observation: admission.observation.clone(),
+            raw_evidence: admission.raw_evidence.clone(),
+            specification: SpecificationReviewSubjectSpecification {
+                provenance_id: admission.specification.provenance_id.clone(),
+                artifact_path: admission.specification.artifact_path.clone(),
+                content_digest: admission.specification.content_digest.clone(),
+                parent_provenance_ids: admission.specification.parent_provenance_ids.clone(),
+            },
+        }
+    }
+}
+
+/// Technical decision attested by a specification reviewer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationReviewDecision {
+    /// Approved or rejected current decision.
+    pub status: SpecificationReviewStatus,
+    /// Exact non-sensitive rationale recorded in the admission.
+    pub rationale: String,
+}
+
+/// One pre-agreed technical review attestation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationReviewAttestation {
+    /// Identifier chosen before review and recorded by the candidate.
+    pub attestation_id: String,
+    /// Exact pre-decision admission subject.
+    pub subject: SpecificationReviewSubject,
+    /// Technical decision made over the subject.
+    pub decision: SpecificationReviewDecision,
+    /// Exact target record reviewed with the subject.
+    pub target_record: OracleTarget,
+    /// Exact covered feature records reviewed with the subject.
+    pub feature_records: Vec<FeatureRecord>,
+    /// Complete specification provenance closure reviewed with the subject.
+    pub provenance_records: Vec<ProvenanceRecord>,
+}
+
+/// Authenticated technical pull-request review data.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationAuthenticatedReview {
+    /// Repository in `owner/name` form.
+    pub repository: String,
+    /// Pull request containing the review.
+    pub pull_request_number: u64,
+    /// Immutable GitHub review identifier.
+    pub review_id: u64,
+    /// Stable full identity returned for the review author.
+    pub reviewer: GovernanceActorIdentity,
+    /// Exact earlier commit containing the attested subject.
+    pub reviewed_commit_sha: String,
+    /// Current authenticated GitHub review state.
+    pub state: AuthenticatedReviewState,
+    /// UTC timestamp at which GitHub recorded the review.
+    pub submitted_at: String,
+    /// UTC timestamp of the latest body edit, or null.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub last_edited_at: Option<String>,
+    /// Technical attestations parsed from the authenticated review.
+    pub attestations: Vec<SpecificationReviewAttestation>,
+}
+
+/// Authenticated technical review context for one pull request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationReviewPullRequest {
+    /// Repository in `owner/name` form.
+    pub repository: String,
+    /// Pull request containing the reviewed subject.
+    pub pull_request_number: u64,
+    /// Stable account identifier of the pull-request author.
+    pub pull_request_author_account_id: u64,
+    /// Current candidate commit when authority was collected.
+    pub candidate_commit_sha: String,
+    /// Reviews obtained from authenticated GitHub API responses.
+    pub authenticated_reviews: Vec<SpecificationAuthenticatedReview>,
+}
+
+/// Protected technical trust domain used to authenticate specification reviews.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationReviewAuthority {
+    /// Contract version used to interpret this authority.
+    pub schema_version: String,
+    /// Candidate repository from the trusted event context.
+    pub candidate_repository: String,
+    /// Current candidate commit from the trusted event context.
+    pub candidate_commit_sha: String,
+    /// Stable account identifier of the current candidate author.
+    pub candidate_author_account_id: u64,
+    /// Stable reviewer identifiers supplied by the protected trust anchor.
+    pub trusted_reviewer_account_ids: Vec<u64>,
+    /// Authenticated technical pull-request contexts.
+    pub pull_requests: Vec<SpecificationReviewPullRequest>,
+}
+
+/// Trusted event context for independent technical authority verification.
+#[derive(Clone, Copy, Debug)]
+pub struct SpecificationReviewVerificationContext<'a> {
+    /// Authority supplied outside the candidate checkout.
+    pub authority: &'a SpecificationReviewAuthority,
+    /// Repository obtained from the trusted event context.
+    pub candidate_repository: &'a str,
+    /// Commit obtained from the trusted event context.
+    pub candidate_commit_sha: &'a str,
 }
 
 /// Human technical review of one sanitized behavior specification.
@@ -673,6 +843,8 @@ pub struct ImplementationAdmissionContext<'a> {
     pub legal_reviews: &'a LegalReviewLedger,
     /// Authenticated legal authority, when non-pending decisions exist.
     pub legal_verification: Option<LegalDecisionVerificationContext<'a>>,
+    /// Authenticated technical review authority for non-pending admissions.
+    pub specification_review_verification: Option<SpecificationReviewVerificationContext<'a>>,
 }
 
 /// Whether externally stored raw evidence may be redistributed.
@@ -1390,6 +1562,7 @@ impl SpecificationReviewEvidenceReference {
     fn is_well_formed(&self) -> bool {
         is_github_repository(&self.repository)
             && self.pull_request_number > 0
+            && is_git_commit_sha(&self.reviewed_commit_sha)
             && is_contract_identifier(&self.attestation_id)
     }
 }
@@ -1640,6 +1813,592 @@ fn authenticated_review_effective_at(review: &AuthenticatedPullRequestReview) ->
         .as_deref()
         .filter(|last_edited_at| *last_edited_at > review.submitted_at.as_str())
         .unwrap_or(&review.submitted_at)
+}
+
+fn specification_review_effective_at(review: &SpecificationAuthenticatedReview) -> &str {
+    review
+        .last_edited_at
+        .as_deref()
+        .filter(|last_edited_at| *last_edited_at > review.submitted_at.as_str())
+        .unwrap_or(&review.submitted_at)
+}
+
+impl SpecificationReviewAuthority {
+    /// Validates constraints expressed by the technical authority schema.
+    #[must_use]
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        if self.schema_version != SPECIFICATION_REVIEW_AUTHORITY_SCHEMA_VERSION {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.schema-version.unsupported",
+                message: "specification-review authority uses an unsupported schema version"
+                    .to_owned(),
+            });
+        }
+        if !is_github_repository(&self.candidate_repository)
+            || !is_git_commit_sha(&self.candidate_commit_sha)
+            || self.candidate_author_account_id == 0
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.candidate.malformed",
+                message: "specification-review authority has a malformed candidate".to_owned(),
+            });
+        }
+        if self.trusted_reviewer_account_ids.is_empty()
+            || self.trusted_reviewer_account_ids.contains(&0)
+            || has_duplicates(&self.trusted_reviewer_account_ids)
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.trust-anchor.invalid",
+                message: "specification-review authority requires unique trusted reviewers"
+                    .to_owned(),
+            });
+        }
+        if self.pull_requests.is_empty() {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.pull-request.missing",
+                message: "specification-review authority requires a pull request".to_owned(),
+            });
+        }
+        for pull_request in &self.pull_requests {
+            if !is_github_repository(&pull_request.repository)
+                || pull_request.pull_request_number == 0
+                || pull_request.pull_request_author_account_id == 0
+                || !is_git_commit_sha(&pull_request.candidate_commit_sha)
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.review-authority.pull-request.malformed",
+                    message: "specification-review authority has a malformed pull request"
+                        .to_owned(),
+                });
+            }
+            for review in &pull_request.authenticated_reviews {
+                if !is_github_repository(&review.repository)
+                    || review.pull_request_number == 0
+                    || review.review_id == 0
+                    || !review.reviewer.is_well_formed()
+                    || !is_git_commit_sha(&review.reviewed_commit_sha)
+                    || !is_iso_utc_timestamp(&review.submitted_at)
+                    || review
+                        .last_edited_at
+                        .as_deref()
+                        .is_some_and(|timestamp| !is_iso_utc_timestamp(timestamp))
+                    || has_equal_duplicates(&review.attestations)
+                {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review-authority.evidence.malformed",
+                        message: format!(
+                            "technical review {} contains malformed evidence",
+                            review.review_id
+                        ),
+                    });
+                }
+                for attestation in &review.attestations {
+                    if !is_contract_identifier(&attestation.attestation_id)
+                        || attestation.decision.status == SpecificationReviewStatus::Pending
+                        || !has_schema_non_whitespace(&attestation.decision.rationale)
+                        || !specification_review_subject_is_well_formed(&attestation.subject)
+                        || !(TargetMatrix {
+                            schema_version: COMPATIBILITY_SCHEMA_VERSION.to_owned(),
+                            baseline_target_id: attestation.target_record.id.clone(),
+                            targets: vec![attestation.target_record.clone()],
+                            expansion_order: Vec::new(),
+                        })
+                        .validate_schema_semantics()
+                        .is_empty()
+                        || attestation.feature_records.is_empty()
+                        || attestation.provenance_records.is_empty()
+                        || has_equal_duplicates(&attestation.feature_records)
+                        || has_equal_duplicates(&attestation.provenance_records)
+                        || attestation
+                            .feature_records
+                            .iter()
+                            .any(|feature| !feature.validate().is_empty())
+                        || attestation
+                            .provenance_records
+                            .iter()
+                            .any(|record| !record.validate_schema_semantics().is_empty())
+                    {
+                        violations.push(ContractViolation {
+                            code: "behavior-admission.review-authority.attestation.malformed",
+                            message: format!(
+                                "technical review {} contains a malformed attestation",
+                                review.review_id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        violations
+    }
+
+    /// Validates authority identities, uniqueness, and candidate binding.
+    #[must_use]
+    pub fn validate_document_semantics(
+        &self,
+        candidate_repository: &str,
+        candidate_commit_sha: &str,
+    ) -> Vec<ContractViolation> {
+        let mut violations = self.validate_schema_semantics();
+        if self.candidate_repository != candidate_repository
+            || self.candidate_commit_sha != candidate_commit_sha
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.candidate.mismatch",
+                message: "specification-review authority does not match the trusted candidate"
+                    .to_owned(),
+            });
+        }
+        let mut pull_request_keys = BTreeSet::new();
+        let mut review_ids = BTreeSet::new();
+        let mut attestation_ids = BTreeSet::new();
+        for pull_request in &self.pull_requests {
+            if pull_request.repository != self.candidate_repository
+                || pull_request.candidate_commit_sha != self.candidate_commit_sha
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.review-authority.pull-request.candidate-mismatch",
+                    message: format!(
+                        "technical pull request {}/{} does not match the current candidate",
+                        pull_request.repository, pull_request.pull_request_number
+                    ),
+                });
+            }
+            if !pull_request_keys.insert((
+                pull_request.repository.as_str(),
+                pull_request.pull_request_number,
+            )) {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.review-authority.pull-request.duplicate",
+                    message: "specification-review authority repeats a pull request".to_owned(),
+                });
+            }
+            for review in &pull_request.authenticated_reviews {
+                if !is_valid_iso_utc_timestamp(&review.submitted_at)
+                    || review
+                        .last_edited_at
+                        .as_deref()
+                        .is_some_and(|timestamp| !is_valid_iso_utc_timestamp(timestamp))
+                {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review-authority.timestamp.invalid",
+                        message: format!(
+                            "technical review {} contains an invalid UTC timestamp",
+                            review.review_id
+                        ),
+                    });
+                }
+                if review.repository != pull_request.repository
+                    || review.pull_request_number != pull_request.pull_request_number
+                {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review-authority.evidence.pull-request-mismatch",
+                        message: format!(
+                            "technical review {} is outside its pull request",
+                            review.review_id
+                        ),
+                    });
+                }
+                if !review_ids.insert(review.review_id) {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review-authority.review-id.duplicate",
+                        message: format!("technical review {} is reused", review.review_id),
+                    });
+                }
+                for attestation in &review.attestations {
+                    let expected_feature_ids = set_of_strings(&attestation.subject.feature_ids);
+                    let authenticated_feature_ids = attestation
+                        .feature_records
+                        .iter()
+                        .map(|feature| feature.id.as_str())
+                        .collect::<BTreeSet<_>>();
+                    let provenance_roots =
+                        [attestation.subject.specification.provenance_id.clone()];
+                    let provenance_ids =
+                        provenance_closure_ids(&provenance_roots, &attestation.provenance_records);
+                    let expected_state = match attestation.decision.status {
+                        SpecificationReviewStatus::Approved => AuthenticatedReviewState::Approved,
+                        SpecificationReviewStatus::Rejected => {
+                            AuthenticatedReviewState::ChangesRequested
+                        }
+                        SpecificationReviewStatus::Pending => review.state,
+                    };
+                    let reviewer_id = review.reviewer.github_account_id;
+                    let roles = &attestation.subject.roles;
+                    if attestation.target_record.id != attestation.subject.target_id
+                        || expected_feature_ids != authenticated_feature_ids
+                        || authenticated_feature_ids.len() != attestation.feature_records.len()
+                        || provenance_ids
+                            .as_ref()
+                            .is_none_or(|ids| ids.len() != attestation.provenance_records.len())
+                        || review.reviewer.github_account_id
+                            != roles.specification_reviewer.actor.github_account_id
+                        || !self.trusted_reviewer_account_ids.contains(&reviewer_id)
+                        || reviewer_id == self.candidate_author_account_id
+                        || reviewer_id == pull_request.pull_request_author_account_id
+                        || reviewer_id == roles.observer.actor.github_account_id
+                        || reviewer_id == roles.implementer.actor.github_account_id
+                        || reviewer_id == roles.conformance_reviewer.actor.github_account_id
+                        || review.state != expected_state
+                    {
+                        violations.push(ContractViolation {
+                            code: "behavior-admission.review-authority.attestation.invalid",
+                            message: format!(
+                                "technical review {} has an invalid attestation context",
+                                review.review_id
+                            ),
+                        });
+                    }
+                    if !attestation_ids.insert(attestation.attestation_id.as_str()) {
+                        violations.push(ContractViolation {
+                            code: "behavior-admission.review-authority.attestation.reused",
+                            message: format!(
+                                "technical attestation {} is reused",
+                                attestation.attestation_id
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        violations
+    }
+
+    /// Validates one current non-pending admission against authenticated evidence.
+    #[must_use]
+    pub fn validate_exact_admission(
+        &self,
+        admission: &BehaviorSpecificationAdmissionRecord,
+        targets: &TargetMatrix,
+        features: &FeatureMatrix,
+        provenance: &ProvenanceLedger,
+        candidate_repository: &str,
+        candidate_commit_sha: &str,
+    ) -> Vec<ContractViolation> {
+        let mut violations =
+            self.validate_document_semantics(candidate_repository, candidate_commit_sha);
+        let review = &admission.specification.technical_review;
+        let (Some(reviewer), Some(decided_at), Some(reference)) = (
+            review.reviewed_by.as_ref(),
+            review.decided_at.as_deref(),
+            review.decision_evidence.as_ref(),
+        ) else {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.evidence.missing",
+                message: format!(
+                    "admission {} lacks complete technical review evidence",
+                    admission.id
+                ),
+            });
+            return violations;
+        };
+        let pull_requests = self
+            .pull_requests
+            .iter()
+            .filter(|pull_request| {
+                pull_request.repository == reference.repository
+                    && pull_request.pull_request_number == reference.pull_request_number
+            })
+            .collect::<Vec<_>>();
+        let [pull_request] = pull_requests.as_slice() else {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.evidence.pull-request-mismatch",
+                message: format!(
+                    "admission {} does not reference one technical pull request",
+                    admission.id
+                ),
+            });
+            return violations;
+        };
+        let evidence_matches = pull_request
+            .authenticated_reviews
+            .iter()
+            .filter(|evidence| {
+                evidence.repository == reference.repository
+                    && evidence.pull_request_number == reference.pull_request_number
+                    && evidence.reviewed_commit_sha == reference.reviewed_commit_sha
+                    && evidence
+                        .attestations
+                        .iter()
+                        .any(|attestation| attestation.attestation_id == reference.attestation_id)
+            })
+            .collect::<Vec<_>>();
+        let [evidence] = evidence_matches.as_slice() else {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.evidence.untrusted",
+                message: format!(
+                    "admission {} does not reference one authenticated technical review",
+                    admission.id
+                ),
+            });
+            return violations;
+        };
+        let attestations = evidence
+            .attestations
+            .iter()
+            .filter(|attestation| attestation.attestation_id == reference.attestation_id)
+            .collect::<Vec<_>>();
+        let [attestation] = attestations.as_slice() else {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.attestation.mismatch",
+                message: format!("admission {} attestation is not unique", admission.id),
+            });
+            return violations;
+        };
+
+        if evidence.reviewer.github_account_id != reviewer.github_account_id
+            || evidence.reviewer.github_account_id
+                != admission
+                    .roles
+                    .specification_reviewer
+                    .actor
+                    .github_account_id
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.reviewer.mismatch",
+                message: format!(
+                    "admission {} does not identify its authenticated reviewer",
+                    admission.id
+                ),
+            });
+        }
+        let reviewer_id = reviewer.github_account_id;
+        if !self.trusted_reviewer_account_ids.contains(&reviewer_id) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.reviewer.untrusted",
+                message: format!("admission {} reviewer is not trusted", admission.id),
+            });
+        }
+        if reviewer_id == self.candidate_author_account_id
+            || reviewer_id == pull_request.pull_request_author_account_id
+            || reviewer_id == admission.roles.observer.actor.github_account_id
+            || reviewer_id == admission.roles.implementer.actor.github_account_id
+            || reviewer_id == admission.roles.conformance_reviewer.actor.github_account_id
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.reviewer.not-independent",
+                message: format!("admission {} reviewer is not independent", admission.id),
+            });
+        }
+
+        let expected_state = match review.status {
+            SpecificationReviewStatus::Approved => AuthenticatedReviewState::Approved,
+            SpecificationReviewStatus::Rejected => AuthenticatedReviewState::ChangesRequested,
+            SpecificationReviewStatus::Pending => return violations,
+        };
+        if evidence.state != expected_state {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.state.mismatch",
+                message: format!(
+                    "admission {} technical decision has the wrong authenticated state",
+                    admission.id
+                ),
+            });
+        }
+        if attestation.decision.status != review.status
+            || attestation.decision.rationale != review.rationale
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.decision.mismatch",
+                message: format!(
+                    "admission {} technical decision differs from its attestation",
+                    admission.id
+                ),
+            });
+        }
+        if attestation.subject != SpecificationReviewSubject::from_admission(admission) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.subject.mismatch",
+                message: format!(
+                    "admission {} pre-decision subject has drifted",
+                    admission.id
+                ),
+            });
+        }
+        if !technical_target_snapshot_matches(admission, targets, &attestation.target_record) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.target.mismatch",
+                message: format!("admission {} target snapshot differs", admission.id),
+            });
+        }
+        if !technical_feature_snapshot_matches(admission, features, &attestation.feature_records) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.features.mismatch",
+                message: format!("admission {} feature snapshot differs", admission.id),
+            });
+        }
+        if !technical_provenance_snapshot_matches(
+            admission,
+            provenance,
+            &attestation.provenance_records,
+        ) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.provenance.mismatch",
+                message: format!(
+                    "admission {} specification provenance snapshot differs",
+                    admission.id
+                ),
+            });
+        }
+
+        let effective_at = specification_review_effective_at(evidence);
+        if decided_at != effective_at {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.timestamp.mismatch",
+                message: format!(
+                    "admission {} decision time differs from effective review time",
+                    admission.id
+                ),
+            });
+        }
+        let disposition_at = match &admission.raw_evidence.disposition {
+            RawEvidenceDisposition::Protected { confirmed_at, .. } => confirmed_at.as_str(),
+            RawEvidenceDisposition::Deleted { deleted_at } => deleted_at.as_str(),
+        };
+        if effective_at <= admission.observation.completed_at.as_str()
+            || effective_at <= disposition_at
+            || admission
+                .raw_evidence
+                .cleanup_events
+                .iter()
+                .any(|event| effective_at <= event.occurred_at.as_str())
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.chronology.invalid",
+                message: format!(
+                    "admission {} review does not strictly follow observation and cleanup",
+                    admission.id
+                ),
+            });
+        }
+        if review.status == SpecificationReviewStatus::Approved
+            && admission
+                .implementation_handoff
+                .as_ref()
+                .is_none_or(|handoff| effective_at >= handoff.handed_off_at.as_str())
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.handoff.not-prior",
+                message: format!(
+                    "admission {} effective review does not predate handoff",
+                    admission.id
+                ),
+            });
+        }
+        if pull_request.authenticated_reviews.iter().any(|candidate| {
+            candidate.reviewer.github_account_id == evidence.reviewer.github_account_id
+                && (
+                    specification_review_effective_at(candidate),
+                    candidate.review_id,
+                ) > (effective_at, evidence.review_id)
+        }) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.evidence.superseded",
+                message: format!(
+                    "admission {} review was superseded by a later review state",
+                    admission.id
+                ),
+            });
+        }
+        violations
+    }
+}
+
+fn technical_target_snapshot_matches(
+    admission: &BehaviorSpecificationAdmissionRecord,
+    targets: &TargetMatrix,
+    snapshot: &OracleTarget,
+) -> bool {
+    let matches = targets
+        .targets
+        .iter()
+        .filter(|target| target.id == admission.target_id)
+        .collect::<Vec<_>>();
+    matches!(matches.as_slice(), [target] if **target == *snapshot)
+}
+
+fn specification_review_subject_is_well_formed(subject: &SpecificationReviewSubject) -> bool {
+    BehaviorSpecificationAdmissionRecord {
+        id: subject.id.clone(),
+        case_id: subject.case_id.clone(),
+        owner_issue: subject.owner_issue,
+        feature_ids: subject.feature_ids.clone(),
+        target_id: subject.target_id.clone(),
+        roles: subject.roles.clone(),
+        source_provenance_ids: subject.source_provenance_ids.clone(),
+        legal_review_ids: subject.legal_review_ids.clone(),
+        observation: subject.observation.clone(),
+        raw_evidence: subject.raw_evidence.clone(),
+        specification: BehaviorSpecificationReference {
+            provenance_id: subject.specification.provenance_id.clone(),
+            artifact_path: subject.specification.artifact_path.clone(),
+            content_digest: subject.specification.content_digest.clone(),
+            parent_provenance_ids: subject.specification.parent_provenance_ids.clone(),
+            technical_review: SpecificationTechnicalReview {
+                status: SpecificationReviewStatus::Pending,
+                reviewed_by: None,
+                decided_at: None,
+                decision_evidence: None,
+                rationale: "Pending technical review".to_owned(),
+            },
+        },
+        implementation_handoff: None,
+        derived_tests: Vec::new(),
+    }
+    .validate_schema_semantics()
+    .is_empty()
+}
+
+fn technical_feature_snapshot_matches(
+    admission: &BehaviorSpecificationAdmissionRecord,
+    features: &FeatureMatrix,
+    snapshot: &[FeatureRecord],
+) -> bool {
+    let expected_ids = set_of_strings(&admission.feature_ids);
+    let snapshot_ids = snapshot
+        .iter()
+        .map(|feature| feature.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if expected_ids != snapshot_ids || snapshot_ids.len() != snapshot.len() {
+        return false;
+    }
+    expected_ids.iter().all(|id| {
+        let current = features
+            .features
+            .iter()
+            .filter(|feature| feature.id == *id)
+            .collect::<Vec<_>>();
+        let authenticated = snapshot
+            .iter()
+            .filter(|feature| feature.id == *id)
+            .collect::<Vec<_>>();
+        matches!(
+            (current.as_slice(), authenticated.as_slice()),
+            ([current], [authenticated]) if current == authenticated
+        )
+    })
+}
+
+fn technical_provenance_snapshot_matches(
+    admission: &BehaviorSpecificationAdmissionRecord,
+    provenance: &ProvenanceLedger,
+    snapshot: &[ProvenanceRecord],
+) -> bool {
+    let roots = [admission.specification.provenance_id.clone()];
+    let Some(current_ids) = provenance_closure_ids(&roots, &provenance.records) else {
+        return false;
+    };
+    let Some(snapshot_ids) = provenance_closure_ids(&roots, snapshot) else {
+        return false;
+    };
+    if current_ids != snapshot_ids || snapshot_ids.len() != snapshot.len() {
+        return false;
+    }
+    current_ids.iter().all(|id| {
+        provenance.records.iter().find(|record| record.id == *id)
+            == snapshot.iter().find(|record| record.id == *id)
+    })
 }
 
 impl LegalReviewRecord {
@@ -2459,7 +3218,8 @@ impl BehaviorSpecificationAdmissionRecord {
 
         let review = &self.specification.technical_review;
         if let Some(reviewed_by) = &review.reviewed_by
-            && reviewed_by != &self.roles.specification_reviewer.actor
+            && reviewed_by.github_account_id
+                != self.roles.specification_reviewer.actor.github_account_id
         {
             violations.push(ContractViolation {
                 code: "behavior-admission.review.reviewer-mismatch",
@@ -2572,14 +3332,11 @@ impl BehaviorSpecificationAdmissionRecord {
                     ),
                 });
             }
-            if !derived_test
-                .parent_provenance_ids
-                .contains(&self.specification.provenance_id)
-            {
+            if derived_test.parent_provenance_ids != [self.specification.provenance_id.clone()] {
                 violations.push(ContractViolation {
-                    code: "behavior-admission.derived-test.specification-parent-missing",
+                    code: "behavior-admission.derived-test.parent-set-mismatch",
                     message: format!(
-                        "admission {} derived test does not name the specification parent",
+                        "admission {} derived test parents must equal the specification",
                         self.id
                     ),
                 });
@@ -2662,13 +3419,13 @@ impl BehaviorSpecificationAdmissionLedger {
     /// Validates whether one exact feature and target may guide implementation.
     ///
     /// Candidate-authored specification-review metadata is never sufficient
-    /// authority. Until a protected review authority is added, an otherwise
-    /// approved admission remains fail closed.
+    /// authority; non-pending metadata is authenticated independently.
     #[must_use]
     fn validate_exact_implementation(
         &self,
         feature_id: &str,
         target_id: &str,
+        features: &FeatureMatrix,
         context: ImplementationAdmissionContext<'_>,
     ) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
@@ -2699,17 +3456,37 @@ impl BehaviorSpecificationAdmissionLedger {
                 code: "behavior-admission.review.pending",
                 message: format!("admission {} technical review is pending", admission.id),
             }),
-            SpecificationReviewStatus::Rejected => violations.push(ContractViolation {
-                code: "behavior-admission.review.rejected",
-                message: format!("admission {} technical review was rejected", admission.id),
-            }),
-            SpecificationReviewStatus::Approved => violations.push(ContractViolation {
-                code: "behavior-admission.review-authority.required",
-                message: format!(
-                    "admission {} requires protected specification-review authority",
-                    admission.id
-                ),
-            }),
+            SpecificationReviewStatus::Rejected | SpecificationReviewStatus::Approved => {
+                if admission.specification.technical_review.status
+                    == SpecificationReviewStatus::Rejected
+                {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review.rejected",
+                        message: format!(
+                            "admission {} technical review was rejected",
+                            admission.id
+                        ),
+                    });
+                }
+                if let Some(verification) = context.specification_review_verification {
+                    violations.extend(verification.authority.validate_exact_admission(
+                        admission,
+                        context.targets,
+                        features,
+                        context.provenance,
+                        verification.candidate_repository,
+                        verification.candidate_commit_sha,
+                    ));
+                } else {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review-authority.required",
+                        message: format!(
+                            "admission {} requires protected specification-review authority",
+                            admission.id
+                        ),
+                    });
+                }
+            }
         }
         let observation_deadline = AdmissionUseDeadline {
             timestamp: &admission.observation.started_at,
@@ -4254,7 +5031,7 @@ impl FeatureMatrix {
             [_] => violations.extend(
                 context
                     .admissions
-                    .validate_exact_implementation(feature_id, target_id, context),
+                    .validate_exact_implementation(feature_id, target_id, self, context),
             ),
         }
 
@@ -4724,8 +5501,11 @@ mod tests {
         LegalDecisionAttestation, LegalDecisionAuthority, LegalDecisionEvidenceReference,
         LegalDecisionVerificationContext, LegalReviewLedger, LegalReviewRecord, LegalReviewStatus,
         LegalReviewerIdentity, OracleTarget, ProvenanceLedger, ProvenanceRecord,
-        ProvenanceSourceKind, ProvenanceUse, SpecificationReviewStatus, TargetMatrix,
-        validate_governance_references,
+        ProvenanceSourceKind, ProvenanceUse, SPECIFICATION_REVIEW_AUTHORITY_SCHEMA_VERSION,
+        SpecificationAuthenticatedReview, SpecificationReviewAttestation,
+        SpecificationReviewAuthority, SpecificationReviewDecision, SpecificationReviewPullRequest,
+        SpecificationReviewStatus, SpecificationReviewSubject,
+        SpecificationReviewVerificationContext, TargetMatrix, validate_governance_references,
     };
     use serde_json::{Value, json};
 
@@ -5914,7 +6694,7 @@ mod tests {
         for code in [
             "behavior-admission.feature.target-mismatch",
             "behavior-admission.specification.provenance-mismatch",
-            "behavior-admission.derived-test.specification-parent-missing",
+            "behavior-admission.derived-test.parent-set-mismatch",
             "behavior-admission.legal-review-set.mismatch",
             "behavior-admission.legal-review.unknown",
         ] {
@@ -5944,6 +6724,7 @@ mod tests {
                 provenance: &contracts.provenance,
                 legal_reviews: &contracts.legal_reviews,
                 legal_verification: Some(legal_decision_verification(&authority)),
+                specification_review_verification: None,
             },
         );
 
@@ -5952,6 +6733,285 @@ mod tests {
                 violation.code == "behavior-admission.review-authority.required"
             }),
             "{violations:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_specification_review_enables_non_circular_handoff()
+    -> Result<(), serde_json::Error> {
+        let contracts = approved_behavior_admission_contracts()?;
+        let legal_authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+        let specification_authority = specification_review_authority(&contracts);
+
+        let violations = validate_approved_behavior_admission(
+            &contracts,
+            &legal_authority,
+            &specification_authority,
+        );
+
+        assert!(violations.is_empty(), "{violations:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_specification_review_rejects_snapshot_and_identity_attacks()
+    -> Result<(), serde_json::Error> {
+        let contracts = approved_behavior_admission_contracts()?;
+        let legal_authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+        let base = specification_review_authority(&contracts);
+
+        let mut subject_drift = base.clone();
+        subject_drift.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .subject
+            .case_id = "case.drifted".to_owned();
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &subject_drift),
+            "behavior-admission.review-authority.subject.mismatch",
+        );
+
+        let mut target_drift = base.clone();
+        target_drift.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .target_record
+            .timezone = "Asia/Tokyo".to_owned();
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &target_drift),
+            "behavior-admission.review-authority.target.mismatch",
+        );
+
+        let mut feature_drift = base.clone();
+        feature_drift.pull_requests[0].authenticated_reviews[0].attestations[0].feature_records
+            [0]
+        .owner_issue = 999;
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &feature_drift),
+            "behavior-admission.review-authority.features.mismatch",
+        );
+
+        let mut provenance_drift = base.clone();
+        provenance_drift.pull_requests[0].authenticated_reviews[0].attestations[0]
+            .provenance_records[0]
+            .title = "Drifted".to_owned();
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &provenance_drift),
+            "behavior-admission.review-authority.provenance.mismatch",
+        );
+
+        let mut unknown_reviewer = base.clone();
+        unknown_reviewer.trusted_reviewer_account_ids = vec![9999];
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &unknown_reviewer),
+            "behavior-admission.review-authority.reviewer.untrusted",
+        );
+
+        let mut self_review = base.clone();
+        self_review.candidate_author_account_id = 1002;
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &self_review),
+            "behavior-admission.review-authority.reviewer.not-independent",
+        );
+
+        let mut renamed_contracts = approved_behavior_admission_contracts()?;
+        if let Some(reviewer) = renamed_contracts.admissions.admissions[0]
+            .specification
+            .technical_review
+            .reviewed_by
+            .as_mut()
+        {
+            reviewer.github_login = "renamed-spec-reviewer".to_owned();
+        }
+        let mut renamed_reviewer = specification_review_authority(&renamed_contracts);
+        renamed_reviewer.pull_requests[0].authenticated_reviews[0]
+            .reviewer
+            .github_login = "renamed-spec-reviewer".to_owned();
+        let renamed_violations = validate_approved_behavior_admission(
+            &renamed_contracts,
+            &legal_authority,
+            &renamed_reviewer,
+        );
+        assert!(renamed_violations.is_empty(), "{renamed_violations:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn specification_review_authority_rejects_missing_decision_evidence_directly()
+    -> Result<(), serde_json::Error> {
+        let mut contracts = approved_behavior_admission_contracts()?;
+        let authority = specification_review_authority(&contracts);
+        contracts.admissions.admissions[0]
+            .specification
+            .technical_review
+            .decision_evidence = None;
+
+        let violations = authority.validate_exact_admission(
+            &contracts.admissions.admissions[0],
+            &contracts.targets,
+            &contracts.features,
+            &contracts.provenance,
+            "anaregdesign/ntsql",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+
+        assert_has_violation(
+            &violations,
+            "behavior-admission.review-authority.evidence.missing",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_specification_review_uses_effective_time_and_latest_state()
+    -> Result<(), serde_json::Error> {
+        let contracts = approved_behavior_admission_contracts()?;
+        let legal_authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+        let base = specification_review_authority(&contracts);
+
+        let mut edited_contracts = approved_behavior_admission_contracts()?;
+        edited_contracts.admissions.admissions[0]
+            .specification
+            .technical_review
+            .decided_at = Some("2026-01-01T01:03:30Z".to_owned());
+        let mut valid_edit = base.clone();
+        valid_edit.pull_requests[0].authenticated_reviews[0].last_edited_at =
+            Some("2026-01-01T01:03:30Z".to_owned());
+        let valid_edit_violations =
+            validate_approved_behavior_admission(&edited_contracts, &legal_authority, &valid_edit);
+        assert!(
+            valid_edit_violations.is_empty(),
+            "{valid_edit_violations:#?}"
+        );
+
+        let mut state_mismatch = base.clone();
+        state_mismatch.pull_requests[0].authenticated_reviews[0].state =
+            AuthenticatedReviewState::Commented;
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &state_mismatch),
+            "behavior-admission.review-authority.state.mismatch",
+        );
+
+        let mut stale = base.clone();
+        stale.pull_requests[0].authenticated_reviews[0].reviewed_commit_sha =
+            "cccccccccccccccccccccccccccccccccccccccc".to_owned();
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &stale),
+            "behavior-admission.review-authority.evidence.untrusted",
+        );
+
+        let mut superseded = base.clone();
+        let mut later = superseded.pull_requests[0].authenticated_reviews[0].clone();
+        later.review_id = 7002;
+        later.reviewed_commit_sha = "dddddddddddddddddddddddddddddddddddddddd".to_owned();
+        later.state = AuthenticatedReviewState::Commented;
+        later.submitted_at = "2026-01-01T01:03:01Z".to_owned();
+        later.attestations.clear();
+        superseded.pull_requests[0]
+            .authenticated_reviews
+            .push(later);
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &superseded),
+            "behavior-admission.review-authority.evidence.superseded",
+        );
+
+        let mut edited_after_handoff = base.clone();
+        edited_after_handoff.pull_requests[0].authenticated_reviews[0].last_edited_at =
+            Some("2026-01-01T01:04:01Z".to_owned());
+        let edit_violations = validate_approved_behavior_admission(
+            &contracts,
+            &legal_authority,
+            &edited_after_handoff,
+        );
+        assert_has_violation(
+            &edit_violations,
+            "behavior-admission.review-authority.timestamp.mismatch",
+        );
+        assert_has_violation(
+            &edit_violations,
+            "behavior-admission.review-authority.handoff.not-prior",
+        );
+
+        let mut exact_second = contracts;
+        exact_second.admissions.admissions[0]
+            .specification
+            .technical_review
+            .decided_at = Some("2026-01-01T01:03:01Z".to_owned());
+        assert_has_violation(
+            &validate_approved_behavior_admission(&exact_second, &legal_authority, &base),
+            "behavior-admission.review-authority.timestamp.mismatch",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_specification_review_is_authenticated_but_never_authorizes()
+    -> Result<(), serde_json::Error> {
+        let mut contracts = approved_behavior_admission_contracts()?;
+        let admission = &mut contracts.admissions.admissions[0];
+        admission.specification.technical_review.status = SpecificationReviewStatus::Rejected;
+        admission.specification.technical_review.rationale =
+            "Synthetic authenticated rejection.".to_owned();
+        admission.implementation_handoff = None;
+        let legal_authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+        let mut specification_authority = specification_review_authority(&contracts);
+        specification_authority.pull_requests[0].authenticated_reviews[0].state =
+            AuthenticatedReviewState::ChangesRequested;
+
+        let violations = validate_approved_behavior_admission(
+            &contracts,
+            &legal_authority,
+            &specification_authority,
+        );
+
+        assert_has_violation(&violations, "behavior-admission.review.rejected");
+        assert!(
+            !violations.iter().any(|violation| violation
+                .code
+                .starts_with("behavior-admission.review-authority")),
+            "{violations:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authenticated_specification_review_rejects_candidate_and_attestation_replay()
+    -> Result<(), serde_json::Error> {
+        let contracts = approved_behavior_admission_contracts()?;
+        let legal_authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+        let base = specification_review_authority(&contracts);
+
+        let mut candidate_mismatch = base.clone();
+        candidate_mismatch.candidate_commit_sha =
+            "cccccccccccccccccccccccccccccccccccccccc".to_owned();
+        assert_has_violation(
+            &validate_approved_behavior_admission(
+                &contracts,
+                &legal_authority,
+                &candidate_mismatch,
+            ),
+            "behavior-admission.review-authority.candidate.mismatch",
+        );
+
+        let mut replay = base.clone();
+        let mut repeated = replay.pull_requests[0].authenticated_reviews[0].clone();
+        repeated.review_id = 7002;
+        replay.pull_requests[0].authenticated_reviews.push(repeated);
+        assert_has_violation(
+            &validate_approved_behavior_admission(&contracts, &legal_authority, &replay),
+            "behavior-admission.review-authority.attestation.reused",
         );
         Ok(())
     }
@@ -5974,6 +7034,7 @@ mod tests {
                 provenance: &contracts.provenance,
                 legal_reviews: &contracts.legal_reviews,
                 legal_verification: None,
+                specification_review_verification: None,
             },
         );
 
@@ -6010,6 +7071,7 @@ mod tests {
                 provenance: &contracts.provenance,
                 legal_reviews: &contracts.legal_reviews,
                 legal_verification: Some(legal_decision_verification(&authority)),
+                specification_review_verification: None,
             },
         );
 
@@ -6042,6 +7104,7 @@ mod tests {
                 provenance: &contracts.provenance,
                 legal_reviews: &contracts.legal_reviews,
                 legal_verification: Some(legal_decision_verification(&authority)),
+                specification_review_verification: None,
             },
         );
 
@@ -6068,6 +7131,7 @@ mod tests {
             provenance: &contracts.provenance,
             legal_reviews: &contracts.legal_reviews,
             legal_verification: Some(legal_decision_verification(&authority)),
+            specification_review_verification: None,
         };
 
         let derived_test_violations = super::validate_admission_closure_uses(
@@ -6131,6 +7195,7 @@ mod tests {
                 provenance: &target_contracts.provenance,
                 legal_reviews: &target_contracts.legal_reviews,
                 legal_verification: Some(legal_decision_verification(&target_authority)),
+                specification_review_verification: None,
             },
         );
 
@@ -6166,6 +7231,7 @@ mod tests {
                 provenance: &test_contracts.provenance,
                 legal_reviews: &test_contracts.legal_reviews,
                 legal_verification: Some(legal_decision_verification(&test_authority)),
+                specification_review_verification: None,
             },
         );
 
@@ -6204,6 +7270,7 @@ mod tests {
                 provenance: &contracts.provenance,
                 legal_reviews: &contracts.legal_reviews,
                 legal_verification: None,
+                specification_review_verification: None,
             },
         );
 
@@ -6243,7 +7310,7 @@ mod tests {
             expansion_order: Vec::new(),
         };
         let admissions = BehaviorSpecificationAdmissionLedger {
-            schema_version: "1.0.0".to_owned(),
+            schema_version: super::BEHAVIOR_SPECIFICATION_ADMISSION_SCHEMA_VERSION.to_owned(),
             admissions: Vec::new(),
         };
 
@@ -6256,6 +7323,7 @@ mod tests {
                 provenance: &provenance_ledger(),
                 legal_reviews: &pending_legal_reviews(),
                 legal_verification: None,
+                specification_review_verification: None,
             },
         );
 
@@ -6660,6 +7728,103 @@ mod tests {
             candidate_repository: "anaregdesign/ntsql",
             candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         }
+    }
+
+    fn specification_review_authority(
+        contracts: &BehaviorAdmissionContracts,
+    ) -> SpecificationReviewAuthority {
+        let admission = &contracts.admissions.admissions[0];
+        let technical_review = &admission.specification.technical_review;
+        let reference = technical_review.decision_evidence.as_ref().map_or_else(
+            || super::SpecificationReviewEvidenceReference {
+                repository: "anaregdesign/ntsql".to_owned(),
+                pull_request_number: 1,
+                reviewed_commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+                attestation_id: "attestation.synthetic.select".to_owned(),
+            },
+            Clone::clone,
+        );
+        let feature_records = contracts
+            .features
+            .features
+            .iter()
+            .filter(|feature| admission.feature_ids.contains(&feature.id))
+            .cloned()
+            .collect();
+        let provenance_records = contracts
+            .provenance
+            .records
+            .iter()
+            .filter(|record| {
+                record.id == admission.specification.provenance_id
+                    || admission.source_provenance_ids.contains(&record.id)
+            })
+            .cloned()
+            .collect();
+        SpecificationReviewAuthority {
+            schema_version: SPECIFICATION_REVIEW_AUTHORITY_SCHEMA_VERSION.to_owned(),
+            candidate_repository: "anaregdesign/ntsql".to_owned(),
+            candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            candidate_author_account_id: 1003,
+            trusted_reviewer_account_ids: vec![1002],
+            pull_requests: vec![SpecificationReviewPullRequest {
+                repository: reference.repository.clone(),
+                pull_request_number: reference.pull_request_number,
+                pull_request_author_account_id: 2000,
+                candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+                authenticated_reviews: vec![SpecificationAuthenticatedReview {
+                    repository: reference.repository.clone(),
+                    pull_request_number: reference.pull_request_number,
+                    review_id: 7001,
+                    reviewer: admission.roles.specification_reviewer.actor.clone(),
+                    reviewed_commit_sha: reference.reviewed_commit_sha,
+                    state: AuthenticatedReviewState::Approved,
+                    submitted_at: "2026-01-01T01:03:00Z".to_owned(),
+                    last_edited_at: None,
+                    attestations: vec![SpecificationReviewAttestation {
+                        attestation_id: reference.attestation_id,
+                        subject: SpecificationReviewSubject::from_admission(admission),
+                        decision: SpecificationReviewDecision {
+                            status: technical_review.status,
+                            rationale: technical_review.rationale.clone(),
+                        },
+                        target_record: contracts.targets.targets[0].clone(),
+                        feature_records,
+                        provenance_records,
+                    }],
+                }],
+            }],
+        }
+    }
+
+    fn validate_approved_behavior_admission(
+        contracts: &BehaviorAdmissionContracts,
+        legal_authority: &LegalDecisionAuthority,
+        specification_authority: &SpecificationReviewAuthority,
+    ) -> Vec<super::ContractViolation> {
+        contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &contracts.targets,
+                admissions: &contracts.admissions,
+                provenance: &contracts.provenance,
+                legal_reviews: &contracts.legal_reviews,
+                legal_verification: Some(legal_decision_verification(legal_authority)),
+                specification_review_verification: Some(SpecificationReviewVerificationContext {
+                    authority: specification_authority,
+                    candidate_repository: "anaregdesign/ntsql",
+                    candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                }),
+            },
+        )
+    }
+
+    fn assert_has_violation(violations: &[super::ContractViolation], code: &str) {
+        assert!(
+            violations.iter().any(|violation| violation.code == code),
+            "missing {code}: {violations:#?}"
+        );
     }
 
     fn approved_fixture_governance() -> (ProvenanceLedger, LegalReviewLedger) {

@@ -100,8 +100,9 @@ artifacts and decisions exist:
    settings, environment, raw-evidence digest, and cleanup result without
    implementing the case. Only the observer or specification reviewer may
    handle raw evidence, and disposition and cleanup precede technical review.
-4. A separate specification reviewer approves a sanitized, typed behavior
-   specification, its digest, path, and complete provenance lineage.
+4. A separate specification reviewer attests the exact pre-decision admission
+   subject on an earlier commit, together with the sanitized specification,
+   exact target and feature records, and complete provenance closure.
 5. The audit record identifies the issue and case, every role, timestamps,
    provenance and legal-review IDs, target, commands, raw-evidence digest,
    specification path and digest, review decision, and cleanup or deletion
@@ -112,13 +113,19 @@ artifacts and decisions exist:
    states expected syntax, typed result, metadata, diagnostic, side-effect, and
    operational observations without importing protected raw evidence.
 
-The versioned behavior-specification admission ledger now records and validates
-this complete boundary, but its published admission list is empty. Candidate
-technical-review metadata also remains unauthenticated until Issue #55 provides
-the protected authority boundary. Consequently, this ADR authorizes inventory
-and architecture planning only. It does not authorize a query parser,
-integer-literal rule, result value, metadata field, error value, or compatibility
-claim.
+The versioned behavior-specification admission ledger and the distinct
+specification-review authority contract now record and validate this complete
+consumer boundary, but the published admission list is empty. The non-circular
+workflow reviews an exact pre-decision subject commit, then uses a later
+candidate commit to record authenticated reviewer/time/reference metadata and
+the controlled handoff. Exact subject projection prevents relevant drift;
+technical reviewed-head equality is deliberately not required. The authority
+producer must supply current review state and last-edit timestamps, and legal
+authority cannot substitute for technical authority. Issue #55 still must
+provide the protected producer and trust anchor. Consequently, this ADR
+authorizes inventory and architecture planning only. It does not authorize a
+query parser, integer-literal rule, result value, metadata field, error value, or
+compatibility claim.
 
 ## Test Boundaries
 

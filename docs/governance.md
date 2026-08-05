@@ -273,10 +273,19 @@ independence.
    hash, and cleanup result. Only the observer or specification reviewer may
    handle raw evidence or record its cleanup.
 5. Produce a behavior specification containing only necessary factual behavior and typed observations.
-6. Have the specification reviewer approve the sanitized specification and its lineage.
-7. Give the implementer only that approved specification and public project interfaces.
-8. Review implementation and conformance evidence against the provenance and legal ledgers.
-9. Permit a release claim only when the compatibility contract's complete-claim gate also passes.
+6. Commit the exact pre-decision admission subject: every admission field except
+   the technical decision, implementation handoff, and derived tests.
+7. Have the preassigned specification reviewer attest that exact subject, exact
+   target and feature records, and the complete specification provenance closure
+   on the subject commit.
+8. In a later candidate commit, record the authenticated reviewer identity,
+   effective full-second UTC decision time, reviewed subject commit, attestation
+   ID, and controlled handoff. Give the implementer only that approved
+   specification and public project interfaces.
+9. Review implementation and conformance evidence against the provenance and
+   legal ledgers.
+10. Permit a release claim only when the compatibility contract's
+    complete-claim gate also passes.
 
 The audit record for each case must identify the issue and case ID, observer,
 specification reviewer, implementer, timestamps, provenance IDs, legal-review
@@ -291,7 +300,8 @@ argv-form commands, bounded environment and session facts, input and raw
 evidence digests and lengths, a protected-or-deleted evidence disposition with
 cleanup events completed before technical review, exact specification and
 derived-test provenance, and a controlled implementer handoff. The published
-ledger is empty; no synthetic schema-corpus approval is authority.
+ledger is empty; no synthetic schema-corpus approval is authority. Each derived
+test's direct parent set must equal the sanitized specification provenance ID.
 
 Authenticated legal evidence must precede the first governed use of each
 provenance closure. Oracle-target and observation-source approvals precede
@@ -300,20 +310,38 @@ derived-test approval precedes implementation handoff. For editable GitHub
 review bodies, the later of submission and the authenticated last edit is the
 effective approval time.
 
+`contracts/schemas/specification-review-authority.schema.json` defines a
+technical trust domain distinct from legal authority. The candidate review
+reference binds repository, pull request, reviewed subject commit, and a
+pre-agreed attestation ID. The protected producer must report each review's
+current state and required-nullable last-edit timestamp. The verifier compares
+the attested subject projection to the current admission, so relevant drift
+fails without requiring the earlier reviewed subject commit to equal the later
+candidate head. Approved records require current `approved` state; rejected
+records require `changes-requested` only to authenticate their metadata and
+remain non-authorizing. Any later review by the same reviewer in the same pull
+request supersedes the evidence, including comments and reviews of other
+commits. The effective time must equal `decided_at`, follow observation,
+disposition, and every cleanup event, and, for approval, precede handoff.
+Authenticated-review and decision-metadata logins are audit labels and may
+differ from the preassignment snapshot after an account rename; the protected
+roster and identity-separation checks use the stable numeric GitHub account ID.
+
 Before a semantic change, run:
 
 ```sh
 cargo run --locked -p ntsql-contract --bin ntsql-governance -- \
   implementation-admission <feature-id> <target-id> \
-  [<legal-authority-path> <repository> <commit>]
+  [<legal-authority-path> <specification-authority-path> <repository> <commit>]
 ```
 
 The command is intentionally not a global CI step while no feature has an
-admission. Missing, pending, rejected, ambiguous, or legally unauthorized
-records fail. Candidate-authored technical `approved` metadata also fails until
-the separate protected specification-review producer and verifier in Issue #55
-authenticate it. Legal authority and technical-review authority are independent;
-neither may substitute for the other.
+admission. All four optional values must be supplied together. Missing, pending,
+rejected, ambiguous, or legally unauthorized records fail. This repository
+contains only the fail-closed technical consumer; activation remains blocked
+until Issue #55 provides a real protected producer and trust anchor. Legal and
+technical authority documents are independent and cannot substitute for each
+other.
 
 ## Behavior Specifications and Tests
 

@@ -2,19 +2,21 @@ use std::{collections::BTreeSet, error::Error, io};
 
 use ntsql_contract::{
     BehaviorSpecificationAdmissionLedger, ConformanceRecord, FeatureMatrix, LegalDecisionAuthority,
-    LegalReviewLedger, ProvenanceLedger, TargetMatrix, validate_governance_references,
+    LegalReviewLedger, ProvenanceLedger, SpecificationReviewAuthority, TargetMatrix,
+    validate_governance_references,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 const CORPUS_VERSION: &str = "1.0.0";
-const PUBLISHED_SCHEMAS: [&str; 7] = [
+const PUBLISHED_SCHEMAS: [&str; 8] = [
     include_str!("../../../contracts/schemas/behavior-specification-admission-ledger.schema.json"),
     include_str!("../../../contracts/schemas/conformance-record.schema.json"),
     include_str!("../../../contracts/schemas/feature-matrix.schema.json"),
     include_str!("../../../contracts/schemas/legal-decision-authority.schema.json"),
     include_str!("../../../contracts/schemas/legal-review-ledger.schema.json"),
     include_str!("../../../contracts/schemas/provenance-ledger.schema.json"),
+    include_str!("../../../contracts/schemas/specification-review-authority.schema.json"),
     include_str!("../../../contracts/schemas/target-matrix.schema.json"),
 ];
 const TARGETS: &str = include_str!("../../../contracts/compatibility/targets.json");
@@ -23,7 +25,7 @@ const LEGAL_REVIEWS: &str = include_str!("../../../contracts/compatibility/legal
 const PROVENANCE: &str = include_str!("../../../contracts/compatibility/provenance.json");
 const BEHAVIOR_ADMISSIONS: &str =
     include_str!("../../../contracts/compatibility/behavior-specification-admissions.json");
-const CORPORA: [&str; 7] = [
+const CORPORA: [&str; 8] = [
     include_str!("../../../contracts/schema-corpus/behavior-specification-admission-ledger.json"),
     include_str!("../../../contracts/schema-corpus/target-matrix.json"),
     include_str!("../../../contracts/schema-corpus/feature-matrix.json"),
@@ -31,6 +33,7 @@ const CORPORA: [&str; 7] = [
     include_str!("../../../contracts/schema-corpus/legal-review-ledger.json"),
     include_str!("../../../contracts/schema-corpus/conformance-record.json"),
     include_str!("../../../contracts/schema-corpus/legal-decision-authority.json"),
+    include_str!("../../../contracts/schema-corpus/specification-review-authority.json"),
 ];
 
 #[derive(Debug, Deserialize)]
@@ -509,6 +512,12 @@ fn evaluate_rust_contract(
                 case.trusted_candidate.as_ref(),
             ))
         }
+        "https://github.com/anaregdesign/ntsql/contracts/schemas/specification-review-authority.schema.json" => {
+            Ok(evaluate_specification_authority(
+                instance,
+                case.trusted_candidate.as_ref(),
+            ))
+        }
         _ => Err(invalid_data(format!("unknown corpus schema id: {schema_id}")).into()),
     }
 }
@@ -635,6 +644,31 @@ fn evaluate_authority(instance: Value, trusted: Option<&TrustedCandidate>) -> Ru
         && contract.validate_document_semantics().is_empty()
         && contract
             .validate_trusted_candidate(trusted_repository, trusted_commit)
+            .is_empty();
+    RustResults {
+        deserialize: true,
+        schema_semantics,
+        full_validation,
+    }
+}
+
+fn evaluate_specification_authority(
+    instance: Value,
+    trusted: Option<&TrustedCandidate>,
+) -> RustResults {
+    let Ok(contract) = deserialize_wire::<SpecificationReviewAuthority>(&instance) else {
+        return rejected_at_deserialization();
+    };
+    let schema_semantics = contract.validate_schema_semantics().is_empty();
+    let trusted_repository = trusted
+        .map(|candidate| candidate.repository.as_str())
+        .unwrap_or(contract.candidate_repository.as_str());
+    let trusted_commit = trusted
+        .map(|candidate| candidate.commit_sha.as_str())
+        .unwrap_or(contract.candidate_commit_sha.as_str());
+    let full_validation = schema_semantics
+        && contract
+            .validate_document_semantics(trusted_repository, trusted_commit)
             .is_empty();
     RustResults {
         deserialize: true,

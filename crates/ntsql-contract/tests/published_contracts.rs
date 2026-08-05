@@ -12,7 +12,7 @@ const FEATURES: &str = include_str!("../../../contracts/compatibility/features.j
 const LEGAL_REVIEWS: &str = include_str!("../../../contracts/compatibility/legal-reviews.json");
 const PROVENANCE: &str = include_str!("../../../contracts/compatibility/provenance.json");
 const TARGETS: &str = include_str!("../../../contracts/compatibility/targets.json");
-const SCHEMAS: [(&str, &str); 7] = [
+const SCHEMAS: [(&str, &str); 8] = [
     (
         "behavior-specification-admission-ledger",
         include_str!(
@@ -38,6 +38,10 @@ const SCHEMAS: [(&str, &str); 7] = [
     (
         "provenance-ledger",
         include_str!("../../../contracts/schemas/provenance-ledger.schema.json"),
+    ),
+    (
+        "specification-review-authority",
+        include_str!("../../../contracts/schemas/specification-review-authority.schema.json"),
     ),
     (
         "target-matrix",

@@ -7,8 +7,10 @@ use ntsql_page::{
     PageVersion, PageWritePermit, StoredPageSnapshotObservation, UnloggedPage,
 };
 use ntsql_transaction::{
-    DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
-    TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
+    DurableCommitLookup, DurableTransactionCommitObservation,
+    DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
+    DurableTransactionPageObservationBytesError, TransactionCommitRecord, TransactionEpochSource,
+    TransactionId, TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -256,6 +258,59 @@ impl<const N: usize> InMemoryLogRecord<N> {
                 record.page_number(),
                 record.page_version(),
                 *record.bytes(),
+                self.position.clone(),
+            )
+            .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Projects an owned-page record into transaction-aware recovery evidence.
+    ///
+    /// Callers must select this record from the complete durable prefix before
+    /// treating the result as durable. Commit and raw page records return
+    /// `Ok(None)`. An owned page intentionally also projects through
+    /// [`Self::page_recovery_observation`] for commit-agnostic physical
+    /// reconciliation; callers must not double-count those two views.
+    pub fn transaction_page_recovery_observation(
+        &self,
+    ) -> Result<
+        Option<DurableTransactionPageObservation<N>>,
+        DurableTransactionPageObservationBytesError<N>,
+    > {
+        match self.transaction_page_write() {
+            Some(record) => {
+                let transaction_id = record.transaction_id();
+                let page = record.page_write();
+                DurableTransactionPageObservation::from_bytes(
+                    transaction_id.epoch().get(),
+                    transaction_id.sequence(),
+                    page.page_number(),
+                    page.page_version(),
+                    *page.bytes(),
+                    self.position.clone(),
+                )
+                .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Projects a commit record into transaction-aware recovery evidence.
+    ///
+    /// Callers must select this record from the complete durable prefix before
+    /// treating the result as durable. Both page record kinds return
+    /// `Ok(None)`, so page ownership remains separate from commitment.
+    pub fn transaction_commit_recovery_observation(
+        &self,
+    ) -> Result<
+        Option<DurableTransactionCommitObservation>,
+        DurableTransactionCommitObservationFieldsError,
+    > {
+        match self.transaction_id() {
+            Some(transaction_id) => DurableTransactionCommitObservation::from_fields(
+                transaction_id.epoch().get(),
+                transaction_id.sequence(),
                 self.position.clone(),
             )
             .map(Some),

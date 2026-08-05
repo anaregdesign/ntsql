@@ -6,10 +6,10 @@ use ntsql_storage_memory::{
     InMemoryPageStoreError, InMemoryTransactionRecoveryError, PageStoreFaultPoint,
 };
 use ntsql_transaction::{
-    CoordinatedCommitError, DurableCommitLookup, TransactionCommitResolution,
-    TransactionCommittedFlushError, TransactionCoordinator, TransactionLifecycleStatus,
-    TransactionPageStageError, TransactionPageStageRejectionReason, TransactionRecoverySource,
-    flush_committed_page,
+    CoordinatedCommitError, DurableCommitLookup, DurableTransactionPageCommitClassification,
+    TransactionCommitResolution, TransactionCommittedFlushError, TransactionCoordinator,
+    TransactionLifecycleStatus, TransactionPageStageError, TransactionPageStageRejectionReason,
+    TransactionRecoverySource, classify_durable_transaction_page, flush_committed_page,
 };
 use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
 
@@ -474,6 +474,192 @@ fn restart_and_reopen_retain_durable_owned_page_and_commit() -> Result<(), Box<d
     let later_page = unlogged_page(restarted.lineage(), 37, 9, [4, 5, 6])?;
     let later = stage_page_write(&mut restarted, later_page)?;
     assert_eq!(later.required_position().get(), 3);
+    Ok(())
+}
+
+#[test]
+fn durable_prefix_projection_classifies_memory_pages_across_restart_and_reopen()
+-> Result<(), Box<dyn Error>> {
+    let persistent_id = persistent_log_id(13)?;
+    let mut log = InMemoryCommitLog::<2>::with_persistent_lineage_id(persistent_id);
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+
+    let committed_active = coordinator.begin()?;
+    let committed_owner = committed_active.transaction_id();
+    let committed_page = unlogged_page(log.lineage(), 50, 1, [1, 2])?;
+    let (committed_active, committed_dirty) =
+        coordinator.stage_page_write(committed_active, committed_page, &mut log)?;
+    let committed = coordinator.commit(committed_active, &mut log)?;
+    assert_eq!(committed_dirty.required_position().get(), 1);
+    assert_eq!(committed.log_position().get(), 2);
+
+    let uncommitted_active = coordinator.begin()?;
+    let uncommitted_owner = uncommitted_active.transaction_id();
+    let uncommitted_page = unlogged_page(log.lineage(), 51, 2, [3, 4])?;
+    let (uncommitted_active, uncommitted_dirty) =
+        coordinator.stage_page_write(uncommitted_active, uncommitted_page, &mut log)?;
+    assert_eq!(uncommitted_dirty.required_position().get(), 3);
+    log.flush_through(uncommitted_dirty.required_position())?;
+
+    let raw_page = unlogged_page(log.lineage(), 52, 3, [5, 6])?;
+    let raw_dirty = stage_page_write(&mut log, raw_page)?;
+    assert_eq!(raw_dirty.required_position().get(), 4);
+    log.flush_through(raw_dirty.required_position())?;
+
+    log.arm_fault(FaultPoint::BeforeFlush)?;
+    let volatile_commit = coordinator
+        .commit(uncommitted_active, &mut log)
+        .err()
+        .ok_or_else(|| io::Error::other("volatile commit unexpectedly became durable"))?;
+    assert!(matches!(
+        volatile_commit,
+        CoordinatedCommitError::Indeterminate(_)
+    ));
+    assert_eq!(log.records().len(), 5);
+    assert_eq!(log.durable_records().len(), 4);
+
+    let committed_page_observation = log.records()[0]
+        .transaction_page_recovery_observation()?
+        .ok_or_else(|| io::Error::other("committed owned page did not project"))?;
+    assert!(
+        log.records()[0]
+            .transaction_commit_recovery_observation()?
+            .is_none()
+    );
+    assert!(log.records()[0].page_recovery_observation()?.is_some());
+
+    assert!(
+        log.records()[1]
+            .transaction_page_recovery_observation()?
+            .is_none()
+    );
+    assert!(
+        log.records()[1]
+            .transaction_commit_recovery_observation()?
+            .is_some()
+    );
+
+    let uncommitted_page_observation = log.records()[2]
+        .transaction_page_recovery_observation()?
+        .ok_or_else(|| io::Error::other("uncommitted owned page did not project"))?;
+    assert!(
+        uncommitted_page_observation
+            .owner()
+            .matches_transaction_id(uncommitted_owner)
+    );
+
+    assert!(
+        log.records()[3]
+            .transaction_page_recovery_observation()?
+            .is_none()
+    );
+    assert!(
+        log.records()[3]
+            .transaction_commit_recovery_observation()?
+            .is_none()
+    );
+    assert!(log.records()[3].page_recovery_observation()?.is_some());
+
+    let durable_commits = log
+        .durable_records()
+        .map(|record| record.transaction_commit_recovery_observation())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(durable_commits.len(), 1);
+    assert!(
+        durable_commits[0]
+            .transaction()
+            .matches_transaction_id(committed_owner)
+    );
+    assert_eq!(
+        classify_durable_transaction_page(
+            log.lineage(),
+            &committed_page_observation,
+            durable_commits.iter(),
+        )?,
+        DurableTransactionPageCommitClassification::Committed {
+            page_position: log.lineage().position(1),
+            commit_position: log.lineage().position(2),
+        }
+    );
+    assert_eq!(
+        classify_durable_transaction_page(
+            log.lineage(),
+            &uncommitted_page_observation,
+            durable_commits.iter(),
+        )?,
+        DurableTransactionPageCommitClassification::Uncommitted {
+            page_position: log.lineage().position(3),
+        }
+    );
+
+    // The complete volatile commit would change the second result if callers
+    // projected records() instead of the adapter's durable prefix.
+    let all_commits = log
+        .records()
+        .iter()
+        .map(|record| record.transaction_commit_recovery_observation())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(all_commits.len(), 2);
+    assert_eq!(
+        classify_durable_transaction_page(
+            log.lineage(),
+            &uncommitted_page_observation,
+            all_commits.iter(),
+        )?,
+        DurableTransactionPageCommitClassification::Committed {
+            page_position: log.lineage().position(3),
+            commit_position: log.lineage().position(5),
+        }
+    );
+
+    drop(committed_dirty);
+    drop(uncommitted_dirty);
+    drop(raw_dirty);
+    let mut reopened = log.restart();
+    reopened.reopen()?;
+    assert_eq!(reopened.records().len(), 4);
+    assert_eq!(reopened.durable_records().len(), 4);
+
+    let reopened_committed_page = reopened.records()[0]
+        .transaction_page_recovery_observation()?
+        .ok_or_else(|| io::Error::other("reopen lost committed page projection"))?;
+    let reopened_uncommitted_page = reopened.records()[2]
+        .transaction_page_recovery_observation()?
+        .ok_or_else(|| io::Error::other("reopen lost uncommitted page projection"))?;
+    let reopened_commits = reopened
+        .durable_records()
+        .map(|record| record.transaction_commit_recovery_observation())
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        classify_durable_transaction_page(
+            reopened.lineage(),
+            &reopened_committed_page,
+            reopened_commits.iter(),
+        )?,
+        DurableTransactionPageCommitClassification::Committed {
+            page_position: reopened.lineage().position(1),
+            commit_position: reopened.lineage().position(2),
+        }
+    );
+    assert_eq!(
+        classify_durable_transaction_page(
+            reopened.lineage(),
+            &reopened_uncommitted_page,
+            reopened_commits.iter(),
+        )?,
+        DurableTransactionPageCommitClassification::Uncommitted {
+            page_position: reopened.lineage().position(3),
+        }
+    );
     Ok(())
 }
 

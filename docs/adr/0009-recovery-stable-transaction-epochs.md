@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #66
 - Extends: ADR 0001, ADR 0007, ADR 0008
+- Extended by: ADR 0010
 
 ## Context
 
@@ -87,7 +88,7 @@ crash outcome. No behavior feature or compatibility status changes.
 ## Consequences
 
 Durable records can distinguish coordinator lifetimes within one persistence
-lineage. This is necessary but insufficient for recovery. No API yet converts an
-`IndeterminateTransaction` to a committed or not-committed outcome; that later
-protocol must require authoritative durable evidence and retain the token on
-lookup failure.
+lineage. ADR 0010 uses that identity to resolve an `IndeterminateTransaction`
+from authoritative durable-record evidence. It retains the token on lookup
+failure and treats authoritative absence as a terminal internal state, not as
+rollback, retry permission, or a client-visible outcome.

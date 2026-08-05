@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #50
 - Extends: ADR 0001
-- Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009
+- Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009, ADR 0010
 
 ## Context
 
@@ -46,6 +46,12 @@ different log before append. This runtime check complements epoch-qualified
 transaction identities; it does not persist or brand raw `LogSequenceNumber`
 values.
 
+ADR 0010 also requires an authoritative recovery lookup to return its lineage
+with the lookup result in one operation. The transaction coordinator accepts a
+recovered position only after that lineage matches the indeterminate token. This
+does not make a raw `LogSequenceNumber` independently transferable or
+authoritative.
+
 The intended dependency direction is:
 
 ```text
@@ -86,6 +92,8 @@ fault-injection decisions.
 - Architecture tests reject any direct dependency from `ntsql-wal`.
 - Transaction tests reject a mismatched log lineage before either port method is
   called and retain the active token.
+- Recovery tests reject a durable-record lookup from another lineage and retain
+  indeterminate state without accepting its position or absence result.
 
 ## Consequences
 

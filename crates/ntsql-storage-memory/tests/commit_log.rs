@@ -1,9 +1,12 @@
 use std::{error::Error, io};
 
-use ntsql_storage_memory::{FaultPoint, InMemoryCommitLog, InMemoryCommitLogError};
+use ntsql_storage_memory::{
+    FaultPoint, InMemoryCommitLog, InMemoryCommitLogError, InMemoryTransactionRecoveryError,
+};
 use ntsql_transaction::{
-    CoordinatedCommitError, TransactionCommitRejectionReason, TransactionCoordinator,
-    TransactionLifecycleStatus,
+    CoordinatedCommitError, IndeterminateTransaction, TransactionCommitRejectionReason,
+    TransactionCommitResolution, TransactionCoordinator, TransactionLifecycleStatus,
+    TransactionResolutionFailure,
 };
 use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber};
 
@@ -319,6 +322,135 @@ fn restart_preserves_log_lineage_and_advances_coordinator_epoch() -> Result<(), 
 }
 
 #[test]
+fn before_append_failure_resolves_as_no_durable_record() -> Result<(), Box<dyn Error>> {
+    let mut log = InMemoryCommitLog::new();
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    log.arm_fault(FaultPoint::BeforeAppend)?;
+    let active = coordinator.begin()?;
+    let transaction_id = active.transaction_id();
+    let (indeterminate, _) = indeterminate_parts(coordinator.commit(active, &mut log))?;
+
+    let resolution = coordinator.resolve(indeterminate, &mut log)?;
+
+    let TransactionCommitResolution::NoDurableCommitRecord(without_record) = resolution else {
+        return Err(io::Error::other("absent record resolved as committed").into());
+    };
+    assert_eq!(without_record.transaction_id(), transaction_id);
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::NoDurableCommitRecord)
+    );
+    Ok(())
+}
+
+#[test]
+fn after_flush_failure_resolves_as_committed_at_exact_position() -> Result<(), Box<dyn Error>> {
+    let mut log = InMemoryCommitLog::new();
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    log.arm_fault(FaultPoint::AfterFlush)?;
+    let active = coordinator.begin()?;
+    let transaction_id = active.transaction_id();
+    let (indeterminate, _) = indeterminate_parts(coordinator.commit(active, &mut log))?;
+
+    let resolution = coordinator.resolve(indeterminate, &mut log)?;
+
+    let TransactionCommitResolution::Committed(committed) = resolution else {
+        return Err(io::Error::other("durable record resolved as absent").into());
+    };
+    assert_eq!(committed.transaction_id(), transaction_id);
+    assert_eq!(committed.log_position(), LogSequenceNumber::new(1));
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::Committed)
+    );
+    Ok(())
+}
+
+#[test]
+fn volatile_record_retains_token_until_restart_discards_it() -> Result<(), Box<dyn Error>> {
+    let mut log = InMemoryCommitLog::new();
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    log.arm_fault(FaultPoint::AfterAppend)?;
+    let active = coordinator.begin()?;
+    let transaction_id = active.transaction_id();
+    let (indeterminate, _) = indeterminate_parts(coordinator.commit(active, &mut log))?;
+
+    let error = coordinator
+        .resolve(indeterminate, &mut log)
+        .err()
+        .ok_or_else(|| io::Error::other("volatile record produced a terminal resolution"))?;
+
+    assert_eq!(
+        error.failure(),
+        &TransactionResolutionFailure::Source(
+            InMemoryTransactionRecoveryError::VolatileCommitRecord(transaction_id)
+        )
+    );
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::Indeterminate)
+    );
+
+    let mut restarted = log.restart();
+    let resolution = coordinator.resolve(error.into_transaction(), &mut restarted)?;
+    assert!(matches!(
+        resolution,
+        TransactionCommitResolution::NoDurableCommitRecord(_)
+    ));
+    Ok(())
+}
+
+#[test]
+fn later_flush_resolves_an_earlier_volatile_record_as_committed() -> Result<(), Box<dyn Error>> {
+    let mut log = InMemoryCommitLog::new();
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    log.arm_fault(FaultPoint::AfterAppend)?;
+    let first = coordinator.begin()?;
+    let first_id = first.transaction_id();
+    let (indeterminate, _) = indeterminate_parts(coordinator.commit(first, &mut log))?;
+    let error = coordinator
+        .resolve(indeterminate, &mut log)
+        .err()
+        .ok_or_else(|| io::Error::other("volatile record produced a terminal resolution"))?;
+
+    let second = coordinator.begin()?;
+    coordinator.commit(second, &mut log)?;
+
+    let resolution = coordinator.resolve(error.into_transaction(), &mut log)?;
+    let TransactionCommitResolution::Committed(committed) = resolution else {
+        return Err(io::Error::other("flushed record resolved as absent").into());
+    };
+    assert_eq!(committed.transaction_id(), first_id);
+    assert_eq!(committed.log_position(), LogSequenceNumber::new(1));
+    Ok(())
+}
+
+#[test]
+fn complete_identity_prevents_equal_sequences_from_aliasing() -> Result<(), Box<dyn Error>> {
+    let mut log = InMemoryCommitLog::new();
+    let mut first_coordinator = TransactionCoordinator::open(&mut log)?;
+    let mut second_coordinator = TransactionCoordinator::open(&mut log)?;
+
+    log.arm_fault(FaultPoint::BeforeAppend)?;
+    let first = first_coordinator.begin()?;
+    let first_id = first.transaction_id();
+    let (indeterminate, _) = indeterminate_parts(first_coordinator.commit(first, &mut log))?;
+
+    let second = second_coordinator.begin()?;
+    let second_id = second.transaction_id();
+    second_coordinator.commit(second, &mut log)?;
+
+    assert_eq!(first_id.sequence(), second_id.sequence());
+    assert_ne!(first_id.epoch(), second_id.epoch());
+    let resolution = first_coordinator.resolve(indeterminate, &mut log)?;
+    assert!(matches!(
+        resolution,
+        TransactionCommitResolution::NoDurableCommitRecord(_)
+    ));
+    Ok(())
+}
+
+#[test]
 fn arming_a_fault_never_silently_replaces_one() -> Result<(), Box<dyn Error>> {
     let mut log = InMemoryCommitLog::new();
     log.arm_fault(FaultPoint::AfterAppend)?;
@@ -340,11 +472,26 @@ fn commit_cause(
         CoordinatedCommitError<InMemoryCommitLogError>,
     >,
 ) -> Result<CommitError<InMemoryCommitLogError>, Box<dyn Error>> {
+    Ok(indeterminate_parts(result)?.1)
+}
+
+fn indeterminate_parts(
+    result: Result<
+        ntsql_transaction::CommittedTransaction,
+        CoordinatedCommitError<InMemoryCommitLogError>,
+    >,
+) -> Result<
+    (
+        IndeterminateTransaction,
+        CommitError<InMemoryCommitLogError>,
+    ),
+    Box<dyn Error>,
+> {
     let error = result
         .err()
         .ok_or_else(|| io::Error::other("faulted commit unexpectedly succeeded"))?;
     match error {
-        CoordinatedCommitError::Indeterminate(error) => Ok(error.into_parts().1),
+        CoordinatedCommitError::Indeterminate(error) => Ok(error.into_parts()),
         CoordinatedCommitError::Rejected(_) => {
             Err(io::Error::other("faulted commit was rejected before WAL").into())
         }

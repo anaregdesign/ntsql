@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #63
 - Extends: ADR 0001, ADR 0005, ADR 0006, ADR 0007
-- Extended by: ADR 0009
+- Extended by: ADR 0009, ADR 0010
 
 ## Context
 
@@ -28,12 +28,13 @@ ntsql-storage-memory -> ntsql-transaction
 ntsql-storage-memory -> ntsql-wal
 ```
 
-The adapter implements `CommitLog<TransactionCommitRecord>` and the
-`TransactionEpochSource` added by ADR 0009. It copies only the opaque transaction
-identity into immutable record snapshots, assigns nonzero strictly increasing
-in-memory positions and coordinator epochs, owns one opaque runtime
-`LogLineage`, and tracks a durable prefix. It never constructs a transaction
-identity or durability acknowledgement.
+The adapter implements `CommitLog<TransactionCommitRecord>`,
+`TransactionEpochSource`, and the authoritative `TransactionRecoverySource`
+added by ADR 0010. It copies only the opaque transaction identity into immutable
+record snapshots, assigns nonzero strictly increasing in-memory positions and
+coordinator epochs, owns one opaque runtime `LogLineage`, and tracks a durable
+prefix. It never constructs transaction identity, transaction terminal state, or
+a durability acknowledgement.
 
 One fault may be armed at a time. It is consumed exactly once when its matching
 stage is reached:
@@ -65,9 +66,16 @@ The adapter makes the existing ambiguity contract observable:
 - a transaction can remain `Indeterminate` while its commit record is present in
   the durable prefix.
 
-The adapter does not resolve that divergence. A later recovery component must
-use persistent identity and durable evidence before deciding an external
-outcome or retry.
+The recovery lookup searches the complete epoch-qualified identity. Exactly one
+matching record in the durable prefix returns its position, and no physical
+match returns authoritative absence. A matching record only in the volatile
+suffix is an error because it may later become durable or be discarded.
+Duplicate physical matches are also an error rather than a guessed verdict.
+
+The transaction coordinator, not this adapter, consumes those results and
+changes terminal state. Restart can make a volatile match authoritatively absent
+by discarding it; a later exact flush can instead make that same match durable.
+Neither result decides an external outcome or retry.
 
 ## Compatibility Boundary
 
@@ -89,6 +97,9 @@ remain blocked by the legal contract.
   are idempotent.
 - Position exhaustion and attempts to replace an armed fault return typed
   errors.
+- Resolution distinguishes the four fault boundaries, retains an indeterminate
+  token for volatile or duplicate records, and uses the complete transaction
+  identity rather than its coordinator-local sequence.
 - Architecture tests allow exactly the two inward dependencies and reject
   reverse adapter dependencies.
 
@@ -96,6 +107,6 @@ remain blocked by the legal contract.
 
 Subsequent recovery tests have a deterministic shared adapter instead of
 reimplementing ambiguous fakes. The model is intentionally synchronous and
-in-memory. Persistent epochs, WAL encoding, filesystem barriers, checkpoints,
-redo/undo, group commit, and client-visible outcomes remain later Issue #9
-work.
+in-memory. Its authoritative lookup is only a model of durable-record presence;
+persistent lineages and epochs, WAL encoding, filesystem barriers, checkpoints,
+redo/undo, group commit, and client-visible outcomes remain later Issue #9 work.

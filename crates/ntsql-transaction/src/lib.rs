@@ -23,6 +23,39 @@ pub trait TransactionEpochSource {
     fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error>;
 }
 
+/// Authoritative lookup of one transaction identity in a durable log view.
+///
+/// Implementations must return [`DurableCommitLookup::Absent`] only after
+/// completely checking the matching lineage. Partial, corrupt, duplicate, or
+/// otherwise uncertain views must return an error instead.
+pub trait TransactionRecoverySource {
+    /// Source-specific failure to establish an authoritative lookup.
+    type Error;
+
+    /// Looks up one complete transaction identity and atomically pairs the
+    /// result with the lineage that was searched.
+    fn lookup_durable_commit(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> Result<(LogLineage, DurableCommitLookup), Self::Error>;
+}
+
+/// Result of authoritatively searching one durable log view.
+///
+/// This adapter-provided value is data, not proof by itself. Only
+/// [`TransactionCoordinator::resolve`] can convert it into terminal transaction
+/// state after validating token ownership, lifecycle, and lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableCommitLookup {
+    /// Exactly one durable commit record was found at this internal position.
+    Found {
+        /// Adapter-assigned position of the durable record.
+        position: LogSequenceNumber,
+    },
+    /// The complete durable view contains no record for this identity.
+    Absent,
+}
+
 /// Opaque persistence-lineage epoch assigned to one coordinator.
 ///
 /// ```compile_fail
@@ -90,6 +123,8 @@ pub enum TransactionLifecycleStatus {
     Committed,
     /// The WAL port failed after the commit attempt began.
     Indeterminate,
+    /// Authoritative recovery found no durable commit record.
+    NoDurableCommitRecord,
 }
 
 /// Failure to issue a fresh in-process transaction identity.
@@ -201,6 +236,12 @@ impl TransactionCoordinator {
         Arc::ptr_eq(&self.identity, &transaction.coordinator_identity)
     }
 
+    /// Returns whether this coordinator issued the indeterminate token.
+    #[must_use]
+    pub fn owns_indeterminate(&self, transaction: &IndeterminateTransaction) -> bool {
+        Arc::ptr_eq(&self.identity, &transaction.coordinator_identity)
+    }
+
     /// Returns the in-process lifecycle phase for an issued identity.
     #[must_use]
     pub fn status(&self, transaction_id: TransactionId) -> Option<TransactionLifecycleStatus> {
@@ -237,6 +278,7 @@ impl TransactionCoordinator {
             ));
         }
 
+        let log_lineage = self.log_lineage.clone();
         let transaction_id = transaction.transaction_id();
         let status = match self.lifecycles.get_mut(&transaction_id) {
             Some(status) if *status == TransactionLifecycleStatus::Active => status,
@@ -263,7 +305,7 @@ impl TransactionCoordinator {
         };
 
         *status = TransactionLifecycleStatus::CommitAttempted;
-        match transaction.commit(log) {
+        match transaction.commit(log, log_lineage) {
             Ok(committed) => {
                 *status = TransactionLifecycleStatus::Committed;
                 Ok(committed)
@@ -271,6 +313,77 @@ impl TransactionCoordinator {
             Err(error) => {
                 *status = TransactionLifecycleStatus::Indeterminate;
                 Err(CoordinatedCommitError::Indeterminate(error))
+            }
+        }
+    }
+
+    /// Resolves one indeterminate token from authoritative durable-log evidence.
+    ///
+    /// Ownership and lifecycle mismatches are rejected before consulting the
+    /// source. Source failures and lineage mismatches retain the same token and
+    /// leave the lifecycle indeterminate. Authoritative absence is terminal but
+    /// does not recreate active state or define a retry or rollback rule.
+    pub fn resolve<Source>(
+        &mut self,
+        transaction: IndeterminateTransaction,
+        source: &mut Source,
+    ) -> Result<TransactionCommitResolution, TransactionResolutionError<Source::Error>>
+    where
+        Source: TransactionRecoverySource + ?Sized,
+    {
+        if !self.owns_indeterminate(&transaction) {
+            return Err(TransactionResolutionError {
+                transaction,
+                failure: TransactionResolutionFailure::ForeignCoordinator,
+            });
+        }
+
+        let transaction_id = transaction.transaction_id();
+        let actual = self.status(transaction_id);
+        if actual != Some(TransactionLifecycleStatus::Indeterminate) {
+            return Err(TransactionResolutionError {
+                transaction,
+                failure: TransactionResolutionFailure::LifecycleMismatch { actual },
+            });
+        }
+
+        let (lineage, lookup) = match source.lookup_durable_commit(transaction_id) {
+            Ok(result) => result,
+            Err(source) => {
+                return Err(TransactionResolutionError {
+                    transaction,
+                    failure: TransactionResolutionFailure::Source(source),
+                });
+            }
+        };
+        if !transaction.log_lineage.same_lineage(&lineage) {
+            return Err(TransactionResolutionError {
+                transaction,
+                failure: TransactionResolutionFailure::ForeignLogLineage,
+            });
+        }
+
+        let Some(status) = self.lifecycles.get_mut(&transaction_id) else {
+            return Err(TransactionResolutionError {
+                transaction,
+                failure: TransactionResolutionFailure::LifecycleMismatch { actual: None },
+            });
+        };
+        match lookup {
+            DurableCommitLookup::Found { position } => {
+                *status = TransactionLifecycleStatus::Committed;
+                Ok(TransactionCommitResolution::Committed(
+                    CommittedTransaction {
+                        transaction_id,
+                        log_position: position,
+                    },
+                ))
+            }
+            DurableCommitLookup::Absent => {
+                *status = TransactionLifecycleStatus::NoDurableCommitRecord;
+                Ok(TransactionCommitResolution::NoDurableCommitRecord(
+                    NoDurableCommitRecord { transaction_id },
+                ))
             }
         }
     }
@@ -335,21 +448,31 @@ impl ActiveTransaction {
     fn commit<L>(
         self,
         log: &mut L,
+        log_lineage: LogLineage,
     ) -> Result<CommittedTransaction, TransactionCommitError<L::Error>>
     where
         L: CommitLog<TransactionCommitRecord>,
     {
-        let transaction_id = self.transaction_id;
+        let Self {
+            transaction_id,
+            coordinator_identity,
+        } = self;
         let record = TransactionCommitRecord { transaction_id };
 
-        commit_durability(log, &record, |acknowledgement| CommittedTransaction {
+        match commit_durability(log, &record, |acknowledgement| CommittedTransaction {
             transaction_id,
             log_position: acknowledgement.position(),
-        })
-        .map_err(|source| TransactionCommitError {
-            transaction: IndeterminateTransaction { transaction_id },
-            source,
-        })
+        }) {
+            Ok(committed) => Ok(committed),
+            Err(source) => Err(TransactionCommitError {
+                transaction: IndeterminateTransaction {
+                    transaction_id,
+                    coordinator_identity,
+                    log_lineage,
+                },
+                source,
+            }),
+        }
     }
 }
 
@@ -469,6 +592,50 @@ impl CommittedTransaction {
     }
 }
 
+/// Terminal transaction state for authoritative absence of a durable record.
+///
+/// This state offers no active, retry, rollback, or client-visible transition.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{NoDurableCommitRecord, TransactionId};
+///
+/// fn cannot_construct(transaction_id: TransactionId) {
+///     let forged = NoDurableCommitRecord { transaction_id };
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct NoDurableCommitRecord {
+    transaction_id: TransactionId,
+}
+
+impl NoDurableCommitRecord {
+    /// Returns the transaction identity absent from the durable view.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+}
+
+/// Terminal result of resolving an indeterminate commit attempt.
+#[derive(Debug, Eq, PartialEq)]
+pub enum TransactionCommitResolution {
+    /// The exact commit record is present in the durable view.
+    Committed(CommittedTransaction),
+    /// The complete durable view contains no commit record.
+    NoDurableCommitRecord(NoDurableCommitRecord),
+}
+
+impl TransactionCommitResolution {
+    /// Returns the resolved transaction identity.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        match self {
+            Self::Committed(transaction) => transaction.transaction_id(),
+            Self::NoDurableCommitRecord(transaction) => transaction.transaction_id(),
+        }
+    }
+}
+
 /// Transaction whose durable commit outcome cannot be established safely.
 ///
 /// This state deliberately offers no commit or rollback operation.
@@ -490,9 +657,11 @@ impl CommittedTransaction {
 ///     coordinator.commit(transaction, log);
 /// }
 /// ```
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct IndeterminateTransaction {
     transaction_id: TransactionId,
+    coordinator_identity: Arc<()>,
+    log_lineage: LogLineage,
 }
 
 impl IndeterminateTransaction {
@@ -503,8 +672,104 @@ impl IndeterminateTransaction {
     }
 }
 
-/// WAL failure paired with the consumed transaction's fail-closed state.
+/// Reason authoritative resolution did not produce terminal transaction state.
 #[derive(Debug, Eq, PartialEq)]
+pub enum TransactionResolutionFailure<E> {
+    /// The token belongs to another coordinator runtime identity.
+    ForeignCoordinator,
+    /// The recovery source searched a different log lineage.
+    ForeignLogLineage,
+    /// The issuing coordinator did not retain the expected indeterminate phase.
+    LifecycleMismatch {
+        /// Recorded phase, or `None` when the registry entry is absent.
+        actual: Option<TransactionLifecycleStatus>,
+    },
+    /// The recovery source could not establish an authoritative result.
+    Source(E),
+}
+
+/// Failed resolution that retains the consumed indeterminate token.
+#[derive(Debug)]
+pub struct TransactionResolutionError<E> {
+    transaction: IndeterminateTransaction,
+    failure: TransactionResolutionFailure<E>,
+}
+
+impl<E> TransactionResolutionError<E> {
+    /// Returns the transaction identity that remains indeterminate.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction.transaction_id()
+    }
+
+    /// Borrows the token retained after failed resolution.
+    #[must_use]
+    pub const fn transaction(&self) -> &IndeterminateTransaction {
+        &self.transaction
+    }
+
+    /// Borrows the exact resolution failure.
+    #[must_use]
+    pub const fn failure(&self) -> &TransactionResolutionFailure<E> {
+        &self.failure
+    }
+
+    /// Returns the retained token for another authoritative resolution attempt.
+    #[must_use]
+    pub fn into_transaction(self) -> IndeterminateTransaction {
+        self.transaction
+    }
+
+    /// Returns the retained token and exact resolution failure.
+    #[must_use]
+    pub fn into_parts(self) -> (IndeterminateTransaction, TransactionResolutionFailure<E>) {
+        (self.transaction, self.failure)
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for TransactionResolutionError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.failure {
+            TransactionResolutionFailure::ForeignCoordinator => write!(
+                formatter,
+                "transaction {} belongs to another coordinator",
+                self.transaction_id()
+            ),
+            TransactionResolutionFailure::ForeignLogLineage => write!(
+                formatter,
+                "transaction {} recovery source belongs to another log lineage",
+                self.transaction_id()
+            ),
+            TransactionResolutionFailure::LifecycleMismatch { actual } => write!(
+                formatter,
+                "transaction {} is not indeterminate in its coordinator registry: {actual:?}",
+                self.transaction_id()
+            ),
+            TransactionResolutionFailure::Source(source) => write!(
+                formatter,
+                "transaction {} durable commit lookup failed: {source}",
+                self.transaction_id()
+            ),
+        }
+    }
+}
+
+impl<E> Error for TransactionResolutionError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.failure {
+            TransactionResolutionFailure::Source(source) => Some(source),
+            TransactionResolutionFailure::ForeignCoordinator
+            | TransactionResolutionFailure::ForeignLogLineage
+            | TransactionResolutionFailure::LifecycleMismatch { .. } => None,
+        }
+    }
+}
+
+/// WAL failure paired with the consumed transaction's fail-closed state.
+#[derive(Debug)]
 pub struct TransactionCommitError<E> {
     transaction: IndeterminateTransaction,
     source: CommitError<E>,
@@ -571,6 +836,23 @@ mod tests {
         }
     }
 
+    struct TestRecoverySource {
+        lineage: LogLineage,
+        calls: usize,
+    }
+
+    impl TransactionRecoverySource for TestRecoverySource {
+        type Error = TransactionIssueError;
+
+        fn lookup_durable_commit(
+            &mut self,
+            _transaction_id: TransactionId,
+        ) -> Result<(LogLineage, DurableCommitLookup), Self::Error> {
+            self.calls += 1;
+            Ok((self.lineage.clone(), DurableCommitLookup::Absent))
+        }
+    }
+
     #[test]
     fn identity_exhaustion_is_terminal_without_wrapping() -> Result<(), TransactionIssueError> {
         let mut source = TestEpochSource {
@@ -590,6 +872,42 @@ mod tests {
         assert_eq!(
             coordinator.begin().err(),
             Some(TransactionIssueError::IdentitySpaceExhausted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_mismatch_rejects_before_recovery_lookup() -> Result<(), TransactionIssueError> {
+        let lineage = LogLineage::new();
+        let mut source = TestEpochSource {
+            lineage: lineage.clone(),
+            next_epoch: Some(NonZeroU64::MIN),
+        };
+        let mut coordinator = TransactionCoordinator::open(&mut source)?;
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        let indeterminate = IndeterminateTransaction {
+            transaction_id,
+            coordinator_identity: Arc::clone(&coordinator.identity),
+            log_lineage: lineage.clone(),
+        };
+        let mut recovery = TestRecoverySource { lineage, calls: 0 };
+
+        let error = coordinator.resolve(indeterminate, &mut recovery).err();
+
+        let Some(error) = error else {
+            return Err(TransactionIssueError::IdentityAlreadyIssued(transaction_id));
+        };
+        assert_eq!(
+            error.failure(),
+            &TransactionResolutionFailure::LifecycleMismatch {
+                actual: Some(TransactionLifecycleStatus::Active)
+            }
+        );
+        assert_eq!(recovery.calls, 0);
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::Active)
         );
         Ok(())
     }

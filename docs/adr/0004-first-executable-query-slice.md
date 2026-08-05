@@ -95,11 +95,11 @@ artifacts and decisions exist:
    content digest, and the exact implementation, conformance-evidence, and
    fixture uses have qualified legal approval.
 2. The observer, specification reviewer, implementer, and conformance reviewer
-   are assigned before observation, with the observer and implementer held by
-   different people.
+   are assigned to four distinct people before observation.
 3. The observer records the exact target, input bytes, commands, session
    settings, environment, raw-evidence digest, and cleanup result without
-   implementing the case.
+   implementing the case. Only the observer or specification reviewer may
+   handle raw evidence, and disposition and cleanup precede technical review.
 4. A separate specification reviewer approves a sanitized, typed behavior
    specification, its digest, path, and complete provenance lineage.
 5. The audit record identifies the issue and case, every role, timestamps,
@@ -112,9 +112,11 @@ artifacts and decisions exist:
    states expected syntax, typed result, metadata, diagnostic, side-effect, and
    operational observations without importing protected raw evidence.
 
-The current ledgers do not record an approved behavior specification or the
-required role separation for this case. Consequently, this ADR authorizes
-inventory and architecture planning only. It does not authorize a query parser,
+The versioned behavior-specification admission ledger now records and validates
+this complete boundary, but its published admission list is empty. Candidate
+technical-review metadata also remains unauthenticated until Issue #55 provides
+the protected authority boundary. Consequently, this ADR authorizes inventory
+and architecture planning only. It does not authorize a query parser,
 integer-literal rule, result value, metadata field, error value, or compatibility
 claim.
 
@@ -126,8 +128,10 @@ claim.
 - Existing feature-matrix validation continues to enforce unique IDs, complete
   categories, target references, and status invariants.
 - The first semantic PR must add a test that fails before implementation and
-  names the approved behavior specification. Synthetic examples alone cannot
-  promote a feature status or support a compatibility claim.
+  names the approved behavior specification, then pass the exact-feature,
+  exact-target `implementation-admission` command with both authenticated
+  authority boundaries. Synthetic examples alone cannot promote a feature
+  status or support a compatibility claim.
 
 ## Consequences
 

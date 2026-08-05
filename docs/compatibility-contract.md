@@ -145,10 +145,12 @@ Every admitted dependency must have a compatible license, minimal feature set, l
 
 ## Machine-Readable Files
 
+- `contracts/compatibility/behavior-specification-admissions.json`: clean-room roles, observation audit, sanitized specification review, handoff, and derived-test inventory
 - `contracts/compatibility/targets.json`: immutable oracle targets and expansion order
 - `contracts/compatibility/features.json`: classified feature inventory and current status
 - `contracts/compatibility/provenance.json`: source, artifact, dependency, lineage, digest, and intended-use inventory
 - `contracts/compatibility/legal-reviews.json`: qualified human legal decisions and unresolved gates
+- `contracts/schemas/behavior-specification-admission-ledger.schema.json`: clean-room implementation-admission interchange schema
 - `contracts/schemas/conformance-record.schema.json`: one comparison record
 - `contracts/schemas/feature-matrix.schema.json`: feature matrix interchange schema
 - `contracts/schemas/legal-decision-authority.schema.json`: authenticated out-of-branch legal-decision evidence
@@ -165,6 +167,13 @@ for cross-record, graph, authenticated-context, and governed-use invariants such
 as unique identifiers, target and provenance references, complete category
 coverage, contiguous expansion order, exact provenance closure, and trusted
 candidate binding.
+
+The behavior-specification admission ledger is intentionally empty until the
+clean-room procedure produces a real case. Structural `approved` metadata is not
+an authority: implementation admission still requires authenticated legal
+authorization and the protected specification-review authority tracked by
+Issue #55. Exact feature and target IDs are mandatory, so neither feature-only
+approval nor baseline fallback can authorize semantic work.
 
 Conformance records currently use schema version `2.0.0`. Version 2 makes raw
 evidence, normalization rules, feature ownership, and reproduction metadata

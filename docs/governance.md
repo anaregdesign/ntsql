@@ -50,14 +50,19 @@ review set for every pull request referenced by the ledger. This permits
 decisions to accumulate across pull requests without treating an approval of
 one commit as approval of another. Every pull request and review must belong to
 the authority's candidate repository, so evidence from another repository
-cannot be replayed. Repository names, pull-request numbers,
-review IDs, account IDs, timestamps, states, and commit SHAs must come from
-authenticated GitHub API responses. Review IDs are unique across the authority;
+cannot be replayed. Repository names, pull-request numbers, review IDs, account
+IDs, submission and last-edit timestamps, states, and commit SHAs must come from
+authenticated GitHub API responses. The effective attestation time is the later
+of submission and the latest body edit. Review IDs are unique across the authority;
 an attestation ID may occur in at most one review for a given repository, pull
 request, and reviewed commit. Historical reviews of different commits may
 retain the same attestation ID, but they cannot satisfy the current-head check.
 Reviewer logins are retained for audit readability, but the numeric account ID
 is the stable identity.
+
+Authority schema version 2 requires an explicit nullable `last_edited_at` for
+every review. Version 1 cannot establish when editable review-body attestations
+became effective and is rejected.
 
 The qualified reviewer submits an `Approve` review on the exact candidate head
 commit. Its body contains exactly one block beginning with this ASCII marker,
@@ -137,8 +142,9 @@ checkout. It may be a GitHub App or a workflow whose definition and trust
 configuration are loaded only from a protected source. Before any candidate
 code executes, it must read the protected reviewer-ID allowlist, fetch the
 referenced pull requests and their current reviews through the GitHub API,
-parse the marked review-body blocks, and materialize one complete multi-PR
-authority document outside the checkout. The producer records the candidate
+including each nullable authenticated last-edit timestamp, parse the marked
+review-body blocks, and materialize one complete multi-PR authority document
+outside the checkout. The producer records the candidate
 repository and commit from the trusted event payload, not from command-line
 values or files supplied by the candidate. It must use read-only permissions
 and must not expose credentials or protected configuration to candidate code.
@@ -242,8 +248,9 @@ they begin or their outputs enter the repository:
 
 ## Clean-room Roles
 
-Separation is applied per behavior case. If independent people cannot fill the
-required roles, the case remains blocked.
+Separation is applied per behavior case. All four roles are assigned to distinct
+people before observation begins. If independent people cannot fill the required
+roles, the case remains blocked.
 
 | Role | Access and responsibility |
 | --- | --- |
@@ -252,16 +259,19 @@ required roles, the case remains blocked.
 | Implementer | Receives only the approved, provenance-linked behavior specification. Has no access to raw proprietary material for that case and does not operate the oracle for it. |
 | Conformance reviewer | Runs independently authored tests, checks lineage and legal uses, and determines only technical comparison status. Does not make a legal decision. |
 
-An observer and implementer for the same case must be different people. Merely
-using separate branches, accounts, prompts, or AI sessions does not create the
-required independence.
+The same person cannot hold two roles for one case. Merely using separate
+branches, accounts, prompts, or AI sessions does not create the required
+independence.
 
 ## Observation-to-Implementation Procedure
 
 1. Register every proposed source and its digest in the provenance ledger.
 2. Obtain an explicit legal decision for the exact intended use. Pending work stops here.
-3. Assign an observer and an implementer before observation begins.
-4. Record the immutable oracle target, commands, session settings, raw evidence hash, and cleanup result.
+3. Assign the observer, specification reviewer, implementer, and conformance
+   reviewer before observation begins.
+4. Record the immutable oracle target, commands, session settings, raw evidence
+   hash, and cleanup result. Only the observer or specification reviewer may
+   handle raw evidence or record its cleanup.
 5. Produce a behavior specification containing only necessary factual behavior and typed observations.
 6. Have the specification reviewer approve the sanitized specification and its lineage.
 7. Give the implementer only that approved specification and public project interfaces.
@@ -273,6 +283,37 @@ specification reviewer, implementer, timestamps, provenance IDs, legal-review
 ID, exact target ID, commands, raw evidence digest, specification path and
 digest, review decision, and any deletion or cleanup event. Sensitive material
 itself is never placed in an issue, pull request, CI log, or audit record.
+
+`contracts/compatibility/behavior-specification-admissions.json` is the
+machine-readable audit ledger for this boundary. Its first-party validator
+requires exact feature and target IDs, pairwise-distinct preassigned roles,
+argv-form commands, bounded environment and session facts, input and raw
+evidence digests and lengths, a protected-or-deleted evidence disposition with
+cleanup events completed before technical review, exact specification and
+derived-test provenance, and a controlled implementer handoff. The published
+ledger is empty; no synthetic schema-corpus approval is authority.
+
+Authenticated legal evidence must precede the first governed use of each
+provenance closure. Oracle-target and observation-source approvals precede
+observation; sanitized-specification approval precedes technical review; and
+derived-test approval precedes implementation handoff. For editable GitHub
+review bodies, the later of submission and the authenticated last edit is the
+effective approval time.
+
+Before a semantic change, run:
+
+```sh
+cargo run --locked -p ntsql-contract --bin ntsql-governance -- \
+  implementation-admission <feature-id> <target-id> \
+  [<legal-authority-path> <repository> <commit>]
+```
+
+The command is intentionally not a global CI step while no feature has an
+admission. Missing, pending, rejected, ambiguous, or legally unauthorized
+records fail. Candidate-authored technical `approved` metadata also fails until
+the separate protected specification-review producer and verifier in Issue #55
+authenticate it. Legal authority and technical-review authority are independent;
+neither may substitute for the other.
 
 ## Behavior Specifications and Tests
 

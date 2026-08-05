@@ -36,6 +36,14 @@ name = "ntsql-diagnostics"
 version = "0.1.0"
 
 [[package]]
+name = "ntsql-storage-memory"
+version = "0.1.0"
+dependencies = [
+ "ntsql-transaction",
+ "ntsql-wal",
+]
+
+[[package]]
 name = "ntsql-testkit"
 version = "0.1.0"
 dependencies = [

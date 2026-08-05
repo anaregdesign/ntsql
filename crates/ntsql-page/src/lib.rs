@@ -162,6 +162,309 @@ impl<const N: usize> PageImage<N> {
     }
 }
 
+/// Ntsql-internal page image that has not yet received a WAL position.
+#[derive(Debug, Eq, PartialEq)]
+pub struct UnloggedPage<const N: usize> {
+    address: PageAddress,
+    version: PageVersion,
+    image: PageImage<N>,
+}
+
+impl<const N: usize> UnloggedPage<N> {
+    /// Creates one page write that still requires WAL append.
+    #[must_use]
+    pub const fn new(address: PageAddress, version: PageVersion, image: PageImage<N>) -> Self {
+        Self {
+            address,
+            version,
+            image,
+        }
+    }
+
+    /// Returns the internal page address.
+    #[must_use]
+    pub const fn address(&self) -> &PageAddress {
+        &self.address
+    }
+
+    /// Returns the adapter-assigned page version.
+    #[must_use]
+    pub const fn version(&self) -> PageVersion {
+        self.version
+    }
+
+    /// Returns the unlogged image.
+    #[must_use]
+    pub const fn image(&self) -> &PageImage<N> {
+        &self.image
+    }
+
+    /// Returns every owned input.
+    #[must_use]
+    pub fn into_parts(self) -> (PageAddress, PageVersion, PageImage<N>) {
+        (self.address, self.version, self.image)
+    }
+}
+
+/// WAL append port for one complete ntsql-internal page image.
+pub trait PageLog<const N: usize>: LogDurability {
+    /// Appends one page image and returns its exact assigned WAL position.
+    ///
+    /// Success means the record was appended, not made durable. The returned
+    /// position must identify that record in this log's lineage. An error does
+    /// not specify whether the physical append occurred.
+    fn append_page(&mut self, page: &UnloggedPage<N>) -> Result<LogSequenceNumber, Self::Error>;
+}
+
+/// Terminal page state after a WAL append was attempted but valid append
+/// evidence was not established.
+///
+/// The append may have changed physical state. This type deliberately offers no
+/// conversion back to unlogged, dirty, clean, or directly retryable state.
+///
+/// ```compile_fail
+/// use ntsql_page::IndeterminatePageLogAppend;
+///
+/// fn cannot_retry<const N: usize>(page: IndeterminatePageLogAppend<N>) {
+///     let _ = page.into_unlogged_page();
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct IndeterminatePageLogAppend<const N: usize> {
+    address: PageAddress,
+    version: PageVersion,
+    image: PageImage<N>,
+    observed_position: Option<LogSequenceNumber>,
+}
+
+impl<const N: usize> IndeterminatePageLogAppend<N> {
+    fn from_unlogged(page: UnloggedPage<N>, observed_position: Option<LogSequenceNumber>) -> Self {
+        let UnloggedPage {
+            address,
+            version,
+            image,
+        } = page;
+        Self {
+            address,
+            version,
+            image,
+            observed_position,
+        }
+    }
+
+    /// Returns the internal page address.
+    #[must_use]
+    pub const fn address(&self) -> &PageAddress {
+        &self.address
+    }
+
+    /// Returns the adapter-assigned version.
+    #[must_use]
+    pub const fn version(&self) -> PageVersion {
+        self.version
+    }
+
+    /// Returns the page image whose append outcome is unresolved.
+    #[must_use]
+    pub const fn image(&self) -> &PageImage<N> {
+        &self.image
+    }
+
+    /// Returns an adapter-reported position when append returned success but
+    /// its evidence was invalid.
+    #[must_use]
+    pub const fn observed_position(&self) -> Option<&LogSequenceNumber> {
+        self.observed_position.as_ref()
+    }
+}
+
+/// Pre-append rejection reason for an unlogged page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagePageWriteRejectionReason {
+    /// The page and supplied WAL belong to different lineages.
+    ForeignLog,
+}
+
+/// Page staging rejected before the WAL append port was called.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StagePageWriteRejection<const N: usize> {
+    page: UnloggedPage<N>,
+    reason: StagePageWriteRejectionReason,
+}
+
+impl<const N: usize> StagePageWriteRejection<N> {
+    /// Returns the unchanged unlogged page.
+    #[must_use]
+    pub const fn page(&self) -> &UnloggedPage<N> {
+        &self.page
+    }
+
+    /// Returns the exact rejection reason.
+    #[must_use]
+    pub const fn reason(&self) -> StagePageWriteRejectionReason {
+        self.reason
+    }
+
+    /// Returns the unchanged unlogged page for a corrected composition.
+    #[must_use]
+    pub fn into_page(self) -> UnloggedPage<N> {
+        self.page
+    }
+}
+
+impl<const N: usize> fmt::Display for StagePageWriteRejection<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason {
+            StagePageWriteRejectionReason::ForeignLog => write!(
+                formatter,
+                "page {} belongs to another WAL lineage",
+                self.page.address().number().get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for StagePageWriteRejection<N> {}
+
+/// WAL append failure paired with terminal page state.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StagePageWriteAppendError<E, const N: usize> {
+    page: IndeterminatePageLogAppend<N>,
+    source: E,
+}
+
+impl<E, const N: usize> StagePageWriteAppendError<E, N> {
+    /// Returns the terminal page state.
+    #[must_use]
+    pub const fn page(&self) -> &IndeterminatePageLogAppend<N> {
+        &self.page
+    }
+
+    /// Returns the exact WAL append failure.
+    #[must_use]
+    pub const fn cause(&self) -> &E {
+        &self.source
+    }
+
+    /// Returns the terminal state and exact WAL cause.
+    #[must_use]
+    pub fn into_parts(self) -> (IndeterminatePageLogAppend<N>, E) {
+        (self.page, self.source)
+    }
+}
+
+impl<E: fmt::Display, const N: usize> fmt::Display for StagePageWriteAppendError<E, N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "page {} WAL append failed: {}",
+            self.page.address().number().get(),
+            self.source
+        )
+    }
+}
+
+impl<E, const N: usize> Error for StagePageWriteAppendError<E, N>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Invalid evidence returned after a page WAL append reported success.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StagePageWriteEvidenceErrorReason {
+    /// The returned position belongs to another lineage.
+    ForeignPosition,
+    /// The WAL lineage changed while append was in progress.
+    LogLineageChanged,
+}
+
+/// Invalid post-append evidence paired with terminal page state.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StagePageWriteEvidenceError<const N: usize> {
+    page: IndeterminatePageLogAppend<N>,
+    reason: StagePageWriteEvidenceErrorReason,
+}
+
+impl<const N: usize> StagePageWriteEvidenceError<N> {
+    /// Returns the terminal page state.
+    #[must_use]
+    pub const fn page(&self) -> &IndeterminatePageLogAppend<N> {
+        &self.page
+    }
+
+    /// Returns the exact evidence failure.
+    #[must_use]
+    pub const fn reason(&self) -> StagePageWriteEvidenceErrorReason {
+        self.reason
+    }
+}
+
+impl<const N: usize> fmt::Display for StagePageWriteEvidenceError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(position) = self.page.observed_position() else {
+            return write!(
+                formatter,
+                "page {} WAL append evidence has no observed position",
+                self.page.address().number().get()
+            );
+        };
+        match self.reason {
+            StagePageWriteEvidenceErrorReason::ForeignPosition => write!(
+                formatter,
+                "page {} WAL append returned foreign position {}",
+                self.page.address().number().get(),
+                position.get()
+            ),
+            StagePageWriteEvidenceErrorReason::LogLineageChanged => write!(
+                formatter,
+                "page {} WAL lineage changed after append at position {}",
+                self.page.address().number().get(),
+                position.get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for StagePageWriteEvidenceError<N> {}
+
+/// Failure before or after the page-WAL append effect boundary.
+#[derive(Debug, Eq, PartialEq)]
+pub enum StagePageWriteError<E, const N: usize> {
+    /// Composition was rejected before append.
+    Rejected(StagePageWriteRejection<N>),
+    /// Append returned an adapter failure after it was invoked.
+    Append(StagePageWriteAppendError<E, N>),
+    /// Append returned success with invalid lineage evidence.
+    InvalidEvidence(StagePageWriteEvidenceError<N>),
+}
+
+impl<E: fmt::Display, const N: usize> fmt::Display for StagePageWriteError<E, N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(error) => error.fmt(formatter),
+            Self::Append(error) => error.fmt(formatter),
+            Self::InvalidEvidence(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E, const N: usize> Error for StagePageWriteError<E, N>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rejected(error) => Some(error),
+            Self::Append(error) => Some(error),
+            Self::InvalidEvidence(error) => Some(error),
+        }
+    }
+}
+
 /// Reason dirty-page construction was rejected before any page state existed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirtyPageConstructionErrorReason {
@@ -216,6 +519,20 @@ impl<const N: usize> Error for DirtyPageConstructionError<N> {}
 
 /// Ntsql-internal page state that still requires one exact WAL durability fence
 /// before the page store may report success.
+///
+/// ```compile_fail
+/// use ntsql_page::{DirtyPage, PageAddress, PageImage, PageVersion};
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_construct<const N: usize>(
+///     address: PageAddress,
+///     version: PageVersion,
+///     image: PageImage<N>,
+///     position: LogSequenceNumber,
+/// ) {
+///     let _ = DirtyPage::new(address, version, image, position);
+/// }
+/// ```
 #[derive(Debug, Eq, PartialEq)]
 pub struct DirtyPage<const N: usize> {
     address: PageAddress,
@@ -225,9 +542,7 @@ pub struct DirtyPage<const N: usize> {
 }
 
 impl<const N: usize> DirtyPage<N> {
-    /// Creates one dirty page after validating that the page address and exact
-    /// required WAL position belong to the same lineage.
-    pub fn new(
+    fn new(
         address: PageAddress,
         version: PageVersion,
         image: PageImage<N>,
@@ -273,6 +588,68 @@ impl<const N: usize> DirtyPage<N> {
     #[must_use]
     pub const fn required_position(&self) -> &LogSequenceNumber {
         &self.required_position
+    }
+}
+
+/// Appends one full page image and stages it as dirty only after validating the
+/// exact returned position and unchanged WAL lineage.
+///
+/// A foreign WAL is rejected before append and returns the unchanged unlogged
+/// page. Once append is invoked, any error or invalid evidence is terminal
+/// because the physical append effect is unspecified.
+pub fn stage_page_write<Log, const N: usize>(
+    log: &mut Log,
+    page: UnloggedPage<N>,
+) -> Result<DirtyPage<N>, StagePageWriteError<Log::Error, N>>
+where
+    Log: PageLog<N>,
+{
+    if !page.address().lineage().same_lineage(log.lineage()) {
+        return Err(StagePageWriteError::Rejected(StagePageWriteRejection {
+            page,
+            reason: StagePageWriteRejectionReason::ForeignLog,
+        }));
+    }
+    let expected_lineage = log.lineage().clone();
+    let position = match log.append_page(&page) {
+        Ok(position) => position,
+        Err(source) => {
+            return Err(StagePageWriteError::Append(StagePageWriteAppendError {
+                page: IndeterminatePageLogAppend::from_unlogged(page, None),
+                source,
+            }));
+        }
+    };
+    let reason = if !position.lineage().same_lineage(&expected_lineage) {
+        Some(StagePageWriteEvidenceErrorReason::ForeignPosition)
+    } else if !expected_lineage.same_lineage(log.lineage()) {
+        Some(StagePageWriteEvidenceErrorReason::LogLineageChanged)
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
+        return Err(StagePageWriteError::InvalidEvidence(
+            StagePageWriteEvidenceError {
+                page: IndeterminatePageLogAppend::from_unlogged(page, Some(position)),
+                reason,
+            },
+        ));
+    }
+    let (address, version, image) = page.into_parts();
+    match DirtyPage::new(address, version, image, position) {
+        Ok(dirty) => Ok(dirty),
+        Err(error) => {
+            let (address, version, image, position) = error.into_parts();
+            Err(StagePageWriteError::InvalidEvidence(
+                StagePageWriteEvidenceError {
+                    page: IndeterminatePageLogAppend::from_unlogged(
+                        UnloggedPage::new(address, version, image),
+                        Some(position),
+                    ),
+                    reason: StagePageWriteEvidenceErrorReason::ForeignPosition,
+                },
+            ))
+        }
     }
 }
 
@@ -752,6 +1129,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum FakeError {
+        LogAppend,
         LogFlush,
         StoreWrite,
     }
@@ -759,6 +1137,7 @@ mod tests {
     impl fmt::Display for FakeError {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
+                Self::LogAppend => formatter.write_str("log append failed"),
                 Self::LogFlush => formatter.write_str("log flush failed"),
                 Self::StoreWrite => formatter.write_str("store write failed"),
             }
@@ -770,6 +1149,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum EventKind {
         Unused,
+        Append,
         Flush,
         Write,
     }
@@ -837,8 +1217,11 @@ mod tests {
     struct FakeLog<'trace> {
         lineage: LogLineage,
         expected_position: LogSequenceNumber,
+        append_position: LogSequenceNumber,
         trace: &'trace CallTrace,
+        fail_append: bool,
         fail_flush: bool,
+        lineage_after_append: Option<LogLineage>,
     }
 
     impl<'trace> FakeLog<'trace> {
@@ -849,9 +1232,12 @@ mod tests {
         ) -> Self {
             Self {
                 lineage,
+                append_position: expected_position.clone(),
                 expected_position,
                 trace,
+                fail_append: false,
                 fail_flush: false,
+                lineage_after_append: None,
             }
         }
     }
@@ -874,6 +1260,28 @@ mod tests {
                 Err(FakeError::LogFlush)
             } else {
                 Ok(())
+            }
+        }
+    }
+
+    impl<const N: usize> PageLog<N> for FakeLog<'_> {
+        fn append_page(
+            &mut self,
+            page: &UnloggedPage<N>,
+        ) -> Result<LogSequenceNumber, Self::Error> {
+            self.trace.push(
+                EventKind::Append,
+                self.append_position.get(),
+                page.address().lineage().same_lineage(&self.lineage),
+                page.address().number().get(),
+            );
+            if let Some(lineage) = self.lineage_after_append.take() {
+                self.lineage = lineage;
+            }
+            if self.fail_append {
+                Err(FakeError::LogAppend)
+            } else {
+                Ok(self.append_position.clone())
             }
         }
     }
@@ -968,6 +1376,172 @@ mod tests {
             };
         };
         dirty
+    }
+
+    fn unlogged_page<const N: usize>(
+        lineage: &LogLineage,
+        number: u64,
+        version: u64,
+        bytes: [u8; N],
+    ) -> UnloggedPage<N> {
+        UnloggedPage::new(
+            PageAddress::new(lineage, page_number(number)),
+            PageVersion::new(version),
+            page_image(bytes),
+        )
+    }
+
+    #[test]
+    fn stages_flushes_and_writes_one_exact_page_image() {
+        let trace = CallTrace::new();
+        let lineage = LogLineage::new();
+        let required_position = lineage.position(7);
+        let bytes = [41_u8, 42, 43, 44];
+        let page = unlogged_page(&lineage, 21, 12, bytes);
+        let mut log = FakeLog::new(lineage.clone(), required_position.clone(), &trace);
+        let mut store = FakeStore::new(lineage.clone(), required_position.clone(), &trace);
+
+        let dirty = stage_page_write(&mut log, page);
+        assert!(dirty.is_ok());
+        let Ok(dirty) = dirty else {
+            return;
+        };
+        let clean = flush_dirty_page(&mut log, &mut store, dirty);
+
+        assert!(clean.is_ok());
+        let Ok(clean) = clean else {
+            return;
+        };
+        assert_eq!(trace.len(), 3);
+        assert_eq!(trace.kind(0), EventKind::Append);
+        assert_eq!(trace.kind(1), EventKind::Flush);
+        assert_eq!(trace.kind(2), EventKind::Write);
+        assert_eq!(trace.position(0), 7);
+        assert_eq!(trace.position(1), 7);
+        assert_eq!(trace.position(2), 7);
+        assert!(trace.matches_expected(0));
+        assert!(trace.matches_expected(1));
+        assert!(trace.matches_expected(2));
+        assert_eq!(trace.page_number(0), 21);
+        assert_eq!(trace.page_number(2), 21);
+        assert_eq!(
+            clean.address(),
+            &PageAddress::new(&lineage, page_number(21))
+        );
+        assert_eq!(clean.version(), PageVersion::new(12));
+        assert_eq!(clean.image().bytes(), &bytes);
+        assert_eq!(clean.required_position(), &required_position);
+    }
+
+    #[test]
+    fn foreign_log_rejects_unlogged_page_before_append() {
+        let trace = CallTrace::new();
+        let lineage = LogLineage::new();
+        let foreign_lineage = LogLineage::new();
+        let page = unlogged_page(&lineage, 22, 13, [45_u8, 46]);
+        let mut log = FakeLog::new(foreign_lineage.clone(), foreign_lineage.position(9), &trace);
+
+        let error = stage_page_write(&mut log, page);
+
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
+        assert_eq!(trace.len(), 0);
+        let StagePageWriteError::Rejected(error) = error else {
+            return;
+        };
+        assert_eq!(error.reason(), StagePageWriteRejectionReason::ForeignLog);
+        let page = error.into_page();
+        assert_eq!(page.address(), &PageAddress::new(&lineage, page_number(22)));
+        assert_eq!(page.version(), PageVersion::new(13));
+        assert_eq!(page.image().bytes(), &[45_u8, 46]);
+    }
+
+    #[test]
+    fn append_failure_is_terminal_and_preserves_cause() {
+        let trace = CallTrace::new();
+        let lineage = LogLineage::new();
+        let page = unlogged_page(&lineage, 23, 14, [47_u8, 48]);
+        let mut log = FakeLog::new(lineage.clone(), lineage.position(11), &trace);
+        log.fail_append = true;
+
+        let error = stage_page_write(&mut log, page);
+
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace.kind(0), EventKind::Append);
+        let StagePageWriteError::Append(error) = error else {
+            return;
+        };
+        assert_eq!(error.cause(), &FakeError::LogAppend);
+        let (page, source) = error.into_parts();
+        assert_eq!(source, FakeError::LogAppend);
+        assert_eq!(page.address().number().get(), 23);
+        assert_eq!(page.version(), PageVersion::new(14));
+        assert_eq!(page.image().bytes(), &[47_u8, 48]);
+        assert_eq!(page.observed_position(), None);
+    }
+
+    #[test]
+    fn foreign_append_position_is_terminal() {
+        let trace = CallTrace::new();
+        let lineage = LogLineage::new();
+        let foreign_lineage = LogLineage::new();
+        let page = unlogged_page(&lineage, 24, 15, [49_u8, 50]);
+        let mut log = FakeLog::new(lineage.clone(), lineage.position(13), &trace);
+        log.append_position = foreign_lineage.position(17);
+
+        let error = stage_page_write(&mut log, page);
+
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
+        assert_eq!(trace.len(), 1);
+        let StagePageWriteError::InvalidEvidence(error) = error else {
+            return;
+        };
+        assert_eq!(
+            error.reason(),
+            StagePageWriteEvidenceErrorReason::ForeignPosition
+        );
+        assert_eq!(
+            error.page().observed_position(),
+            Some(&foreign_lineage.position(17))
+        );
+        assert_eq!(error.page().address().number().get(), 24);
+    }
+
+    #[test]
+    fn append_time_lineage_rotation_is_terminal() {
+        let trace = CallTrace::new();
+        let lineage = LogLineage::new();
+        let replacement = LogLineage::new();
+        let returned_position = lineage.position(19);
+        let page = unlogged_page(&lineage, 25, 16, [51_u8, 52]);
+        let mut log = FakeLog::new(lineage, returned_position.clone(), &trace);
+        log.lineage_after_append = Some(replacement);
+
+        let error = stage_page_write(&mut log, page);
+
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
+        assert_eq!(trace.len(), 1);
+        let StagePageWriteError::InvalidEvidence(error) = error else {
+            return;
+        };
+        assert_eq!(
+            error.reason(),
+            StagePageWriteEvidenceErrorReason::LogLineageChanged
+        );
+        assert_eq!(error.page().observed_position(), Some(&returned_position));
+        assert_eq!(error.page().address().number().get(), 25);
     }
 
     #[test]

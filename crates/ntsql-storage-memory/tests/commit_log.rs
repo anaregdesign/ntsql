@@ -28,7 +28,7 @@ fn successful_commit_appends_and_flushes_exact_record() -> Result<(), Box<dyn Er
             .first()
             .ok_or_else(|| io::Error::other("appended record is missing"))?
             .transaction_id(),
-        transaction_id
+        Some(transaction_id)
     );
     assert_eq!(
         log.durable_records().cloned().collect::<Vec<_>>(),
@@ -91,7 +91,7 @@ fn after_append_fault_leaves_volatile_record_and_later_flush_covers_it()
             .first()
             .ok_or_else(|| io::Error::other("volatile record is missing"))?
             .transaction_id(),
-        first_id
+        Some(first_id)
     );
     assert_eq!(log.durable_records().len(), 0);
 
@@ -313,7 +313,7 @@ fn one_log_lineage_distinguishes_same_sequence_from_two_coordinators() -> Result
             .iter()
             .map(|record| record.transaction_id())
             .collect::<Vec<_>>(),
-        [first_id, second_id]
+        [Some(first_id), Some(second_id)]
     );
     Ok(())
 }

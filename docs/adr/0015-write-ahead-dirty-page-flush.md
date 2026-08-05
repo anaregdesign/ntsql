@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #80
 - Extends: ADR 0001, ADR 0005, ADR 0011, ADR 0012
+- Extended by: ADR 0016
 
 ## Context
 
@@ -40,9 +41,10 @@ durability without appending transaction records.
   `IndeterminatePageWrite` values; and
 - the `PageStore` inward port and `flush_dirty_page` ordering operation.
 
-`DirtyPage::new` requires the page address and exact required
-`LogSequenceNumber` to share one lineage. Rejection happens before page state
-exists and returns every moved input.
+Dirty-page construction requires the page address and exact required
+`LogSequenceNumber` to share one lineage. ADR 0016 makes that constructor
+private: safe downstream code first supplies an `UnloggedPage` to `PageLog`, and
+only validated append evidence can create `DirtyPage`.
 
 `flush_dirty_page` performs exactly these stages:
 
@@ -92,8 +94,9 @@ was consulted.
   indeterminate state with the exact cause.
 - Construction tests prove nonzero page numbers, nonempty fixed images, and
   lineage-bound page identity.
-- Compile-fail tests reject direct permit and clean-page construction, permit
-  widening, write calls without a permit, and indeterminate-to-dirty bypass.
+- Compile-fail tests reject direct dirty-page, permit, and clean-page
+  construction, permit widening, write calls without a permit, and
+  indeterminate-to-dirty bypass.
 - Architecture tests reject every page dependency except `ntsql-wal` and reject
   the reverse `ntsql-wal -> ntsql-page` edge.
 

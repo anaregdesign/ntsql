@@ -36,7 +36,7 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
     },
     PackagePolicy {
         package: "ntsql-storage-memory",
-        allowed_dependencies: &["ntsql-transaction", "ntsql-wal"],
+        allowed_dependencies: &["ntsql-page", "ntsql-transaction", "ntsql-wal"],
     },
     PackagePolicy {
         package: "ntsql-testkit",
@@ -275,6 +275,7 @@ mod tests {
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-storage-memory v0.1.0\n\
+             1ntsql-page v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-testkit v0.1.0\n\
@@ -447,14 +448,20 @@ mod tests {
             "0ntsql-page v0.1.0\n\
              1ntsql-contract v0.1.0\n\
              1ntsql-storage-file v0.1.0\n\
-             1ntsql-wal v0.1.0\n\
+            1ntsql-storage-memory v0.1.0\n\
+            1ntsql-wal v0.1.0\n\
              1serde v1.0.0\n\
              0ntsql-wal v0.1.0\n",
         )?;
 
         let violations = validate_graph(&graph, PACKAGE_POLICIES);
 
-        for dependency in ["ntsql-contract", "ntsql-storage-file", "serde"] {
+        for dependency in [
+            "ntsql-contract",
+            "ntsql-storage-file",
+            "ntsql-storage-memory",
+            "serde",
+        ] {
             assert!(violations.iter().any(|violation| violation
                 == &format!("package ntsql-page has forbidden direct dependency {dependency}")));
         }
@@ -513,12 +520,16 @@ mod tests {
              0ntsql-diagnostics v0.1.0\n\
              0ntsql-storage-memory v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             1ntsql-page v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              1serde v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
              0ntsql-transaction v0.1.0\n\
+             1ntsql-storage-memory v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
+             0ntsql-page v0.1.0\n\
              1ntsql-storage-memory v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n\
@@ -535,6 +546,8 @@ mod tests {
         }
         assert!(violations.iter().any(|violation| violation
             == "package ntsql-transaction has forbidden direct dependency ntsql-storage-memory"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-page has forbidden direct dependency ntsql-storage-memory"));
         assert!(violations.iter().any(|violation| violation
             == "package ntsql-wal has forbidden direct dependency ntsql-storage-memory"));
         Ok(())

@@ -4,7 +4,7 @@
 - Date: 2026-08-04
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
-  ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014, ADR 0015
+  ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014, ADR 0015, ADR 0016
 
 ## Context
 
@@ -69,7 +69,7 @@ ntsql-wal --------------> standard library only
 
 ntsql-storage-file -----> ntsql-transaction, ntsql-wal
 
-ntsql-storage-memory ---> ntsql-transaction, ntsql-wal
+ntsql-storage-memory ---> ntsql-page, ntsql-transaction, ntsql-wal
 
 ntsql-architecture-check -------> standard library only
 ```
@@ -113,9 +113,10 @@ that position reports durable. It owns no filesystem, persistent page format,
 checkpoint, buffer replacement, redo/undo, or client diagnostic.
 
 `ntsql-storage-memory` is an outer synthetic persistence adapter. It implements
-the transaction commit-log, epoch-source, and recovery-lookup ports, depends
-inward on both domain crates, and provides deterministic before/after-effect
-fault injection. Neither domain crate may depend on it.
+the transaction commit-log, epoch-source, recovery-lookup, page-log, and
+page-store ports, depends inward on their three owning domain crates, and
+provides deterministic before/after-effect fault injection. No domain crate may
+depend on it.
 
 `ntsql-storage-file` is the first outer filesystem persistence adapter. It owns
 the ntsql-specific transaction commit-log bytes and synchronous file barriers,

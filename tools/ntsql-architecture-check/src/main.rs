@@ -32,7 +32,7 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
     },
     PackagePolicy {
         package: "ntsql-storage-file",
-        allowed_dependencies: &["ntsql-transaction", "ntsql-wal"],
+        allowed_dependencies: &["ntsql-page", "ntsql-transaction", "ntsql-wal"],
     },
     PackagePolicy {
         package: "ntsql-storage-memory",
@@ -272,6 +272,7 @@ mod tests {
              0ntsql-page v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-storage-file v0.1.0\n\
+             1ntsql-page v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-storage-memory v0.1.0\n\
@@ -565,6 +566,7 @@ mod tests {
              0ntsql-diagnostics v0.1.0\n\
              0ntsql-storage-file v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             1ntsql-page v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              1serde v1.0.0\n\

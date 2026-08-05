@@ -24,8 +24,30 @@
       "legal_review_id": null
     },
     {
+      "id": "language.query.select",
+      "title": "SELECT query statement syntax and binding",
+      "category": "language",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 8,
+      "legal_review_id": null
+    },
+    {
       "id": "category.data-types",
       "title": "Data types and conversions inventory root",
+      "category": "data-types",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 6,
+      "legal_review_id": null
+    },
+    {
+      "id": "data-types.literal.integer",
+      "title": "Integer literal typing and value representation",
       "category": "data-types",
       "status": "not-tested",
       "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
@@ -59,6 +81,17 @@
     {
       "id": "category.query-processing",
       "title": "Query processing inventory root",
+      "category": "query-processing",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 14,
+      "legal_review_id": null
+    },
+    {
+      "id": "query-processing.constant-projection",
+      "title": "Constant projection planning and execution",
       "category": "query-processing",
       "status": "not-tested",
       "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],

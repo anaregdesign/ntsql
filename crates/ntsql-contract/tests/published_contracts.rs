@@ -1,8 +1,8 @@
 use std::{collections::BTreeSet, error::Error, io};
 
 use ntsql_contract::{
-    FeatureMatrix, LegalReviewLedger, ProvenanceLedger, TargetMatrix,
-    validate_governance_references,
+    CompatibilityStatus, FeatureCategory, FeatureMatrix, LegalReviewLedger, ProvenanceLedger,
+    TargetMatrix, validate_governance_references,
 };
 use serde_json::Value;
 
@@ -53,6 +53,39 @@ fn published_feature_matrix_is_valid() -> Result<(), Box<dyn Error>> {
     let violations = features.validate(&targets);
 
     assert!(violations.is_empty(), "{violations:#?}");
+    Ok(())
+}
+
+#[test]
+fn first_query_slice_inventory_is_explicit() -> Result<(), Box<dyn Error>> {
+    const BASELINE_TARGET: &str = "sqlserver-2022-cu26-linux-x86_64-developer-compat160";
+    const INVENTORY_PROVENANCE: &str = "prov-ms-sql-engine-overview-2022";
+    let features: FeatureMatrix = serde_json::from_str(FEATURES)?;
+
+    for (id, category, owner_issue) in [
+        ("language.query.select", FeatureCategory::Language, 8),
+        ("data-types.literal.integer", FeatureCategory::DataTypes, 6),
+        (
+            "query-processing.constant-projection",
+            FeatureCategory::QueryProcessing,
+            14,
+        ),
+    ] {
+        let feature = features
+            .features
+            .iter()
+            .find(|feature| feature.id == id)
+            .ok_or_else(|| invalid_data(format!("missing first query-slice feature {id}")))?;
+
+        assert_eq!(feature.category, category);
+        assert_eq!(feature.status, CompatibilityStatus::NotTested);
+        assert_eq!(feature.oracle_targets, [BASELINE_TARGET]);
+        assert_eq!(feature.evidence, [INVENTORY_PROVENANCE]);
+        assert!(feature.differences.is_empty());
+        assert_eq!(feature.owner_issue, owner_issue);
+        assert_eq!(feature.legal_review_id, None);
+    }
+
     Ok(())
 }
 

@@ -780,32 +780,14 @@ impl fmt::Display for DurableTransactionPageClassificationError {
 
 impl Error for DurableTransactionPageClassificationError {}
 
-/// Classifies one durable transaction-owned page from a complete commit prefix.
-///
-/// `commit_observations` must contain every durable commit observation in the
-/// expected lineage in strictly increasing physical order. The function
-/// validates the complete iterator, including unrelated identities, before
-/// returning. An absent match means uncommitted only under that completeness
-/// contract.
-///
-/// The function performs one pass with bounded state. It does not select among
-/// repeated page records, return an image, authorize replay, or access a store.
-pub fn classify_durable_transaction_page<'observation, const N: usize, Commits>(
+fn scan_durable_transaction_commits<'observation, Commits>(
     expected_lineage: &LogLineage,
-    page: &DurableTransactionPageObservation<N>,
+    matching_transaction: Option<DurableTransactionIdentityObservation>,
     commit_observations: Commits,
-) -> Result<DurableTransactionPageCommitClassification, DurableTransactionPageClassificationError>
+) -> Result<Option<&'observation LogSequenceNumber>, DurableTransactionPageClassificationError>
 where
     Commits: IntoIterator<Item = &'observation DurableTransactionCommitObservation>,
 {
-    if !expected_lineage.same_lineage(page.position().lineage()) {
-        return Err(
-            DurableTransactionPageClassificationError::ForeignPageLineage {
-                position: page.position().clone(),
-            },
-        );
-    }
-
     let mut previous: Option<&DurableTransactionCommitObservation> = None;
     let mut matching_position: Option<&LogSequenceNumber> = None;
     for observation in commit_observations {
@@ -817,11 +799,11 @@ where
             );
         }
 
-        if observation.transaction() == page.owner() {
+        if matching_transaction == Some(observation.transaction()) {
             if let Some(first) = matching_position {
                 return Err(
                     DurableTransactionPageClassificationError::DuplicateMatchingCommit {
-                        transaction: page.owner(),
+                        transaction: observation.transaction(),
                         first: first.clone(),
                         duplicate: observation.position().clone(),
                     },
@@ -854,6 +836,40 @@ where
         }
         previous = Some(observation);
     }
+    Ok(matching_position)
+}
+
+/// Classifies one durable transaction-owned page from a complete commit prefix.
+///
+/// `commit_observations` must contain every durable commit observation in the
+/// expected lineage in strictly increasing physical order. The function
+/// validates the complete iterator, including unrelated identities, before
+/// returning. An absent match means uncommitted only under that completeness
+/// contract.
+///
+/// The function performs one pass with bounded state. It does not select among
+/// repeated page records, return an image, authorize replay, or access a store.
+pub fn classify_durable_transaction_page<'observation, const N: usize, Commits>(
+    expected_lineage: &LogLineage,
+    page: &DurableTransactionPageObservation<N>,
+    commit_observations: Commits,
+) -> Result<DurableTransactionPageCommitClassification, DurableTransactionPageClassificationError>
+where
+    Commits: IntoIterator<Item = &'observation DurableTransactionCommitObservation>,
+{
+    if !expected_lineage.same_lineage(page.position().lineage()) {
+        return Err(
+            DurableTransactionPageClassificationError::ForeignPageLineage {
+                position: page.position().clone(),
+            },
+        );
+    }
+
+    let matching_position = scan_durable_transaction_commits(
+        expected_lineage,
+        Some(page.owner()),
+        commit_observations,
+    )?;
 
     let Some(commit_position) = matching_position else {
         return Ok(DurableTransactionPageCommitClassification::Uncommitted {
@@ -872,6 +888,358 @@ where
     Ok(DurableTransactionPageCommitClassification::Committed {
         page_position: page.position().clone(),
         commit_position: commit_position.clone(),
+    })
+}
+
+/// Borrowed latest committed full-image page selected from durable evidence.
+///
+/// This value deliberately cannot create transaction lifecycle authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     LatestCommittedTransactionPage, TransactionId,
+/// };
+///
+/// fn cannot_create_transaction_id<const N: usize>(
+///     selection: LatestCommittedTransactionPage<'_, N>,
+/// ) -> TransactionId {
+///     selection.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransaction, LatestCommittedTransactionPage,
+/// };
+///
+/// fn cannot_create_committed<const N: usize>(
+///     selection: LatestCommittedTransactionPage<'_, N>,
+/// ) -> CommittedTransaction {
+///     selection.into()
+/// }
+/// ```
+///
+/// It also cannot create dirty or write-authorizing state:
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::LatestCommittedTransactionPage;
+///
+/// fn cannot_create_dirty<const N: usize>(
+///     selection: LatestCommittedTransactionPage<'_, N>,
+/// ) -> DirtyPage<N> {
+///     selection.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     LatestCommittedTransactionPage, TransactionDirtyPage,
+/// };
+///
+/// fn cannot_create_transaction_dirty<const N: usize>(
+///     selection: LatestCommittedTransactionPage<'_, N>,
+/// ) -> TransactionDirtyPage<N> {
+///     selection.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::LatestCommittedTransactionPage;
+///
+/// fn cannot_authorize_write<const N: usize>(
+///     selection: LatestCommittedTransactionPage<'_, N>,
+/// ) -> PageWritePermit<'static> {
+///     selection.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatestCommittedTransactionPage<'observation, const N: usize> {
+    observation: &'observation DurableTransactionPageObservation<N>,
+    commit_position: LogSequenceNumber,
+}
+
+impl<'observation, const N: usize> LatestCommittedTransactionPage<'observation, N> {
+    /// Returns the exact borrowed owned-page observation selected by WAL order.
+    #[must_use]
+    pub const fn observation(&self) -> &'observation DurableTransactionPageObservation<N> {
+        self.observation
+    }
+
+    /// Returns the matching durable commit position for the selected owner.
+    #[must_use]
+    pub const fn commit_position(&self) -> &LogSequenceNumber {
+        &self.commit_position
+    }
+}
+
+/// Inert result of selecting one page's latest committed durable observation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionPageSelection<'observation, const N: usize> {
+    /// No supplied owned-page observation had matching durable commit evidence.
+    NoCommittedPage {
+        /// Requested page number for which no committed observation was found.
+        page_number: PageNumber,
+    },
+    /// Greatest committed owned-page observation by physical WAL position.
+    LatestCommitted(LatestCommittedTransactionPage<'observation, N>),
+}
+
+/// Contradiction that prevents latest committed transaction-page selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionPageSelectionError {
+    /// The complete commit slice failed validation before page selection.
+    CommitPrefix {
+        /// Exact ADR 0023 commit-evidence failure.
+        source: Box<DurableTransactionPageClassificationError>,
+    },
+    /// An owned observation describes another page.
+    UnexpectedOwnedPage {
+        /// Page requested by the caller.
+        expected: PageNumber,
+        /// Page carried by the observation.
+        actual: PageNumber,
+        /// Position of the unexpected owned-page observation.
+        position: LogSequenceNumber,
+    },
+    /// An owned-page position belongs to another WAL lineage.
+    ForeignOwnedPageLineage {
+        /// Page number carried by the observation.
+        page_number: PageNumber,
+        /// Position supplied by the owned-page observation.
+        position: LogSequenceNumber,
+    },
+    /// Two adjacent observations repeat every relevant field at one position.
+    DuplicateOwnedPagePosition {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Repeated owned-page position.
+        position: LogSequenceNumber,
+    },
+    /// Two adjacent observations reuse one position with differing evidence.
+    ContradictoryOwnedPagePosition {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Contradictory owned-page position.
+        position: LogSequenceNumber,
+    },
+    /// Owned-page observations were not supplied in strictly increasing order.
+    NonAdvancingOwnedPagePosition {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Previous owned-page position.
+        previous: LogSequenceNumber,
+        /// Later supplied position that did not advance.
+        actual: LogSequenceNumber,
+    },
+    /// One owned-page observation failed ADR 0023 classification.
+    PageClassification {
+        /// Page number carried by the observation.
+        page_number: PageNumber,
+        /// Position of the owned-page observation.
+        page_position: LogSequenceNumber,
+        /// Exact ADR 0023 per-record classification failure.
+        source: Box<DurableTransactionPageClassificationError>,
+    },
+}
+
+impl fmt::Display for DurableTransactionPageSelectionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommitPrefix { source } => {
+                write!(
+                    formatter,
+                    "complete durable commit prefix is invalid: {source}"
+                )
+            }
+            Self::UnexpectedOwnedPage {
+                expected,
+                actual,
+                position,
+            } => write!(
+                formatter,
+                "owned-page observation at position {} describes page {}, expected page {}",
+                position.get(),
+                actual.get(),
+                expected.get()
+            ),
+            Self::ForeignOwnedPageLineage {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} owned-page position {} belongs to another WAL lineage",
+                page_number.get(),
+                position.get()
+            ),
+            Self::DuplicateOwnedPagePosition {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} owned-page position {} repeats identical evidence",
+                page_number.get(),
+                position.get()
+            ),
+            Self::ContradictoryOwnedPagePosition {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} owned-page position {} repeats contradictory evidence",
+                page_number.get(),
+                position.get()
+            ),
+            Self::NonAdvancingOwnedPagePosition {
+                page_number,
+                previous,
+                actual,
+            } => write!(
+                formatter,
+                "page {} owned-page position {} does not advance beyond {}",
+                page_number.get(),
+                actual.get(),
+                previous.get()
+            ),
+            Self::PageClassification {
+                page_number,
+                page_position,
+                source,
+            } => write!(
+                formatter,
+                "page {} owned-page observation at position {} cannot be classified: {}",
+                page_number.get(),
+                page_position.get(),
+                source
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionPageSelectionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CommitPrefix { source } | Self::PageClassification { source, .. } => Some(source),
+            Self::UnexpectedOwnedPage { .. }
+            | Self::ForeignOwnedPageLineage { .. }
+            | Self::DuplicateOwnedPagePosition { .. }
+            | Self::ContradictoryOwnedPagePosition { .. }
+            | Self::NonAdvancingOwnedPagePosition { .. } => None,
+        }
+    }
+}
+
+fn same_owned_page_evidence<const N: usize>(
+    left: &DurableTransactionPageObservation<N>,
+    right: &DurableTransactionPageObservation<N>,
+) -> bool {
+    left.owner() == right.owner()
+        && left.page().page_version() == right.page().page_version()
+        && left.page().image().bytes() == right.page().image().bytes()
+}
+
+/// Selects one page's latest committed full image from complete durable evidence.
+///
+/// `owned_pages` must contain every durable transaction-owned observation for
+/// `expected_page` in strictly increasing physical order. `commit_observations`
+/// must contain every durable commit observation in the complete matching
+/// prefix. The commit slice is validated even when no owned page exists.
+///
+/// Selection uses only owned-page WAL position. Uncommitted records are omitted
+/// from the selected state but remain fully validated. The function borrows its
+/// inputs, allocates no collection, authorizes no replay, and accesses no store.
+pub fn select_latest_committed_transaction_page<'page, 'commit, const N: usize, Pages>(
+    expected_lineage: &LogLineage,
+    expected_page: PageNumber,
+    owned_pages: Pages,
+    commit_observations: &'commit [DurableTransactionCommitObservation],
+) -> Result<DurableTransactionPageSelection<'page, N>, DurableTransactionPageSelectionError>
+where
+    Pages: IntoIterator<Item = &'page DurableTransactionPageObservation<N>>,
+{
+    let _ = scan_durable_transaction_commits(expected_lineage, None, commit_observations.iter())
+        .map_err(
+            |source| DurableTransactionPageSelectionError::CommitPrefix {
+                source: Box::new(source),
+            },
+        )?;
+
+    let mut previous: Option<&DurableTransactionPageObservation<N>> = None;
+    let mut selected = None;
+    for observation in owned_pages {
+        let actual_page = observation.page().page_number();
+        if actual_page != expected_page {
+            return Err(DurableTransactionPageSelectionError::UnexpectedOwnedPage {
+                expected: expected_page,
+                actual: actual_page,
+                position: observation.position().clone(),
+            });
+        }
+        if !expected_lineage.same_lineage(observation.position().lineage()) {
+            return Err(
+                DurableTransactionPageSelectionError::ForeignOwnedPageLineage {
+                    page_number: actual_page,
+                    position: observation.position().clone(),
+                },
+            );
+        }
+
+        if let Some(previous) = previous {
+            if observation.position().get() == previous.position().get() {
+                let error = if same_owned_page_evidence(previous, observation) {
+                    DurableTransactionPageSelectionError::DuplicateOwnedPagePosition {
+                        page_number: actual_page,
+                        position: observation.position().clone(),
+                    }
+                } else {
+                    DurableTransactionPageSelectionError::ContradictoryOwnedPagePosition {
+                        page_number: actual_page,
+                        position: observation.position().clone(),
+                    }
+                };
+                return Err(error);
+            }
+            if observation.position().get() < previous.position().get() {
+                return Err(
+                    DurableTransactionPageSelectionError::NonAdvancingOwnedPagePosition {
+                        page_number: actual_page,
+                        previous: previous.position().clone(),
+                        actual: observation.position().clone(),
+                    },
+                );
+            }
+        }
+
+        let classification = classify_durable_transaction_page(
+            expected_lineage,
+            observation,
+            commit_observations.iter(),
+        )
+        .map_err(
+            |source| DurableTransactionPageSelectionError::PageClassification {
+                page_number: actual_page,
+                page_position: observation.position().clone(),
+                source: Box::new(source),
+            },
+        )?;
+        if let DurableTransactionPageCommitClassification::Committed {
+            commit_position, ..
+        } = classification
+        {
+            selected = Some(LatestCommittedTransactionPage {
+                observation,
+                commit_position,
+            });
+        }
+        previous = Some(observation);
+    }
+
+    Ok(match selected {
+        Some(selected) => DurableTransactionPageSelection::LatestCommitted(selected),
+        None => DurableTransactionPageSelection::NoCommittedPage {
+            page_number: expected_page,
+        },
     })
 }
 
@@ -3924,6 +4292,377 @@ mod tests {
             Ok(DurableTransactionPageCommitClassification::Committed {
                 page_position: lineage.position(3),
                 commit_position: lineage.position(6),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_selection_validates_empty_and_all_uncommitted_inputs() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let page_number = PageNumber::new(47).ok_or(TestError("page number"))?;
+        let first_owner = durable_identity(11, 1)?;
+        let second_owner = durable_identity(11, 2)?;
+        let unrelated = durable_identity(11, 3)?;
+        let pages = [
+            durable_page_observation(&lineage, first_owner, 47, 1, 0x47, 1)?,
+            durable_page_observation(&lineage, second_owner, 47, 2, 0x48, 2)?,
+        ];
+        let commits = [durable_commit_observation(&lineage, unrelated, 3)?];
+        let foreign_commits = [durable_commit_observation(&foreign, unrelated, 4)?];
+
+        let empty = select_latest_committed_transaction_page(
+            &lineage,
+            page_number,
+            std::iter::empty::<&DurableTransactionPageObservation<1>>(),
+            &commits,
+        );
+        let all_uncommitted =
+            select_latest_committed_transaction_page(&lineage, page_number, pages.iter(), &commits);
+        let malformed_empty = select_latest_committed_transaction_page(
+            &lineage,
+            page_number,
+            std::iter::empty::<&DurableTransactionPageObservation<1>>(),
+            &foreign_commits,
+        );
+
+        let no_committed = Ok(DurableTransactionPageSelection::NoCommittedPage { page_number });
+        assert_eq!(empty, no_committed);
+        assert_eq!(all_uncommitted, no_committed);
+        assert_eq!(
+            malformed_empty,
+            Err(DurableTransactionPageSelectionError::CommitPrefix {
+                source: Box::new(
+                    DurableTransactionPageClassificationError::ForeignCommitLineage {
+                        position: foreign.position(4),
+                    },
+                ),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_selection_uses_page_wal_order_across_owners() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(48).ok_or(TestError("page number"))?;
+        let uncommitted_before = durable_identity(12, 1)?;
+        let first_committed = durable_identity(12, 2)?;
+        let latest_committed = durable_identity(12, 3)?;
+        let uncommitted_after = durable_identity(12, 4)?;
+        let pages = [
+            durable_page_observation(&lineage, uncommitted_before, 48, 3, 0x48, 1)?,
+            durable_page_observation(&lineage, first_committed, 48, 10, 0x49, 2)?,
+            durable_page_observation(&lineage, latest_committed, 48, 1, 0x4A, 6)?,
+            durable_page_observation(&lineage, uncommitted_after, 48, 20, 0x4B, 9)?,
+        ];
+        let commits = [
+            durable_commit_observation(&lineage, first_committed, 5)?,
+            durable_commit_observation(&lineage, latest_committed, 8)?,
+        ];
+
+        let result =
+            select_latest_committed_transaction_page(&lineage, page_number, pages.iter(), &commits)
+                .map_err(|_| TestError("latest selection failed"))?;
+        let DurableTransactionPageSelection::LatestCommitted(selected) = result else {
+            return Err(TestError("expected latest committed page"));
+        };
+
+        assert!(std::ptr::eq(selected.observation(), &pages[2]));
+        assert_eq!(
+            selected.observation().page().page_version(),
+            PageVersion::new(1)
+        );
+        assert_eq!(selected.observation().position(), &lineage.position(6));
+        assert_eq!(selected.commit_position(), &lineage.position(8));
+        Ok(())
+    }
+
+    #[test]
+    fn latest_selection_accepts_repeated_owner_records_before_one_commit() -> Result<(), TestError>
+    {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(49).ok_or(TestError("page number"))?;
+        let owner = durable_identity(13, 1)?;
+        let pages = [
+            durable_page_observation(&lineage, owner, 49, 1, 0x49, 2)?,
+            durable_page_observation(&lineage, owner, 49, 2, 0x4A, 3)?,
+        ];
+        let commits = [durable_commit_observation(&lineage, owner, 5)?];
+
+        let one_result = {
+            let temporary_commits = [durable_commit_observation(&lineage, owner, 5)?];
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                pages[..1].iter(),
+                &temporary_commits,
+            )
+        }
+        .map_err(|_| TestError("one-page selection failed"))?;
+        let DurableTransactionPageSelection::LatestCommitted(one_selected) = one_result else {
+            return Err(TestError("expected one committed page"));
+        };
+        assert!(std::ptr::eq(one_selected.observation(), &pages[0]));
+        assert_eq!(one_selected.commit_position(), &lineage.position(5));
+
+        let result =
+            select_latest_committed_transaction_page(&lineage, page_number, pages.iter(), &commits)
+                .map_err(|_| TestError("repeated-owner selection failed"))?;
+        let DurableTransactionPageSelection::LatestCommitted(selected) = result else {
+            return Err(TestError("expected repeated-owner selection"));
+        };
+
+        assert!(std::ptr::eq(selected.observation(), &pages[1]));
+        assert_eq!(selected.commit_position(), &lineage.position(5));
+        Ok(())
+    }
+
+    #[test]
+    fn latest_selection_rejects_page_and_lineage_before_position_order() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let page_number = PageNumber::new(50).ok_or(TestError("page number"))?;
+        let owner = durable_identity(14, 1)?;
+        let first = durable_page_observation(&lineage, owner, 50, 1, 0x50, 5)?;
+        let wrong_page = durable_page_observation(&lineage, owner, 51, 1, 0x51, 4)?;
+        let foreign_page = durable_page_observation(&foreign, owner, 50, 1, 0x50, 4)?;
+        let wrong_page_records = [first, wrong_page];
+        let lineage_first = durable_page_observation(&lineage, owner, 50, 1, 0x50, 5)?;
+        let foreign_records = [lineage_first, foreign_page];
+
+        let wrong_page_result = select_latest_committed_transaction_page(
+            &lineage,
+            page_number,
+            wrong_page_records.iter(),
+            &[],
+        );
+        let foreign_result = select_latest_committed_transaction_page(
+            &lineage,
+            page_number,
+            foreign_records.iter(),
+            &[],
+        );
+
+        assert_eq!(
+            wrong_page_result,
+            Err(DurableTransactionPageSelectionError::UnexpectedOwnedPage {
+                expected: page_number,
+                actual: PageNumber::new(51).ok_or(TestError("wrong page number"))?,
+                position: lineage.position(4),
+            })
+        );
+        assert_eq!(
+            foreign_result,
+            Err(
+                DurableTransactionPageSelectionError::ForeignOwnedPageLineage {
+                    page_number,
+                    position: foreign.position(4),
+                }
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_selection_rejects_owned_page_position_shapes() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(52).ok_or(TestError("page number"))?;
+        let owner = durable_identity(15, 1)?;
+        let duplicate = [
+            durable_page_observation(&lineage, owner, 52, 1, 0x52, 2)?,
+            durable_page_observation(&lineage, owner, 52, 1, 0x52, 2)?,
+        ];
+        let contradictory = [
+            durable_page_observation(&lineage, owner, 52, 1, 0x52, 3)?,
+            durable_page_observation(&lineage, owner, 52, 2, 0x53, 3)?,
+        ];
+        let decreasing = [
+            durable_page_observation(&lineage, owner, 52, 1, 0x52, 6)?,
+            durable_page_observation(&lineage, owner, 52, 2, 0x53, 4)?,
+        ];
+
+        assert_eq!(
+            select_latest_committed_transaction_page(&lineage, page_number, duplicate.iter(), &[],),
+            Err(
+                DurableTransactionPageSelectionError::DuplicateOwnedPagePosition {
+                    page_number,
+                    position: lineage.position(2),
+                }
+            )
+        );
+        assert_eq!(
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                contradictory.iter(),
+                &[],
+            ),
+            Err(
+                DurableTransactionPageSelectionError::ContradictoryOwnedPagePosition {
+                    page_number,
+                    position: lineage.position(3),
+                }
+            )
+        );
+        assert_eq!(
+            select_latest_committed_transaction_page(&lineage, page_number, decreasing.iter(), &[],),
+            Err(
+                DurableTransactionPageSelectionError::NonAdvancingOwnedPagePosition {
+                    page_number,
+                    previous: lineage.position(6),
+                    actual: lineage.position(4),
+                }
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_selection_validates_commit_position_shapes_without_pages() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(53).ok_or(TestError("page number"))?;
+        let first = durable_identity(16, 1)?;
+        let second = durable_identity(16, 2)?;
+        let duplicate = [
+            durable_commit_observation(&lineage, first, 4)?,
+            durable_commit_observation(&lineage, first, 4)?,
+        ];
+        let contradictory = [
+            durable_commit_observation(&lineage, first, 5)?,
+            durable_commit_observation(&lineage, second, 5)?,
+        ];
+        let decreasing = [
+            durable_commit_observation(&lineage, first, 8)?,
+            durable_commit_observation(&lineage, second, 6)?,
+        ];
+
+        let empty_pages = || std::iter::empty::<&DurableTransactionPageObservation<1>>();
+        assert_eq!(
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                empty_pages(),
+                &duplicate,
+            ),
+            Err(DurableTransactionPageSelectionError::CommitPrefix {
+                source: Box::new(
+                    DurableTransactionPageClassificationError::DuplicateCommitPosition {
+                        position: lineage.position(4),
+                    },
+                ),
+            })
+        );
+        assert_eq!(
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                empty_pages(),
+                &contradictory,
+            ),
+            Err(DurableTransactionPageSelectionError::CommitPrefix {
+                source: Box::new(
+                    DurableTransactionPageClassificationError::ContradictoryCommitPosition {
+                        position: lineage.position(5),
+                    },
+                ),
+            })
+        );
+        assert_eq!(
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                empty_pages(),
+                &decreasing,
+            ),
+            Err(DurableTransactionPageSelectionError::CommitPrefix {
+                source: Box::new(
+                    DurableTransactionPageClassificationError::NonAdvancingCommitPosition {
+                        previous: lineage.position(8),
+                        actual: lineage.position(6),
+                    },
+                ),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn latest_selection_retains_per_record_classification_failures() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(54).ok_or(TestError("page number"))?;
+        let owner = durable_identity(17, 1)?;
+        let page = durable_page_observation(&lineage, owner, 54, 1, 0x54, 5)?;
+        let early_commit = [durable_commit_observation(&lineage, owner, 3)?];
+        let duplicate_commits = [
+            durable_commit_observation(&lineage, owner, 6)?,
+            durable_commit_observation(&lineage, owner, 7)?,
+        ];
+
+        assert_eq!(
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                std::iter::once(&page),
+                &early_commit,
+            ),
+            Err(DurableTransactionPageSelectionError::PageClassification {
+                page_number,
+                page_position: lineage.position(5),
+                source: Box::new(
+                    DurableTransactionPageClassificationError::CommitNotAfterPage {
+                        transaction: owner,
+                        page_position: lineage.position(5),
+                        commit_position: lineage.position(3),
+                    },
+                ),
+            })
+        );
+
+        let earlier_page = durable_page_observation(&lineage, owner, 54, 1, 0x54, 2)?;
+        assert_eq!(
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                std::iter::once(&earlier_page),
+                &duplicate_commits,
+            ),
+            Err(DurableTransactionPageSelectionError::PageClassification {
+                page_number,
+                page_position: lineage.position(2),
+                source: Box::new(
+                    DurableTransactionPageClassificationError::DuplicateMatchingCommit {
+                        transaction: owner,
+                        first: lineage.position(6),
+                        duplicate: lineage.position(7),
+                    },
+                ),
+            })
+        );
+
+        let post_commit_pages = [
+            durable_page_observation(&lineage, owner, 54, 1, 0x54, 10)?,
+            durable_page_observation(&lineage, owner, 54, 2, 0x55, 30)?,
+        ];
+        let middle_commit = [durable_commit_observation(&lineage, owner, 20)?];
+        assert_eq!(
+            select_latest_committed_transaction_page(
+                &lineage,
+                page_number,
+                post_commit_pages.iter(),
+                &middle_commit,
+            ),
+            Err(DurableTransactionPageSelectionError::PageClassification {
+                page_number,
+                page_position: lineage.position(30),
+                source: Box::new(
+                    DurableTransactionPageClassificationError::CommitNotAfterPage {
+                        transaction: owner,
+                        page_position: lineage.position(30),
+                        commit_position: lineage.position(20),
+                    },
+                ),
             })
         );
         Ok(())

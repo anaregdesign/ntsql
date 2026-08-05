@@ -1,14 +1,21 @@
 //! I/O-free transaction lifecycle invariants.
 
 use std::{
-    collections::{BTreeMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
     num::NonZeroU64,
     sync::Arc,
 };
 
-use ntsql_wal::{CommitError, CommitLog, LogLineage, LogSequenceNumber, commit_durability};
+use ntsql_page::{
+    CleanPage, DirtyPage, FlushDirtyPageError, IndeterminatePageLogAppend, IndeterminatePageWrite,
+    PageLog, PageStore, StagePageWriteError, StagePageWriteEvidenceErrorReason, UnloggedPage,
+    flush_dirty_page, stage_page_write,
+};
+use ntsql_wal::{
+    CommitError, CommitLog, LogDurability, LogLineage, LogSequenceNumber, commit_durability,
+};
 
 /// Persistence-owned source of nonzero coordinator epochs.
 ///
@@ -123,6 +130,13 @@ pub enum TransactionLifecycleStatus {
     Committed,
     /// The WAL port failed after the commit attempt began.
     Indeterminate,
+    /// A transaction-owned page WAL append was attempted but valid append
+    /// evidence was not established.
+    ///
+    /// This phase is distinct from [`Self::Indeterminate`]. Commit and
+    /// commit-outcome resolution gate strictly on [`Self::Indeterminate`] and
+    /// never reinterpret this page-append phase as a commit attempt.
+    PageAppendIndeterminate,
     /// Authoritative recovery found no durable commit record.
     NoDurableCommitRecord,
 }
@@ -178,6 +192,7 @@ pub struct TransactionCoordinator {
     log_lineage: LogLineage,
     next_transaction_id: Option<NonZeroU64>,
     lifecycles: BTreeMap<TransactionId, TransactionLifecycleStatus>,
+    staged_pages: BTreeSet<(TransactionId, ntsql_page::PageNumber)>,
 }
 
 impl TransactionCoordinator {
@@ -193,6 +208,7 @@ impl TransactionCoordinator {
             log_lineage,
             next_transaction_id: Some(NonZeroU64::MIN),
             lifecycles: BTreeMap::new(),
+            staged_pages: BTreeSet::new(),
         })
     }
 
@@ -393,6 +409,139 @@ impl TransactionCoordinator {
                     NoDurableCommitRecord { transaction_id },
                 ))
             }
+        }
+    }
+
+    /// Stages one transaction-owned page write for an active token issued by
+    /// this coordinator.
+    ///
+    /// Ownership, coordinator/log lineage, page/log lineage, the retained
+    /// `Active` phase, and the one-image-per-page limit are validated before the
+    /// transaction-page WAL port is called. Every pre-append rejection retains
+    /// the unchanged active token and the exact unlogged page and never calls
+    /// the append port.
+    ///
+    /// Once the append port is invoked, an adapter error or invalid lineage
+    /// evidence is terminal: the coordinator records
+    /// [`TransactionLifecycleStatus::PageAppendIndeterminate`], returns terminal
+    /// page evidence with no path back to [`ActiveTransaction`], and blocks
+    /// commit and commit-outcome resolution for that identity. Success returns
+    /// the same active token plus one [`TransactionDirtyPage`] and leaves the
+    /// coordinator lifecycle `Active`; the page store is never called here.
+    pub fn stage_page_write<L, const N: usize>(
+        &mut self,
+        transaction: ActiveTransaction,
+        page: UnloggedPage<N>,
+        log: &mut L,
+    ) -> Result<(ActiveTransaction, TransactionDirtyPage<N>), TransactionPageStageError<L::Error, N>>
+    where
+        L: TransactionPageLog<N>,
+    {
+        if !self.owns(&transaction) {
+            return Err(TransactionPageStageError::Rejected(
+                TransactionPageStageRejection {
+                    transaction,
+                    page,
+                    reason: TransactionPageStageRejectionReason::ForeignCoordinator,
+                },
+            ));
+        }
+        if !self.log_lineage.same_lineage(log.lineage()) {
+            return Err(TransactionPageStageError::Rejected(
+                TransactionPageStageRejection {
+                    transaction,
+                    page,
+                    reason: TransactionPageStageRejectionReason::ForeignLogLineage,
+                },
+            ));
+        }
+        if !page.address().lineage().same_lineage(log.lineage()) {
+            return Err(TransactionPageStageError::Rejected(
+                TransactionPageStageRejection {
+                    transaction,
+                    page,
+                    reason: TransactionPageStageRejectionReason::ForeignPageLineage,
+                },
+            ));
+        }
+        let transaction_id = transaction.transaction_id();
+        match self.lifecycles.get(&transaction_id).copied() {
+            Some(TransactionLifecycleStatus::Active) => {}
+            actual => {
+                return Err(TransactionPageStageError::Rejected(
+                    TransactionPageStageRejection {
+                        transaction,
+                        page,
+                        reason: TransactionPageStageRejectionReason::LifecycleMismatch { actual },
+                    },
+                ));
+            }
+        }
+        let page_number = page.address().number();
+        if !self.staged_pages.insert((transaction_id, page_number)) {
+            return Err(TransactionPageStageError::Rejected(
+                TransactionPageStageRejection {
+                    transaction,
+                    page,
+                    reason: TransactionPageStageRejectionReason::PageAlreadyStaged,
+                },
+            ));
+        }
+
+        let mut bridge = TransactionPageAppendBridge {
+            transaction_id,
+            log,
+        };
+        match stage_page_write(&mut bridge, page) {
+            Ok(dirty) => Ok((
+                transaction,
+                TransactionDirtyPage {
+                    transaction_id,
+                    dirty,
+                },
+            )),
+            Err(StagePageWriteError::Rejected(rejection)) => {
+                // The domain page port re-rejected after this coordinator had
+                // already validated the shared lineage. This never invoked the
+                // append effect, so the token stays active without poisoning
+                // the lifecycle.
+                let _ = self.staged_pages.remove(&(transaction_id, page_number));
+                Err(TransactionPageStageError::Rejected(
+                    TransactionPageStageRejection {
+                        transaction,
+                        page: rejection.into_page(),
+                        reason: TransactionPageStageRejectionReason::InternalPageLogRejection,
+                    },
+                ))
+            }
+            Err(StagePageWriteError::Append(error)) => {
+                self.mark_page_append_indeterminate(transaction_id);
+                let (page, source) = error.into_parts();
+                Err(TransactionPageStageError::Append(
+                    TransactionPageAppendError {
+                        transaction_id,
+                        page,
+                        source,
+                    },
+                ))
+            }
+            Err(StagePageWriteError::InvalidEvidence(error)) => {
+                self.mark_page_append_indeterminate(transaction_id);
+                let reason = error.reason();
+                Err(TransactionPageStageError::InvalidEvidence(
+                    TransactionPageEvidenceError {
+                        transaction_id,
+                        page: error.into_page(),
+                        reason,
+                    },
+                ))
+            }
+        }
+    }
+
+    fn mark_page_append_indeterminate(&mut self, transaction_id: TransactionId) {
+        if let Some(status) = self.lifecycles.get_mut(&transaction_id) {
+            *status = TransactionLifecycleStatus::PageAppendIndeterminate;
         }
     }
 }
@@ -823,10 +972,839 @@ where
     }
 }
 
+/// Caller-borrowed WAL record for one transaction-owned page write.
+///
+/// Only the coordinator's private append bridge constructs this value, so safe
+/// downstream code cannot forge a transaction-owned page record. Persistence
+/// adapters may inspect the identity and borrowed page but do not own the
+/// transaction lifecycle.
+///
+/// ```compile_fail
+/// use ntsql_page::UnloggedPage;
+/// use ntsql_transaction::{TransactionId, TransactionPageWriteRecord};
+///
+/// fn cannot_construct<const N: usize>(
+///     transaction_id: TransactionId,
+///     page: &UnloggedPage<N>,
+/// ) {
+///     let _forged = TransactionPageWriteRecord {
+///         transaction_id,
+///         page,
+///     };
+/// }
+/// ```
+#[derive(Debug)]
+pub struct TransactionPageWriteRecord<'page, const N: usize> {
+    transaction_id: TransactionId,
+    page: &'page UnloggedPage<N>,
+}
+
+impl<const N: usize> TransactionPageWriteRecord<'_, N> {
+    /// Returns the transaction identity that owns this page write.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the borrowed unlogged page image being appended.
+    #[must_use]
+    pub const fn page(&self) -> &UnloggedPage<N> {
+        self.page
+    }
+}
+
+/// WAL append port for one transaction-owned full page image.
+///
+/// Hard adapter obligation: transaction-page appends and transaction commit
+/// appends for one lineage must share exactly one monotonic position space and
+/// one durable frontier, so a later commit flush also makes every prior
+/// transaction-page record durable. The domain validates that the returned
+/// position is lineage-bound; it cannot prove the adapter honors this shared
+/// frontier. Extending [`CommitLog<TransactionCommitRecord>`] requires one
+/// adapter surface to provide both append operations. An adapter that assigns
+/// handles sharing a lineage to independent spaces or frontiers still violates
+/// this port even if each record is individually well formed.
+pub trait TransactionPageLog<const N: usize>: CommitLog<TransactionCommitRecord> {
+    /// Appends one transaction-owned page image and returns its exact
+    /// lineage-bound WAL position.
+    ///
+    /// Success means the record was appended, not made durable. An error does
+    /// not specify whether the physical append occurred.
+    fn append_transaction_page(
+        &mut self,
+        record: &TransactionPageWriteRecord<'_, N>,
+    ) -> Result<LogSequenceNumber, Self::Error>;
+}
+
+/// Private adapter that presents a [`TransactionPageLog`] as a [`PageLog`] so
+/// the domain page-staging evidence checks can run unchanged while every append
+/// carries the owning [`TransactionId`].
+struct TransactionPageAppendBridge<'log, L, const N: usize>
+where
+    L: TransactionPageLog<N>,
+{
+    transaction_id: TransactionId,
+    log: &'log mut L,
+}
+
+impl<L, const N: usize> LogDurability for TransactionPageAppendBridge<'_, L, N>
+where
+    L: TransactionPageLog<N>,
+{
+    type Error = L::Error;
+
+    fn lineage(&self) -> &LogLineage {
+        self.log.lineage()
+    }
+
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
+        self.log.flush_through(position)
+    }
+}
+
+impl<L, const N: usize> PageLog<N> for TransactionPageAppendBridge<'_, L, N>
+where
+    L: TransactionPageLog<N>,
+{
+    fn append_page(&mut self, page: &UnloggedPage<N>) -> Result<LogSequenceNumber, Self::Error> {
+        let record = TransactionPageWriteRecord {
+            transaction_id: self.transaction_id,
+            page,
+        };
+        self.log.append_transaction_page(&record)
+    }
+}
+
+/// Transaction-owned dirty page whose exact WAL position was appended under one
+/// transaction identity but which cannot reach the page store until the same
+/// transaction is durably committed.
+///
+/// This wrapper is not cloneable, exposes no raw [`DirtyPage`],
+/// `PageWritePermit`, or store capability, and provides only read-only owner and
+/// page inspection. The local no-steal rule is enforced structurally: a
+/// transaction-owned image cannot be flushed except through
+/// [`flush_committed_page`], which requires a [`CommittedTransaction`].
+///
+/// ```compile_fail
+/// use ntsql_transaction::{TransactionDirtyPage, TransactionId};
+/// use ntsql_page::DirtyPage;
+///
+/// fn cannot_construct<const N: usize>(transaction_id: TransactionId, dirty: DirtyPage<N>) {
+///     let _forged = TransactionDirtyPage {
+///         transaction_id,
+///         dirty,
+///     };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::TransactionDirtyPage;
+///
+/// fn cannot_clone<const N: usize>(page: TransactionDirtyPage<N>) {
+///     let _duplicate = page.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::TransactionDirtyPage;
+/// use ntsql_page::DirtyPage;
+///
+/// fn cannot_extract_raw_dirty<const N: usize>(page: TransactionDirtyPage<N>) -> DirtyPage<N> {
+///     page.into_dirty_page()
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct TransactionDirtyPage<const N: usize> {
+    transaction_id: TransactionId,
+    dirty: DirtyPage<N>,
+}
+
+impl<const N: usize> TransactionDirtyPage<N> {
+    /// Returns the owning transaction identity.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the adapter-assigned page version.
+    #[must_use]
+    pub const fn version(&self) -> ntsql_page::PageVersion {
+        self.dirty.version()
+    }
+
+    /// Returns the internal page address.
+    #[must_use]
+    pub const fn address(&self) -> &ntsql_page::PageAddress {
+        self.dirty.address()
+    }
+
+    /// Returns the borrowed dirty image bytes.
+    #[must_use]
+    pub const fn image(&self) -> &ntsql_page::PageImage<N> {
+        self.dirty.image()
+    }
+
+    /// Returns the exact WAL position that must be durable before a committed
+    /// flush may store this image.
+    #[must_use]
+    pub const fn required_position(&self) -> &LogSequenceNumber {
+        self.dirty.required_position()
+    }
+}
+
+/// Transaction-owned clean page whose required WAL position and durable page
+/// write both reported success for the owning committed transaction.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{TransactionCleanPage, TransactionId};
+/// use ntsql_page::CleanPage;
+///
+/// fn cannot_construct<const N: usize>(transaction_id: TransactionId, clean: CleanPage<N>) {
+///     let _forged = TransactionCleanPage {
+///         transaction_id,
+///         clean,
+///     };
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub struct TransactionCleanPage<const N: usize> {
+    transaction_id: TransactionId,
+    clean: CleanPage<N>,
+}
+
+impl<const N: usize> TransactionCleanPage<N> {
+    /// Returns the owning transaction identity.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the internal page address.
+    #[must_use]
+    pub const fn address(&self) -> &ntsql_page::PageAddress {
+        self.clean.address()
+    }
+
+    /// Returns the adapter-assigned page version.
+    #[must_use]
+    pub const fn version(&self) -> ntsql_page::PageVersion {
+        self.clean.version()
+    }
+
+    /// Returns the borrowed clean image bytes.
+    #[must_use]
+    pub const fn image(&self) -> &ntsql_page::PageImage<N> {
+        self.clean.image()
+    }
+
+    /// Returns the exact WAL position that was durable before durable page
+    /// completion was reported.
+    #[must_use]
+    pub const fn required_position(&self) -> &LogSequenceNumber {
+        self.clean.required_position()
+    }
+
+    /// Returns the owning identity and the terminal clean page.
+    #[must_use]
+    pub fn into_parts(self) -> (TransactionId, CleanPage<N>) {
+        (self.transaction_id, self.clean)
+    }
+}
+
+/// Reason a transaction-owned page write was rejected before the append port
+/// was called.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPageStageRejectionReason {
+    /// The active token belongs to another coordinator runtime identity.
+    ForeignCoordinator,
+    /// The transaction-page log does not match the coordinator lineage.
+    ForeignLogLineage,
+    /// The page address belongs to another lineage than the log.
+    ForeignPageLineage,
+    /// The issuing coordinator did not retain the expected active phase.
+    LifecycleMismatch {
+        /// Recorded phase, or `None` when the registry entry is absent.
+        actual: Option<TransactionLifecycleStatus>,
+    },
+    /// This transaction already staged an image for the same page.
+    PageAlreadyStaged,
+    /// The domain page port re-rejected the composition before invoking the
+    /// append effect. This is retryable and did not poison the lifecycle.
+    InternalPageLogRejection,
+}
+
+/// Pre-append page-stage rejection that retains the still-active token and the
+/// exact unlogged page.
+#[derive(Debug)]
+pub struct TransactionPageStageRejection<const N: usize> {
+    transaction: ActiveTransaction,
+    page: UnloggedPage<N>,
+    reason: TransactionPageStageRejectionReason,
+}
+
+impl<const N: usize> TransactionPageStageRejection<N> {
+    /// Returns the rejected token's transaction identity.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction.transaction_id()
+    }
+
+    /// Returns the exact rejection reason.
+    #[must_use]
+    pub const fn reason(&self) -> TransactionPageStageRejectionReason {
+        self.reason
+    }
+
+    /// Borrows the retained still-active token.
+    #[must_use]
+    pub const fn transaction(&self) -> &ActiveTransaction {
+        &self.transaction
+    }
+
+    /// Borrows the retained unchanged unlogged page.
+    #[must_use]
+    pub const fn page(&self) -> &UnloggedPage<N> {
+        &self.page
+    }
+
+    /// Returns the retained active token and unchanged unlogged page for a
+    /// corrected composition.
+    #[must_use]
+    pub fn into_parts(self) -> (ActiveTransaction, UnloggedPage<N>) {
+        (self.transaction, self.page)
+    }
+}
+
+impl<const N: usize> fmt::Display for TransactionPageStageRejection<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason {
+            TransactionPageStageRejectionReason::ForeignCoordinator => write!(
+                formatter,
+                "transaction {} belongs to another coordinator",
+                self.transaction_id()
+            ),
+            TransactionPageStageRejectionReason::ForeignLogLineage => write!(
+                formatter,
+                "transaction {} belongs to another transaction-page log lineage",
+                self.transaction_id()
+            ),
+            TransactionPageStageRejectionReason::ForeignPageLineage => write!(
+                formatter,
+                "transaction {} page belongs to another log lineage",
+                self.transaction_id()
+            ),
+            TransactionPageStageRejectionReason::LifecycleMismatch { actual } => write!(
+                formatter,
+                "transaction {} is not active in its coordinator registry: {actual:?}",
+                self.transaction_id()
+            ),
+            TransactionPageStageRejectionReason::PageAlreadyStaged => write!(
+                formatter,
+                "transaction {} already staged page {}",
+                self.transaction_id(),
+                self.page.address().number().get()
+            ),
+            TransactionPageStageRejectionReason::InternalPageLogRejection => write!(
+                formatter,
+                "transaction {} page composition was rejected before append",
+                self.transaction_id()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for TransactionPageStageRejection<N> {}
+
+/// Terminal transaction-owned page state after an append port error.
+///
+/// This value offers no path back to [`ActiveTransaction`].
+#[derive(Debug)]
+pub struct TransactionPageAppendError<E, const N: usize> {
+    transaction_id: TransactionId,
+    page: IndeterminatePageLogAppend<N>,
+    source: E,
+}
+
+impl<E, const N: usize> TransactionPageAppendError<E, N> {
+    /// Returns the owning transaction identity that is now page-indeterminate.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the terminal page state.
+    #[must_use]
+    pub const fn page(&self) -> &IndeterminatePageLogAppend<N> {
+        &self.page
+    }
+
+    /// Returns the exact WAL append failure.
+    #[must_use]
+    pub const fn cause(&self) -> &E {
+        &self.source
+    }
+
+    /// Returns the owning identity, terminal page state, and exact WAL cause.
+    #[must_use]
+    pub fn into_parts(self) -> (TransactionId, IndeterminatePageLogAppend<N>, E) {
+        (self.transaction_id, self.page, self.source)
+    }
+}
+
+impl<E: fmt::Display, const N: usize> fmt::Display for TransactionPageAppendError<E, N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction {} page {} WAL append failed: {}",
+            self.transaction_id,
+            self.page.address().number().get(),
+            self.source
+        )
+    }
+}
+
+impl<E, const N: usize> Error for TransactionPageAppendError<E, N>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Terminal transaction-owned page state after append returned invalid lineage
+/// evidence.
+///
+/// This value offers no path back to [`ActiveTransaction`].
+#[derive(Debug, Eq, PartialEq)]
+pub struct TransactionPageEvidenceError<const N: usize> {
+    transaction_id: TransactionId,
+    page: IndeterminatePageLogAppend<N>,
+    reason: StagePageWriteEvidenceErrorReason,
+}
+
+impl<const N: usize> TransactionPageEvidenceError<N> {
+    /// Returns the owning transaction identity that is now page-indeterminate.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the terminal page state.
+    #[must_use]
+    pub const fn page(&self) -> &IndeterminatePageLogAppend<N> {
+        &self.page
+    }
+
+    /// Returns the exact evidence failure.
+    #[must_use]
+    pub const fn reason(&self) -> StagePageWriteEvidenceErrorReason {
+        self.reason
+    }
+
+    /// Returns the owning identity and terminal page state.
+    #[must_use]
+    pub fn into_parts(self) -> (TransactionId, IndeterminatePageLogAppend<N>) {
+        (self.transaction_id, self.page)
+    }
+}
+
+impl<const N: usize> fmt::Display for TransactionPageEvidenceError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction {} page {} WAL append evidence is invalid: {:?}",
+            self.transaction_id,
+            self.page.address().number().get(),
+            self.reason
+        )
+    }
+}
+
+impl<const N: usize> Error for TransactionPageEvidenceError<N> {}
+
+/// Transaction-owned page staging failure before or after the append effect
+/// boundary.
+#[derive(Debug)]
+pub enum TransactionPageStageError<E, const N: usize> {
+    /// Composition was rejected before append; the active token and unlogged
+    /// page are retained.
+    Rejected(TransactionPageStageRejection<N>),
+    /// Append returned an adapter failure after it was invoked; terminal.
+    Append(TransactionPageAppendError<E, N>),
+    /// Append returned success with invalid lineage evidence; terminal.
+    InvalidEvidence(TransactionPageEvidenceError<N>),
+}
+
+impl<E: fmt::Display, const N: usize> fmt::Display for TransactionPageStageError<E, N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(error) => error.fmt(formatter),
+            Self::Append(error) => error.fmt(formatter),
+            Self::InvalidEvidence(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<E, const N: usize> Error for TransactionPageStageError<E, N>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rejected(error) => Some(error),
+            Self::Append(error) => Some(error),
+            Self::InvalidEvidence(error) => Some(error),
+        }
+    }
+}
+
+/// Reason a committed-page flush was rejected before any log or store port was
+/// called.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionCommittedFlushRejectionReason {
+    /// The committed transaction identity does not equal the page owner.
+    WrongTransaction,
+    /// The committed transaction position belongs to another lineage than the
+    /// page's required WAL position.
+    ForeignCommitLineage,
+    /// The committed position is not strictly after the page WAL position, so
+    /// the commit does not cover the page record on the shared frontier.
+    CommitPositionNotAfterPage,
+    /// A domain flush port re-rejected the page for a foreign log or store
+    /// lineage before invoking either port. Retryable.
+    InternalFlushRejection,
+}
+
+/// Failed committed-page flush rejected before touching either injected port.
+#[derive(Debug, Eq, PartialEq)]
+pub struct TransactionCommittedFlushRejection<const N: usize> {
+    page: TransactionDirtyPage<N>,
+    reason: TransactionCommittedFlushRejectionReason,
+}
+
+impl<const N: usize> TransactionCommittedFlushRejection<N> {
+    /// Returns the retained transaction-owned dirty page.
+    #[must_use]
+    pub const fn page(&self) -> &TransactionDirtyPage<N> {
+        &self.page
+    }
+
+    /// Returns the exact rejection reason.
+    #[must_use]
+    pub const fn reason(&self) -> TransactionCommittedFlushRejectionReason {
+        self.reason
+    }
+
+    /// Returns the retained transaction-owned dirty page.
+    #[must_use]
+    pub fn into_page(self) -> TransactionDirtyPage<N> {
+        self.page
+    }
+}
+
+impl<const N: usize> fmt::Display for TransactionCommittedFlushRejection<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason {
+            TransactionCommittedFlushRejectionReason::WrongTransaction => write!(
+                formatter,
+                "committed flush transaction does not own page {}",
+                self.page.address().number().get()
+            ),
+            TransactionCommittedFlushRejectionReason::ForeignCommitLineage => write!(
+                formatter,
+                "committed flush position belongs to another lineage than page {}",
+                self.page.address().number().get()
+            ),
+            TransactionCommittedFlushRejectionReason::CommitPositionNotAfterPage => write!(
+                formatter,
+                "committed flush position is not strictly after page {} WAL position {}",
+                self.page.address().number().get(),
+                self.page.required_position().get()
+            ),
+            TransactionCommittedFlushRejectionReason::InternalFlushRejection => write!(
+                formatter,
+                "committed flush of page {} was rejected before any port",
+                self.page.address().number().get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for TransactionCommittedFlushRejection<N> {}
+
+/// WAL flush failure that retains the retryable transaction-owned dirty page
+/// because the page store was never called.
+#[derive(Debug)]
+pub struct TransactionCommittedFlushLogError<E, const N: usize> {
+    page: TransactionDirtyPage<N>,
+    source: E,
+}
+
+impl<E, const N: usize> TransactionCommittedFlushLogError<E, N> {
+    /// Returns the retained retryable transaction-owned dirty page.
+    #[must_use]
+    pub const fn page(&self) -> &TransactionDirtyPage<N> {
+        &self.page
+    }
+
+    /// Returns the exact WAL failure.
+    #[must_use]
+    pub const fn cause(&self) -> &E {
+        &self.source
+    }
+
+    /// Returns the retryable dirty page and the exact WAL failure.
+    #[must_use]
+    pub fn into_parts(self) -> (TransactionDirtyPage<N>, E) {
+        (self.page, self.source)
+    }
+}
+
+impl<E: fmt::Display, const N: usize> fmt::Display for TransactionCommittedFlushLogError<E, N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction {} page {} WAL flush through {} failed: {}",
+            self.page.transaction_id(),
+            self.page.address().number().get(),
+            self.page.required_position().get(),
+            self.source
+        )
+    }
+}
+
+impl<E, const N: usize> Error for TransactionCommittedFlushLogError<E, N>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Terminal transaction-owned page state after WAL durability succeeded but the
+/// page-store write failed.
+///
+/// This value retains the committed transaction identity and offers no retry
+/// entrypoint and no manufactured success.
+#[derive(Debug)]
+pub struct TransactionCommittedFlushStoreError<E, const N: usize> {
+    transaction_id: TransactionId,
+    page: IndeterminatePageWrite<N>,
+    source: E,
+}
+
+impl<E, const N: usize> TransactionCommittedFlushStoreError<E, N> {
+    /// Returns the committed transaction identity whose page write is now
+    /// terminally indeterminate.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the terminal indeterminate page state.
+    #[must_use]
+    pub const fn page(&self) -> &IndeterminatePageWrite<N> {
+        &self.page
+    }
+
+    /// Returns the exact store failure.
+    #[must_use]
+    pub const fn cause(&self) -> &E {
+        &self.source
+    }
+
+    /// Returns the committed identity, terminal page state, and exact store
+    /// failure.
+    #[must_use]
+    pub fn into_parts(self) -> (TransactionId, IndeterminatePageWrite<N>, E) {
+        (self.transaction_id, self.page, self.source)
+    }
+}
+
+impl<E: fmt::Display, const N: usize> fmt::Display for TransactionCommittedFlushStoreError<E, N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction {} page {} durable write after WAL position {} failed: {}",
+            self.transaction_id,
+            self.page.address().number().get(),
+            self.page.required_position().get(),
+            self.source
+        )
+    }
+}
+
+impl<E, const N: usize> Error for TransactionCommittedFlushStoreError<E, N>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Failed committed-page flush before or after the store indeterminacy boundary.
+#[derive(Debug)]
+pub enum TransactionCommittedFlushError<LogError, StoreError, const N: usize> {
+    /// Identity, lineage, or ordering validation rejected the flush before any
+    /// port was called; the wrapper is retained.
+    Rejected(TransactionCommittedFlushRejection<N>),
+    /// The WAL flush failed before the page store was called; the retryable
+    /// wrapper is retained.
+    LogFlush(TransactionCommittedFlushLogError<LogError, N>),
+    /// The WAL flush succeeded but the page-store result is terminally
+    /// indeterminate.
+    StoreWrite(TransactionCommittedFlushStoreError<StoreError, N>),
+}
+
+impl<LogError: fmt::Display, StoreError: fmt::Display, const N: usize> fmt::Display
+    for TransactionCommittedFlushError<LogError, StoreError, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(error) => error.fmt(formatter),
+            Self::LogFlush(error) => error.fmt(formatter),
+            Self::StoreWrite(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl<LogError, StoreError, const N: usize> Error
+    for TransactionCommittedFlushError<LogError, StoreError, N>
+where
+    LogError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rejected(error) => Some(error),
+            Self::LogFlush(error) => Some(error),
+            Self::StoreWrite(error) => Some(error),
+        }
+    }
+}
+
+/// Flushes one transaction-owned dirty page only after its owning transaction is
+/// durably committed.
+///
+/// This is the committed gate for the local no-steal rule. Before touching any
+/// port it validates exact transaction-identity equality, that the committed
+/// position shares the page's WAL lineage, and that the committed position is
+/// strictly after the page WAL position on the shared frontier. Identity
+/// equality alone is insufficient because identities can repeat across
+/// lineages. Each pre-port rejection retains the wrapper.
+///
+/// On success it delegates to the existing WAL-before-store page flush. A WAL
+/// flush failure retains the retryable transaction-owned dirty page and the
+/// exact cause. A store-write failure is terminal: it retains the committed
+/// identity, an `IndeterminatePageWrite`, and the exact cause and never
+/// manufactures success.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{ActiveTransaction, TransactionDirtyPage, flush_committed_page};
+/// use ntsql_page::PageStore;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_flush_active<Log, Store, const N: usize>(
+///     active: &ActiveTransaction,
+///     log: &mut Log,
+///     store: &mut Store,
+///     page: TransactionDirtyPage<N>,
+/// )
+/// where
+///     Log: LogDurability,
+///     Store: PageStore<N>,
+/// {
+///     let _ = flush_committed_page(active, log, store, page);
+/// }
+/// ```
+pub fn flush_committed_page<Log, Store, const N: usize>(
+    committed: &CommittedTransaction,
+    log: &mut Log,
+    store: &mut Store,
+    page: TransactionDirtyPage<N>,
+) -> Result<TransactionCleanPage<N>, TransactionCommittedFlushError<Log::Error, Store::Error, N>>
+where
+    Log: LogDurability,
+    Store: PageStore<N>,
+{
+    if committed.transaction_id() != page.transaction_id {
+        return Err(TransactionCommittedFlushError::Rejected(
+            TransactionCommittedFlushRejection {
+                page,
+                reason: TransactionCommittedFlushRejectionReason::WrongTransaction,
+            },
+        ));
+    }
+    if !committed
+        .log_position()
+        .lineage()
+        .same_lineage(page.required_position().lineage())
+    {
+        return Err(TransactionCommittedFlushError::Rejected(
+            TransactionCommittedFlushRejection {
+                page,
+                reason: TransactionCommittedFlushRejectionReason::ForeignCommitLineage,
+            },
+        ));
+    }
+    if committed.log_position().get() <= page.required_position().get() {
+        return Err(TransactionCommittedFlushError::Rejected(
+            TransactionCommittedFlushRejection {
+                page,
+                reason: TransactionCommittedFlushRejectionReason::CommitPositionNotAfterPage,
+            },
+        ));
+    }
+
+    let TransactionDirtyPage {
+        transaction_id,
+        dirty,
+    } = page;
+    match flush_dirty_page(log, store, dirty) {
+        Ok(clean) => Ok(TransactionCleanPage {
+            transaction_id,
+            clean,
+        }),
+        Err(FlushDirtyPageError::Rejected(rejection)) => Err(
+            TransactionCommittedFlushError::Rejected(TransactionCommittedFlushRejection {
+                page: TransactionDirtyPage {
+                    transaction_id,
+                    dirty: rejection.into_page(),
+                },
+                reason: TransactionCommittedFlushRejectionReason::InternalFlushRejection,
+            }),
+        ),
+        Err(FlushDirtyPageError::LogFlush(error)) => {
+            let (dirty, source) = error.into_parts();
+            Err(TransactionCommittedFlushError::LogFlush(
+                TransactionCommittedFlushLogError {
+                    page: TransactionDirtyPage {
+                        transaction_id,
+                        dirty,
+                    },
+                    source,
+                },
+            ))
+        }
+        Err(FlushDirtyPageError::StoreWrite(error)) => {
+            let (page, source) = error.into_parts();
+            Err(TransactionCommittedFlushError::StoreWrite(
+                TransactionCommittedFlushStoreError {
+                    transaction_id,
+                    page,
+                    source,
+                },
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     struct TestEpochSource {
         lineage: LogLineage,
         next_epoch: Option<NonZeroU64>,
@@ -917,6 +1895,739 @@ mod tests {
             coordinator.status(transaction_id),
             Some(TransactionLifecycleStatus::Active)
         );
+        Ok(())
+    }
+
+    use std::{cell::RefCell, rc::Rc};
+
+    use ntsql_page::{PageAddress, PageImage, PageNumber, PageVersion};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct FakeFault(&'static str);
+
+    impl fmt::Display for FakeFault {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl Error for FakeFault {}
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct TestError(&'static str);
+
+    impl fmt::Display for TestError {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl Error for TestError {}
+
+    impl From<TransactionIssueError> for TestError {
+        fn from(_: TransactionIssueError) -> Self {
+            Self("transaction issue")
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FlushEvent {
+        Flush(u64),
+        Write(u64),
+    }
+
+    struct FakeLog {
+        lineage: LogLineage,
+        next_position: u64,
+        append_page_fault: Option<FakeFault>,
+        foreign_append_lineage: Option<LogLineage>,
+        rotate_after_append: Option<LogLineage>,
+        flush_fault: Option<FakeFault>,
+        appended_pages: Vec<(TransactionId, u64)>,
+        flushed: Vec<u64>,
+        events: Option<Rc<RefCell<Vec<FlushEvent>>>>,
+    }
+
+    impl FakeLog {
+        fn new(lineage: LogLineage) -> Self {
+            Self {
+                lineage,
+                next_position: 1,
+                append_page_fault: None,
+                foreign_append_lineage: None,
+                rotate_after_append: None,
+                flush_fault: None,
+                appended_pages: Vec::new(),
+                flushed: Vec::new(),
+                events: None,
+            }
+        }
+    }
+
+    impl LogDurability for FakeLog {
+        type Error = FakeFault;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
+            if let Some(events) = &self.events {
+                events.borrow_mut().push(FlushEvent::Flush(position.get()));
+            }
+            if let Some(fault) = self.flush_fault {
+                return Err(fault);
+            }
+            self.flushed.push(position.get());
+            Ok(())
+        }
+    }
+
+    impl<const N: usize> TransactionPageLog<N> for FakeLog {
+        fn append_transaction_page(
+            &mut self,
+            record: &TransactionPageWriteRecord<'_, N>,
+        ) -> Result<LogSequenceNumber, Self::Error> {
+            if let Some(fault) = self.append_page_fault {
+                return Err(fault);
+            }
+            self.appended_pages.push((
+                record.transaction_id(),
+                record.page().address().number().get(),
+            ));
+            let value = self.next_position;
+            self.next_position += 1;
+            let position = match &self.foreign_append_lineage {
+                Some(foreign) => foreign.position(value),
+                None => self.lineage.position(value),
+            };
+            if let Some(rotated) = &self.rotate_after_append {
+                self.lineage = rotated.clone();
+            }
+            Ok(position)
+        }
+    }
+
+    impl CommitLog<TransactionCommitRecord> for FakeLog {
+        fn append_commit(
+            &mut self,
+            _record: &TransactionCommitRecord,
+        ) -> Result<LogSequenceNumber, Self::Error> {
+            let value = self.next_position;
+            self.next_position += 1;
+            Ok(self.lineage.position(value))
+        }
+    }
+
+    struct FakeStore {
+        lineage: LogLineage,
+        write_fault: Option<FakeFault>,
+        writes: Vec<u64>,
+        events: Option<Rc<RefCell<Vec<FlushEvent>>>>,
+    }
+
+    impl FakeStore {
+        fn new(lineage: LogLineage) -> Self {
+            Self {
+                lineage,
+                write_fault: None,
+                writes: Vec::new(),
+                events: None,
+            }
+        }
+    }
+
+    impl<const N: usize> PageStore<N> for FakeStore {
+        type Error = FakeFault;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn write_page(
+            &mut self,
+            page: &DirtyPage<N>,
+            permit: ntsql_page::PageWritePermit<'_>,
+        ) -> Result<(), Self::Error> {
+            if let Some(events) = &self.events {
+                events
+                    .borrow_mut()
+                    .push(FlushEvent::Write(permit.durable_position().get()));
+            }
+            if let Some(fault) = self.write_fault {
+                return Err(fault);
+            }
+            self.writes.push(page.required_position().get());
+            Ok(())
+        }
+    }
+
+    fn open_coordinator(lineage: &LogLineage) -> Result<TransactionCoordinator, TestError> {
+        let mut source = TestEpochSource {
+            lineage: lineage.clone(),
+            next_epoch: Some(NonZeroU64::MIN),
+        };
+        Ok(TransactionCoordinator::open(&mut source)?)
+    }
+
+    fn make_page(
+        lineage: &LogLineage,
+        number: u64,
+        version: u64,
+        byte: u8,
+    ) -> Result<UnloggedPage<1>, TestError> {
+        let number = PageNumber::new(number).ok_or(TestError("page number"))?;
+        let image = PageImage::new([byte]).map_err(|_| TestError("page image"))?;
+        Ok(UnloggedPage::new(
+            PageAddress::new(lineage, number),
+            PageVersion::new(version),
+            image,
+        ))
+    }
+
+    #[test]
+    fn successful_staging_retains_active_and_owns_dirty() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        let page = make_page(&lineage, 7, 0, 0xAB)?;
+
+        let (active, dirty) = coordinator
+            .stage_page_write(active, page, &mut log)
+            .map_err(|_| TestError("stage rejected"))?;
+
+        assert_eq!(active.transaction_id(), transaction_id);
+        assert_eq!(dirty.transaction_id(), transaction_id);
+        assert_eq!(dirty.address().number().get(), 7);
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::Active)
+        );
+        assert_eq!(log.appended_pages, vec![(transaction_id, 7)]);
+        assert!(log.flushed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn two_pages_thread_active_then_commit_succeeds() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+
+        let first = make_page(&lineage, 1, 0, 0x01)?;
+        let (active, first_dirty) = coordinator
+            .stage_page_write(active, first, &mut log)
+            .map_err(|_| TestError("first stage rejected"))?;
+
+        let second = make_page(&lineage, 2, 0, 0x02)?;
+        let (active, second_dirty) = coordinator
+            .stage_page_write(active, second, &mut log)
+            .map_err(|_| TestError("second stage rejected"))?;
+
+        assert_ne!(
+            first_dirty.required_position().get(),
+            second_dirty.required_position().get()
+        );
+        assert_eq!(
+            log.appended_pages,
+            vec![(transaction_id, 1), (transaction_id, 2)]
+        );
+
+        let committed = coordinator
+            .commit(active, &mut log)
+            .map_err(|_| TestError("commit failed"))?;
+        assert_eq!(committed.transaction_id(), transaction_id);
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::Committed)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn second_image_for_same_page_is_rejected_before_append() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+
+        let first = make_page(&lineage, 12, 1, 0x12)?;
+        let (active, first_dirty) = coordinator
+            .stage_page_write(active, first, &mut log)
+            .map_err(|_| TestError("first stage rejected"))?;
+        let second = make_page(&lineage, 12, 2, 0x13)?;
+
+        let error = coordinator
+            .stage_page_write(active, second, &mut log)
+            .err()
+            .ok_or(TestError("expected duplicate-page rejection"))?;
+        let TransactionPageStageError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-append rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionPageStageRejectionReason::PageAlreadyStaged
+        );
+        assert_eq!(rejection.page().version(), PageVersion::new(2));
+        assert_eq!(rejection.page().image().bytes(), &[0x13]);
+        assert_eq!(log.appended_pages, vec![(transaction_id, 12)]);
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::Active)
+        );
+
+        let (active, _) = rejection.into_parts();
+        let committed = coordinator
+            .commit(active, &mut log)
+            .map_err(|_| TestError("commit after duplicate rejection failed"))?;
+        assert_eq!(committed.transaction_id(), transaction_id);
+        drop(first_dirty);
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_dirty_wrapper_before_commit_writes_nothing() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let store: FakeStore = FakeStore::new(lineage.clone());
+        let active = coordinator.begin()?;
+        let page = make_page(&lineage, 3, 0, 0x03)?;
+
+        let (_active, dirty) = coordinator
+            .stage_page_write(active, page, &mut log)
+            .map_err(|_| TestError("stage rejected"))?;
+        drop(dirty);
+
+        assert!(PageStore::<1>::lineage(&store).same_lineage(&lineage));
+        assert!(store.writes.is_empty());
+        assert!(log.flushed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_coordinator_retains_active_and_page() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut owner = open_coordinator(&lineage)?;
+        let mut other = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let foreign = other.begin()?;
+        let transaction_id = foreign.transaction_id();
+        let page = make_page(&lineage, 4, 0, 0x04)?;
+
+        let error = owner
+            .stage_page_write(foreign, page, &mut log)
+            .err()
+            .ok_or(TestError("expected rejection"))?;
+        let TransactionPageStageError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-append rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionPageStageRejectionReason::ForeignCoordinator
+        );
+        assert_eq!(rejection.transaction_id(), transaction_id);
+        assert_eq!(rejection.page().address().number().get(), 4);
+        assert!(log.appended_pages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_log_lineage_retains_active_and_page() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let other_lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(other_lineage);
+        let active = coordinator.begin()?;
+        let page = make_page(&lineage, 5, 0, 0x05)?;
+
+        let error = coordinator
+            .stage_page_write(active, page, &mut log)
+            .err()
+            .ok_or(TestError("expected rejection"))?;
+        let TransactionPageStageError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-append rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionPageStageRejectionReason::ForeignLogLineage
+        );
+        assert!(log.appended_pages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_page_lineage_retains_active_and_page() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign_page_lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let active = coordinator.begin()?;
+        let page = make_page(&foreign_page_lineage, 6, 0, 0x06)?;
+
+        let error = coordinator
+            .stage_page_write(active, page, &mut log)
+            .err()
+            .ok_or(TestError("expected rejection"))?;
+        let TransactionPageStageError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-append rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionPageStageRejectionReason::ForeignPageLineage
+        );
+        assert!(log.appended_pages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_mismatch_retains_active_and_page() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        // Drive the registry out of Active without consuming the token.
+        if let Some(status) = coordinator.lifecycles.get_mut(&transaction_id) {
+            *status = TransactionLifecycleStatus::Committed;
+        }
+        let page = make_page(&lineage, 8, 0, 0x08)?;
+
+        let error = coordinator
+            .stage_page_write(active, page, &mut log)
+            .err()
+            .ok_or(TestError("expected rejection"))?;
+        let TransactionPageStageError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-append rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionPageStageRejectionReason::LifecycleMismatch {
+                actual: Some(TransactionLifecycleStatus::Committed)
+            }
+        );
+        assert!(log.appended_pages.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn append_source_failure_is_terminal_page_indeterminate() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        log.append_page_fault = Some(FakeFault("append boom"));
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        let page = make_page(&lineage, 9, 0, 0x09)?;
+
+        let error = coordinator
+            .stage_page_write(active, page, &mut log)
+            .err()
+            .ok_or(TestError("expected terminal error"))?;
+        let TransactionPageStageError::Append(append) = error else {
+            return Err(TestError("expected append error"));
+        };
+        assert_eq!(append.transaction_id(), transaction_id);
+        assert_eq!(append.cause(), &FakeFault("append boom"));
+        assert_eq!(append.page().address().number().get(), 9);
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::PageAppendIndeterminate)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_returned_position_is_terminal_and_blocks_commit_and_resolve() -> Result<(), TestError>
+    {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        log.foreign_append_lineage = Some(LogLineage::new());
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        let page = make_page(&lineage, 10, 0, 0x0A)?;
+
+        let error = coordinator
+            .stage_page_write(active, page, &mut log)
+            .err()
+            .ok_or(TestError("expected terminal error"))?;
+        let TransactionPageStageError::InvalidEvidence(evidence) = error else {
+            return Err(TestError("expected invalid evidence"));
+        };
+        assert_eq!(evidence.transaction_id(), transaction_id);
+        assert_eq!(
+            evidence.reason(),
+            StagePageWriteEvidenceErrorReason::ForeignPosition
+        );
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::PageAppendIndeterminate)
+        );
+
+        // Commit is impossible without an active token (it was consumed on the
+        // terminal path), and resolve must not reinterpret the distinct
+        // page-append phase as a commit-indeterminate attempt.
+        let indeterminate = IndeterminateTransaction {
+            transaction_id,
+            coordinator_identity: Arc::clone(&coordinator.identity),
+            log_lineage: lineage.clone(),
+        };
+        let mut recovery = TestRecoverySource {
+            lineage: lineage.clone(),
+            calls: 0,
+        };
+        let resolution_error = coordinator
+            .resolve(indeterminate, &mut recovery)
+            .err()
+            .ok_or(TestError("resolve should reject page-append phase"))?;
+        assert_eq!(
+            resolution_error.failure(),
+            &TransactionResolutionFailure::LifecycleMismatch {
+                actual: Some(TransactionLifecycleStatus::PageAppendIndeterminate)
+            }
+        );
+        assert_eq!(recovery.calls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn append_time_lineage_rotation_is_terminal_page_indeterminate() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        log.rotate_after_append = Some(LogLineage::new());
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        let page = make_page(&lineage, 11, 0, 0x0B)?;
+
+        let error = coordinator
+            .stage_page_write(active, page, &mut log)
+            .err()
+            .ok_or(TestError("expected terminal error"))?;
+        let TransactionPageStageError::InvalidEvidence(evidence) = error else {
+            return Err(TestError("expected invalid evidence"));
+        };
+        assert_eq!(
+            evidence.reason(),
+            StagePageWriteEvidenceErrorReason::LogLineageChanged
+        );
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::PageAppendIndeterminate)
+        );
+        Ok(())
+    }
+
+    fn stage_and_commit(
+        lineage: &LogLineage,
+    ) -> Result<
+        (
+            TransactionId,
+            CommittedTransaction,
+            TransactionDirtyPage<1>,
+            FakeLog,
+        ),
+        TestError,
+    > {
+        let mut coordinator = open_coordinator(lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        let page = make_page(lineage, 21, 0, 0x21)?;
+        let (active, dirty) = coordinator
+            .stage_page_write(active, page, &mut log)
+            .map_err(|_| TestError("stage rejected"))?;
+        let committed = coordinator
+            .commit(active, &mut log)
+            .map_err(|_| TestError("commit failed"))?;
+        Ok((transaction_id, committed, dirty, log))
+    }
+
+    #[test]
+    fn committed_flush_preserves_order_and_returns_clean_page() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let (transaction_id, committed, dirty, mut log) = stage_and_commit(&lineage)?;
+        let page_position = dirty.required_position().get();
+        assert!(committed.log_position().get() > page_position);
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        log.events = Some(Rc::clone(&events));
+        let mut store = FakeStore::new(lineage.clone());
+        store.events = Some(Rc::clone(&events));
+
+        let clean = flush_committed_page(&committed, &mut log, &mut store, dirty)
+            .map_err(|_| TestError("committed flush failed"))?;
+
+        assert_eq!(clean.transaction_id(), transaction_id);
+        assert_eq!(clean.required_position().get(), page_position);
+        assert_eq!(
+            events.borrow().as_slice(),
+            &[
+                FlushEvent::Flush(page_position),
+                FlushEvent::Write(page_position)
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_flush_wrong_transaction_retains_wrapper() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+
+        let page_owner = coordinator.begin()?;
+        let page = make_page(&lineage, 30, 0, 0x30)?;
+        let (_page_owner, dirty) = coordinator
+            .stage_page_write(page_owner, page, &mut log)
+            .map_err(|_| TestError("stage rejected"))?;
+
+        let committer = coordinator.begin()?;
+        let committed = coordinator
+            .commit(committer, &mut log)
+            .map_err(|_| TestError("commit failed"))?;
+        assert_ne!(committed.transaction_id(), dirty.transaction_id());
+
+        let mut flush_log = FakeLog::new(lineage.clone());
+        let mut store = FakeStore::new(lineage.clone());
+        let error = flush_committed_page(&committed, &mut flush_log, &mut store, dirty)
+            .err()
+            .ok_or(TestError("expected rejection"))?;
+        let TransactionCommittedFlushError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-port rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionCommittedFlushRejectionReason::WrongTransaction
+        );
+        assert_eq!(rejection.page().address().number().get(), 30);
+        assert!(flush_log.flushed.is_empty());
+        assert!(store.writes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_flush_foreign_commit_lineage_retains_wrapper() -> Result<(), TestError> {
+        // Two coordinators over different lineages issue the same TransactionId,
+        // so identity equality alone would wrongly accept the flush.
+        let page_lineage = LogLineage::new();
+        let commit_lineage = LogLineage::new();
+
+        let mut page_coordinator = open_coordinator(&page_lineage)?;
+        let mut page_log = FakeLog::new(page_lineage.clone());
+        let page_active = page_coordinator.begin()?;
+        let page = make_page(&page_lineage, 31, 0, 0x31)?;
+        let (_page_active, dirty) = page_coordinator
+            .stage_page_write(page_active, page, &mut page_log)
+            .map_err(|_| TestError("stage rejected"))?;
+
+        let mut commit_coordinator = open_coordinator(&commit_lineage)?;
+        let mut commit_log = FakeLog::new(commit_lineage.clone());
+        let commit_active = commit_coordinator.begin()?;
+        let committed = commit_coordinator
+            .commit(commit_active, &mut commit_log)
+            .map_err(|_| TestError("commit failed"))?;
+        assert_eq!(committed.transaction_id(), dirty.transaction_id());
+
+        let mut flush_log = FakeLog::new(page_lineage.clone());
+        let mut store = FakeStore::new(page_lineage.clone());
+        let error = flush_committed_page(&committed, &mut flush_log, &mut store, dirty)
+            .err()
+            .ok_or(TestError("expected rejection"))?;
+        let TransactionCommittedFlushError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-port rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionCommittedFlushRejectionReason::ForeignCommitLineage
+        );
+        assert!(flush_log.flushed.is_empty());
+        assert!(store.writes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_flush_position_not_after_page_retains_wrapper() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut coordinator = open_coordinator(&lineage)?;
+        let mut log = FakeLog::new(lineage.clone());
+        // Force the page append and the commit append onto the same position so
+        // the strict-after check rejects an equal position.
+        log.next_position = 4;
+        let active = coordinator.begin()?;
+        let page = make_page(&lineage, 32, 0, 0x32)?;
+        let (active, dirty) = coordinator
+            .stage_page_write(active, page, &mut log)
+            .map_err(|_| TestError("stage rejected"))?;
+        assert_eq!(dirty.required_position().get(), 4);
+        log.next_position = 4;
+        let committed = coordinator
+            .commit(active, &mut log)
+            .map_err(|_| TestError("commit failed"))?;
+        assert_eq!(committed.log_position().get(), 4);
+
+        let mut flush_log = FakeLog::new(lineage.clone());
+        let mut store = FakeStore::new(lineage.clone());
+        let error = flush_committed_page(&committed, &mut flush_log, &mut store, dirty)
+            .err()
+            .ok_or(TestError("expected rejection"))?;
+        let TransactionCommittedFlushError::Rejected(rejection) = error else {
+            return Err(TestError("expected pre-port rejection"));
+        };
+        assert_eq!(
+            rejection.reason(),
+            TransactionCommittedFlushRejectionReason::CommitPositionNotAfterPage
+        );
+        assert!(flush_log.flushed.is_empty());
+        assert!(store.writes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_flush_wal_failure_retains_retryable_dirty() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let (transaction_id, committed, dirty, mut flush_log) = stage_and_commit(&lineage)?;
+
+        flush_log.flush_fault = Some(FakeFault("flush boom"));
+        let mut store = FakeStore::new(lineage.clone());
+        let error = flush_committed_page(&committed, &mut flush_log, &mut store, dirty)
+            .err()
+            .ok_or(TestError("expected log flush error"))?;
+        let TransactionCommittedFlushError::LogFlush(log_error) = error else {
+            return Err(TestError("expected log flush error"));
+        };
+        assert_eq!(log_error.page().transaction_id(), transaction_id);
+        assert_eq!(log_error.cause(), &FakeFault("flush boom"));
+        assert!(store.writes.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_flush_store_failure_is_terminal_indeterminate() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let (transaction_id, committed, dirty, mut flush_log) = stage_and_commit(&lineage)?;
+        let page_position = dirty.required_position().get();
+
+        let mut store = FakeStore::new(lineage.clone());
+        store.write_fault = Some(FakeFault("store boom"));
+        let error = flush_committed_page(&committed, &mut flush_log, &mut store, dirty)
+            .err()
+            .ok_or(TestError("expected store error"))?;
+        let TransactionCommittedFlushError::StoreWrite(store_error) = error else {
+            return Err(TestError("expected store write error"));
+        };
+        assert_eq!(store_error.transaction_id(), transaction_id);
+        assert_eq!(store_error.cause(), &FakeFault("store boom"));
+        assert_eq!(store_error.page().required_position().get(), page_position);
+        // The commit first made the shared prefix durable, then the page path
+        // repeated the lower fence before the store failed.
+        assert_eq!(flush_log.flushed.last(), Some(&page_position));
         Ok(())
     }
 }

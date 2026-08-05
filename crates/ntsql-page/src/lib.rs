@@ -401,6 +401,15 @@ impl<const N: usize> StagePageWriteEvidenceError<N> {
     pub const fn reason(&self) -> StagePageWriteEvidenceErrorReason {
         self.reason
     }
+
+    /// Returns the owned terminal page state for downstream composition.
+    ///
+    /// The returned value preserves indeterminacy exactly and offers no path
+    /// back to unlogged, dirty, clean, or retryable state.
+    #[must_use]
+    pub fn into_page(self) -> IndeterminatePageLogAppend<N> {
+        self.page
+    }
 }
 
 impl<const N: usize> fmt::Display for StagePageWriteEvidenceError<N> {
@@ -2246,6 +2255,33 @@ mod tests {
             Some(&foreign_lineage.position(17))
         );
         assert_eq!(error.page().address().number().get(), 24);
+    }
+
+    #[test]
+    fn evidence_error_into_page_preserves_terminal_state() {
+        let trace = CallTrace::new();
+        let lineage = LogLineage::new();
+        let foreign_lineage = LogLineage::new();
+        let page = unlogged_page(&lineage, 26, 18, [55_u8, 56]);
+        let mut log = FakeLog::new(lineage.clone(), lineage.position(21), &trace);
+        log.append_position = foreign_lineage.position(23);
+
+        let result = stage_page_write(&mut log, page);
+        assert!(matches!(
+            &result,
+            Err(StagePageWriteError::InvalidEvidence(_))
+        ));
+        let Err(StagePageWriteError::InvalidEvidence(error)) = result else {
+            return;
+        };
+        let terminal = error.into_page();
+        assert_eq!(terminal.address().number().get(), 26);
+        assert_eq!(terminal.version(), PageVersion::new(18));
+        assert_eq!(terminal.image().bytes(), &[55_u8, 56]);
+        assert_eq!(
+            terminal.observed_position(),
+            Some(&foreign_lineage.position(23))
+        );
     }
 
     #[test]

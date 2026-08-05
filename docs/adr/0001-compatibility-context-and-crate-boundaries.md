@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-04
 - Issue: #32
-- Extended by: ADR 0002, ADR 0004
+- Extended by: ADR 0002, ADR 0004, ADR 0005
 
 ## Context
 
@@ -60,6 +60,8 @@ ntsql-contract --------> ntsql-compatibility
 
 ntsql-testkit ----------> ntsql-contract
 
+ntsql-wal --------------> standard library only
+
 ntsql-architecture-check -------> standard library only
 ```
 
@@ -74,6 +76,11 @@ verification through injected ports, requires a plan for all seven dimensions,
 and returns only locally validated `ConformanceRecord` values. It does not own a
 real product oracle, cryptographic implementation, filesystem or network
 access, an ambient clock, or external fixtures.
+
+`ntsql-wal` owns the I/O-free ordering invariant that a commit record is
+appended and its exact assigned position is flushed before a durable
+acknowledgement can exist. It owns no filesystem, byte format, transaction
+semantics, recovery policy, or client diagnostic.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and

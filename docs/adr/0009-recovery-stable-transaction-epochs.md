@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #66
 - Extends: ADR 0001, ADR 0007, ADR 0008
-- Extended by: ADR 0010, ADR 0011
+- Extended by: ADR 0010, ADR 0011, ADR 0012
 
 ## Context
 
@@ -62,9 +62,10 @@ epochs at one.
 
 ADR 0011 closes the runtime raw-position gap: `LogSequenceNumber` now carries
 `LogLineage`, has no public raw constructor, and is non-`Copy`. This still does
-not define a persistent lineage representation. Filesystem-persisted lineage and
-epoch state plus validation of a production epoch source remain explicit
-follow-up work.
+not define a byte representation. ADR 0012 supplies the stable lineage identity
+that a future format must encode. Filesystem persistence of that ID and epoch
+state plus validation of a production epoch source remain explicit follow-up
+work.
 
 ## Compatibility Boundary
 

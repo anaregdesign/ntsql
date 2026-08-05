@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #72
 - Extends: ADR 0001, ADR 0005, ADR 0007, ADR 0008, ADR 0009, ADR 0010
+- Extended by: ADR 0012
 
 ## Context
 
@@ -22,7 +23,7 @@ fail open to accidental cross-log substitution.
 
 `LogSequenceNumber` now owns:
 
-- a cloned opaque runtime `LogLineage`; and
+- a cloned opaque `LogLineage` capability; and
 - the adapter-assigned numeric position.
 
 It is cloneable but not `Copy`, has no public raw numeric constructor, and is
@@ -62,16 +63,16 @@ cannot alias newly assigned numeric values.
 
 ## Trust and Persistence Boundary
 
-`LogLineage` is still an in-process `Arc` identity. Code holding a lineage
-capability can deliberately construct arbitrary numeric positions for that
-lineage, and a malicious adapter can violate its port contract. Branding prevents
-accidental foreign-lineage substitution and makes validation explicit; it is not
-an authorization or cryptographic mechanism.
+ADR 0012 extends `LogLineage` with an adapter-supplied persistent identity while
+retaining ephemeral `Arc` identity. Code holding either lineage capability can
+deliberately construct arbitrary numeric positions for that lineage, and a
+malicious adapter can violate its port contract. Branding prevents accidental
+foreign-lineage substitution and makes validation explicit; it is not an
+authorization or cryptographic mechanism.
 
-No runtime pointer identity or branded position has a persistent byte
-representation. A filesystem adapter must define, persist, validate, and recover
-its own stable lineage identifier before translating stored numeric positions
-into these runtime capabilities.
+No lineage ID or branded position has a persistent byte representation yet. A
+filesystem adapter must define, persist, validate, and recover its stable ID
+before translating stored numeric positions into these runtime capabilities.
 
 ## Compatibility Boundary
 

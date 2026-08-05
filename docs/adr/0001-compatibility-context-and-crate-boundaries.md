@@ -4,7 +4,7 @@
 - Date: 2026-08-04
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
-  ADR 0010, ADR 0011
+  ADR 0010, ADR 0011, ADR 0012
 
 ## Context
 
@@ -87,7 +87,9 @@ appended and its exact assigned position is flushed before a durable
 acknowledgement can exist. It owns no filesystem, byte format, transaction
 semantics, recovery policy, or client diagnostic. Runtime log positions carry
 their originating `LogLineage`; equal numeric positions from independent logs
-are not equal or interchangeable.
+are not equal or interchangeable. A trusted outer adapter may supply a stable
+nonzero lineage ID so the same capability can be reconstructed after runtime
+pointer identity is lost.
 
 `ntsql-transaction` owns I/O-free transaction coordination and lifecycle state.
 Its coordinator requires an injected persistence-lineage epoch, issues monotonic

@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #68
 - Extends: ADR 0001, ADR 0005, ADR 0007, ADR 0008, ADR 0009
-- Extended by: ADR 0011
+- Extended by: ADR 0011, ADR 0012
 
 ## Context
 
@@ -73,10 +73,10 @@ source can still return a false pair; this is an adapter contract violation.
 
 ADR 0011 binds `LogSequenceNumber` to the runtime `LogLineage` and requires
 recovery presence to match both the source lineage and position lineage.
-Neither value is persisted across an operating-system process. This ADR does not
-reconstruct coordinator registries after process loss, define a recovery scan
-cutoff for a filesystem log, or validate production storage. Those require a
-persistent lineage and format design.
+ADR 0012 allows those capabilities to be reconstructed from a trusted stable ID,
+but does not persist or encode it. This ADR does not reconstruct coordinator
+registries after process loss, define a recovery scan cutoff for a filesystem
+log, or validate production storage. Those require a persistent format design.
 
 ## Compatibility Boundary
 

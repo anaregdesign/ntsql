@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #63
 - Extends: ADR 0001, ADR 0005, ADR 0006, ADR 0007
-- Extended by: ADR 0009, ADR 0010, ADR 0011
+- Extended by: ADR 0009, ADR 0010, ADR 0011, ADR 0012
 
 ## Context
 
@@ -59,6 +59,12 @@ The same log lineage is retained so coordinators opened before and after the
 model transformation remain bound to this lineage rather than an independent
 log.
 
+ADR 0012 adds a separate `reopen` transformation for logs created with a
+`PersistentLogId`. It validates that ID before mutation, discards the volatile
+suffix, clears the transient fault, and reconstructs every durable position from
+a fresh lineage value carrying the same ID. Epoch and position high-water marks
+remain unchanged. An ephemeral log rejects reopen without discarding state.
+
 ## Ambiguity and Recovery Boundary
 
 The adapter makes the existing ambiguity contract observable:
@@ -99,6 +105,8 @@ remain blocked by the legal contract.
   are idempotent.
 - Equal numeric positions from independent logs are unequal, and a foreign one
   is rejected before record lookup, fault consumption, or durability mutation.
+- Persistent reopen preserves durable records and allocator high-water marks;
+  ephemeral reopen fails before changing records or faults.
 - Position exhaustion and attempts to replace an armed fault return typed
   errors.
 - Resolution distinguishes the four fault boundaries, retains an indeterminate

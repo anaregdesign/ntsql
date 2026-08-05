@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -1540,8 +1540,16 @@ fn validate_sbom(path: &Path) -> Result<(), Box<dyn Error>> {
     if !metadata.is_file() || metadata.len() == 0 {
         return Err(invalid_data("SBOM must be a non-empty regular file"));
     }
+    let sbom_directory = path
+        .parent()
+        .ok_or_else(|| invalid_data("SBOM path requires a parent directory"))?
+        .canonicalize()?;
 
     let sbom: Value = read_json(path)?;
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let workspace_packages = workspace_package_inventory(&read_cargo_metadata(&workspace_root)?)?;
     require_string(&sbom, "/bomFormat", "CycloneDX")?;
     require_string(&sbom, "/specVersion", "1.5")?;
     require_nonempty_string(&sbom, "/serialNumber")?;
@@ -1562,38 +1570,176 @@ fn validate_sbom(path: &Path) -> Result<(), Box<dyn Error>> {
         return Err(invalid_data("SBOM must contain dependency components"));
     }
     for component in components {
-        let name = component
-            .get("name")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| invalid_data("every SBOM component requires a name"))?;
-        component
-            .get("version")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| invalid_data(format!("SBOM component {name} requires a version")))?;
-        let licenses = component
-            .get("licenses")
-            .and_then(Value::as_array)
-            .filter(|values| !values.is_empty())
-            .ok_or_else(|| invalid_data(format!("SBOM component {name} requires a license")))?;
-        if !licenses.iter().all(valid_license_entry) {
-            return Err(invalid_data(format!(
-                "SBOM component {name} has an invalid license entry"
-            )));
-        }
-        let hashes = component
-            .get("hashes")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid_data(format!("SBOM component {name} requires hashes")))?;
-        if !hashes.iter().any(valid_sha256_entry) {
-            return Err(invalid_data(format!(
-                "SBOM component {name} requires a SHA-256 hash"
-            )));
-        }
+        validate_sbom_component(component, &workspace_packages, &sbom_directory)?;
     }
 
     println!("SBOM governance ok ({} components)", components.len());
+    Ok(())
+}
+
+struct WorkspacePackageIdentity {
+    name: String,
+    version: String,
+    source_directory: PathBuf,
+}
+
+fn workspace_package_inventory(
+    metadata: &Value,
+) -> Result<BTreeMap<String, WorkspacePackageIdentity>, Box<dyn Error>> {
+    let workspace_members = metadata
+        .get("workspace_members")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_data("cargo metadata requires workspace_members"))?;
+    let packages = metadata
+        .get("packages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_data("cargo metadata requires packages"))?;
+    let mut inventory = BTreeMap::new();
+
+    for member in workspace_members {
+        let package_id = member
+            .as_str()
+            .ok_or_else(|| invalid_data("cargo metadata workspace member must be a string"))?;
+        let package = packages
+            .iter()
+            .find(|package| package.get("id").and_then(Value::as_str) == Some(package_id))
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "cargo metadata workspace member {package_id} has no package"
+                ))
+            })?;
+        let name = package
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "cargo metadata workspace package {package_id} requires a name"
+                ))
+            })?;
+        let version = package
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "cargo metadata workspace package {package_id} requires a version"
+                ))
+            })?;
+        let manifest_path = package
+            .get("manifest_path")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "cargo metadata workspace package {package_id} requires a manifest path"
+                ))
+            })?;
+        let source_directory = Path::new(manifest_path)
+            .parent()
+            .ok_or_else(|| {
+                invalid_data(format!(
+                    "cargo metadata workspace package {package_id} manifest requires a parent"
+                ))
+            })?
+            .canonicalize()?;
+        inventory.insert(
+            package_id.to_owned(),
+            WorkspacePackageIdentity {
+                name: name.to_owned(),
+                version: version.to_owned(),
+                source_directory,
+            },
+        );
+    }
+
+    Ok(inventory)
+}
+
+fn validate_sbom_component(
+    component: &Value,
+    workspace_packages: &BTreeMap<String, WorkspacePackageIdentity>,
+    sbom_directory: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let name = component
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid_data("every SBOM component requires a name"))?;
+    let version = component
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid_data(format!("SBOM component {name} requires a version")))?;
+    let licenses = component
+        .get("licenses")
+        .and_then(Value::as_array)
+        .filter(|values| !values.is_empty())
+        .ok_or_else(|| invalid_data(format!("SBOM component {name} requires a license")))?;
+    if !licenses.iter().all(valid_license_entry) {
+        return Err(invalid_data(format!(
+            "SBOM component {name} has an invalid license entry"
+        )));
+    }
+
+    let workspace_package =
+        component
+            .get("bom-ref")
+            .and_then(Value::as_str)
+            .and_then(|package_id| {
+                workspace_packages
+                    .get(package_id)
+                    .map(|package| (package_id, package))
+            });
+    if let Some((package_id, package)) = workspace_package {
+        if name != package.name || version != package.version {
+            return Err(invalid_data(format!(
+                "SBOM workspace component {package_id} does not match Cargo metadata"
+            )));
+        }
+        let purl = component
+            .get("purl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                invalid_data(format!("SBOM workspace component {name} requires a purl"))
+            })?;
+        let purl_prefix = format!("pkg:cargo/{name}@{version}?download_url=file://");
+        let source_path = purl.strip_prefix(&purl_prefix).ok_or_else(|| {
+            invalid_data(format!(
+                "SBOM workspace component {name} purl does not match Cargo metadata"
+            ))
+        })?;
+        if source_path.is_empty() || source_path.contains(['?', '#', '&']) {
+            return Err(invalid_data(format!(
+                "SBOM workspace component {name} has an invalid file purl"
+            )));
+        }
+        let component_source =
+            sbom_directory
+                .join(source_path)
+                .canonicalize()
+                .map_err(|error| {
+                    invalid_data(format!(
+                        "SBOM workspace component {name} source cannot be inspected: {error}"
+                    ))
+                })?;
+        if component_source != package.source_directory {
+            return Err(invalid_data(format!(
+                "SBOM workspace component {name} source does not match Cargo metadata"
+            )));
+        }
+        return Ok(());
+    }
+
+    let hashes = component
+        .get("hashes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_data(format!("SBOM component {name} requires hashes")))?;
+    if !hashes.iter().any(valid_sha256_entry) {
+        return Err(invalid_data(format!(
+            "SBOM component {name} requires a SHA-256 hash"
+        )));
+    }
     Ok(())
 }
 
@@ -1801,6 +1947,71 @@ mod tests {
         assert!(missing_lock_error.contains("has no exact crates.io package"));
         assert!(unknown_error.contains("unknown direct dependency provenance record"));
         assert!(unsupported_source_error.contains("unsupported external source"));
+        Ok(())
+    }
+
+    #[test]
+    fn sbom_workspace_components_require_exact_cargo_identity() -> Result<(), Box<dyn Error>> {
+        let test_root = temporary_test_root("sbom-workspace-identity")?;
+        let package_directory = test_root.join("crates/example");
+        let sbom_directory = test_root.join("crates/consumer");
+        fs::create_dir_all(&package_directory)?;
+        fs::create_dir_all(&sbom_directory)?;
+        let package_id = format!("path+file://{}#0.1.0", package_directory.to_string_lossy());
+        let metadata = serde_json::json!({
+            "workspace_members": [&package_id],
+            "packages": [{
+                "id": &package_id,
+                "name": "example",
+                "version": "0.1.0",
+                "manifest_path": package_directory.join("Cargo.toml")
+            }]
+        });
+        let inventory = workspace_package_inventory(&metadata)?;
+        let component = serde_json::json!({
+            "bom-ref": &package_id,
+            "name": "example",
+            "version": "0.1.0",
+            "purl": "pkg:cargo/example@0.1.0?download_url=file://../example",
+            "licenses": [{"expression": "Apache-2.0"}]
+        });
+
+        validate_sbom_component(&component, &inventory, &sbom_directory)?;
+
+        let mut mismatched_component = component;
+        mismatched_component["version"] = Value::String("0.2.0".to_owned());
+        let mismatch_error = result_error(validate_sbom_component(
+            &mismatched_component,
+            &inventory,
+            &sbom_directory,
+        ))?;
+        fs::remove_dir_all(&test_root)?;
+        assert!(mismatch_error.contains("does not match Cargo metadata"));
+        Ok(())
+    }
+
+    #[test]
+    fn sbom_external_components_require_sha256() -> Result<(), Box<dyn Error>> {
+        let inventory = BTreeMap::new();
+        let mut component = serde_json::json!({
+            "bom-ref": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.219",
+            "name": "serde",
+            "version": "1.0.219",
+            "licenses": [{"license": {"id": "MIT"}}]
+        });
+
+        let missing_hash_error = result_error(validate_sbom_component(
+            &component,
+            &inventory,
+            Path::new("."),
+        ))?;
+        assert!(missing_hash_error.contains("requires hashes"));
+
+        component["hashes"] = serde_json::json!([{
+            "alg": "SHA-256",
+            "content": "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+        }]);
+        validate_sbom_component(&component, &inventory, Path::new("."))?;
         Ok(())
     }
 

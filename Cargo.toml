@@ -17,9 +17,9 @@ repository = "https://github.com/anaregdesign/ntsql"
 rust-version = "1.97.1"
 
 [workspace.dependencies]
-ntsql-compatibility = { path = "crates/ntsql-compatibility" }
-ntsql-contract = { path = "crates/ntsql-contract" }
-ntsql-wal = { path = "crates/ntsql-wal" }
+ntsql-compatibility = { version = "0.1.0", path = "crates/ntsql-compatibility" }
+ntsql-contract = { version = "0.1.0", path = "crates/ntsql-contract" }
+ntsql-wal = { version = "0.1.0", path = "crates/ntsql-wal" }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.142", default-features = false, features = ["arbitrary_precision", "std"] }
 

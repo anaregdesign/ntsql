@@ -8,7 +8,7 @@ use ntsql_page::{
 };
 use ntsql_transaction::{
     DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
-    TransactionRecoverySource,
+    TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -78,7 +78,54 @@ impl<const N: usize> InMemoryPageWriteRecord<N> {
     }
 }
 
-/// Safely inspectable payload of one physically appended in-memory log record.
+/// Immutable snapshot of one physically appended transaction-owned page image.
+///
+/// This owns the exact owning [`TransactionId`] alongside the same
+/// [`InMemoryPageWriteRecord`] payload that a nontransactional page record
+/// snapshots. It has no public constructor: safe downstream code cannot forge a
+/// transaction-owned page record, and only the adapter's private append path
+/// builds one from a domain [`TransactionPageWriteRecord`].
+///
+/// ```compile_fail
+/// use ntsql_storage_memory::{InMemoryPageWriteRecord, InMemoryTransactionPageWriteRecord};
+/// use ntsql_transaction::TransactionId;
+///
+/// fn cannot_construct(transaction_id: TransactionId, page: InMemoryPageWriteRecord<1>) {
+///     let _forged = InMemoryTransactionPageWriteRecord {
+///         transaction_id,
+///         page,
+///     };
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InMemoryTransactionPageWriteRecord<const N: usize = 1> {
+    transaction_id: TransactionId,
+    page: InMemoryPageWriteRecord<N>,
+}
+
+impl<const N: usize> InMemoryTransactionPageWriteRecord<N> {
+    fn from_record(record: &TransactionPageWriteRecord<'_, N>) -> Self {
+        Self {
+            transaction_id: record.transaction_id(),
+            page: InMemoryPageWriteRecord::from_unlogged(record.page()),
+        }
+    }
+
+    /// Returns the transaction identity that owns this page write.
+    ///
+    /// This is a page-ownership tag, not a durable commit. It never implies the
+    /// owning transaction committed.
+    #[must_use]
+    pub const fn transaction_id(&self) -> TransactionId {
+        self.transaction_id
+    }
+
+    /// Returns the copied full page-image payload.
+    #[must_use]
+    pub const fn page_write(&self) -> &InMemoryPageWriteRecord<N> {
+        &self.page
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InMemoryLogRecordKind<const N: usize = 1> {
     /// One transaction commit record.
@@ -86,26 +133,59 @@ pub enum InMemoryLogRecordKind<const N: usize = 1> {
         /// The caller-owned transaction identity.
         transaction_id: TransactionId,
     },
-    /// One complete page-image write.
+    /// One complete nontransactional page-image write.
     PageWrite(InMemoryPageWriteRecord<N>),
+    /// One complete transaction-owned page-image write.
+    TransactionPageWrite(InMemoryTransactionPageWriteRecord<N>),
 }
 
 impl<const N: usize> InMemoryLogRecordKind<N> {
     /// Returns the transaction identity when this record is a commit.
+    ///
+    /// This is commit-only on purpose: a transaction-owned page record returns
+    /// `None` so [`TransactionRecoverySource`] scans of this accessor never
+    /// mistake page ownership for a durable commit. Use
+    /// [`Self::page_owner_transaction_id`] to inspect page ownership.
     #[must_use]
     pub const fn transaction_id(&self) -> Option<TransactionId> {
         match self {
             Self::TransactionCommit { transaction_id } => Some(*transaction_id),
-            Self::PageWrite(_) => None,
+            Self::PageWrite(_) | Self::TransactionPageWrite(_) => None,
         }
     }
 
-    /// Returns the full page-image payload when this record is a page write.
+    /// Returns the full page-image payload for both page-write record kinds.
+    ///
+    /// A commit record returns `None`. Both the nontransactional and the
+    /// transaction-owned page records return their identical page payload.
     #[must_use]
     pub const fn page_write(&self) -> Option<&InMemoryPageWriteRecord<N>> {
         match self {
             Self::TransactionCommit { .. } => None,
             Self::PageWrite(record) => Some(record),
+            Self::TransactionPageWrite(record) => Some(record.page_write()),
+        }
+    }
+
+    /// Returns the owning transaction identity only for a transaction-owned page
+    /// record.
+    ///
+    /// A commit record and a nontransactional page record both return `None`.
+    /// This owner tag is never a durable commit signal.
+    #[must_use]
+    pub const fn page_owner_transaction_id(&self) -> Option<TransactionId> {
+        match self {
+            Self::TransactionCommit { .. } | Self::PageWrite(_) => None,
+            Self::TransactionPageWrite(record) => Some(record.transaction_id()),
+        }
+    }
+
+    /// Returns the typed transaction-owned page record when present.
+    #[must_use]
+    pub const fn transaction_page_write(&self) -> Option<&InMemoryTransactionPageWriteRecord<N>> {
+        match self {
+            Self::TransactionCommit { .. } | Self::PageWrite(_) => None,
+            Self::TransactionPageWrite(record) => Some(record),
         }
     }
 }
@@ -131,21 +211,43 @@ impl<const N: usize> InMemoryLogRecord<N> {
     }
 
     /// Returns the transaction identity when this record is a commit.
+    ///
+    /// This stays commit-only: a transaction-owned page record returns `None`
+    /// here. Recovery commit scans must never observe page ownership through
+    /// this accessor.
     #[must_use]
     pub const fn transaction_id(&self) -> Option<TransactionId> {
         self.kind.transaction_id()
     }
 
-    /// Returns the full page-image payload when this record is a page write.
+    /// Returns the full page-image payload for either page-write record kind.
     #[must_use]
     pub const fn page_write(&self) -> Option<&InMemoryPageWriteRecord<N>> {
         self.kind.page_write()
     }
 
+    /// Returns the owning transaction identity only for a transaction-owned page
+    /// record.
+    ///
+    /// A commit record and a nontransactional page record both return `None`.
+    #[must_use]
+    pub const fn page_owner_transaction_id(&self) -> Option<TransactionId> {
+        self.kind.page_owner_transaction_id()
+    }
+
+    /// Returns the typed transaction-owned page record when present.
+    #[must_use]
+    pub const fn transaction_page_write(&self) -> Option<&InMemoryTransactionPageWriteRecord<N>> {
+        self.kind.transaction_page_write()
+    }
+
     /// Projects a page record into adapter-neutral recovery evidence.
     ///
     /// Callers must select records from a commit log's durable prefix before
-    /// treating the result as durable. Transaction records return `Ok(None)`.
+    /// treating the result as durable. Both page-write record kinds project
+    /// their exact page payload; commit records return `Ok(None)`. The owning
+    /// transaction identity is intentionally not carried into the observation:
+    /// ADR 0019 reconciliation stays commit-agnostic and non-authorizing.
     pub fn page_recovery_observation(
         &self,
     ) -> Result<Option<DurablePageWalObservation<N>>, PageRecoveryObservationBytesError<N>> {
@@ -755,6 +857,22 @@ impl<const N: usize> PageLog<N> for InMemoryCommitLog<N> {
         }
         self.append_record(InMemoryLogRecordKind::PageWrite(
             InMemoryPageWriteRecord::from_unlogged(page),
+        ))
+    }
+}
+
+impl<const N: usize> TransactionPageLog<N> for InMemoryCommitLog<N> {
+    fn append_transaction_page(
+        &mut self,
+        record: &TransactionPageWriteRecord<'_, N>,
+    ) -> Result<LogSequenceNumber, Self::Error> {
+        if !self.lineage.same_lineage(record.page().address().lineage()) {
+            return Err(InMemoryCommitLogError::ForeignPageLineage(
+                record.page().address().number(),
+            ));
+        }
+        self.append_record(InMemoryLogRecordKind::TransactionPageWrite(
+            InMemoryTransactionPageWriteRecord::from_record(record),
         ))
     }
 }

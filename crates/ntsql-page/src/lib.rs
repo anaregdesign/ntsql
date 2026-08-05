@@ -1122,6 +1122,540 @@ where
     Ok(CleanPage::from_dirty(dirty))
 }
 
+/// Why an adapter-neutral page-recovery observation could not be constructed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageRecoveryObservationErrorReason {
+    /// Durable page WAL positions and stored required positions must be nonzero.
+    ZeroPosition,
+}
+
+/// Failed construction of one adapter-neutral page-recovery observation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PageRecoveryObservationError<const N: usize> {
+    page_number: PageNumber,
+    page_version: PageVersion,
+    image: PageImage<N>,
+    position: LogSequenceNumber,
+    reason: PageRecoveryObservationErrorReason,
+}
+
+impl<const N: usize> PageRecoveryObservationError<N> {
+    /// Returns the retained page number.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.page_number
+    }
+
+    /// Returns the retained page version.
+    #[must_use]
+    pub const fn page_version(&self) -> PageVersion {
+        self.page_version
+    }
+
+    /// Returns the retained page image.
+    #[must_use]
+    pub const fn image(&self) -> &PageImage<N> {
+        &self.image
+    }
+
+    /// Returns the retained lineage-bound position.
+    #[must_use]
+    pub const fn position(&self) -> &LogSequenceNumber {
+        &self.position
+    }
+
+    /// Returns the exact construction failure.
+    #[must_use]
+    pub const fn reason(&self) -> PageRecoveryObservationErrorReason {
+        self.reason
+    }
+
+    /// Returns every retained input.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        PageNumber,
+        PageVersion,
+        PageImage<N>,
+        LogSequenceNumber,
+        PageRecoveryObservationErrorReason,
+    ) {
+        (
+            self.page_number,
+            self.page_version,
+            self.image,
+            self.position,
+            self.reason,
+        )
+    }
+}
+
+impl<const N: usize> fmt::Display for PageRecoveryObservationError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason {
+            PageRecoveryObservationErrorReason::ZeroPosition => write!(
+                formatter,
+                "page {} recovery observation has zero as its WAL position",
+                self.page_number.get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for PageRecoveryObservationError<N> {}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PageRecoveryObservation<const N: usize> {
+    page_number: PageNumber,
+    page_version: PageVersion,
+    image: PageImage<N>,
+    position: LogSequenceNumber,
+}
+
+impl<const N: usize> PageRecoveryObservation<N> {
+    fn new(
+        page_number: PageNumber,
+        page_version: PageVersion,
+        image: PageImage<N>,
+        position: LogSequenceNumber,
+    ) -> Result<Self, PageRecoveryObservationError<N>> {
+        if position.get() == 0 {
+            return Err(PageRecoveryObservationError {
+                page_number,
+                page_version,
+                image,
+                position,
+                reason: PageRecoveryObservationErrorReason::ZeroPosition,
+            });
+        }
+        Ok(Self {
+            page_number,
+            page_version,
+            image,
+            position,
+        })
+    }
+}
+
+/// Adapter-neutral observation of one complete durable full-image page WAL
+/// record.
+///
+/// Construction validates only the repository-owned value shape. Calling code
+/// remains responsible for supplying records from an authoritative durable
+/// prefix.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DurablePageWalObservation<const N: usize> {
+    observation: PageRecoveryObservation<N>,
+}
+
+impl<const N: usize> DurablePageWalObservation<N> {
+    /// Constructs one observed durable full-image page WAL record.
+    pub fn new(
+        page_number: PageNumber,
+        page_version: PageVersion,
+        image: PageImage<N>,
+        position: LogSequenceNumber,
+    ) -> Result<Self, PageRecoveryObservationError<N>> {
+        PageRecoveryObservation::new(page_number, page_version, image, position)
+            .map(|observation| Self { observation })
+    }
+
+    /// Returns the observed page number.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.observation.page_number
+    }
+
+    /// Returns the observed page version.
+    #[must_use]
+    pub const fn page_version(&self) -> PageVersion {
+        self.observation.page_version
+    }
+
+    /// Returns the observed full page image.
+    #[must_use]
+    pub const fn image(&self) -> &PageImage<N> {
+        &self.observation.image
+    }
+
+    /// Returns the observed durable WAL position.
+    #[must_use]
+    pub const fn position(&self) -> &LogSequenceNumber {
+        &self.observation.position
+    }
+}
+
+/// Adapter-neutral observation of one current durable page-store snapshot.
+///
+/// The required position is evidence supplied by an adapter, not a replay
+/// permit or proof that the matching WAL record exists.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StoredPageSnapshotObservation<const N: usize> {
+    observation: PageRecoveryObservation<N>,
+}
+
+impl<const N: usize> StoredPageSnapshotObservation<N> {
+    /// Constructs one observed durable page-store snapshot.
+    pub fn new(
+        page_number: PageNumber,
+        page_version: PageVersion,
+        image: PageImage<N>,
+        required_position: LogSequenceNumber,
+    ) -> Result<Self, PageRecoveryObservationError<N>> {
+        PageRecoveryObservation::new(page_number, page_version, image, required_position)
+            .map(|observation| Self { observation })
+    }
+
+    /// Returns the observed page number.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.observation.page_number
+    }
+
+    /// Returns the observed page version.
+    #[must_use]
+    pub const fn page_version(&self) -> PageVersion {
+        self.observation.page_version
+    }
+
+    /// Returns the observed full page image.
+    #[must_use]
+    pub const fn image(&self) -> &PageImage<N> {
+        &self.observation.image
+    }
+
+    /// Returns the exact WAL position required by this stored snapshot.
+    #[must_use]
+    pub const fn required_position(&self) -> &LogSequenceNumber {
+        &self.observation.position
+    }
+}
+
+/// Allocation-free physical comparison of durable page WAL and page-store
+/// observations.
+///
+/// This value deliberately cannot become a page-write permit:
+///
+/// ```compile_fail
+/// use ntsql_page::{DurablePageReconciliation, PageWritePermit};
+///
+/// fn cannot_authorize_write(
+///     comparison: DurablePageReconciliation,
+/// ) -> PageWritePermit<'static> {
+///     comparison.into()
+/// }
+/// ```
+///
+/// It also cannot become a dirty page or replay command:
+///
+/// ```compile_fail
+/// use ntsql_page::{DirtyPage, DurablePageReconciliation};
+///
+/// fn cannot_create_dirty<const N: usize>(
+///     comparison: DurablePageReconciliation,
+/// ) -> DirtyPage<N> {
+///     comparison.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurablePageReconciliation {
+    /// Neither a stored snapshot nor a durable page WAL record was observed.
+    NoDurableState,
+    /// The stored snapshot exactly matches the latest durable page WAL record.
+    ExactCurrent {
+        /// Exact durable position shared by WAL and store observations.
+        durable_position: LogSequenceNumber,
+    },
+    /// The stored snapshot is backed by WAL but a later durable full image
+    /// exists.
+    StoreBehind {
+        /// Durable WAL position backing the current stored snapshot.
+        stored_position: LogSequenceNumber,
+        /// Highest observed durable page WAL position for this page.
+        latest_durable_position: LogSequenceNumber,
+    },
+    /// Durable page WAL state exists but no stored snapshot was observed.
+    StoreMissing {
+        /// Highest observed durable page WAL position for this page.
+        latest_durable_position: LogSequenceNumber,
+    },
+}
+
+/// Contradiction that prevents authoritative physical page reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurablePageReconciliationError {
+    /// The supplied snapshot belongs to another page.
+    UnexpectedSnapshotPage {
+        expected: PageNumber,
+        actual: PageNumber,
+    },
+    /// The supplied snapshot position belongs to another WAL lineage.
+    ForeignSnapshotLineage {
+        page_number: PageNumber,
+        position: LogSequenceNumber,
+    },
+    /// A supplied WAL observation belongs to another page.
+    UnexpectedWalPage {
+        expected: PageNumber,
+        actual: PageNumber,
+        position: LogSequenceNumber,
+    },
+    /// A supplied WAL observation belongs to another lineage.
+    ForeignWalLineage {
+        page_number: PageNumber,
+        position: LogSequenceNumber,
+    },
+    /// Two adjacent observations reuse one position with identical payload.
+    DuplicateWalPosition {
+        page_number: PageNumber,
+        position: LogSequenceNumber,
+    },
+    /// Two adjacent observations reuse one position with different payload.
+    ContradictoryWalPosition {
+        page_number: PageNumber,
+        position: LogSequenceNumber,
+    },
+    /// WAL observations were not supplied in strictly increasing durable order.
+    NonAdvancingWalPosition {
+        page_number: PageNumber,
+        previous: LogSequenceNumber,
+        actual: LogSequenceNumber,
+    },
+    /// The snapshot's required position has no matching durable page WAL
+    /// observation.
+    SnapshotPositionUnbacked {
+        page_number: PageNumber,
+        position: LogSequenceNumber,
+    },
+    /// Snapshot metadata or bytes contradict the WAL observation at the same
+    /// position.
+    SnapshotPayloadContradiction {
+        page_number: PageNumber,
+        position: LogSequenceNumber,
+    },
+}
+
+impl fmt::Display for DurablePageReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedSnapshotPage { expected, actual } => write!(
+                formatter,
+                "expected page {} but snapshot describes page {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::ForeignSnapshotLineage {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} snapshot position {} belongs to another WAL lineage",
+                page_number.get(),
+                position.get()
+            ),
+            Self::UnexpectedWalPage {
+                expected,
+                actual,
+                position,
+            } => write!(
+                formatter,
+                "expected page {} but WAL position {} describes page {}",
+                expected.get(),
+                position.get(),
+                actual.get()
+            ),
+            Self::ForeignWalLineage {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} WAL position {} belongs to another lineage",
+                page_number.get(),
+                position.get()
+            ),
+            Self::DuplicateWalPosition {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} repeats WAL position {} with identical payload",
+                page_number.get(),
+                position.get()
+            ),
+            Self::ContradictoryWalPosition {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} repeats WAL position {} with contradictory payload",
+                page_number.get(),
+                position.get()
+            ),
+            Self::NonAdvancingWalPosition {
+                page_number,
+                previous,
+                actual,
+            } => write!(
+                formatter,
+                "page {} WAL position {} does not advance beyond {}",
+                page_number.get(),
+                actual.get(),
+                previous.get()
+            ),
+            Self::SnapshotPositionUnbacked {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} snapshot position {} has no matching durable page WAL record",
+                page_number.get(),
+                position.get()
+            ),
+            Self::SnapshotPayloadContradiction {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} snapshot contradicts durable WAL payload at position {}",
+                page_number.get(),
+                position.get()
+            ),
+        }
+    }
+}
+
+impl Error for DurablePageReconciliationError {}
+
+/// Reconciles one page's ordered durable WAL observations with its optional
+/// current stored snapshot without authorizing any physical mutation.
+///
+/// `wal_observations` must contain every durable full-image WAL observation for
+/// `page_number` in strictly increasing log order. Gaps are valid because
+/// transaction records and writes for other pages may occupy intervening
+/// positions.
+pub fn reconcile_durable_page<'observation, const N: usize, Observations>(
+    expected_lineage: &LogLineage,
+    page_number: PageNumber,
+    snapshot: Option<&StoredPageSnapshotObservation<N>>,
+    wal_observations: Observations,
+) -> Result<DurablePageReconciliation, DurablePageReconciliationError>
+where
+    Observations: IntoIterator<Item = &'observation DurablePageWalObservation<N>>,
+{
+    if let Some(snapshot) = snapshot {
+        if snapshot.page_number() != page_number {
+            return Err(DurablePageReconciliationError::UnexpectedSnapshotPage {
+                expected: page_number,
+                actual: snapshot.page_number(),
+            });
+        }
+        if !expected_lineage.same_lineage(snapshot.required_position().lineage()) {
+            return Err(DurablePageReconciliationError::ForeignSnapshotLineage {
+                page_number,
+                position: snapshot.required_position().clone(),
+            });
+        }
+    }
+
+    let mut previous: Option<&DurablePageWalObservation<N>> = None;
+    let mut latest_position = None;
+    let mut snapshot_backed = false;
+    for observation in wal_observations {
+        if observation.page_number() != page_number {
+            return Err(DurablePageReconciliationError::UnexpectedWalPage {
+                expected: page_number,
+                actual: observation.page_number(),
+                position: observation.position().clone(),
+            });
+        }
+        if !expected_lineage.same_lineage(observation.position().lineage()) {
+            return Err(DurablePageReconciliationError::ForeignWalLineage {
+                page_number,
+                position: observation.position().clone(),
+            });
+        }
+
+        if let Some(previous) = previous {
+            if observation.position().get() == previous.position().get() {
+                let reason = if observation.page_version() == previous.page_version()
+                    && observation.image().bytes() == previous.image().bytes()
+                {
+                    DurablePageReconciliationError::DuplicateWalPosition {
+                        page_number,
+                        position: observation.position().clone(),
+                    }
+                } else {
+                    DurablePageReconciliationError::ContradictoryWalPosition {
+                        page_number,
+                        position: observation.position().clone(),
+                    }
+                };
+                return Err(reason);
+            }
+            if observation.position().get() < previous.position().get() {
+                return Err(DurablePageReconciliationError::NonAdvancingWalPosition {
+                    page_number,
+                    previous: previous.position().clone(),
+                    actual: observation.position().clone(),
+                });
+            }
+        }
+
+        if let Some(snapshot) = snapshot
+            && observation.position().get() == snapshot.required_position().get()
+        {
+            if observation.page_version() != snapshot.page_version()
+                || observation.image().bytes() != snapshot.image().bytes()
+            {
+                return Err(
+                    DurablePageReconciliationError::SnapshotPayloadContradiction {
+                        page_number,
+                        position: snapshot.required_position().clone(),
+                    },
+                );
+            }
+            snapshot_backed = true;
+        }
+
+        latest_position = Some(observation.position().get());
+        previous = Some(observation);
+    }
+
+    let Some(latest_position) = latest_position else {
+        return match snapshot {
+            Some(snapshot) => Err(DurablePageReconciliationError::SnapshotPositionUnbacked {
+                page_number,
+                position: snapshot.required_position().clone(),
+            }),
+            None => Ok(DurablePageReconciliation::NoDurableState),
+        };
+    };
+
+    let latest_durable_position = expected_lineage.position(latest_position);
+    let Some(snapshot) = snapshot else {
+        return Ok(DurablePageReconciliation::StoreMissing {
+            latest_durable_position,
+        });
+    };
+    if !snapshot_backed {
+        return Err(DurablePageReconciliationError::SnapshotPositionUnbacked {
+            page_number,
+            position: snapshot.required_position().clone(),
+        });
+    }
+    if snapshot.required_position().get() == latest_position {
+        Ok(DurablePageReconciliation::ExactCurrent {
+            durable_position: latest_durable_position,
+        })
+    } else {
+        Ok(DurablePageReconciliation::StoreBehind {
+            stored_position: snapshot.required_position().clone(),
+            latest_durable_position,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1389,6 +1923,60 @@ mod tests {
             PageVersion::new(version),
             page_image(bytes),
         )
+    }
+
+    fn wal_observation<const N: usize>(
+        lineage: &LogLineage,
+        number: u64,
+        version: u64,
+        bytes: [u8; N],
+        position: u64,
+    ) -> DurablePageWalObservation<N> {
+        let observation = DurablePageWalObservation::new(
+            page_number(number),
+            PageVersion::new(version),
+            page_image(bytes),
+            lineage.position(position),
+        );
+        assert!(observation.is_ok());
+        let Ok(observation) = observation else {
+            return DurablePageWalObservation {
+                observation: PageRecoveryObservation {
+                    page_number: page_number(number),
+                    page_version: PageVersion::new(version),
+                    image: page_image(bytes),
+                    position: lineage.position(position),
+                },
+            };
+        };
+        observation
+    }
+
+    fn stored_observation<const N: usize>(
+        lineage: &LogLineage,
+        number: u64,
+        version: u64,
+        bytes: [u8; N],
+        position: u64,
+    ) -> StoredPageSnapshotObservation<N> {
+        let observation = StoredPageSnapshotObservation::new(
+            page_number(number),
+            PageVersion::new(version),
+            page_image(bytes),
+            lineage.position(position),
+        );
+        assert!(observation.is_ok());
+        let Ok(observation) = observation else {
+            return StoredPageSnapshotObservation {
+                observation: PageRecoveryObservation {
+                    page_number: page_number(number),
+                    page_version: PageVersion::new(version),
+                    image: page_image(bytes),
+                    position: lineage.position(position),
+                },
+            };
+        };
+        observation
     }
 
     #[test]
@@ -1811,5 +2399,286 @@ mod tests {
         assert_eq!(version, PageVersion::new(9));
         assert_eq!(image.bytes(), &bytes);
         assert_eq!(position, required_position);
+    }
+
+    #[test]
+    fn recovery_observation_zero_position_retains_every_input() {
+        let lineage = LogLineage::new();
+        let number = page_number(31);
+        let version = PageVersion::new(7);
+        let bytes = [1_u8, 2];
+        let position = lineage.position(0);
+
+        let error =
+            DurablePageWalObservation::new(number, version, page_image(bytes), position.clone());
+
+        assert!(error.is_err());
+        let Err(error) = error else {
+            return;
+        };
+        assert_eq!(
+            error.reason(),
+            PageRecoveryObservationErrorReason::ZeroPosition
+        );
+        assert_eq!(error.page_number(), number);
+        assert_eq!(error.page_version(), version);
+        assert_eq!(error.image().bytes(), &bytes);
+        assert_eq!(error.position(), &position);
+        let (actual_number, actual_version, image, actual_position, reason) = error.into_parts();
+        assert_eq!(actual_number, number);
+        assert_eq!(actual_version, version);
+        assert_eq!(image.bytes(), &bytes);
+        assert_eq!(actual_position, position);
+        assert_eq!(reason, PageRecoveryObservationErrorReason::ZeroPosition);
+    }
+
+    #[test]
+    fn durable_page_reconciliation_reports_exact_current() {
+        let lineage = LogLineage::new();
+        let number = page_number(32);
+        let records = [
+            wal_observation(&lineage, 32, 1, [1_u8, 2], 3),
+            wal_observation(&lineage, 32, 2, [3_u8, 4], 7),
+        ];
+        let snapshot = stored_observation(&lineage, 32, 2, [3_u8, 4], 7);
+
+        let result = reconcile_durable_page(&lineage, number, Some(&snapshot), records.iter());
+
+        assert_eq!(
+            result,
+            Ok(DurablePageReconciliation::ExactCurrent {
+                durable_position: lineage.position(7),
+            })
+        );
+    }
+
+    #[test]
+    fn durable_page_reconciliation_reports_store_behind_without_ordering_versions() {
+        let lineage = LogLineage::new();
+        let number = page_number(33);
+        let records = [
+            wal_observation(&lineage, 33, 99, [5_u8, 6], 5),
+            wal_observation(&lineage, 33, 1, [7_u8, 8], 9),
+        ];
+        let snapshot = stored_observation(&lineage, 33, 99, [5_u8, 6], 5);
+
+        let result = reconcile_durable_page(&lineage, number, Some(&snapshot), records.iter());
+
+        assert_eq!(
+            result,
+            Ok(DurablePageReconciliation::StoreBehind {
+                stored_position: lineage.position(5),
+                latest_durable_position: lineage.position(9),
+            })
+        );
+    }
+
+    #[test]
+    fn durable_page_reconciliation_reports_missing_and_no_state() {
+        let lineage = LogLineage::new();
+        let number = page_number(34);
+        let records = [
+            wal_observation(&lineage, 34, 1, [9_u8, 10], 2),
+            wal_observation(&lineage, 34, 2, [11_u8, 12], 8),
+        ];
+
+        let missing = reconcile_durable_page(&lineage, number, None, records.iter());
+        let empty = reconcile_durable_page(
+            &lineage,
+            number,
+            None,
+            std::iter::empty::<&DurablePageWalObservation<2>>(),
+        );
+
+        assert_eq!(
+            missing,
+            Ok(DurablePageReconciliation::StoreMissing {
+                latest_durable_position: lineage.position(8),
+            })
+        );
+        assert_eq!(empty, Ok(DurablePageReconciliation::NoDurableState));
+    }
+
+    #[test]
+    fn snapshot_position_must_be_backed_by_a_durable_page_record() {
+        let lineage = LogLineage::new();
+        let number = page_number(35);
+        let records = [
+            wal_observation(&lineage, 35, 1, [13_u8, 14], 3),
+            wal_observation(&lineage, 35, 2, [15_u8, 16], 9),
+        ];
+        let within_range = stored_observation(&lineage, 35, 7, [17_u8, 18], 8);
+        let beyond_range = stored_observation(&lineage, 35, 8, [19_u8, 20], 12);
+
+        let within_result =
+            reconcile_durable_page(&lineage, number, Some(&within_range), records.iter());
+        let beyond_result =
+            reconcile_durable_page(&lineage, number, Some(&beyond_range), records.iter());
+
+        assert_eq!(
+            within_result,
+            Err(DurablePageReconciliationError::SnapshotPositionUnbacked {
+                page_number: number,
+                position: lineage.position(8),
+            })
+        );
+        assert_eq!(
+            beyond_result,
+            Err(DurablePageReconciliationError::SnapshotPositionUnbacked {
+                page_number: number,
+                position: lineage.position(12),
+            })
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_snapshot_payload_contradiction_at_backing_position() {
+        let lineage = LogLineage::new();
+        let number = page_number(36);
+        let records = [wal_observation(&lineage, 36, 4, [19_u8, 20], 6)];
+        let wrong_version = stored_observation(&lineage, 36, 5, [19_u8, 20], 6);
+        let wrong_bytes = stored_observation(&lineage, 36, 4, [21_u8, 22], 6);
+
+        let version_result =
+            reconcile_durable_page(&lineage, number, Some(&wrong_version), records.iter());
+        let bytes_result =
+            reconcile_durable_page(&lineage, number, Some(&wrong_bytes), records.iter());
+        let expected = Err(
+            DurablePageReconciliationError::SnapshotPayloadContradiction {
+                page_number: number,
+                position: lineage.position(6),
+            },
+        );
+
+        assert_eq!(version_result, expected);
+        assert_eq!(
+            bytes_result,
+            Err(
+                DurablePageReconciliationError::SnapshotPayloadContradiction {
+                    page_number: number,
+                    position: lineage.position(6),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_foreign_lineages_before_numeric_ordering() {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let number = page_number(37);
+        let foreign_snapshot = stored_observation(&foreign, 37, 1, [23_u8, 24], 2);
+        let valid = wal_observation(&lineage, 37, 1, [23_u8, 24], 10);
+        let foreign_record = wal_observation(&foreign, 37, 2, [25_u8, 26], 1);
+        let records = [valid, foreign_record];
+
+        let snapshot_result = reconcile_durable_page(
+            &lineage,
+            number,
+            Some(&foreign_snapshot),
+            std::iter::empty::<&DurablePageWalObservation<2>>(),
+        );
+        let wal_result = reconcile_durable_page(&lineage, number, None, records.iter());
+
+        assert_eq!(
+            snapshot_result,
+            Err(DurablePageReconciliationError::ForeignSnapshotLineage {
+                page_number: number,
+                position: foreign.position(2),
+            })
+        );
+        assert_eq!(
+            wal_result,
+            Err(DurablePageReconciliationError::ForeignWalLineage {
+                page_number: number,
+                position: foreign.position(1),
+            })
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_observations_for_another_page() {
+        let lineage = LogLineage::new();
+        let expected = page_number(38);
+        let snapshot = stored_observation(&lineage, 39, 1, [27_u8, 28], 2);
+        let records = [wal_observation(&lineage, 40, 1, [29_u8, 30], 3)];
+
+        let snapshot_result = reconcile_durable_page(
+            &lineage,
+            expected,
+            Some(&snapshot),
+            std::iter::empty::<&DurablePageWalObservation<2>>(),
+        );
+        let wal_result = reconcile_durable_page(&lineage, expected, None, records.iter());
+
+        assert_eq!(
+            snapshot_result,
+            Err(DurablePageReconciliationError::UnexpectedSnapshotPage {
+                expected,
+                actual: page_number(39),
+            })
+        );
+        assert_eq!(
+            wal_result,
+            Err(DurablePageReconciliationError::UnexpectedWalPage {
+                expected,
+                actual: page_number(40),
+                position: lineage.position(3),
+            })
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_duplicate_and_contradictory_wal_positions() {
+        let lineage = LogLineage::new();
+        let number = page_number(41);
+        let identical = [
+            wal_observation(&lineage, 41, 1, [31_u8, 32], 4),
+            wal_observation(&lineage, 41, 1, [31_u8, 32], 4),
+        ];
+        let contradictory = [
+            wal_observation(&lineage, 41, 1, [31_u8, 32], 4),
+            wal_observation(&lineage, 41, 2, [33_u8, 34], 4),
+        ];
+
+        let duplicate_result = reconcile_durable_page(&lineage, number, None, identical.iter());
+        let contradiction_result =
+            reconcile_durable_page(&lineage, number, None, contradictory.iter());
+
+        assert_eq!(
+            duplicate_result,
+            Err(DurablePageReconciliationError::DuplicateWalPosition {
+                page_number: number,
+                position: lineage.position(4),
+            })
+        );
+        assert_eq!(
+            contradiction_result,
+            Err(DurablePageReconciliationError::ContradictoryWalPosition {
+                page_number: number,
+                position: lineage.position(4),
+            })
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_nonadvancing_wal_order() {
+        let lineage = LogLineage::new();
+        let number = page_number(42);
+        let records = [
+            wal_observation(&lineage, 42, 1, [35_u8, 36], 12),
+            wal_observation(&lineage, 42, 2, [37_u8, 38], 7),
+        ];
+
+        let result = reconcile_durable_page(&lineage, number, None, records.iter());
+
+        assert_eq!(
+            result,
+            Err(DurablePageReconciliationError::NonAdvancingWalPosition {
+                page_number: number,
+                previous: lineage.position(12),
+                actual: lineage.position(7),
+            })
+        );
     }
 }

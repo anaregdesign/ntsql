@@ -1697,6 +1697,585 @@ pub fn reconcile_committed_transaction_page<'observation, const N: usize>(
     }
 }
 
+/// Exact store precondition retained by one inert committed-page recovery
+/// candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableCommittedTransactionPageRecoveryPrecondition<'snapshot, const N: usize> {
+    /// The validated page store had no snapshot.
+    StoreMissing,
+    /// The validated page store contained one exact earlier committed snapshot.
+    ExactSnapshot {
+        /// Exact snapshot supplied to committed-relative reconciliation.
+        snapshot: &'snapshot StoredPageSnapshotObservation<N>,
+        /// Durable commit position that classified the snapshot backing as
+        /// committed.
+        commit_position: LogSequenceNumber,
+    },
+}
+
+/// Compare-only recovery candidate from validated committed-relative evidence.
+///
+/// The candidate binds an exact source-store precondition to the selected
+/// committed target. It is not a replay command and cannot create transaction
+/// lifecycle authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableCommittedTransactionPageRecoveryCandidate, TransactionId,
+/// };
+///
+/// fn cannot_create_transaction_id<const N: usize>(
+///     candidate: DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+/// ) -> TransactionId {
+///     candidate.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransaction, DurableCommittedTransactionPageRecoveryCandidate,
+/// };
+///
+/// fn cannot_create_committed<const N: usize>(
+///     candidate: DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+/// ) -> CommittedTransaction {
+///     candidate.into()
+/// }
+/// ```
+///
+/// It also cannot create dirty or write-authorizing state:
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::DurableCommittedTransactionPageRecoveryCandidate;
+///
+/// fn cannot_create_dirty<const N: usize>(
+///     candidate: DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+/// ) -> DirtyPage<N> {
+///     candidate.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableCommittedTransactionPageRecoveryCandidate, TransactionDirtyPage,
+/// };
+///
+/// fn cannot_create_transaction_dirty<const N: usize>(
+///     candidate: DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+/// ) -> TransactionDirtyPage<N> {
+///     candidate.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableCommittedTransactionPageRecoveryCandidate;
+///
+/// fn cannot_authorize_write<'candidate, const N: usize>(
+///     candidate: DurableCommittedTransactionPageRecoveryCandidate<
+///         'candidate,
+///         'candidate,
+///         N,
+///     >,
+/// ) -> PageWritePermit<'candidate> {
+///     candidate.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableCommittedTransactionPageRecoveryCandidate<'observation, 'snapshot, const N: usize>
+{
+    precondition: DurableCommittedTransactionPageRecoveryPrecondition<'snapshot, N>,
+    latest_committed: LatestCommittedTransactionPage<'observation, N>,
+}
+
+impl<'observation, 'snapshot, const N: usize>
+    DurableCommittedTransactionPageRecoveryCandidate<'observation, 'snapshot, N>
+{
+    /// Returns the exact validated source-store precondition.
+    #[must_use]
+    pub const fn precondition(
+        &self,
+    ) -> &DurableCommittedTransactionPageRecoveryPrecondition<'snapshot, N> {
+        &self.precondition
+    }
+
+    /// Returns the exact selected committed target.
+    #[must_use]
+    pub const fn latest_committed(&self) -> &LatestCommittedTransactionPage<'observation, N> {
+        &self.latest_committed
+    }
+}
+
+/// Inert decision produced while deriving a committed-page recovery candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableCommittedTransactionPageRecoveryDecision<'observation, 'snapshot, const N: usize> {
+    /// No committed transaction-owned page exists and no recovery is proposed.
+    NoCommittedPage {
+        /// Requested page number with no committed durable state.
+        page_number: PageNumber,
+    },
+    /// The store already contains the latest committed page.
+    ExactCurrent {
+        /// Exact selected committed observation already present in the store.
+        latest_committed: LatestCommittedTransactionPage<'observation, N>,
+    },
+    /// A missing or behind store produced one compare-only candidate.
+    Candidate(DurableCommittedTransactionPageRecoveryCandidate<'observation, 'snapshot, N>),
+}
+
+/// Failure to derive a candidate from committed-relative reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableCommittedTransactionPageRecoveryPlanningError {
+    /// Committed-relative reconciliation failed.
+    Reconciliation {
+        /// Exact ADR 0026 reconciliation failure.
+        source: Box<DurableCommittedTransactionPageReconciliationError>,
+    },
+    /// Reconciliation reported an absent store despite a supplied snapshot.
+    UnexpectedSnapshotForAbsentStore {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Supplied snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// Reconciliation reported a present store despite no supplied snapshot.
+    MissingSnapshotForPresentStore {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Position reconciliation reported as stored.
+        expected_position: LogSequenceNumber,
+    },
+    /// The supplied snapshot position disagreed with the successful
+    /// reconciliation result.
+    SnapshotPositionContradiction {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Position returned by reconciliation.
+        reconciled_position: LogSequenceNumber,
+        /// Position carried by the supplied snapshot.
+        snapshot_position: LogSequenceNumber,
+    },
+}
+
+impl fmt::Display for DurableCommittedTransactionPageRecoveryPlanningError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reconciliation { source } => {
+                write!(formatter, "committed page reconciliation failed: {source}")
+            }
+            Self::UnexpectedSnapshotForAbsentStore {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} reconciliation reported an absent store despite snapshot position {}",
+                page_number.get(),
+                position.get()
+            ),
+            Self::MissingSnapshotForPresentStore {
+                page_number,
+                expected_position,
+            } => write!(
+                formatter,
+                "page {} reconciliation reported stored position {} without a snapshot",
+                page_number.get(),
+                expected_position.get()
+            ),
+            Self::SnapshotPositionContradiction {
+                page_number,
+                reconciled_position,
+                snapshot_position,
+            } => write!(
+                formatter,
+                "page {} reconciliation position {} contradicts snapshot position {}",
+                page_number.get(),
+                reconciled_position.get(),
+                snapshot_position.get()
+            ),
+        }
+    }
+}
+
+impl Error for DurableCommittedTransactionPageRecoveryPlanningError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Reconciliation { source } => Some(source.as_ref()),
+            Self::UnexpectedSnapshotForAbsentStore { .. }
+            | Self::MissingSnapshotForPresentStore { .. }
+            | Self::SnapshotPositionContradiction { .. } => None,
+        }
+    }
+}
+
+/// Derives a non-authorizing recovery candidate from complete durable evidence.
+///
+/// This operation composes [`reconcile_committed_transaction_page`] over the
+/// same inputs. Missing and behind stores retain exact source preconditions;
+/// no-committed and exact-current states remain explicit no-candidate decisions.
+/// The returned target is current only for the supplied durable prefix. A future
+/// mutation gate must re-run authoritative reconciliation immediately before
+/// attempting a physical write.
+pub fn derive_committed_transaction_page_recovery_candidate<
+    'observation,
+    'snapshot,
+    const N: usize,
+>(
+    expected_lineage: &LogLineage,
+    page_number: PageNumber,
+    snapshot: Option<&'snapshot StoredPageSnapshotObservation<N>>,
+    physical_pages: &[DurablePageWalObservation<N>],
+    owned_pages: &'observation [DurableTransactionPageObservation<N>],
+    commit_observations: &[DurableTransactionCommitObservation],
+) -> Result<
+    DurableCommittedTransactionPageRecoveryDecision<'observation, 'snapshot, N>,
+    DurableCommittedTransactionPageRecoveryPlanningError,
+> {
+    let reconciliation = reconcile_committed_transaction_page(
+        expected_lineage,
+        page_number,
+        snapshot,
+        physical_pages,
+        owned_pages,
+        commit_observations,
+    )
+    .map_err(|source| {
+        DurableCommittedTransactionPageRecoveryPlanningError::Reconciliation {
+            source: Box::new(source),
+        }
+    })?;
+
+    match reconciliation {
+        DurableCommittedTransactionPageReconciliation::NoCommittedPage { page_number } => {
+            if let Some(snapshot) = snapshot {
+                return Err(
+                    DurableCommittedTransactionPageRecoveryPlanningError::UnexpectedSnapshotForAbsentStore {
+                        page_number,
+                        position: snapshot.required_position().clone(),
+                    },
+                );
+            }
+            Ok(DurableCommittedTransactionPageRecoveryDecision::NoCommittedPage { page_number })
+        }
+        DurableCommittedTransactionPageReconciliation::StoreMissing { latest_committed } => {
+            if let Some(snapshot) = snapshot {
+                return Err(
+                    DurableCommittedTransactionPageRecoveryPlanningError::UnexpectedSnapshotForAbsentStore {
+                        page_number,
+                        position: snapshot.required_position().clone(),
+                    },
+                );
+            }
+            Ok(DurableCommittedTransactionPageRecoveryDecision::Candidate(
+                DurableCommittedTransactionPageRecoveryCandidate {
+                    precondition: DurableCommittedTransactionPageRecoveryPrecondition::StoreMissing,
+                    latest_committed,
+                },
+            ))
+        }
+        DurableCommittedTransactionPageReconciliation::ExactCurrent { latest_committed } => {
+            let Some(snapshot) = snapshot else {
+                return Err(
+                    DurableCommittedTransactionPageRecoveryPlanningError::MissingSnapshotForPresentStore {
+                        page_number,
+                        expected_position: latest_committed.observation().position().clone(),
+                    },
+                );
+            };
+            if snapshot.required_position() != latest_committed.observation().position() {
+                return Err(
+                    DurableCommittedTransactionPageRecoveryPlanningError::SnapshotPositionContradiction {
+                        page_number,
+                        reconciled_position: latest_committed.observation().position().clone(),
+                        snapshot_position: snapshot.required_position().clone(),
+                    },
+                );
+            }
+            Ok(DurableCommittedTransactionPageRecoveryDecision::ExactCurrent { latest_committed })
+        }
+        DurableCommittedTransactionPageReconciliation::StoreBehind {
+            stored_page_position,
+            stored_commit_position,
+            latest_committed,
+        } => {
+            let Some(snapshot) = snapshot else {
+                return Err(
+                    DurableCommittedTransactionPageRecoveryPlanningError::MissingSnapshotForPresentStore {
+                        page_number,
+                        expected_position: stored_page_position,
+                    },
+                );
+            };
+            if snapshot.required_position() != &stored_page_position {
+                return Err(
+                    DurableCommittedTransactionPageRecoveryPlanningError::SnapshotPositionContradiction {
+                        page_number,
+                        reconciled_position: stored_page_position,
+                        snapshot_position: snapshot.required_position().clone(),
+                    },
+                );
+            }
+            Ok(DurableCommittedTransactionPageRecoveryDecision::Candidate(
+                DurableCommittedTransactionPageRecoveryCandidate {
+                    precondition:
+                        DurableCommittedTransactionPageRecoveryPrecondition::ExactSnapshot {
+                            snapshot,
+                            commit_position: stored_commit_position,
+                        },
+                    latest_committed,
+                },
+            ))
+        }
+    }
+}
+
+/// Inert result of comparing a candidate with a newly observed store state.
+///
+/// Neither variant is write authority:
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableCommittedTransactionPageRecoveryComparison;
+///
+/// fn cannot_authorize_write(
+///     comparison: DurableCommittedTransactionPageRecoveryComparison,
+/// ) -> PageWritePermit<'static> {
+///     comparison.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableCommittedTransactionPageRecoveryComparison {
+    /// The exact source-store precondition still matches.
+    SourceMatches,
+    /// The exact target page image is already present in the store.
+    ///
+    /// This does not prove the candidate remains latest in a newer WAL prefix.
+    TargetAlreadyPresent,
+}
+
+/// Contradiction between a recovery candidate and newly observed store state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableCommittedTransactionPageRecoveryComparisonError {
+    /// The current snapshot describes another page.
+    UnexpectedCurrentSnapshotPage {
+        /// Candidate page number.
+        expected: PageNumber,
+        /// Current snapshot page number.
+        actual: PageNumber,
+        /// Current snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// The current snapshot belongs to another WAL lineage.
+    ForeignCurrentSnapshotLineage {
+        /// Candidate page number.
+        page_number: PageNumber,
+        /// Foreign current snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// The current snapshot uses the target position but contradicts its
+    /// version or bytes.
+    TargetSnapshotPayloadContradiction {
+        /// Candidate page number.
+        page_number: PageNumber,
+        /// Contradictory target position.
+        position: LogSequenceNumber,
+    },
+    /// The current snapshot uses the source position but contradicts its
+    /// version or bytes.
+    SourceSnapshotPayloadContradiction {
+        /// Candidate page number.
+        page_number: PageNumber,
+        /// Contradictory source position.
+        position: LogSequenceNumber,
+    },
+    /// The current store matches neither the candidate source nor target.
+    StoreChanged {
+        /// Candidate page number.
+        page_number: PageNumber,
+        /// Expected source position, or absence for a missing-store candidate.
+        expected_source_position: Option<LogSequenceNumber>,
+        /// Newly observed position, or absence when the store is now missing.
+        actual_position: Option<LogSequenceNumber>,
+    },
+}
+
+impl fmt::Display for DurableCommittedTransactionPageRecoveryComparisonError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedCurrentSnapshotPage {
+                expected,
+                actual,
+                position,
+            } => write!(
+                formatter,
+                "recovery candidate for page {} received page {} at position {}",
+                expected.get(),
+                actual.get(),
+                position.get()
+            ),
+            Self::ForeignCurrentSnapshotLineage {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} current snapshot position {} belongs to another log lineage",
+                page_number.get(),
+                position.get()
+            ),
+            Self::TargetSnapshotPayloadContradiction {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} current snapshot contradicts target payload at position {}",
+                page_number.get(),
+                position.get()
+            ),
+            Self::SourceSnapshotPayloadContradiction {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} current snapshot contradicts source payload at position {}",
+                page_number.get(),
+                position.get()
+            ),
+            Self::StoreChanged {
+                page_number,
+                expected_source_position,
+                actual_position,
+            } => write!(
+                formatter,
+                "page {} store changed from source position {:?} to position {:?}",
+                page_number.get(),
+                expected_source_position
+                    .as_ref()
+                    .map(LogSequenceNumber::get),
+                actual_position.as_ref().map(LogSequenceNumber::get)
+            ),
+        }
+    }
+}
+
+impl Error for DurableCommittedTransactionPageRecoveryComparisonError {}
+
+fn snapshot_matches_owned_page<const N: usize>(
+    snapshot: &StoredPageSnapshotObservation<N>,
+    page: &DurableTransactionPageObservation<N>,
+) -> bool {
+    snapshot.page_number() == page.page().page_number()
+        && snapshot.required_position() == page.position()
+        && snapshot.page_version() == page.page().page_version()
+        && snapshot.image().bytes() == page.page().image().bytes()
+}
+
+fn snapshots_match<const N: usize>(
+    left: &StoredPageSnapshotObservation<N>,
+    right: &StoredPageSnapshotObservation<N>,
+) -> bool {
+    left.page_number() == right.page_number()
+        && left.required_position() == right.required_position()
+        && left.page_version() == right.page_version()
+        && left.image().bytes() == right.image().bytes()
+}
+
+/// Compares a candidate with the current store without authorizing mutation.
+///
+/// Page and lineage validation precede target/source position and payload
+/// comparison. An absent store matches only a missing-store precondition. Exact
+/// target presence provides idempotent retry classification, but does not prove
+/// that later durable WAL evidence has not superseded the candidate.
+pub fn compare_committed_transaction_page_recovery_candidate<const N: usize>(
+    candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+    current_snapshot: Option<&StoredPageSnapshotObservation<N>>,
+) -> Result<
+    DurableCommittedTransactionPageRecoveryComparison,
+    DurableCommittedTransactionPageRecoveryComparisonError,
+> {
+    let target = candidate.latest_committed().observation();
+    let page_number = target.page().page_number();
+    let Some(current_snapshot) = current_snapshot else {
+        return match candidate.precondition() {
+            DurableCommittedTransactionPageRecoveryPrecondition::StoreMissing => {
+                Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches)
+            }
+            DurableCommittedTransactionPageRecoveryPrecondition::ExactSnapshot {
+                snapshot, ..
+            } => Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::StoreChanged {
+                    page_number,
+                    expected_source_position: Some(snapshot.required_position().clone()),
+                    actual_position: None,
+                },
+            ),
+        };
+    };
+
+    if current_snapshot.page_number() != page_number {
+        return Err(
+            DurableCommittedTransactionPageRecoveryComparisonError::UnexpectedCurrentSnapshotPage {
+                expected: page_number,
+                actual: current_snapshot.page_number(),
+                position: current_snapshot.required_position().clone(),
+            },
+        );
+    }
+    if !target
+        .position()
+        .lineage()
+        .same_lineage(current_snapshot.required_position().lineage())
+    {
+        return Err(
+            DurableCommittedTransactionPageRecoveryComparisonError::ForeignCurrentSnapshotLineage {
+                page_number,
+                position: current_snapshot.required_position().clone(),
+            },
+        );
+    }
+
+    if current_snapshot.required_position().get() == target.position().get() {
+        if snapshot_matches_owned_page(current_snapshot, target) {
+            return Ok(DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent);
+        }
+        return Err(
+            DurableCommittedTransactionPageRecoveryComparisonError::TargetSnapshotPayloadContradiction {
+                page_number,
+                position: current_snapshot.required_position().clone(),
+            },
+        );
+    }
+
+    match candidate.precondition() {
+        DurableCommittedTransactionPageRecoveryPrecondition::StoreMissing => Err(
+            DurableCommittedTransactionPageRecoveryComparisonError::StoreChanged {
+                page_number,
+                expected_source_position: None,
+                actual_position: Some(current_snapshot.required_position().clone()),
+            },
+        ),
+        DurableCommittedTransactionPageRecoveryPrecondition::ExactSnapshot { snapshot, .. } => {
+            if current_snapshot.required_position().get() == snapshot.required_position().get() {
+                if snapshots_match(current_snapshot, snapshot) {
+                    return Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches);
+                }
+                return Err(
+                    DurableCommittedTransactionPageRecoveryComparisonError::SourceSnapshotPayloadContradiction {
+                        page_number,
+                        position: current_snapshot.required_position().clone(),
+                    },
+                );
+            }
+            Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::StoreChanged {
+                    page_number,
+                    expected_source_position: Some(snapshot.required_position().clone()),
+                    actual_position: Some(current_snapshot.required_position().clone()),
+                },
+            )
+        }
+    }
+}
+
 /// Read-only in-process lifecycle phase recorded by the coordinator.
 ///
 /// This phase is not persistent recovery evidence and deliberately carries no
@@ -5526,6 +6105,383 @@ mod tests {
                     selected_page_position: lineage.position(2),
                 }
             )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_candidate_from_missing_store_matches_source_and_target() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(63).ok_or(TestError("page number"))?;
+        let owner = durable_identity(26, 1)?;
+        let physical = [physical_page_observation(&lineage, 63, 4, 0x63, 2)?];
+        let owned = [durable_page_observation(&lineage, owner, 63, 4, 0x63, 2)?];
+        let commits = [durable_commit_observation(&lineage, owner, 4)?];
+
+        let decision = derive_committed_transaction_page_recovery_candidate(
+            &lineage,
+            page_number,
+            None,
+            &physical,
+            &owned,
+            &commits,
+        )
+        .map_err(|_| TestError("missing-store candidate"))?;
+        let DurableCommittedTransactionPageRecoveryDecision::Candidate(candidate) = decision else {
+            return Err(TestError("expected recovery candidate"));
+        };
+
+        assert_eq!(
+            candidate.precondition(),
+            &DurableCommittedTransactionPageRecoveryPrecondition::StoreMissing
+        );
+        assert!(std::ptr::eq(
+            candidate.latest_committed().observation(),
+            &owned[0]
+        ));
+        assert_eq!(
+            candidate.latest_committed().commit_position(),
+            &lineage.position(4)
+        );
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, None),
+            Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches)
+        );
+
+        let target = stored_page_observation(&lineage, 63, 4, 0x63, 2)?;
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, Some(&target)),
+            Ok(DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_candidate_from_behind_store_retains_exact_source_and_lower_version_target()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(64).ok_or(TestError("page number"))?;
+        let source_owner = durable_identity(27, 1)?;
+        let target_owner = durable_identity(27, 2)?;
+        let physical = [
+            physical_page_observation(&lineage, 64, 10, 0x64, 2)?,
+            physical_page_observation(&lineage, 64, 1, 0x65, 5)?,
+        ];
+        let owned = [
+            durable_page_observation(&lineage, source_owner, 64, 10, 0x64, 2)?,
+            durable_page_observation(&lineage, target_owner, 64, 1, 0x65, 5)?,
+        ];
+        let commits = [
+            durable_commit_observation(&lineage, source_owner, 3)?,
+            durable_commit_observation(&lineage, target_owner, 7)?,
+        ];
+        let source = stored_page_observation(&lineage, 64, 10, 0x64, 2)?;
+
+        let decision = derive_committed_transaction_page_recovery_candidate(
+            &lineage,
+            page_number,
+            Some(&source),
+            &physical,
+            &owned,
+            &commits,
+        )
+        .map_err(|_| TestError("behind-store candidate"))?;
+        let DurableCommittedTransactionPageRecoveryDecision::Candidate(candidate) = decision else {
+            return Err(TestError("expected recovery candidate"));
+        };
+
+        let DurableCommittedTransactionPageRecoveryPrecondition::ExactSnapshot {
+            snapshot,
+            commit_position,
+        } = candidate.precondition()
+        else {
+            return Err(TestError("expected exact source snapshot"));
+        };
+        assert!(std::ptr::eq(*snapshot, &source));
+        assert_eq!(commit_position, &lineage.position(3));
+        assert!(std::ptr::eq(
+            candidate.latest_committed().observation(),
+            &owned[1]
+        ));
+        assert_eq!(
+            candidate
+                .latest_committed()
+                .observation()
+                .page()
+                .page_version(),
+            PageVersion::new(1)
+        );
+        assert_eq!(
+            candidate.latest_committed().commit_position(),
+            &lineage.position(7)
+        );
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, Some(&source)),
+            Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches)
+        );
+
+        let target = stored_page_observation(&lineage, 64, 1, 0x65, 5)?;
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, Some(&target)),
+            Ok(DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent)
+        );
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, None),
+            Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::StoreChanged {
+                    page_number,
+                    expected_source_position: Some(lineage.position(2)),
+                    actual_position: None,
+                }
+            )
+        );
+
+        let contradictory_source = stored_page_observation(&lineage, 64, 11, 0x66, 2)?;
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(
+                &candidate,
+                Some(&contradictory_source)
+            ),
+            Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::SourceSnapshotPayloadContradiction {
+                    page_number,
+                    position: lineage.position(2),
+                }
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_planning_preserves_explicit_no_candidate_decisions() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let page_number = PageNumber::new(65).ok_or(TestError("page number"))?;
+        let empty_physical: [DurablePageWalObservation<1>; 0] = [];
+        let empty_owned: [DurableTransactionPageObservation<1>; 0] = [];
+
+        assert_eq!(
+            derive_committed_transaction_page_recovery_candidate(
+                &lineage,
+                page_number,
+                None,
+                &empty_physical,
+                &empty_owned,
+                &[],
+            ),
+            Ok(DurableCommittedTransactionPageRecoveryDecision::NoCommittedPage { page_number })
+        );
+
+        let owner = durable_identity(28, 1)?;
+        let foreign_commits = [durable_commit_observation(&foreign, owner, 1)?];
+        assert_eq!(
+            derive_committed_transaction_page_recovery_candidate(
+                &lineage,
+                page_number,
+                None,
+                &empty_physical,
+                &empty_owned,
+                &foreign_commits,
+            ),
+            Err(
+                DurableCommittedTransactionPageRecoveryPlanningError::Reconciliation {
+                    source: Box::new(
+                        DurableCommittedTransactionPageReconciliationError::Selection {
+                            source: Box::new(
+                                DurableTransactionPageSelectionError::CommitPrefix {
+                                    source: Box::new(
+                                        DurableTransactionPageClassificationError::ForeignCommitLineage {
+                                            position: foreign.position(1),
+                                        },
+                                    ),
+                                },
+                            ),
+                        },
+                    ),
+                },
+            )
+        );
+
+        let physical = [physical_page_observation(&lineage, 65, 3, 0x65, 2)?];
+        let owned = [durable_page_observation(&lineage, owner, 65, 3, 0x65, 2)?];
+        let commits = [durable_commit_observation(&lineage, owner, 4)?];
+        let snapshot = stored_page_observation(&lineage, 65, 3, 0x65, 2)?;
+        let decision = derive_committed_transaction_page_recovery_candidate(
+            &lineage,
+            page_number,
+            Some(&snapshot),
+            &physical,
+            &owned,
+            &commits,
+        )
+        .map_err(|_| TestError("exact-current planning"))?;
+        let DurableCommittedTransactionPageRecoveryDecision::ExactCurrent { latest_committed } =
+            decision
+        else {
+            return Err(TestError("expected exact-current decision"));
+        };
+        assert!(std::ptr::eq(latest_committed.observation(), &owned[0]));
+        assert_eq!(latest_committed.commit_position(), &lineage.position(4));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_candidate_comparison_rejects_invalid_or_changed_store_state()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let page_number = PageNumber::new(66).ok_or(TestError("page number"))?;
+        let other_page = PageNumber::new(67).ok_or(TestError("other page number"))?;
+        let owner = durable_identity(29, 1)?;
+        let physical = [physical_page_observation(&lineage, 66, 2, 0x66, 2)?];
+        let owned = [durable_page_observation(&lineage, owner, 66, 2, 0x66, 2)?];
+        let commits = [durable_commit_observation(&lineage, owner, 4)?];
+        let decision = derive_committed_transaction_page_recovery_candidate(
+            &lineage,
+            page_number,
+            None,
+            &physical,
+            &owned,
+            &commits,
+        )
+        .map_err(|_| TestError("comparison candidate"))?;
+        let DurableCommittedTransactionPageRecoveryDecision::Candidate(candidate) = decision else {
+            return Err(TestError("expected recovery candidate"));
+        };
+
+        let wrong_page = StoredPageSnapshotObservation::from_bytes(
+            other_page,
+            PageVersion::new(2),
+            [0x66],
+            foreign.position(2),
+        )
+        .map_err(|_| TestError("wrong-page snapshot"))?;
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(
+                &candidate,
+                Some(&wrong_page)
+            ),
+            Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::UnexpectedCurrentSnapshotPage {
+                    expected: page_number,
+                    actual: other_page,
+                    position: foreign.position(2),
+                }
+            )
+        );
+
+        let foreign_target = stored_page_observation(&foreign, 66, 2, 0x66, 2)?;
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(
+                &candidate,
+                Some(&foreign_target)
+            ),
+            Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::ForeignCurrentSnapshotLineage {
+                    page_number,
+                    position: foreign.position(2),
+                }
+            )
+        );
+
+        let contradictory_target = stored_page_observation(&lineage, 66, 3, 0x67, 2)?;
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(
+                &candidate,
+                Some(&contradictory_target)
+            ),
+            Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::TargetSnapshotPayloadContradiction {
+                    page_number,
+                    position: lineage.position(2),
+                }
+            )
+        );
+
+        let changed = stored_page_observation(&lineage, 66, 5, 0x68, 9)?;
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, Some(&changed)),
+            Err(
+                DurableCommittedTransactionPageRecoveryComparisonError::StoreChanged {
+                    page_number,
+                    expected_source_position: None,
+                    actual_position: Some(lineage.position(9)),
+                }
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_candidate_comparison_does_not_prove_wal_currency() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(68).ok_or(TestError("page number"))?;
+        let first_owner = durable_identity(30, 1)?;
+        let later_owner = durable_identity(30, 2)?;
+        let first_physical = [physical_page_observation(&lineage, 68, 4, 0x68, 2)?];
+        let first_owned = [durable_page_observation(
+            &lineage,
+            first_owner,
+            68,
+            4,
+            0x68,
+            2,
+        )?];
+        let first_commits = [durable_commit_observation(&lineage, first_owner, 4)?];
+        let decision = derive_committed_transaction_page_recovery_candidate(
+            &lineage,
+            page_number,
+            None,
+            &first_physical,
+            &first_owned,
+            &first_commits,
+        )
+        .map_err(|_| TestError("stale candidate"))?;
+        let DurableCommittedTransactionPageRecoveryDecision::Candidate(candidate) = decision else {
+            return Err(TestError("expected recovery candidate"));
+        };
+        let first_target = stored_page_observation(&lineage, 68, 4, 0x68, 2)?;
+
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, Some(&first_target)),
+            Ok(DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent)
+        );
+
+        let current_physical = [
+            physical_page_observation(&lineage, 68, 4, 0x68, 2)?,
+            physical_page_observation(&lineage, 68, 5, 0x69, 5)?,
+        ];
+        let current_owned = [
+            durable_page_observation(&lineage, first_owner, 68, 4, 0x68, 2)?,
+            durable_page_observation(&lineage, later_owner, 68, 5, 0x69, 5)?,
+        ];
+        let current_commits = [
+            durable_commit_observation(&lineage, first_owner, 4)?,
+            durable_commit_observation(&lineage, later_owner, 7)?,
+        ];
+        let current = reconcile_committed_transaction_page(
+            &lineage,
+            page_number,
+            Some(&first_target),
+            &current_physical,
+            &current_owned,
+            &current_commits,
+        )
+        .map_err(|_| TestError("current reconciliation"))?;
+        let DurableCommittedTransactionPageReconciliation::StoreBehind {
+            latest_committed, ..
+        } = current
+        else {
+            return Err(TestError("expected newer committed target"));
+        };
+        assert!(std::ptr::eq(
+            latest_committed.observation(),
+            &current_owned[1]
+        ));
+
+        assert_eq!(
+            compare_committed_transaction_page_recovery_candidate(&candidate, Some(&first_target)),
+            Ok(DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent)
         );
         Ok(())
     }

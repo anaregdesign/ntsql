@@ -5,6 +5,7 @@
 - Issue: #76
 - Extends: ADR 0001, ADR 0005, ADR 0008, ADR 0009, ADR 0010, ADR 0011,
   ADR 0012
+- Extended by: ADR 0014
 
 ## Context
 
@@ -105,16 +106,17 @@ reported as successful creation. Parent-directory synchronization uses
 standard-library filesystem behavior. An unsupported platform or filesystem
 returns the original typed I/O error.
 
-The caller must establish a trusted path and exclusive single-writer ownership
-for the adapter lifetime. This version adds no cross-process lock and cannot
-prove that another process is not writing the file.
+ADR 0014 acquires a nonblocking standard-library advisory exclusive lock
+immediately after obtaining the file descriptor and holds it for the adapter
+lifetime. The caller must still establish a trusted path and prevent
+non-cooperating writers; advisory locks are not mandatory access control.
 
 ## Open, Validation, and Tail Repair
 
-Open first synchronizes the existing file, then reads the header and every
-complete frame. It validates all magic, version, length, flags, reserved bytes,
-checksums, nonzero fields, ordering, identities, and marker references before
-exposing any domain port.
+Open first acquires the ADR 0014 lock and then synchronizes the existing file
+before reading the header and every complete frame. It validates all magic,
+version, length, flags, reserved bytes, checksums, nonzero fields, ordering,
+identities, and marker references before exposing any domain port.
 
 Only a final byte count shorter than one complete frame is repairable. After
 validating the complete prefix, open truncates that incomplete tail,
@@ -202,8 +204,9 @@ status. No native-format evidence or external fixture enters this change.
 ## Consequences
 
 ntsql now owns a minimal persistent transaction commit-log stream with
-reconstructable identity, allocator epochs, positions, barriers, and recovery
-evidence. It is not yet a page WAL or database storage engine. File locking,
-multi-file database creation, page/record formats, checkpoints, analysis,
-redo/undo, group commit, torn-page handling, backup/restore, and client-visible
-transaction behavior remain later Issue #9 work.
+reconstructable identity, allocator epochs, positions, barriers, recovery
+evidence, and cooperative exclusive-writer exclusion. It is not yet a page WAL
+or database storage engine. Mandatory writer exclusion, multi-file database
+creation, page/record formats, checkpoints, analysis, redo/undo, group commit,
+torn-page handling, backup/restore, and client-visible transaction behavior
+remain later Issue #9 work.

@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #63
 - Extends: ADR 0001, ADR 0005, ADR 0006, ADR 0007
+- Extended by: ADR 0009
 
 ## Context
 
@@ -27,10 +28,12 @@ ntsql-storage-memory -> ntsql-transaction
 ntsql-storage-memory -> ntsql-wal
 ```
 
-The adapter implements `CommitLog<TransactionCommitRecord>`. It copies only the
-opaque transaction identity into immutable record snapshots, assigns nonzero
-strictly increasing in-memory positions, and tracks a durable prefix. It never
-constructs a transaction identity or durability acknowledgement.
+The adapter implements `CommitLog<TransactionCommitRecord>` and the
+`TransactionEpochSource` added by ADR 0009. It copies only the opaque transaction
+identity into immutable record snapshots, assigns nonzero strictly increasing
+in-memory positions and coordinator epochs, owns one opaque runtime
+`LogLineage`, and tracks a durable prefix. It never constructs a transaction
+identity or durability acknowledgement.
 
 One fault may be armed at a time. It is consumed exactly once when its matching
 stage is reached:
@@ -46,9 +49,12 @@ because the port promises durability through at least that position.
 
 `restart` is a model transformation, not process or filesystem behavior. It
 retains exactly the marked durable prefix, discards the volatile suffix, and
-clears the transient fault. The allocator high-water mark survives so a copied
-position for a discarded record cannot alias a future record. Intentional gaps
-may therefore appear after restart.
+clears the transient fault. Position and coordinator-epoch allocator high-water
+marks survive so copied or persisted identities cannot alias future records.
+Intentional position gaps may therefore appear after restart.
+The same log lineage is retained so coordinators opened before and after the
+model transformation remain bound to this lineage rather than an independent
+log.
 
 ## Ambiguity and Recovery Boundary
 

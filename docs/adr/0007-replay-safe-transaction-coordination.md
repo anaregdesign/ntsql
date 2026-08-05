@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #59
 - Extends: ADR 0001, ADR 0005, ADR 0006
+- Extended by: ADR 0009
 
 ## Context
 
@@ -67,10 +68,12 @@ Numeric IDs, runtime coordinator identity, lifecycle phases, and log positions
 are ntsql-internal values. They define no SQL Server transaction count, state,
 diagnostic, retry rule, commit point, or crash outcome.
 
-Multiple coordinator instances may issue the same numeric value, but their
-active tokens cannot cross the private runtime identity boundary. Persistent
-uniqueness across process or coordinator lifetimes requires a future
-recovery-backed epoch or allocator and is not claimed here.
+ADR 0009 qualifies each coordinator-local sequence with an injected
+persistence-lineage epoch. Multiple coordinators may still issue the same
+sequence value, but a conforming epoch source makes their complete
+`TransactionId` values distinct within one lineage. Active tokens additionally
+cannot cross the private runtime identity boundary. Independent persistence
+lineages may reuse epoch values; global uniqueness is not claimed.
 
 ## Test Boundaries
 
@@ -84,12 +87,15 @@ recovery-backed epoch or allocator and is not claimed here.
   construction, double commit, and indeterminate retry.
 - Workspace architecture tests continue enforcing the exact
   `ntsql-transaction -> ntsql-wal` edge.
+- Source-backed construction and memory-adapter tests prove distinct epochs
+  across coordinator and model-restart boundaries.
 
 ## Consequences
 
-Safe downstream code cannot reissue or reconstruct active state within one
-coordinator lifetime, and an attempted token cannot be replayed through another
-coordinator. A panic in an outer WAL adapter would leave the in-memory registry
-at `CommitAttempted`, which is fail-closed but is not a recovery verdict. The
-future recovery protocol must reconcile attempted identities with durable log
-state before permitting any external outcome or retry.
+Safe downstream code cannot directly construct a coordinator epoch, transaction
+identity, or active state, and an attempted token cannot be replayed through
+another coordinator. Epoch uniqueness remains a persistence-port obligation. A
+panic in an outer WAL adapter would leave the in-memory registry at
+`CommitAttempted`, which is fail-closed but is not a recovery verdict. The future
+recovery protocol must reconcile epoch-qualified attempted identities with
+durable log state before permitting any external outcome or retry.

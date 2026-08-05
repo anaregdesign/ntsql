@@ -1,6 +1,6 @@
 use std::{cell::Cell, error::Error, fmt};
 
-use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber, commit_durability};
+use ntsql_wal::{CommitError, CommitLog, LogLineage, LogSequenceNumber, commit_durability};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FakeError {
@@ -26,6 +26,7 @@ enum Call {
 }
 
 struct FakeCommitLog {
+    lineage: LogLineage,
     position: LogSequenceNumber,
     append_fails: bool,
     flush_fails: bool,
@@ -35,6 +36,7 @@ struct FakeCommitLog {
 impl FakeCommitLog {
     fn succeeds_at(position: u64) -> Self {
         Self {
+            lineage: LogLineage::new(),
             position: LogSequenceNumber::new(position),
             append_fails: false,
             flush_fails: false,
@@ -45,6 +47,10 @@ impl FakeCommitLog {
 
 impl CommitLog<str> for FakeCommitLog {
     type Error = FakeError;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
 
     fn append_commit(&mut self, record: &str) -> Result<LogSequenceNumber, Self::Error> {
         self.calls.push(Call::Append(record.to_owned()));

@@ -6,17 +6,20 @@ linked to an issue with explicit acceptance criteria.
 
 ## Toolchain and Validation
 
-- Use Rust 1.88.0, edition 2024, and the committed `Cargo.lock`.
+- Use the exact Rust/Cargo toolchain in `rust-toolchain.toml`, edition 2024,
+  and the committed `Cargo.lock`. Keep rustup shims ahead of other Rust
+  installations on `PATH`; `rustup show active-toolchain` must report the
+  repository override before validation.
 - Before a pull request, run:
 
 ```sh
-rustup run 1.88.0 cargo fmt --all -- --check
-rustup run 1.88.0 cargo test --workspace --all-features --locked
-rustup run 1.88.0 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-rustup run 1.88.0 cargo run --locked -p ntsql-architecture-check
-rustup run 1.88.0 cargo run --locked -p ntsql-contract --bin ntsql-governance -- fixtures
-rustup run 1.88.0 cargo run --locked -p ntsql-contract --bin ntsql-governance -- provenance-offline
-rustup run 1.88.0 cargo run --locked -p ntsql-contract --bin ntsql-governance -- provenance-online
+cargo fmt --all -- --check
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo run --locked -p ntsql-architecture-check
+cargo run --locked -p ntsql-contract --bin ntsql-governance -- fixtures
+cargo run --locked -p ntsql-contract --bin ntsql-governance -- provenance-offline
+cargo run --locked -p ntsql-contract --bin ntsql-governance -- provenance-online
 git diff --check
 ```
 

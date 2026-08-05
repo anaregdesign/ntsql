@@ -41,20 +41,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Rust 1.88.0
-        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt
-
-      - name: Select Rust 1.88.0
-        run: rustup default 1.88.0
+      - name: Install and select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain | grep '^1\.97\.1-'
+          rustc --version --verbose | grep '^release: 1\.97\.1$'
+          cargo --version --verbose | grep '^release: 1\.97\.1$'
+          rustup component list --installed
 
       - name: Verify formatting
         run: cargo fmt --all -- --check
 
       - name: Test workspace
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
 
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Check first-party dependency boundaries
         run: cargo run --locked -p ntsql-architecture-check

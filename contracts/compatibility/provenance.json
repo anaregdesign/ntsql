@@ -226,6 +226,23 @@
       "legal_review_id": "legal-review-third-party-dependencies"
     },
     {
+      "id": "prov-rust-toolchain-1.97.1",
+      "source_kind": "dependency",
+      "title": "Rust 1.97.1 distribution channel manifest",
+      "source_url": "https://static.rust-lang.org/dist/channel-rust-1.97.1.toml",
+      "artifact_path": null,
+      "revision": "Rust 1.97.1; rustc 8bab26f4f; Cargo c980f4866",
+      "retrieved_on": "2026-08-05",
+      "author": "The Rust Project Developers",
+      "generation_method": "Official channel manifest retrieved over HTTPS without redirects; local SHA-256 matched the adjacent official .sha256 value",
+      "environment": "rustup profile minimal with rustc, Cargo, rust-std, Clippy, and rustfmt for the selected host",
+      "license": "MIT OR Apache-2.0 for Rust project components; bundled third-party notices apply; qualified legal review pending",
+      "content_digest": "sha256:03569b1886ceb5c05276b50c8431ab111de944cd6140fe1fa7d821dd8e0f29cf",
+      "intended_uses": ["supply-chain-verification"],
+      "parent_provenance_ids": [],
+      "legal_review_id": "legal-review-third-party-dependencies"
+    },
+    {
       "id": "prov-crates-cargo-deny-0.20.2",
       "source_kind": "dependency",
       "title": "cargo-deny 0.20.2 crate archive",

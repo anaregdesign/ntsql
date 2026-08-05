@@ -27,6 +27,10 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
         allowed_dependencies: &["ntsql-compatibility", "serde", "serde_json"],
     },
     PackagePolicy {
+        package: "ntsql-storage-memory",
+        allowed_dependencies: &["ntsql-transaction", "ntsql-wal"],
+    },
+    PackagePolicy {
         package: "ntsql-testkit",
         allowed_dependencies: &["ntsql-contract"],
     },
@@ -44,6 +48,7 @@ const CARGO_TREE_ARGS: &[&str] = &[
     "tree",
     "--workspace",
     "--all-features",
+    "--no-dedupe",
     "--depth",
     "1",
     "--edges",
@@ -243,6 +248,7 @@ mod tests {
     #[test]
     fn cargo_tree_enables_every_feature() {
         assert!(CARGO_TREE_ARGS.contains(&"--all-features"));
+        assert!(CARGO_TREE_ARGS.contains(&"--no-dedupe"));
     }
 
     #[test]
@@ -255,8 +261,14 @@ mod tests {
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
              1serde_json v1.0.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n",
@@ -287,6 +299,9 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n",
@@ -354,6 +369,9 @@ mod tests {
              1ntsql-contract v0.1.0\n\
              1ntsql-server v0.1.0\n\
              1serde_json v1.0.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n",
@@ -380,6 +398,9 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n\
              1ntsql-contract v0.1.0\n\
              1ntsql-filesystem-adapter v0.1.0\n\
@@ -417,6 +438,9 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              1ntsql-contract v0.1.0\n\
@@ -439,6 +463,45 @@ mod tests {
                     "package ntsql-transaction has forbidden direct dependency {dependency}"
                 )));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn memory_storage_adapter_dependencies_are_enforced() -> Result<(), ArchitectureCheckError> {
+        let graph = parse_dependency_tree(
+            "0ntsql-architecture-check v0.1.0\n\
+             0ntsql-compatibility v0.1.0\n\
+             0ntsql-contract v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
+             1serde v1.0.0\n\
+             1serde_json v1.0.0\n\
+             0ntsql-diagnostics v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
+             1serde v1.0.0\n\
+             0ntsql-testkit v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             0ntsql-transaction v0.1.0\n\
+             1ntsql-storage-memory v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
+             0ntsql-wal v0.1.0\n\
+             1ntsql-storage-memory v0.1.0\n",
+        )?;
+
+        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+
+        for dependency in ["ntsql-contract", "serde"] {
+            assert!(violations.iter().any(|violation| violation
+                == &format!(
+                    "package ntsql-storage-memory has forbidden direct dependency {dependency}"
+                )));
+        }
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-transaction has forbidden direct dependency ntsql-storage-memory"));
+        assert!(violations.iter().any(|violation| violation
+            == "package ntsql-wal has forbidden direct dependency ntsql-storage-memory"));
         Ok(())
     }
 }

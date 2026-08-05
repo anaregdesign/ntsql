@@ -1,0 +1,15 @@
+[package]
+name = "ntsql-storage-memory"
+version = "0.1.0"
+description = "Deterministic in-memory persistence adapter for ntsql"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ntsql-transaction.workspace = true
+ntsql-wal.workspace = true
+
+[lints]
+workspace = true

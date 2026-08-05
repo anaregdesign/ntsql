@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #82
 - Extends: ADR 0001, ADR 0008, ADR 0011, ADR 0012, ADR 0015
+- Extended by: ADR 0017
 
 ## Context
 
@@ -122,7 +123,7 @@ external observation or proprietary format was consulted.
 ## Consequences
 
 The deterministic model can now falsify page-WAL ordering and ambiguity
-hypotheses before a filesystem format exists. The next storage slice can specify
-versioned persistent page-log records and page-store barriers without changing
-the domain staging sequence. Checkpoints, redo/undo, page eviction, and external
-compatibility remain separate work.
+hypotheses before a filesystem format exists. ADR 0017 specifies versioned
+persistent page-log records without changing the domain staging sequence.
+Filesystem page-store barriers, checkpoints, redo/undo, page eviction, and
+external compatibility remain separate work.

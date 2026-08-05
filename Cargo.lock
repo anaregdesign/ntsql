@@ -46,6 +46,7 @@ dependencies = [
 name = "ntsql-storage-file"
 version = "0.1.0"
 dependencies = [
+ "ntsql-page",
  "ntsql-transaction",
  "ntsql-wal",
 ]

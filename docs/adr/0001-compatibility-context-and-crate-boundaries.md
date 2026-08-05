@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-04
 - Issue: #32
-- Extended by: ADR 0002
+- Extended by: ADR 0002, ADR 0004
 
 ## Context
 

@@ -10,7 +10,8 @@ use std::{
 
 use ntsql_page::{
     CleanPage, DirtyPage, DurablePageWalObservation, FlushDirtyPageError,
-    IndeterminatePageLogAppend, IndeterminatePageWrite, PageLog, PageStore, StagePageWriteError,
+    IndeterminatePageLogAppend, IndeterminatePageWrite, PageLog, PageNumber,
+    PageRecoveryObservationBytesErrorReason, PageStore, PageVersion, StagePageWriteError,
     StagePageWriteEvidenceErrorReason, UnloggedPage, flush_dirty_page, stage_page_write,
 };
 use ntsql_wal::{
@@ -265,6 +266,55 @@ impl<const N: usize> DurableTransactionPageObservation<N> {
         Self { owner, page }
     }
 
+    /// Projects exact raw adapter fields into one owned-page observation.
+    ///
+    /// Owner fields are validated before page fields. A failure retains every
+    /// supplied owner field, page field, byte, and lineage-bound position.
+    pub fn from_bytes(
+        epoch: u64,
+        sequence: u64,
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: [u8; N],
+        position: LogSequenceNumber,
+    ) -> Result<Self, DurableTransactionPageObservationBytesError<N>> {
+        let owner = match DurableTransactionIdentityObservation::new(epoch, sequence) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Err(DurableTransactionPageObservationBytesError {
+                    epoch,
+                    sequence,
+                    page_number,
+                    page_version,
+                    bytes,
+                    position,
+                    reason: DurableTransactionPageObservationBytesErrorReason::Identity(
+                        error.reason(),
+                    ),
+                });
+            }
+        };
+        let page =
+            match DurablePageWalObservation::from_bytes(page_number, page_version, bytes, position)
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    let reason = error.reason();
+                    let (page_number, page_version, bytes, position, _) = error.into_parts();
+                    return Err(DurableTransactionPageObservationBytesError {
+                        epoch,
+                        sequence,
+                        page_number,
+                        page_version,
+                        bytes,
+                        position,
+                        reason: DurableTransactionPageObservationBytesErrorReason::Page(reason),
+                    });
+                }
+            };
+        Ok(Self { owner, page })
+    }
+
     /// Returns the observed persisted owner fields.
     #[must_use]
     pub const fn owner(&self) -> DurableTransactionIdentityObservation {
@@ -283,6 +333,110 @@ impl<const N: usize> DurableTransactionPageObservation<N> {
         self.page.position()
     }
 }
+
+/// Why raw adapter fields could not become an owned-page observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionPageObservationBytesErrorReason {
+    /// The persisted owner fields were invalid.
+    Identity(DurableTransactionIdentityObservationErrorReason),
+    /// The page payload or position was invalid.
+    Page(PageRecoveryObservationBytesErrorReason),
+}
+
+/// Rejected raw owned-page fields retained without alteration.
+#[derive(Debug, Eq, PartialEq)]
+pub struct DurableTransactionPageObservationBytesError<const N: usize> {
+    epoch: u64,
+    sequence: u64,
+    page_number: PageNumber,
+    page_version: PageVersion,
+    bytes: [u8; N],
+    position: LogSequenceNumber,
+    reason: DurableTransactionPageObservationBytesErrorReason,
+}
+
+impl<const N: usize> DurableTransactionPageObservationBytesError<N> {
+    /// Returns the rejected owner epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns the rejected owner sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the retained page number.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.page_number
+    }
+
+    /// Returns the retained page version.
+    #[must_use]
+    pub const fn page_version(&self) -> PageVersion {
+        self.page_version
+    }
+
+    /// Returns the retained raw page bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; N] {
+        &self.bytes
+    }
+
+    /// Returns the retained lineage-bound position.
+    #[must_use]
+    pub const fn position(&self) -> &LogSequenceNumber {
+        &self.position
+    }
+
+    /// Returns the exact projection failure.
+    #[must_use]
+    pub const fn reason(&self) -> DurableTransactionPageObservationBytesErrorReason {
+        self.reason
+    }
+
+    /// Returns every retained input and the exact projection failure.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        u64,
+        u64,
+        PageNumber,
+        PageVersion,
+        [u8; N],
+        LogSequenceNumber,
+        DurableTransactionPageObservationBytesErrorReason,
+    ) {
+        (
+            self.epoch,
+            self.sequence,
+            self.page_number,
+            self.page_version,
+            self.bytes,
+            self.position,
+            self.reason,
+        )
+    }
+}
+
+impl<const N: usize> fmt::Display for DurableTransactionPageObservationBytesError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction {}:{} page {} recovery observation is invalid: {:?}",
+            self.epoch,
+            self.sequence,
+            self.page_number.get(),
+            self.reason
+        )
+    }
+}
+
+impl<const N: usize> Error for DurableTransactionPageObservationBytesError<N> {}
 
 /// Adapter-neutral observation of one complete durable commit record.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -307,6 +461,42 @@ impl DurableTransactionCommitObservation {
             transaction,
             position,
         })
+    }
+
+    /// Projects exact raw adapter fields into one durable commit observation.
+    ///
+    /// Identity fields are validated before the position. A failure retains all
+    /// three raw inputs and the exact lineage capability on the position.
+    pub fn from_fields(
+        epoch: u64,
+        sequence: u64,
+        position: LogSequenceNumber,
+    ) -> Result<Self, DurableTransactionCommitObservationFieldsError> {
+        let transaction = match DurableTransactionIdentityObservation::new(epoch, sequence) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return Err(DurableTransactionCommitObservationFieldsError {
+                    epoch,
+                    sequence,
+                    position,
+                    reason: DurableTransactionCommitObservationFieldsErrorReason::Identity(
+                        error.reason(),
+                    ),
+                });
+            }
+        };
+        match Self::new(transaction, position) {
+            Ok(observation) => Ok(observation),
+            Err(error) => {
+                let (_, position) = error.into_parts();
+                Err(DurableTransactionCommitObservationFieldsError {
+                    epoch,
+                    sequence,
+                    position,
+                    reason: DurableTransactionCommitObservationFieldsErrorReason::ZeroPosition,
+                })
+            }
+        }
     }
 
     /// Returns the persisted transaction identity fields.
@@ -360,6 +550,75 @@ impl fmt::Display for DurableTransactionCommitObservationError {
 }
 
 impl Error for DurableTransactionCommitObservationError {}
+
+/// Why raw commit fields could not become a durable commit observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionCommitObservationFieldsErrorReason {
+    /// The persisted transaction identity fields were invalid.
+    Identity(DurableTransactionIdentityObservationErrorReason),
+    /// The supplied commit position was zero.
+    ZeroPosition,
+}
+
+/// Rejected raw durable commit fields retained without alteration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableTransactionCommitObservationFieldsError {
+    epoch: u64,
+    sequence: u64,
+    position: LogSequenceNumber,
+    reason: DurableTransactionCommitObservationFieldsErrorReason,
+}
+
+impl DurableTransactionCommitObservationFieldsError {
+    /// Returns the rejected transaction epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns the rejected transaction sequence.
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the retained lineage-bound position.
+    #[must_use]
+    pub const fn position(&self) -> &LogSequenceNumber {
+        &self.position
+    }
+
+    /// Returns the exact projection failure.
+    #[must_use]
+    pub const fn reason(&self) -> DurableTransactionCommitObservationFieldsErrorReason {
+        self.reason
+    }
+
+    /// Returns every retained input and the exact projection failure.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        u64,
+        u64,
+        LogSequenceNumber,
+        DurableTransactionCommitObservationFieldsErrorReason,
+    ) {
+        (self.epoch, self.sequence, self.position, self.reason)
+    }
+}
+
+impl fmt::Display for DurableTransactionCommitObservationFieldsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction {}:{} durable commit observation is invalid: {:?}",
+            self.epoch, self.sequence, self.reason
+        )
+    }
+}
+
+impl Error for DurableTransactionCommitObservationFieldsError {}
 
 /// Inert per-record classification of durable transaction commit evidence.
 ///
@@ -3226,6 +3485,173 @@ mod tests {
         assert_eq!(retained_transaction, transaction);
         assert_eq!(retained_position.get(), 0);
         assert!(retained_position.lineage().same_lineage(&lineage));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_owned_page_constructor_retains_every_input_on_each_failure() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let number = PageNumber::new(39).ok_or(TestError("durable page number"))?;
+        let version = PageVersion::new(6);
+
+        let valid = DurableTransactionPageObservation::from_bytes(
+            3,
+            4,
+            number,
+            version,
+            [7_u8, 8],
+            lineage.position(9),
+        )
+        .map_err(|_| TestError("valid raw owned page"))?;
+        assert_eq!(valid.owner().epoch(), 3);
+        assert_eq!(valid.owner().sequence(), 4);
+        assert_eq!(valid.page().page_number(), number);
+        assert_eq!(valid.page().page_version(), version);
+        assert_eq!(valid.page().image().bytes(), &[7_u8, 8]);
+        assert_eq!(valid.position(), &lineage.position(9));
+
+        let identity_error = DurableTransactionPageObservation::from_bytes(
+            0,
+            5,
+            number,
+            version,
+            [9_u8, 10],
+            lineage.position(11),
+        )
+        .err()
+        .ok_or(TestError("zero owner epoch must fail"))?;
+        assert_eq!(identity_error.epoch(), 0);
+        assert_eq!(identity_error.sequence(), 5);
+        assert_eq!(identity_error.page_number(), number);
+        assert_eq!(identity_error.page_version(), version);
+        assert_eq!(identity_error.bytes(), &[9_u8, 10]);
+        assert_eq!(identity_error.position(), &lineage.position(11));
+        assert_eq!(
+            identity_error.reason(),
+            DurableTransactionPageObservationBytesErrorReason::Identity(
+                DurableTransactionIdentityObservationErrorReason::ZeroEpoch
+            )
+        );
+        assert_eq!(
+            identity_error.into_parts(),
+            (
+                0,
+                5,
+                number,
+                version,
+                [9_u8, 10],
+                lineage.position(11),
+                DurableTransactionPageObservationBytesErrorReason::Identity(
+                    DurableTransactionIdentityObservationErrorReason::ZeroEpoch
+                ),
+            )
+        );
+
+        let zero_width = DurableTransactionPageObservation::<0>::from_bytes(
+            6,
+            7,
+            number,
+            version,
+            [],
+            lineage.position(12),
+        )
+        .err()
+        .ok_or(TestError("zero page width must fail"))?;
+        assert_eq!(zero_width.epoch(), 6);
+        assert_eq!(zero_width.sequence(), 7);
+        assert_eq!(zero_width.page_number(), number);
+        assert_eq!(zero_width.page_version(), version);
+        assert_eq!(zero_width.bytes(), &[]);
+        assert_eq!(zero_width.position(), &lineage.position(12));
+        assert_eq!(
+            zero_width.reason(),
+            DurableTransactionPageObservationBytesErrorReason::Page(
+                PageRecoveryObservationBytesErrorReason::ZeroPageWidth
+            )
+        );
+
+        let zero_position = DurableTransactionPageObservation::from_bytes(
+            8,
+            9,
+            number,
+            version,
+            [11_u8, 12],
+            lineage.position(0),
+        )
+        .err()
+        .ok_or(TestError("zero page position must fail"))?;
+        assert_eq!(zero_position.epoch(), 8);
+        assert_eq!(zero_position.sequence(), 9);
+        assert_eq!(zero_position.page_number(), number);
+        assert_eq!(zero_position.page_version(), version);
+        assert_eq!(zero_position.bytes(), &[11_u8, 12]);
+        assert_eq!(zero_position.position(), &lineage.position(0));
+        assert_eq!(
+            zero_position.reason(),
+            DurableTransactionPageObservationBytesErrorReason::Page(
+                PageRecoveryObservationBytesErrorReason::ZeroPosition
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_commit_constructor_retains_identity_and_position_failures() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let valid = DurableTransactionCommitObservation::from_fields(10, 11, lineage.position(13))
+            .map_err(|_| TestError("valid raw commit"))?;
+        assert_eq!(valid.transaction().epoch(), 10);
+        assert_eq!(valid.transaction().sequence(), 11);
+        assert_eq!(valid.position(), &lineage.position(13));
+
+        let zero_epoch =
+            DurableTransactionCommitObservation::from_fields(0, 12, lineage.position(14))
+                .err()
+                .ok_or(TestError("zero commit epoch must fail"))?;
+        assert_eq!(zero_epoch.epoch(), 0);
+        assert_eq!(zero_epoch.sequence(), 12);
+        assert_eq!(zero_epoch.position(), &lineage.position(14));
+        assert_eq!(
+            zero_epoch.reason(),
+            DurableTransactionCommitObservationFieldsErrorReason::Identity(
+                DurableTransactionIdentityObservationErrorReason::ZeroEpoch
+            )
+        );
+
+        let zero_sequence =
+            DurableTransactionCommitObservation::from_fields(13, 0, lineage.position(15))
+                .err()
+                .ok_or(TestError("zero commit sequence must fail"))?;
+        assert_eq!(zero_sequence.epoch(), 13);
+        assert_eq!(zero_sequence.sequence(), 0);
+        assert_eq!(zero_sequence.position(), &lineage.position(15));
+        assert_eq!(
+            zero_sequence.reason(),
+            DurableTransactionCommitObservationFieldsErrorReason::Identity(
+                DurableTransactionIdentityObservationErrorReason::ZeroSequence
+            )
+        );
+
+        let zero_position =
+            DurableTransactionCommitObservation::from_fields(14, 15, lineage.position(0))
+                .err()
+                .ok_or(TestError("zero commit position must fail"))?;
+        assert_eq!(zero_position.epoch(), 14);
+        assert_eq!(zero_position.sequence(), 15);
+        assert_eq!(zero_position.position(), &lineage.position(0));
+        assert_eq!(
+            zero_position.reason(),
+            DurableTransactionCommitObservationFieldsErrorReason::ZeroPosition
+        );
+        assert_eq!(
+            zero_position.into_parts(),
+            (
+                14,
+                15,
+                lineage.position(0),
+                DurableTransactionCommitObservationFieldsErrorReason::ZeroPosition,
+            )
+        );
         Ok(())
     }
 

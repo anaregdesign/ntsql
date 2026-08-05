@@ -84,10 +84,12 @@ appended and its exact assigned position is flushed before a durable
 acknowledgement can exist. It owns no filesystem, byte format, transaction
 semantics, recovery policy, or client diagnostic.
 
-`ntsql-transaction` owns I/O-free transaction lifecycle state. Its first
-behavior consumes active state once, depends only on `ntsql-wal`, creates
-committed state inside the durable callback, and otherwise returns an
-indeterminate state with no transition back to active.
+`ntsql-transaction` owns I/O-free transaction coordination and lifecycle state.
+Its coordinator issues monotonic nonzero identities, binds active tokens to one
+private runtime identity, records every commit attempt before crossing the WAL
+port, and never reconstructs terminal state as active. Commit consumes active
+state once, creates committed state inside the durable callback, and otherwise
+returns indeterminate state with no transition back to active.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and

@@ -9,10 +9,11 @@ use std::{
 };
 
 use ntsql_page::{
-    CleanPage, DirtyPage, DurablePageWalObservation, FlushDirtyPageError,
-    IndeterminatePageLogAppend, IndeterminatePageWrite, PageLog, PageNumber,
+    CleanPage, DirtyPage, DurablePageReconciliationError, DurablePageWalObservation,
+    FlushDirtyPageError, IndeterminatePageLogAppend, IndeterminatePageWrite, PageLog, PageNumber,
     PageRecoveryObservationBytesErrorReason, PageStore, PageVersion, StagePageWriteError,
-    StagePageWriteEvidenceErrorReason, UnloggedPage, flush_dirty_page, stage_page_write,
+    StagePageWriteEvidenceErrorReason, StoredPageSnapshotObservation, UnloggedPage,
+    flush_dirty_page, reconcile_durable_page, stage_page_write,
 };
 use ntsql_wal::{
     CommitError, CommitLog, LogDurability, LogLineage, LogSequenceNumber, commit_durability,
@@ -1241,6 +1242,459 @@ where
             page_number: expected_page,
         },
     })
+}
+
+/// Committed-relative reconciliation of one durable page and stored snapshot.
+///
+/// This value deliberately cannot create transaction lifecycle authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableCommittedTransactionPageReconciliation, TransactionId,
+/// };
+///
+/// fn cannot_create_transaction_id<const N: usize>(
+///     reconciliation: DurableCommittedTransactionPageReconciliation<'_, N>,
+/// ) -> TransactionId {
+///     reconciliation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransaction, DurableCommittedTransactionPageReconciliation,
+/// };
+///
+/// fn cannot_create_committed<const N: usize>(
+///     reconciliation: DurableCommittedTransactionPageReconciliation<'_, N>,
+/// ) -> CommittedTransaction {
+///     reconciliation.into()
+/// }
+/// ```
+///
+/// It also cannot create dirty or write-authorizing state:
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::DurableCommittedTransactionPageReconciliation;
+///
+/// fn cannot_create_dirty<const N: usize>(
+///     reconciliation: DurableCommittedTransactionPageReconciliation<'_, N>,
+/// ) -> DirtyPage<N> {
+///     reconciliation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableCommittedTransactionPageReconciliation, TransactionDirtyPage,
+/// };
+///
+/// fn cannot_create_transaction_dirty<const N: usize>(
+///     reconciliation: DurableCommittedTransactionPageReconciliation<'_, N>,
+/// ) -> TransactionDirtyPage<N> {
+///     reconciliation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableCommittedTransactionPageReconciliation;
+///
+/// fn cannot_authorize_write<const N: usize>(
+///     reconciliation: DurableCommittedTransactionPageReconciliation<'_, N>,
+/// ) -> PageWritePermit<'static> {
+///     reconciliation.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableCommittedTransactionPageReconciliation<'observation, const N: usize> {
+    /// No committed transaction-owned page and no stored snapshot were observed.
+    NoCommittedPage {
+        /// Requested page number with no committed durable state.
+        page_number: PageNumber,
+    },
+    /// A latest committed page exists but the store has no snapshot.
+    StoreMissing {
+        /// Exact latest committed transaction-owned observation.
+        latest_committed: LatestCommittedTransactionPage<'observation, N>,
+    },
+    /// The store is backed by the exact latest committed page observation.
+    ExactCurrent {
+        /// Exact latest committed transaction-owned observation.
+        latest_committed: LatestCommittedTransactionPage<'observation, N>,
+    },
+    /// The store is backed by an earlier committed page observation.
+    StoreBehind {
+        /// Durable owned-page position backing the current stored snapshot.
+        stored_page_position: LogSequenceNumber,
+        /// Matching durable commit position for the stored owned page.
+        stored_commit_position: LogSequenceNumber,
+        /// Exact later committed transaction-owned observation.
+        latest_committed: LatestCommittedTransactionPage<'observation, N>,
+    },
+}
+
+/// Contradiction that prevents committed-relative page reconciliation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableCommittedTransactionPageReconciliationError {
+    /// Complete commit or owner-aware evidence failed ADR 0025 selection.
+    Selection {
+        /// Exact latest-selection failure.
+        source: Box<DurableTransactionPageSelectionError>,
+    },
+    /// Snapshot or physical page evidence failed ADR 0019 reconciliation.
+    Physical {
+        /// Exact physical reconciliation failure.
+        source: Box<DurablePageReconciliationError>,
+    },
+    /// One owner-aware page has no physical projection at the same position.
+    OwnedPagePositionUnbacked {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Unbacked owner-aware page position.
+        position: LogSequenceNumber,
+    },
+    /// Owner-aware and physical projections disagree at one shared position.
+    OwnedPagePayloadContradiction {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Position whose page version or bytes disagree.
+        position: LogSequenceNumber,
+    },
+    /// The stored snapshot is backed by a physical raw-page record.
+    SnapshotBackedByRawPage {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Raw physical position backing the snapshot.
+        position: LogSequenceNumber,
+    },
+    /// The stored snapshot is backed by an uncommitted owned-page record.
+    SnapshotBackedByUncommittedTransactionPage {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Persisted owner of the uncommitted page.
+        transaction: DurableTransactionIdentityObservation,
+        /// Uncommitted owned-page position backing the snapshot.
+        page_position: LogSequenceNumber,
+    },
+    /// Snapshot-backing owner evidence failed ADR 0023 classification.
+    SnapshotBackingClassification {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Owned-page position backing the snapshot.
+        page_position: LogSequenceNumber,
+        /// Exact per-record classification failure.
+        source: Box<DurableTransactionPageClassificationError>,
+    },
+    /// A committed snapshot backing exists despite an empty committed selection.
+    CommittedSnapshotWithoutSelection {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Committed owned-page position backing the snapshot.
+        stored_page_position: LogSequenceNumber,
+        /// Matching commit position for the stored page.
+        stored_commit_position: LogSequenceNumber,
+    },
+    /// A committed snapshot backing occurs after the selected latest record.
+    CommittedSnapshotAfterSelection {
+        /// Requested page number.
+        page_number: PageNumber,
+        /// Committed owned-page position backing the snapshot.
+        stored_page_position: LogSequenceNumber,
+        /// Selected latest committed owned-page position.
+        selected_page_position: LogSequenceNumber,
+    },
+}
+
+impl fmt::Display for DurableCommittedTransactionPageReconciliationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Selection { source } => {
+                write!(formatter, "committed page selection failed: {source}")
+            }
+            Self::Physical { source } => {
+                write!(formatter, "physical page reconciliation failed: {source}")
+            }
+            Self::OwnedPagePositionUnbacked {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} owned observation at position {} has no physical projection",
+                page_number.get(),
+                position.get()
+            ),
+            Self::OwnedPagePayloadContradiction {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} owned and physical projections contradict at position {}",
+                page_number.get(),
+                position.get()
+            ),
+            Self::SnapshotBackedByRawPage {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} snapshot is backed by raw physical position {}",
+                page_number.get(),
+                position.get()
+            ),
+            Self::SnapshotBackedByUncommittedTransactionPage {
+                page_number,
+                transaction,
+                page_position,
+            } => write!(
+                formatter,
+                "page {} snapshot is backed by uncommitted transaction {} at position {}",
+                page_number.get(),
+                transaction,
+                page_position.get()
+            ),
+            Self::SnapshotBackingClassification {
+                page_number,
+                page_position,
+                source,
+            } => write!(
+                formatter,
+                "page {} snapshot backing at position {} cannot be classified: {}",
+                page_number.get(),
+                page_position.get(),
+                source
+            ),
+            Self::CommittedSnapshotWithoutSelection {
+                page_number,
+                stored_page_position,
+                stored_commit_position,
+            } => write!(
+                formatter,
+                "page {} snapshot has committed backing at positions {}/{} but selection found no committed page",
+                page_number.get(),
+                stored_page_position.get(),
+                stored_commit_position.get()
+            ),
+            Self::CommittedSnapshotAfterSelection {
+                page_number,
+                stored_page_position,
+                selected_page_position,
+            } => write!(
+                formatter,
+                "page {} committed snapshot position {} is after selected committed position {}",
+                page_number.get(),
+                stored_page_position.get(),
+                selected_page_position.get()
+            ),
+        }
+    }
+}
+
+impl Error for DurableCommittedTransactionPageReconciliationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Selection { source } => Some(source.as_ref()),
+            Self::Physical { source } => Some(source.as_ref()),
+            Self::SnapshotBackingClassification { source, .. } => Some(source.as_ref()),
+            Self::OwnedPagePositionUnbacked { .. }
+            | Self::OwnedPagePayloadContradiction { .. }
+            | Self::SnapshotBackedByRawPage { .. }
+            | Self::SnapshotBackedByUncommittedTransactionPage { .. }
+            | Self::CommittedSnapshotWithoutSelection { .. }
+            | Self::CommittedSnapshotAfterSelection { .. } => None,
+        }
+    }
+}
+
+fn validate_owned_physical_page_projections<const N: usize>(
+    page_number: PageNumber,
+    physical_pages: &[DurablePageWalObservation<N>],
+    owned_pages: &[DurableTransactionPageObservation<N>],
+) -> Result<(), DurableCommittedTransactionPageReconciliationError> {
+    let mut physical_index = 0;
+    for owned in owned_pages {
+        while physical_pages
+            .get(physical_index)
+            .is_some_and(|physical| physical.position().get() < owned.position().get())
+        {
+            physical_index += 1;
+        }
+        let Some(physical) = physical_pages.get(physical_index) else {
+            return Err(
+                DurableCommittedTransactionPageReconciliationError::OwnedPagePositionUnbacked {
+                    page_number,
+                    position: owned.position().clone(),
+                },
+            );
+        };
+        if physical.position().get() != owned.position().get() {
+            return Err(
+                DurableCommittedTransactionPageReconciliationError::OwnedPagePositionUnbacked {
+                    page_number,
+                    position: owned.position().clone(),
+                },
+            );
+        }
+        if physical.page_version() != owned.page().page_version()
+            || physical.image().bytes() != owned.page().image().bytes()
+        {
+            return Err(
+                DurableCommittedTransactionPageReconciliationError::OwnedPagePayloadContradiction {
+                    page_number,
+                    position: owned.position().clone(),
+                },
+            );
+        }
+        physical_index += 1;
+    }
+    Ok(())
+}
+
+fn resolve_committed_snapshot_reconciliation<'observation, const N: usize>(
+    page_number: PageNumber,
+    selection: DurableTransactionPageSelection<'observation, N>,
+    stored_page_position: LogSequenceNumber,
+    stored_commit_position: LogSequenceNumber,
+) -> Result<
+    DurableCommittedTransactionPageReconciliation<'observation, N>,
+    DurableCommittedTransactionPageReconciliationError,
+> {
+    let DurableTransactionPageSelection::LatestCommitted(latest_committed) = selection else {
+        return Err(
+            DurableCommittedTransactionPageReconciliationError::CommittedSnapshotWithoutSelection {
+                page_number,
+                stored_page_position,
+                stored_commit_position,
+            },
+        );
+    };
+    match stored_page_position
+        .get()
+        .cmp(&latest_committed.observation().position().get())
+    {
+        std::cmp::Ordering::Equal => {
+            Ok(DurableCommittedTransactionPageReconciliation::ExactCurrent { latest_committed })
+        }
+        std::cmp::Ordering::Less => {
+            Ok(DurableCommittedTransactionPageReconciliation::StoreBehind {
+                stored_page_position,
+                stored_commit_position,
+                latest_committed,
+            })
+        }
+        std::cmp::Ordering::Greater => Err(
+            DurableCommittedTransactionPageReconciliationError::CommittedSnapshotAfterSelection {
+                page_number,
+                stored_page_position,
+                selected_page_position: latest_committed.observation().position().clone(),
+            },
+        ),
+    }
+}
+
+/// Reconciles latest committed transaction state with physical WAL and store
+/// evidence without authorizing mutation.
+///
+/// `physical_pages` must contain the ADR 0019 physical projection of every
+/// durable full-image record for `page_number`, including every transaction-owned
+/// record. `owned_pages` must contain every owner-aware projection for the same
+/// complete durable prefix. Unmatched physical positions are raw only under
+/// those completeness contracts.
+///
+/// Validation deterministically proceeds through ADR 0025 selection, ADR 0019
+/// physical reconciliation, cross-projection integrity, and snapshot-backing
+/// classification. Success builds no collection and the result borrows only the
+/// selected owned-page observation.
+pub fn reconcile_committed_transaction_page<'observation, const N: usize>(
+    expected_lineage: &LogLineage,
+    page_number: PageNumber,
+    snapshot: Option<&StoredPageSnapshotObservation<N>>,
+    physical_pages: &[DurablePageWalObservation<N>],
+    owned_pages: &'observation [DurableTransactionPageObservation<N>],
+    commit_observations: &[DurableTransactionCommitObservation],
+) -> Result<
+    DurableCommittedTransactionPageReconciliation<'observation, N>,
+    DurableCommittedTransactionPageReconciliationError,
+> {
+    let selection = select_latest_committed_transaction_page(
+        expected_lineage,
+        page_number,
+        owned_pages.iter(),
+        commit_observations,
+    )
+    .map_err(
+        |source| DurableCommittedTransactionPageReconciliationError::Selection {
+            source: Box::new(source),
+        },
+    )?;
+
+    let _ = reconcile_durable_page(
+        expected_lineage,
+        page_number,
+        snapshot,
+        physical_pages.iter(),
+    )
+    .map_err(
+        |source| DurableCommittedTransactionPageReconciliationError::Physical {
+            source: Box::new(source),
+        },
+    )?;
+
+    validate_owned_physical_page_projections(page_number, physical_pages, owned_pages)?;
+
+    let Some(snapshot) = snapshot else {
+        return Ok(match selection {
+            DurableTransactionPageSelection::NoCommittedPage { page_number } => {
+                DurableCommittedTransactionPageReconciliation::NoCommittedPage { page_number }
+            }
+            DurableTransactionPageSelection::LatestCommitted(latest_committed) => {
+                DurableCommittedTransactionPageReconciliation::StoreMissing { latest_committed }
+            }
+        });
+    };
+
+    let Ok(backing_index) = owned_pages
+        .binary_search_by_key(&snapshot.required_position().get(), |observation| {
+            observation.position().get()
+        })
+    else {
+        return Err(
+            DurableCommittedTransactionPageReconciliationError::SnapshotBackedByRawPage {
+                page_number,
+                position: snapshot.required_position().clone(),
+            },
+        );
+    };
+    let backing = &owned_pages[backing_index];
+    let classification =
+        classify_durable_transaction_page(expected_lineage, backing, commit_observations.iter())
+            .map_err(|source| {
+                DurableCommittedTransactionPageReconciliationError::SnapshotBackingClassification {
+                    page_number,
+                    page_position: backing.position().clone(),
+                    source: Box::new(source),
+                }
+            })?;
+
+    match classification {
+        DurableTransactionPageCommitClassification::Uncommitted { page_position } => Err(
+            DurableCommittedTransactionPageReconciliationError::SnapshotBackedByUncommittedTransactionPage {
+                page_number,
+                transaction: backing.owner(),
+                page_position,
+            },
+        ),
+        DurableTransactionPageCommitClassification::Committed {
+            page_position,
+            commit_position,
+        } => resolve_committed_snapshot_reconciliation(
+            page_number,
+            selection,
+            page_position,
+            commit_position,
+        ),
+    }
 }
 
 /// Read-only in-process lifecycle phase recorded by the coordinator.
@@ -3220,6 +3674,23 @@ mod tests {
             .map_err(|_| TestError("durable transaction identity"))
     }
 
+    fn physical_page_observation(
+        lineage: &LogLineage,
+        number: u64,
+        version: u64,
+        byte: u8,
+        position: u64,
+    ) -> Result<DurablePageWalObservation<1>, TestError> {
+        let number = PageNumber::new(number).ok_or(TestError("durable page number"))?;
+        DurablePageWalObservation::from_bytes(
+            number,
+            PageVersion::new(version),
+            [byte],
+            lineage.position(position),
+        )
+        .map_err(|_| TestError("durable page observation"))
+    }
+
     fn durable_page_observation(
         lineage: &LogLineage,
         owner: DurableTransactionIdentityObservation,
@@ -3228,15 +3699,25 @@ mod tests {
         byte: u8,
         position: u64,
     ) -> Result<DurableTransactionPageObservation<1>, TestError> {
-        let number = PageNumber::new(number).ok_or(TestError("durable page number"))?;
-        let page = DurablePageWalObservation::from_bytes(
+        let page = physical_page_observation(lineage, number, version, byte, position)?;
+        Ok(DurableTransactionPageObservation::new(owner, page))
+    }
+
+    fn stored_page_observation(
+        lineage: &LogLineage,
+        number: u64,
+        version: u64,
+        byte: u8,
+        position: u64,
+    ) -> Result<StoredPageSnapshotObservation<1>, TestError> {
+        let number = PageNumber::new(number).ok_or(TestError("stored page number"))?;
+        StoredPageSnapshotObservation::from_bytes(
             number,
             PageVersion::new(version),
             [byte],
             lineage.position(position),
         )
-        .map_err(|_| TestError("durable page observation"))?;
-        Ok(DurableTransactionPageObservation::new(owner, page))
+        .map_err(|_| TestError("stored page observation"))
     }
 
     fn durable_commit_observation(
@@ -4664,6 +5145,387 @@ mod tests {
                     },
                 ),
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_reports_no_committed_state_without_store() -> Result<(), TestError>
+    {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(55).ok_or(TestError("page number"))?;
+        let owner = durable_identity(18, 1)?;
+        let physical = [
+            physical_page_observation(&lineage, 55, 1, 0x55, 1)?,
+            physical_page_observation(&lineage, 55, 2, 0x56, 2)?,
+        ];
+        let owned = [durable_page_observation(&lineage, owner, 55, 2, 0x56, 2)?];
+        let empty_physical: [DurablePageWalObservation<1>; 0] = [];
+        let empty_owned: [DurableTransactionPageObservation<1>; 0] = [];
+
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                None,
+                &empty_physical,
+                &empty_owned,
+                &[],
+            ),
+            Ok(DurableCommittedTransactionPageReconciliation::NoCommittedPage { page_number })
+        );
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                None,
+                &physical,
+                &owned,
+                &[],
+            ),
+            Ok(DurableCommittedTransactionPageReconciliation::NoCommittedPage { page_number })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_reports_missing_store_and_borrows_only_owned_input()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(56).ok_or(TestError("page number"))?;
+        let owner = durable_identity(19, 1)?;
+        let owned = [durable_page_observation(&lineage, owner, 56, 1, 0x56, 2)?];
+
+        let result = {
+            let physical = [physical_page_observation(&lineage, 56, 1, 0x56, 2)?];
+            let commits = [durable_commit_observation(&lineage, owner, 4)?];
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                None,
+                &physical,
+                &owned,
+                &commits,
+            )
+        }
+        .map_err(|_| TestError("missing-store reconciliation failed"))?;
+        let DurableCommittedTransactionPageReconciliation::StoreMissing { latest_committed } =
+            result
+        else {
+            return Err(TestError("expected missing store"));
+        };
+
+        assert!(std::ptr::eq(latest_committed.observation(), &owned[0]));
+        assert_eq!(latest_committed.commit_position(), &lineage.position(4));
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_is_exact_despite_later_raw_and_uncommitted_records()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(57).ok_or(TestError("page number"))?;
+        let committed_owner = durable_identity(20, 1)?;
+        let uncommitted_owner = durable_identity(20, 2)?;
+        let physical = [
+            physical_page_observation(&lineage, 57, 5, 0x57, 2)?,
+            physical_page_observation(&lineage, 57, 6, 0x58, 5)?,
+            physical_page_observation(&lineage, 57, 7, 0x59, 6)?,
+        ];
+        let owned = [
+            durable_page_observation(&lineage, committed_owner, 57, 5, 0x57, 2)?,
+            durable_page_observation(&lineage, uncommitted_owner, 57, 7, 0x59, 6)?,
+        ];
+        let commits = [durable_commit_observation(&lineage, committed_owner, 4)?];
+        let snapshot = stored_page_observation(&lineage, 57, 5, 0x57, 2)?;
+
+        let result = reconcile_committed_transaction_page(
+            &lineage,
+            page_number,
+            Some(&snapshot),
+            &physical,
+            &owned,
+            &commits,
+        )
+        .map_err(|_| TestError("exact committed reconciliation failed"))?;
+        let DurableCommittedTransactionPageReconciliation::ExactCurrent { latest_committed } =
+            result
+        else {
+            return Err(TestError("expected exact committed state"));
+        };
+
+        assert!(std::ptr::eq(latest_committed.observation(), &owned[0]));
+        assert_eq!(
+            latest_committed.observation().position(),
+            &lineage.position(2)
+        );
+        assert_eq!(latest_committed.commit_position(), &lineage.position(4));
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_reports_store_behind_later_lower_version() -> Result<(), TestError>
+    {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(58).ok_or(TestError("page number"))?;
+        let stored_owner = durable_identity(21, 1)?;
+        let latest_owner = durable_identity(21, 2)?;
+        let physical = [
+            physical_page_observation(&lineage, 58, 10, 0x58, 2)?,
+            physical_page_observation(&lineage, 58, 1, 0x59, 5)?,
+        ];
+        let owned = [
+            durable_page_observation(&lineage, stored_owner, 58, 10, 0x58, 2)?,
+            durable_page_observation(&lineage, latest_owner, 58, 1, 0x59, 5)?,
+        ];
+        let commits = [
+            durable_commit_observation(&lineage, stored_owner, 3)?,
+            durable_commit_observation(&lineage, latest_owner, 7)?,
+        ];
+        let snapshot = stored_page_observation(&lineage, 58, 10, 0x58, 2)?;
+
+        let result = reconcile_committed_transaction_page(
+            &lineage,
+            page_number,
+            Some(&snapshot),
+            &physical,
+            &owned,
+            &commits,
+        )
+        .map_err(|_| TestError("behind reconciliation failed"))?;
+        let DurableCommittedTransactionPageReconciliation::StoreBehind {
+            stored_page_position,
+            stored_commit_position,
+            latest_committed,
+        } = result
+        else {
+            return Err(TestError("expected store behind"));
+        };
+
+        assert_eq!(stored_page_position, lineage.position(2));
+        assert_eq!(stored_commit_position, lineage.position(3));
+        assert!(std::ptr::eq(latest_committed.observation(), &owned[1]));
+        assert_eq!(
+            latest_committed.observation().page().page_version(),
+            PageVersion::new(1)
+        );
+        assert_eq!(latest_committed.commit_position(), &lineage.position(7));
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_rejects_raw_and_uncommitted_snapshot_backing()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(59).ok_or(TestError("page number"))?;
+        let committed_owner = durable_identity(22, 1)?;
+        let uncommitted_owner = durable_identity(22, 2)?;
+        let commits = [durable_commit_observation(&lineage, committed_owner, 4)?];
+
+        let raw_physical = [
+            physical_page_observation(&lineage, 59, 1, 0x59, 2)?,
+            physical_page_observation(&lineage, 59, 2, 0x5A, 5)?,
+        ];
+        let raw_owned = [durable_page_observation(
+            &lineage,
+            committed_owner,
+            59,
+            1,
+            0x59,
+            2,
+        )?];
+        let raw_snapshot = stored_page_observation(&lineage, 59, 2, 0x5A, 5)?;
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                Some(&raw_snapshot),
+                &raw_physical,
+                &raw_owned,
+                &commits,
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::SnapshotBackedByRawPage {
+                    page_number,
+                    position: lineage.position(5),
+                }
+            )
+        );
+
+        let uncommitted_physical = [
+            physical_page_observation(&lineage, 59, 1, 0x59, 2)?,
+            physical_page_observation(&lineage, 59, 3, 0x5B, 6)?,
+        ];
+        let uncommitted_owned = [
+            durable_page_observation(&lineage, committed_owner, 59, 1, 0x59, 2)?,
+            durable_page_observation(&lineage, uncommitted_owner, 59, 3, 0x5B, 6)?,
+        ];
+        let uncommitted_snapshot = stored_page_observation(&lineage, 59, 3, 0x5B, 6)?;
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                Some(&uncommitted_snapshot),
+                &uncommitted_physical,
+                &uncommitted_owned,
+                &commits,
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::SnapshotBackedByUncommittedTransactionPage {
+                    page_number,
+                    transaction: uncommitted_owner,
+                    page_position: lineage.position(6),
+                }
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_retains_selection_and_physical_failures() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let page_number = PageNumber::new(60).ok_or(TestError("page number"))?;
+        let owner = durable_identity(23, 1)?;
+        let foreign_commits = [durable_commit_observation(&foreign, owner, 1)?];
+        let empty_physical: [DurablePageWalObservation<1>; 0] = [];
+        let empty_owned: [DurableTransactionPageObservation<1>; 0] = [];
+
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                None,
+                &empty_physical,
+                &empty_owned,
+                &foreign_commits,
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::Selection {
+                    source: Box::new(DurableTransactionPageSelectionError::CommitPrefix {
+                        source: Box::new(
+                            DurableTransactionPageClassificationError::ForeignCommitLineage {
+                                position: foreign.position(1),
+                            },
+                        ),
+                    }),
+                }
+            )
+        );
+
+        let snapshot = stored_page_observation(&lineage, 60, 1, 0x60, 2)?;
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                Some(&snapshot),
+                &empty_physical,
+                &empty_owned,
+                &[],
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::Physical {
+                    source: Box::new(DurablePageReconciliationError::SnapshotPositionUnbacked {
+                        page_number,
+                        position: lineage.position(2),
+                    }),
+                }
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_rejects_missing_and_contradictory_physical_projections()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(61).ok_or(TestError("page number"))?;
+        let owner = durable_identity(24, 1)?;
+        let owned = [durable_page_observation(&lineage, owner, 61, 1, 0x61, 2)?];
+        let empty_physical: [DurablePageWalObservation<1>; 0] = [];
+        let contradictory_physical = [physical_page_observation(&lineage, 61, 2, 0x62, 2)?];
+
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                None,
+                &empty_physical,
+                &owned,
+                &[],
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::OwnedPagePositionUnbacked {
+                    page_number,
+                    position: lineage.position(2),
+                }
+            )
+        );
+        assert_eq!(
+            reconcile_committed_transaction_page(
+                &lineage,
+                page_number,
+                None,
+                &contradictory_physical,
+                &owned,
+                &[],
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::OwnedPagePayloadContradiction {
+                    page_number,
+                    position: lineage.position(2),
+                }
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_reconciliation_defensively_rejects_impossible_committed_backing()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(62).ok_or(TestError("page number"))?;
+        let owner = durable_identity(25, 1)?;
+
+        assert_eq!(
+            resolve_committed_snapshot_reconciliation::<1>(
+                page_number,
+                DurableTransactionPageSelection::NoCommittedPage { page_number },
+                lineage.position(2),
+                lineage.position(4),
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::CommittedSnapshotWithoutSelection {
+                    page_number,
+                    stored_page_position: lineage.position(2),
+                    stored_commit_position: lineage.position(4),
+                }
+            )
+        );
+
+        let owned = durable_page_observation(&lineage, owner, 62, 1, 0x62, 2)?;
+        let commits = [durable_commit_observation(&lineage, owner, 4)?];
+        let selection = select_latest_committed_transaction_page(
+            &lineage,
+            page_number,
+            std::iter::once(&owned),
+            &commits,
+        )
+        .map_err(|_| TestError("selection failed"))?;
+        assert_eq!(
+            resolve_committed_snapshot_reconciliation(
+                page_number,
+                selection,
+                lineage.position(5),
+                lineage.position(6),
+            ),
+            Err(
+                DurableCommittedTransactionPageReconciliationError::CommittedSnapshotAfterSelection {
+                    page_number,
+                    stored_page_position: lineage.position(5),
+                    selected_page_position: lineage.position(2),
+                }
+            )
         );
         Ok(())
     }

@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #52
 - Extends: ADR 0001, ADR 0005
+- Extended by: ADR 0007
 
 ## Context
 
@@ -21,12 +22,12 @@ internal fail-closed lifecycle invariant.
 ## Decision
 
 `ntsql-transaction` is an I/O-free domain crate whose sole direct dependency is
-`ntsql-wal`. It owns five staged values:
+`ntsql-wal`. This ADR initially introduced five staged values:
 
 - `TransactionId`, an opaque coordinator-assigned internal identity with no
   wire, session, or persistent representation;
-- `ActiveTransaction`, the only state that exposes `commit`, which consumes
-  `self`;
+- `ActiveTransaction`, the only state that can begin a commit, which is consumed
+  by the coordinator;
 - `TransactionCommitRecord`, constructed privately from the consumed active
   identity and borrowed by a `CommitLog<TransactionCommitRecord>` port;
 - `CommittedTransaction`, constructed only inside the generative WAL durability
@@ -40,19 +41,17 @@ append error does not imply that no bytes were persisted, and a flush error does
 not imply that the record can never become durable. Both outcomes are therefore
 indeterminate and unsafe to retry without a later resolution protocol.
 
-This typestate enforces linear use of each `ActiveTransaction` value, not
-transaction-ID uniqueness. The public constructors accept a
-coordinator-supplied identity so focused adapters can be built before that
-coordinator exists. The future coordinator owns unique issuance and must not
-reconstruct active state for an identity whose commit was attempted. Preventing
-such reconstruction is deliberately not claimed by this crate.
+This typestate by itself enforces linear use of each `ActiveTransaction` value,
+not transaction-ID uniqueness. ADR 0007 removes the temporary public
+construction path and adds coordinator-owned unique issuance, runtime token
+binding, and an attempt registry without changing the WAL durability proof.
 
 The dependency direction is:
 
 ```text
-future transaction coordinator -> ntsql-transaction -> ntsql-wal
-future persistence adapter -----> ntsql-transaction
-future persistence adapter ----------------------------> ntsql-wal
+transaction coordination and lifecycle state -> ntsql-transaction -> ntsql-wal
+future persistence adapter ------------------> ntsql-transaction
+future persistence adapter --------------------------------------> ntsql-wal
 
 ntsql-transaction -> standard library
 ntsql-wal         -> standard library
@@ -82,16 +81,17 @@ identities must never be exposed as SQL Server values.
   state with both values preserved.
 - Append and flush failure each consume active state and return the same identity
   in indeterminate state with the original phase-specific cause.
-- Compile-fail tests reject committing one active value twice and calling commit
-  on indeterminate state.
+- Compile-fail tests reject direct identity construction, cloning coordinators
+  or active values, committing one active value twice, and calling commit on
+  indeterminate state.
 - Architecture tests enforce the sole `ntsql-transaction -> ntsql-wal` edge and
   continue rejecting the reverse edge.
 
 ## Consequences
 
-Later transaction coordination cannot represent a successful commit without
-passing the WAL durability fence. This crate neither retries an ambiguous
-attempt nor converts its indeterminate result back into active state. Rollback,
-resolution, recovery, transaction uniqueness, replay prevention, concurrency,
+Transaction coordination cannot represent a successful commit without passing
+the WAL durability fence. This crate neither retries an ambiguous attempt nor
+converts its indeterminate result back into active state. Rollback, resolution,
+recovery, persistent identity across coordinator lifetimes, concurrency policy,
 and all external semantics remain explicit future responsibilities rather than
-fallback behavior hidden in this initial state machine.
+fallback behavior hidden in this state machine.

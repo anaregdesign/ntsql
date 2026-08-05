@@ -1,6 +1,9 @@
 use std::{error::Error, fmt, io};
 
-use ntsql_transaction::{ActiveTransaction, TransactionCommitRecord, TransactionId};
+use ntsql_transaction::{
+    CoordinatedCommitError, TransactionCommitRecord, TransactionCommitRejectionReason,
+    TransactionCoordinator, TransactionId, TransactionLifecycleStatus,
+};
 use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,14 +74,19 @@ impl CommitLog<TransactionCommitRecord> for FakeCommitLog {
 
 #[test]
 fn durable_commit_consumes_active_state_and_preserves_identity() -> Result<(), Box<dyn Error>> {
+    let mut coordinator = TransactionCoordinator::new();
     let mut log = FakeCommitLog::succeeds_at(41);
-    let transaction_id = TransactionId::new(7);
-    let transaction = ActiveTransaction::new(transaction_id);
+    let transaction = coordinator.begin()?;
+    let transaction_id = transaction.transaction_id();
 
-    let committed = transaction.commit(&mut log)?;
+    let committed = coordinator.commit(transaction, &mut log)?;
 
     assert_eq!(committed.transaction_id(), transaction_id);
     assert_eq!(committed.log_position(), LogSequenceNumber::new(41));
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::Committed)
+    );
     assert_eq!(
         log.calls,
         [
@@ -91,19 +99,28 @@ fn durable_commit_consumes_active_state_and_preserves_identity() -> Result<(), B
 
 #[test]
 fn append_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dyn Error>> {
+    let mut coordinator = TransactionCoordinator::new();
     let mut log = FakeCommitLog {
         append_fails: true,
         ..FakeCommitLog::succeeds_at(41)
     };
-    let transaction_id = TransactionId::new(7);
+    let transaction = coordinator.begin()?;
+    let transaction_id = transaction.transaction_id();
 
-    let error = ActiveTransaction::new(transaction_id)
-        .commit(&mut log)
+    let error = coordinator
+        .commit(transaction, &mut log)
         .err()
         .ok_or_else(|| invalid_data("append failure unexpectedly committed"))?;
+    let CoordinatedCommitError::Indeterminate(error) = error else {
+        return Err(invalid_data("append failure was rejected before WAL").into());
+    };
     let (indeterminate, cause) = error.into_parts();
 
     assert_eq!(indeterminate.transaction_id(), transaction_id);
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::Indeterminate)
+    );
     assert_eq!(
         cause,
         CommitError::Append {
@@ -116,19 +133,28 @@ fn append_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<d
 
 #[test]
 fn flush_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dyn Error>> {
+    let mut coordinator = TransactionCoordinator::new();
     let mut log = FakeCommitLog {
         flush_fails: true,
         ..FakeCommitLog::succeeds_at(83)
     };
-    let transaction_id = TransactionId::new(11);
+    let transaction = coordinator.begin()?;
+    let transaction_id = transaction.transaction_id();
 
-    let error = ActiveTransaction::new(transaction_id)
-        .commit(&mut log)
+    let error = coordinator
+        .commit(transaction, &mut log)
         .err()
         .ok_or_else(|| invalid_data("flush failure unexpectedly committed"))?;
+    let CoordinatedCommitError::Indeterminate(error) = error else {
+        return Err(invalid_data("flush failure was rejected before WAL").into());
+    };
     let (indeterminate, cause) = error.into_parts();
 
     assert_eq!(indeterminate.transaction_id(), transaction_id);
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::Indeterminate)
+    );
     assert_eq!(
         cause,
         CommitError::Flush {
@@ -142,6 +168,62 @@ fn flush_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dy
             Call::Append(transaction_id),
             Call::Flush(LogSequenceNumber::new(83)),
         ]
+    );
+    Ok(())
+}
+
+#[test]
+fn coordinator_issues_distinct_active_transactions() -> Result<(), Box<dyn Error>> {
+    let mut coordinator = TransactionCoordinator::new();
+
+    let first = coordinator.begin()?;
+    let second = coordinator.begin()?;
+
+    assert_ne!(first.transaction_id(), second.transaction_id());
+    assert_ne!(first.transaction_id().get(), 0);
+    assert_ne!(second.transaction_id().get(), 0);
+    assert_eq!(
+        coordinator.status(first.transaction_id()),
+        Some(TransactionLifecycleStatus::Active)
+    );
+    assert_eq!(
+        coordinator.status(second.transaction_id()),
+        Some(TransactionLifecycleStatus::Active)
+    );
+    Ok(())
+}
+
+#[test]
+fn foreign_coordinator_rejects_before_wal_and_returns_token() -> Result<(), Box<dyn Error>> {
+    let mut owner = TransactionCoordinator::new();
+    let mut foreign = TransactionCoordinator::new();
+    let transaction = owner.begin()?;
+    let transaction_id = transaction.transaction_id();
+    let mut log = FakeCommitLog::succeeds_at(41);
+
+    assert!(owner.owns(&transaction));
+    assert!(!foreign.owns(&transaction));
+    let error = foreign
+        .commit(transaction, &mut log)
+        .err()
+        .ok_or_else(|| invalid_data("foreign coordinator unexpectedly committed"))?;
+    let CoordinatedCommitError::Rejected(rejection) = error else {
+        return Err(invalid_data("foreign coordinator reached the WAL").into());
+    };
+
+    assert_eq!(
+        rejection.reason(),
+        TransactionCommitRejectionReason::ForeignCoordinator
+    );
+    assert!(log.calls.is_empty());
+
+    let transaction = rejection.into_transaction();
+    let committed = owner.commit(transaction, &mut log)?;
+
+    assert_eq!(committed.transaction_id(), transaction_id);
+    assert_eq!(
+        owner.status(transaction_id),
+        Some(TransactionLifecycleStatus::Committed)
     );
     Ok(())
 }

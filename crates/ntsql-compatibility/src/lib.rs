@@ -1,6 +1,6 @@
 //! I/O-free compatibility policy shared by ntsql engine components.
 
-use std::{collections::BTreeSet, error::Error, fmt};
+use std::{collections::BTreeSet, error::Error, fmt, marker::PhantomData};
 
 /// One externally observable aspect required in every conformance record.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -147,6 +147,28 @@ pub struct CompatibilityContext {
     session_defaults: Box<[String]>,
 }
 
+type ScopeBrandMarker<'scope> = (&'scope (), fn(&'scope ()) -> &'scope ());
+
+/// Generative identity for one request's exact compatibility context.
+///
+/// Values carrying different private scope brands cannot be combined through a
+/// public API that requires one brand. The scope borrows rather than copies the
+/// selected context and can be created only by
+/// [`CompatibilityContext::with_scope`].
+#[derive(Clone, Copy, Debug)]
+pub struct CompatibilityScope<'context, 'scope> {
+    context: &'context CompatibilityContext,
+    scope_brand: PhantomData<ScopeBrandMarker<'scope>>,
+}
+
+impl<'context, 'scope> CompatibilityScope<'context, 'scope> {
+    /// Returns the exact immutable context selected for this request scope.
+    #[must_use]
+    pub const fn context(self) -> &'context CompatibilityContext {
+        self.context
+    }
+}
+
 impl CompatibilityContext {
     /// Validates and freezes one complete set of behavior selectors.
     pub fn try_new(profile: CompatibilityProfile) -> Result<Self, CompatibilityContextError> {
@@ -174,6 +196,67 @@ impl CompatibilityContext {
             lcid: profile.lcid,
             timezone: profile.timezone.into_boxed_str(),
             session_defaults: profile.session_defaults.into_boxed_slice(),
+        })
+    }
+
+    /// Runs an operation with a fresh, non-escaping request scope brand.
+    ///
+    /// Staged request values can carry the scope and require the same private
+    /// brand in later APIs. Independently opened scopes therefore cannot be
+    /// mixed accidentally:
+    ///
+    /// ```compile_fail
+    /// use ntsql_compatibility::{CompatibilityContext, CompatibilityScope};
+    ///
+    /// fn require_same_scope<'context, 'scope>(
+    ///     _left: CompatibilityScope<'context, 'scope>,
+    ///     _right: CompatibilityScope<'context, 'scope>,
+    /// ) {}
+    ///
+    /// fn cannot_mix<'context>(
+    ///     left: &'context CompatibilityContext,
+    ///     right: &'context CompatibilityContext,
+    /// ) {
+    ///     left.with_scope(|left_scope| {
+    ///         right.with_scope(|right_scope| {
+    ///             require_same_scope(left_scope, right_scope);
+    ///         });
+    ///     });
+    /// }
+    /// ```
+    ///
+    /// The fresh brand also cannot escape its callback:
+    ///
+    /// ```compile_fail
+    /// use ntsql_compatibility::CompatibilityContext;
+    ///
+    /// fn cannot_escape(context: &CompatibilityContext) {
+    ///     let _scope = context.with_scope(|scope| scope);
+    /// }
+    /// ```
+    ///
+    /// Erasing the concrete return type cannot make the brand `'static`:
+    ///
+    /// ```compile_fail
+    /// use ntsql_compatibility::CompatibilityContext;
+    ///
+    /// fn cannot_erase(
+    ///     context: &'static CompatibilityContext,
+    /// ) -> Box<dyn FnOnce()> {
+    ///     context.with_scope(|scope| -> Box<dyn FnOnce()> {
+    ///         Box::new(move || {
+    ///             let _context = scope.context();
+    ///         })
+    ///     })
+    /// }
+    /// ```
+    pub fn with_scope<'context, R, F>(&'context self, operation: F) -> R
+    where
+        F: for<'scope> FnOnce(CompatibilityScope<'context, 'scope>) -> R,
+    {
+        operation(CompatibilityScope {
+            context: self,
+            scope_brand: PhantomData,
         })
     }
 

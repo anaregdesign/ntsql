@@ -25,6 +25,12 @@ dependencies and exposes immutable value types, `CompatibilityContext`, and the
 canonical seven observation dimensions. It does not read files, deserialize
 JSON, contact an oracle, or choose a process-wide target.
 
+`CompatibilityContext::with_scope` creates a fresh invariant brand for one
+request through a higher-ranked callback. `CompatibilityScope` borrows the
+selected context, has no public constructor, and cannot escape that callback.
+Future staged request types carry the brand so independently opened scopes
+cannot be combined accidentally through public APIs.
+
 `ntsql-contract` owns the published JSON representation and its validation. It
 is the adapter from a raw `TargetMatrix` to `ValidatedTargetMatrix`. Promotion
 to that typestate runs all target-matrix invariants before constructing any
@@ -37,6 +43,8 @@ The runtime composition root will perform these steps in order:
 3. Require an exact target ID from startup configuration.
 4. Select it with `select_context` and inject the resulting immutable context
    into request-scoped engine components.
+5. Open `with_scope` and complete every compatibility-dependent request stage
+   inside that branded callback.
 
 Production startup must not silently fall back to the baseline target.
 `baseline_context` exists for contract verification and deliberately requested
@@ -93,6 +101,8 @@ catch-all package solely to avoid an explicit dependency.
 
 - `ntsql-compatibility` unit tests use repository-authored synthetic profiles
   and verify policy without JSON or I/O.
+- Compile-fail scope tests reject mixing independently opened scopes and reject
+  returning or type-erasing a scope token from its higher-ranked callback.
 - `ntsql-contract` integration tests verify full validation, exact mapping, and
   target selection at the adapter boundary.
 - `ntsql-testkit` tests use repository-authored in-memory sources and explicit

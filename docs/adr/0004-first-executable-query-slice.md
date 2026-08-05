@@ -66,22 +66,24 @@ focused falsifying test, ADR update, architecture policy, and negative
 dependency test. The later catalog, transaction, storage, clock, and resource
 ports enter only with behavior that needs them.
 
-The parser receives the immutable `CompatibilityContext` selected by the
-composition root and stores a private borrow of that context inside
-`ParsedBatch<'ctx>`. `BoundBatch<'ctx>`, the logical plan, and
-`ExecutionResult<'ctx>` consume the preceding type and move that exact private
-borrow forward; binder, planner, and executor public APIs do not accept a second
-context. This prevents callers from expressing a mid-request target switch
-through the staged API.
+The composition root opens `CompatibilityContext::with_scope` for the selected
+target. The parser receives `CompatibilityScope<'ctx, 'scope>` and stores it
+privately inside `ParsedBatch<'ctx, 'scope>`. `BoundBatch`, the logical plan, and
+executor state consume the preceding type and propagate that exact invariant
+brand; binder, planner, and executor public APIs do not accept a second scope or
+context. Independently opened brands cannot satisfy one staged API, and the
+brand cannot escape the higher-ranked callback. Compatibility-dependent
+adaptation, including protocol output, completes inside that callback; only
+fully decided unbranded output may leave it.
 
-The shared lifetime alone does not prove reference identity or prevent crate
-implementation code from constructing another context. Each stage therefore
-also has a reviewed invariant: it may only propagate the private context field
-from its input. It may not choose a target, clone or reconstruct selectors,
-invoke `CompatibilityContext::try_new`, read global target state, or fall back to
-the baseline. The first implementation tests this propagation with two distinct
-synthetic contexts. Domain crates must not depend on `ntsql-contract`, Serde,
-`ntsql-testkit`, filesystems, networks, product oracles, or protocol hosts.
+Branding prevents accidental mixing through public APIs, not arbitrary
+malicious implementation code. Each stage also has a reviewed invariant: it may
+only propagate the private scope from its input. It may not choose a target,
+clone or reconstruct selectors, invoke `CompatibilityContext::try_new`, read
+global target state, or fall back to the baseline. The first implementation
+tests this propagation with two distinct synthetic contexts and scopes. Domain
+crates must not depend on `ntsql-contract`, Serde, `ntsql-testkit`, filesystems,
+networks, product oracles, or protocol hosts.
 
 ## Implementation Admission Gate
 

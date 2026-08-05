@@ -5,7 +5,7 @@
 - Issue: #50
 - Extends: ADR 0001
 - Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009, ADR 0010, ADR 0011,
-  ADR 0012, ADR 0013
+  ADR 0012, ADR 0013, ADR 0015
 
 ## Context
 
@@ -30,15 +30,17 @@ until both operations succeed.
 - `LogLineage`, an opaque identity shared by ports for one logical log, using
   either ephemeral runtime pointer identity or an adapter-supplied persistent
   ID;
-- `CommitLog<Record>`, the inward port for appending a caller-owned record and
-  flushing through a position, together with its lineage identity;
+- `LogDurability`, the inward port for one lineage identity and exact-position
+  durable-prefix flushing;
+- `CommitLog<Record>`, which extends `LogDurability` with append of one
+  caller-owned record;
 - `CommitError`, which distinguishes append failure from flush failure and
   retains the unacknowledged position on the latter; and
 - `CommitAcknowledgement`, whose private, generatively branded value exists only
   in a callback reached after append and exact-position flush both report
   success.
 
-The port is synchronous for this deterministic domain boundary. That does not
+The ports are synchronous for this deterministic domain boundary. That does not
 require a persistence adapter to block an async runtime thread: a future outer
 composition layer may run the complete synchronous fence on a blocking worker.
 `flush_through` may return success only after durable completion; merely
@@ -71,13 +73,20 @@ barrier for the complete commit prefix followed by a checksummed durable-through
 marker and a second barrier. The marker is the recovered durable frontier; no
 adapter success is reported before both barriers complete.
 
+ADR 0015 reuses `LogDurability` without granting page code append authority. Its
+page lifecycle flushes the exact lineage-bound required position before creating
+a private page-write permit. This extraction does not change commit ordering,
+acknowledgement construction, adapter errors, or recovery semantics.
+
 The intended dependency direction is:
 
 ```text
 ntsql-storage-file ------> ntsql-wal <------ ntsql-storage-memory
                                ^
                                |
-                       ntsql-transaction
+                   +-----------+-----------+
+                   |                       |
+           ntsql-transaction          ntsql-page
 
 ntsql-wal --------------> standard library only
 ```
@@ -95,11 +104,12 @@ does not claim a SQL Server commit point, LSN value, crash outcome, diagnostic,
 or compatibility status. The repository-authored call-order tests establish
 only this internal safety invariant.
 
-Page formats, checkpoints, redo/undo, group commit, broader transaction
-lifecycle, and externally observable crash-recovery outcomes require their own
-behavior, format, provenance, and fault-injection decisions. ADR 0013 defines
-only the ntsql-internal transaction commit-log format and standard-library file
-barriers.
+Persistent page formats, checkpoints, redo/undo, group commit, broader
+transaction lifecycle, and externally observable crash-recovery outcomes
+require their own behavior, format, provenance, and fault-injection decisions.
+ADR 0013 defines only the ntsql-internal transaction commit-log format and
+standard-library file barriers. ADR 0015 defines only internal page staging and
+WAL-before-page call ordering.
 
 ## Test Boundaries
 

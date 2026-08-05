@@ -1,7 +1,8 @@
 use std::{cell::Cell, error::Error, fmt};
 
 use ntsql_wal::{
-    CommitError, CommitLog, LogLineage, LogSequenceNumber, PersistentLogId, commit_durability,
+    CommitError, CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId,
+    commit_durability,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,13 +51,24 @@ impl FakeCommitLog {
     }
 }
 
-impl CommitLog<str> for FakeCommitLog {
+impl LogDurability for FakeCommitLog {
     type Error = FakeError;
 
     fn lineage(&self) -> &LogLineage {
         &self.lineage
     }
 
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
+        self.calls.push(Call::Flush(position.clone()));
+        if self.flush_fails {
+            Err(FakeError::Flush)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CommitLog<str> for FakeCommitLog {
     fn append_commit(&mut self, record: &str) -> Result<LogSequenceNumber, Self::Error> {
         self.calls.push(Call::Append(record.to_owned()));
         if let Some(lineage) = self.lineage_after_append.take() {
@@ -66,15 +78,6 @@ impl CommitLog<str> for FakeCommitLog {
             Err(FakeError::Append)
         } else {
             Ok(self.position.clone())
-        }
-    }
-
-    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
-        self.calls.push(Call::Flush(position.clone()));
-        if self.flush_fails {
-            Err(FakeError::Flush)
-        } else {
-            Ok(())
         }
     }
 }

@@ -67,7 +67,7 @@ use ntsql_transaction::{
     DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
     TransactionRecoverySource,
 };
-use ntsql_wal::{CommitLog, LogLineage, LogSequenceNumber, PersistentLogId};
+use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
 const HEADER_MAGIC: [u8; 8] = *b"NTSQLOG1";
 const FRAME_MAGIC: [u8; 4] = *b"NTSQ";
@@ -921,13 +921,51 @@ impl TransactionRecoverySource for FileCommitLog {
     }
 }
 
-impl CommitLog<TransactionCommitRecord> for FileCommitLog {
+impl LogDurability for FileCommitLog {
     type Error = FileCommitLogError;
 
     fn lineage(&self) -> &LogLineage {
         &self.lineage
     }
 
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
+        if self.poisoned {
+            return Err(FileCommitLogError::PoisonedWriter);
+        }
+        if !self.lineage.same_lineage(position.lineage()) {
+            return Err(FileCommitLogError::ForeignFlushPosition(position.clone()));
+        }
+        let record_index = self
+            .records
+            .iter()
+            .position(|record| record.position() == position)
+            .ok_or_else(|| FileCommitLogError::UnknownFlushPosition(position.clone()))?;
+        let requested_durable_len = record_index + 1;
+        if requested_durable_len <= self.durable_len {
+            return Ok(());
+        }
+        if self.consume_fault(FaultPoint::BeforeFlush) {
+            return Err(FileCommitLogError::InjectedFault(FaultPoint::BeforeFlush));
+        }
+
+        self.sync_file(FileIoStage::SyncCommitPrefix, false)
+            .map_err(FileCommitLogError::Io)?;
+        let marker = build_frame(FrameKind::DurableThrough, position.get(), 0, 0);
+        self.write_frame(&marker, FileIoStage::WriteDurableMarker, true)
+            .map_err(FileCommitLogError::Io)?;
+        self.sync_file(FileIoStage::SyncDurableMarker, true)
+            .map_err(FileCommitLogError::Io)?;
+        self.durable_len = requested_durable_len;
+
+        if self.consume_fault(FaultPoint::AfterFlush) {
+            Err(FileCommitLogError::InjectedFault(FaultPoint::AfterFlush))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CommitLog<TransactionCommitRecord> for FileCommitLog {
     fn append_commit(
         &mut self,
         record: &TransactionCommitRecord,
@@ -966,42 +1004,6 @@ impl CommitLog<TransactionCommitRecord> for FileCommitLog {
             Err(FileCommitLogError::InjectedFault(FaultPoint::AfterAppend))
         } else {
             Ok(position)
-        }
-    }
-
-    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
-        if self.poisoned {
-            return Err(FileCommitLogError::PoisonedWriter);
-        }
-        if !self.lineage.same_lineage(position.lineage()) {
-            return Err(FileCommitLogError::ForeignFlushPosition(position.clone()));
-        }
-        let record_index = self
-            .records
-            .iter()
-            .position(|record| record.position() == position)
-            .ok_or_else(|| FileCommitLogError::UnknownFlushPosition(position.clone()))?;
-        let requested_durable_len = record_index + 1;
-        if requested_durable_len <= self.durable_len {
-            return Ok(());
-        }
-        if self.consume_fault(FaultPoint::BeforeFlush) {
-            return Err(FileCommitLogError::InjectedFault(FaultPoint::BeforeFlush));
-        }
-
-        self.sync_file(FileIoStage::SyncCommitPrefix, false)
-            .map_err(FileCommitLogError::Io)?;
-        let marker = build_frame(FrameKind::DurableThrough, position.get(), 0, 0);
-        self.write_frame(&marker, FileIoStage::WriteDurableMarker, true)
-            .map_err(FileCommitLogError::Io)?;
-        self.sync_file(FileIoStage::SyncDurableMarker, true)
-            .map_err(FileCommitLogError::Io)?;
-        self.durable_len = requested_durable_len;
-
-        if self.consume_fault(FaultPoint::AfterFlush) {
-            Err(FileCommitLogError::InjectedFault(FaultPoint::AfterFlush))
-        } else {
-            Ok(())
         }
     }
 }

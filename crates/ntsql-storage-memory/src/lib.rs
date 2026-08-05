@@ -6,7 +6,7 @@ use ntsql_transaction::{
     DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
     TransactionRecoverySource,
 };
-use ntsql_wal::{CommitLog, LogLineage, LogSequenceNumber, PersistentLogId};
+use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
 /// One-shot physical-effect boundary for the next matching log operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -369,43 +369,11 @@ impl TransactionRecoverySource for InMemoryCommitLog {
     }
 }
 
-impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
+impl LogDurability for InMemoryCommitLog {
     type Error = InMemoryCommitLogError;
 
     fn lineage(&self) -> &LogLineage {
         &self.lineage
-    }
-
-    fn append_commit(
-        &mut self,
-        record: &TransactionCommitRecord,
-    ) -> Result<LogSequenceNumber, Self::Error> {
-        let position_value = self
-            .next_position
-            .ok_or(InMemoryCommitLogError::PositionSpaceExhausted)?;
-        if self.consume_fault(FaultPoint::BeforeAppend) {
-            return Err(InMemoryCommitLogError::InjectedFault(
-                FaultPoint::BeforeAppend,
-            ));
-        }
-        self.records
-            .try_reserve(1)
-            .map_err(|_| InMemoryCommitLogError::RecordCapacityExhausted)?;
-
-        let position = self.lineage.position(position_value);
-        self.records.push(InMemoryLogRecord {
-            position: position.clone(),
-            transaction_id: record.transaction_id(),
-        });
-        self.next_position = position_value.checked_add(1);
-
-        if self.consume_fault(FaultPoint::AfterAppend) {
-            Err(InMemoryCommitLogError::InjectedFault(
-                FaultPoint::AfterAppend,
-            ))
-        } else {
-            Ok(position)
-        }
     }
 
     fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
@@ -437,6 +405,40 @@ impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
             ))
         } else {
             Ok(())
+        }
+    }
+}
+
+impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
+    fn append_commit(
+        &mut self,
+        record: &TransactionCommitRecord,
+    ) -> Result<LogSequenceNumber, Self::Error> {
+        let position_value = self
+            .next_position
+            .ok_or(InMemoryCommitLogError::PositionSpaceExhausted)?;
+        if self.consume_fault(FaultPoint::BeforeAppend) {
+            return Err(InMemoryCommitLogError::InjectedFault(
+                FaultPoint::BeforeAppend,
+            ));
+        }
+        self.records
+            .try_reserve(1)
+            .map_err(|_| InMemoryCommitLogError::RecordCapacityExhausted)?;
+
+        let position = self.lineage.position(position_value);
+        self.records.push(InMemoryLogRecord {
+            position: position.clone(),
+            transaction_id: record.transaction_id(),
+        });
+        self.next_position = position_value.checked_add(1);
+
+        if self.consume_fault(FaultPoint::AfterAppend) {
+            Err(InMemoryCommitLogError::InjectedFault(
+                FaultPoint::AfterAppend,
+            ))
+        } else {
+            Ok(position)
         }
     }
 }

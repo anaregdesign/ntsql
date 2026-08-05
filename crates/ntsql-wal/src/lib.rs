@@ -148,24 +148,29 @@ impl PartialEq for LogSequenceNumber {
 
 impl Eq for LogSequenceNumber {}
 
-/// Persistence port needed to establish one commit durability fence.
+/// Persistence port for one lineage's durable-prefix boundary.
 ///
-/// The record type is owned by the caller. A concrete outer adapter decides how
-/// to encode and persist it; this domain crate owns only call ordering.
-pub trait CommitLog<Record: ?Sized> {
-    /// Adapter-specific failure retained by [`CommitError`].
+/// A successful flush means durable completion through at least the requested
+/// position, not queued or scheduled work. Implementations must make repeated
+/// flushes through an already durable position safe and idempotent.
+pub trait LogDurability {
+    /// Adapter-specific failure retained by higher-level staged operations.
     type Error;
 
     /// Returns the opaque runtime identity of this logical log lineage.
     fn lineage(&self) -> &LogLineage;
 
+    /// Makes the log durable through at least `position`.
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error>;
+}
+
+/// Persistence port needed to establish one commit durability fence.
+///
+/// The record type is owned by the caller. A concrete outer adapter decides how
+/// to encode and persist it; this domain crate owns only call ordering.
+pub trait CommitLog<Record: ?Sized>: LogDurability {
     /// Appends one commit record and returns its exact assigned position.
     fn append_commit(&mut self, record: &Record) -> Result<LogSequenceNumber, Self::Error>;
-
-    /// Makes the log durable through at least `position`.
-    ///
-    /// `Ok(())` must mean durable completion, not queued or scheduled work.
-    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error>;
 }
 
 /// Internal failure to establish commit durability.

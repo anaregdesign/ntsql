@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -72,6 +72,35 @@ struct RemoteArchive {
     record_id: String,
     source_url: String,
     content_digest: String,
+}
+
+#[derive(Debug)]
+struct DownloadCommand {
+    program: OsString,
+    leading_arguments: Vec<OsString>,
+}
+
+impl DownloadCommand {
+    fn direct(program: &OsStr) -> Self {
+        Self {
+            program: program.to_owned(),
+            leading_arguments: Vec::new(),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_leading_argument(program: &OsStr, argument: &OsStr) -> Self {
+        Self {
+            program: program.to_owned(),
+            leading_arguments: vec![argument.to_owned()],
+        }
+    }
+
+    fn process(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.leading_arguments);
+        command
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1004,7 +1033,7 @@ fn validate_online_provenance() -> Result<(), Box<dyn Error>> {
     let toolchain = validate_pinned_toolchain(&workspace_root)?;
     let archives = resolve_remote_archive_records(&workflow, &toolchain, &provenance)?;
 
-    verify_remote_archives(OsStr::new("curl"), &archives)?;
+    verify_remote_archives(&DownloadCommand::direct(OsStr::new("curl")), &archives)?;
     println!("online provenance ok ({} remote archives)", archives.len());
     Ok(())
 }
@@ -1221,7 +1250,7 @@ fn governance_tool_archive(command: &str) -> Result<ExpectedRemoteArchive, Box<d
 }
 
 fn verify_remote_archives(
-    curl_program: &OsStr,
+    curl_command: &DownloadCommand,
     archives: &[RemoteArchive],
 ) -> Result<(), Box<dyn Error>> {
     let download_root = create_temporary_directory("ntsql-provenance-downloads")?;
@@ -1230,7 +1259,7 @@ fn verify_remote_archives(
         .enumerate()
         .try_for_each(|(index, archive)| {
             let output_path = download_root.join(format!("archive-{index}"));
-            download_and_verify_archive(curl_program, archive, &output_path)
+            download_and_verify_archive(curl_command, archive, &output_path)
         });
     let cleanup = fs::remove_dir_all(&download_root);
 
@@ -1253,11 +1282,12 @@ fn verify_remote_archives(
 }
 
 fn download_and_verify_archive(
-    curl_program: &OsStr,
+    curl_command: &DownloadCommand,
     archive: &RemoteArchive,
     output_path: &Path,
 ) -> Result<(), Box<dyn Error>> {
-    let output = Command::new(curl_program)
+    let output = curl_command
+        .process()
         .args([
             "--fail",
             "--silent",
@@ -1284,7 +1314,7 @@ fn download_and_verify_archive(
             if error.kind() == io::ErrorKind::NotFound {
                 invalid_data(format!(
                     "required download tool {} is unavailable",
-                    Path::new(curl_program).display()
+                    Path::new(&curl_command.program).display()
                 ))
             } else {
                 Box::new(error) as Box<dyn Error>
@@ -2137,41 +2167,34 @@ mod tests {
             "curl-success",
             "printf '%s' 'archive bytes' > \"$output\"\nprintf '200\\n%s' \"$url\"",
         )?;
-        verify_remote_archives(successful_curl.as_os_str(), &archives)?;
+        verify_remote_archives(&successful_curl, &archives)?;
 
         let redirecting_curl = write_fake_curl(
             &test_root,
             "curl-redirect",
             "printf '%s' 'redirect' > \"$output\"\nprintf '302\\n%s' 'https://evil.example/archive'",
         )?;
-        let redirect_error = result_error(verify_remote_archives(
-            redirecting_curl.as_os_str(),
-            &archives[..1],
-        ))?;
+        let redirect_error =
+            result_error(verify_remote_archives(&redirecting_curl, &archives[..1]))?;
 
         let failing_curl = write_fake_curl(
             &test_root,
             "curl-network-failure",
             "printf '%s' 'network failed' >&2\nexit 7",
         )?;
-        let network_error = result_error(verify_remote_archives(
-            failing_curl.as_os_str(),
-            &archives[..1],
-        ))?;
+        let network_error = result_error(verify_remote_archives(&failing_curl, &archives[..1]))?;
 
         let mismatching_curl = write_fake_curl(
             &test_root,
             "curl-mismatch",
             "printf '%s' 'different bytes' > \"$output\"\nprintf '200\\n%s' \"$url\"",
         )?;
-        let mismatch_error = result_error(verify_remote_archives(
-            mismatching_curl.as_os_str(),
-            &archives[..1],
-        ))?;
+        let mismatch_error =
+            result_error(verify_remote_archives(&mismatching_curl, &archives[..1]))?;
 
         let missing_program = test_root.join("curl-missing");
         let missing_tool_error = result_error(verify_remote_archives(
-            missing_program.as_os_str(),
+            &DownloadCommand::direct(missing_program.as_os_str()),
             &archives[..1],
         ))?;
 
@@ -2324,16 +2347,20 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
         test_root: &Path,
         name: &str,
         behavior: &str,
-    ) -> Result<PathBuf, Box<dyn Error>> {
+    ) -> Result<DownloadCommand, Box<dyn Error>> {
         let path = test_root.join(name);
         let script = format!(
-            "#!/bin/sh\nset -eu\noutput=''\nurl=''\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --output) output=\"$2\"; shift 2 ;;\n    --url) url=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n{behavior}\n"
+            "set -eu\noutput=''\nurl=''\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    --output) output=\"$2\"; shift 2 ;;\n    --url) url=\"$2\"; shift 2 ;;\n    *) shift ;;\n  esac\ndone\n{behavior}\n"
         );
         fs::write(&path, script)?;
         let mut permissions = fs::metadata(&path)?.permissions();
-        permissions.set_mode(0o700);
+        permissions.set_mode(0o600);
         fs::set_permissions(&path, permissions)?;
-        Ok(path)
+        // Keep the generated file out of execve; Linux may reject a write-observed executable.
+        Ok(DownloadCommand::with_leading_argument(
+            OsStr::new("/bin/sh"),
+            path.as_os_str(),
+        ))
     }
 
     #[test]

@@ -30,13 +30,54 @@ Every conformance case records all seven dimensions:
 6. `transactional_side_effect`
 7. `operational`
 
-An observation is either `observed`, with normalized oracle and subject payloads and a comparison status, or `not-observed`, with a nonempty reason. A missing dimension is invalid evidence. `not-observed` is acceptable while work is incomplete but cannot support a complete-compatibility claim.
+An observation is either `observed`, with distinct raw oracle and subject
+evidence, normalized oracle and subject payloads, the exact normalization-rule
+revisions applied in order, and a comparison status, or `not-observed`, with a
+nonempty reason. A missing dimension is invalid evidence. `not-observed` is
+acceptable while work is incomplete but cannot support a
+complete-compatibility claim.
 
 Expected behavior is classified as `documented`, `version-dependent`, `unspecified`, or `implementation-dependent`. Public authoritative specifications take precedence. Oracle observations fill gaps only where public documentation does not define the behavior; they do not convert implementation-dependent behavior into a public contract.
 
 ## Comparison Rules
 
-The harness retains the raw input and raw observations, then compares a typed normalized representation. A case may normalize a nondeterministic value only when the normalization rule is named in that case and linked to public documentation or a provenance record. Timestamps, generated identifiers, paths, process identifiers, and message text are not silently discarded. Changing a normalization rule invalidates prior results unless the contract change explicitly preserves their meaning.
+The harness retains the raw input and raw observations, then compares a typed
+normalized representation. Synthetic or redistributable structured evidence
+may be stored inline. Other raw bytes are represented by an evidence-store ID,
+artifact ID, SHA-256 digest, byte length, media type, and `public` or `protected`
+access classification. Protected evidence remains outside the repository and
+public build artifacts; the record retains enough immutable metadata to detect
+substitution or absence.
+
+A case may normalize a nondeterministic value only when the normalization rule
+is defined in that record with a stable ID, positive revision, provenance ID,
+and nonempty description. Each observed dimension references exact rule
+revisions in application order. An empty reference list means no normalization
+rule was applied, so each inline raw value must equal its normalized value
+exactly. Artifact evidence always requires an explicit projection rule because
+the retained bytes cannot be compared from the record alone. An empty list never
+permits silent transformation or field removal. Unknown, duplicate, or unused
+rules invalidate the record. Changing a rule creates a new revision and new
+conformance evidence unless a versioned contract migration explicitly preserves
+its meaning. Timestamps, generated identifiers, paths, process identifiers, and
+message text are not silently discarded.
+
+`compatible` requires exact equality between the normalized oracle and subject
+values, including JSON numeric kind and IEEE signed zero. `divergent` requires
+an inequality; `partial` records a deliberately incomplete comparison. A
+zero-byte artifact is valid evidence only with the SHA-256 digest of empty
+content, so absence cannot masquerade as an empty observation. Conformance
+digests use canonical lowercase hexadecimal, and inline JSON numbers retain
+their arbitrary-precision lexical identity.
+
+Every record also names one feature and its owning issue, one exact target and
+evidence provenance record, the exact runner and subject Git revisions and
+artifact SHA-256 digests, a deterministic case seed, the SHA-256 digest of the
+input bytes, complete name/value environment facts, and a shell-free runner
+argument vector whose elements are nonempty and NUL-free. The feature, owner,
+target, case provenance, and normalization provenance references must resolve
+against the published ledgers before the record can become governed evidence. A
+feature in `blocked-legal` state cannot produce a valid conformance record.
 
 | Dimension | Required comparison |
 | --- | --- |
@@ -124,6 +165,11 @@ for cross-record, graph, authenticated-context, and governed-use invariants such
 as unique identifiers, target and provenance references, complete category
 coverage, contiguous expansion order, exact provenance closure, and trusted
 candidate binding.
+
+Conformance records currently use schema version `2.0.0`. Version 2 makes raw
+evidence, normalization rules, feature ownership, and reproduction metadata
+mandatory; a version 1 normalized-only record is not lossless evidence and is
+therefore not valid under version 2.
 
 The shared corpus records separate expectations for all four boundaries and
 requires JSON Schema and typed Rust schema-semantic expectations to agree for

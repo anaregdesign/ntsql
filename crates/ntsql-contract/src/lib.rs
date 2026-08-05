@@ -14,14 +14,20 @@ where
     Option::deserialize(deserializer)
 }
 
+/// Current version shared by the target, feature, and provenance ledgers.
+pub const COMPATIBILITY_SCHEMA_VERSION: &str = "1.0.0";
+
 /// Current version of the conformance record contract.
-pub const CONFORMANCE_SCHEMA_VERSION: &str = "1.0.0";
+pub const CONFORMANCE_SCHEMA_VERSION: &str = "2.0.0";
 
 /// Current version of the legal-review ledger contract.
 pub const LEGAL_REVIEW_SCHEMA_VERSION: &str = "2.0.0";
 
 /// Current version of authenticated legal-decision authority input.
 pub const LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION: &str = "1.0.0";
+
+const SHA256_EMPTY_CONTENT: &str =
+    "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// Compatibility dimensions that must be evaluated for every case.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -393,16 +399,132 @@ pub struct LegalReviewLedger {
     pub reviews: Vec<LegalReviewRecord>,
 }
 
+/// Whether externally stored raw evidence may be redistributed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceAccess {
+    /// The referenced artifact may be included in public evidence.
+    Public,
+    /// The referenced artifact remains in an access-controlled evidence store.
+    Protected,
+}
+
+/// Raw evidence retained for one side of a comparison.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RawEvidence {
+    /// A synthetic or redistributable structured value stored directly.
+    Inline {
+        /// Unnormalized observation value.
+        value: Value,
+    },
+    /// Immutable metadata for bytes retained outside the conformance record.
+    Artifact {
+        /// Stable identifier of the evidence store boundary.
+        store_id: String,
+        /// Stable identifier of the artifact within that store.
+        artifact_id: String,
+        /// SHA-256 digest of the retained bytes.
+        content_digest: String,
+        /// Exact number of retained bytes.
+        byte_length: u64,
+        /// Media type used to interpret the retained bytes.
+        media_type: String,
+        /// Redistribution boundary for the retained bytes.
+        access: EvidenceAccess,
+    },
+}
+
+/// Raw oracle and subject observations before normalization.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawObservationPair {
+    /// Raw oracle evidence.
+    pub oracle: RawEvidence,
+    /// Raw ntsql evidence.
+    pub subject: RawEvidence,
+}
+
+/// Typed values compared after applying named normalization rules.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizedObservationPair {
+    /// Normalized oracle value.
+    pub oracle: Value,
+    /// Normalized ntsql value.
+    pub subject: Value,
+}
+
+/// One immutable normalization rule definition captured with a record.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizationRule {
+    /// Stable rule identifier.
+    pub id: String,
+    /// Positive rule revision.
+    pub revision: u32,
+    /// Provenance record authorizing the rule.
+    pub provenance_id: String,
+    /// Nonempty description of the value transformation.
+    pub description: String,
+}
+
+/// Exact normalization rule revision applied to one dimension.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NormalizationRuleReference {
+    /// Stable rule identifier.
+    pub id: String,
+    /// Exact rule revision.
+    pub revision: u32,
+}
+
+/// One exact fact needed to reproduce the subject environment.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformanceEnvironmentFact {
+    /// Stable environment field name.
+    pub name: String,
+    /// Exact observed value.
+    pub value: String,
+}
+
+/// Machine-actionable identity of the runner, input, and subject build.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformanceReproduction {
+    /// Stable runner implementation identifier.
+    pub runner_id: String,
+    /// Exact Git revision of the runner implementation.
+    pub runner_revision: String,
+    /// SHA-256 digest of the runner artifact that executed the case.
+    pub runner_digest: String,
+    /// Exact Git revision of the ntsql subject.
+    pub subject_revision: String,
+    /// SHA-256 digest of the ntsql subject artifact under test.
+    pub subject_digest: String,
+    /// Deterministic seed used to construct the case input.
+    pub case_seed: String,
+    /// SHA-256 digest of the exact input bytes.
+    pub input_digest: String,
+    /// Complete bounded environment facts required by the runner.
+    pub environment: Vec<ConformanceEnvironmentFact>,
+    /// Argument vector passed to the identified runner, without a shell.
+    pub arguments: Vec<String>,
+}
+
 /// A mandatory dimension observation, including an explicit reason when absent.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum DimensionObservation {
     /// The oracle and subject observations were captured.
     Observed {
-        /// Normalized, dimension-specific observation payload.
-        oracle: Value,
-        /// Normalized observation produced by ntsql.
-        subject: Value,
+        /// Unmodified evidence or immutable references to retained bytes.
+        raw: Box<RawObservationPair>,
+        /// Typed values after applying the named rules.
+        normalized: NormalizedObservationPair,
+        /// Exact rule revisions applied in order; empty means no normalization.
+        normalization_rules: Vec<NormalizationRuleReference>,
         /// Outcome of comparing the normalized payloads.
         status: ComparisonStatus,
     },
@@ -441,6 +563,10 @@ pub struct ConformanceRecord {
     pub schema_version: String,
     /// Stable identifier of the test input.
     pub case_id: String,
+    /// Feature inventory entry exercised by this case.
+    pub feature_id: String,
+    /// Issue that owns the referenced feature at capture time.
+    pub owner_issue: u64,
     /// Identifier of the exact oracle target from the target matrix.
     pub target_id: String,
     /// ISO 8601 UTC capture timestamp.
@@ -449,6 +575,10 @@ pub struct ConformanceRecord {
     pub provenance_id: String,
     /// Behavior authority classification.
     pub behavior_class: BehaviorClass,
+    /// Deterministic runner, subject, input, and environment identity.
+    pub reproduction: ConformanceReproduction,
+    /// Complete rule definitions referenced by observed dimensions.
+    pub normalization_rules: Vec<NormalizationRule>,
     /// All required observable dimensions.
     pub observations: ConformanceObservations,
 }
@@ -589,7 +719,7 @@ impl TargetMatrix {
     pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
 
-        if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
+        if self.schema_version != COMPATIBILITY_SCHEMA_VERSION {
             violations.push(ContractViolation {
                 code: "target.schema-version.unsupported",
                 message: format!("unsupported target schema version: {}", self.schema_version),
@@ -895,6 +1025,17 @@ fn is_sha256_digest(value: &str) -> bool {
     };
 
     hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_canonical_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn has_four_numeric_components(value: &str) -> bool {
@@ -1778,7 +1919,7 @@ impl ProvenanceLedger {
     pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
 
-        if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
+        if self.schema_version != COMPATIBILITY_SCHEMA_VERSION {
             violations.push(ContractViolation {
                 code: "provenance.schema-version.unsupported",
                 message: format!(
@@ -2174,6 +2315,73 @@ pub fn validate_governance_references(
     violations
 }
 
+impl ConformanceObservations {
+    fn entries(&self) -> [(&'static str, &DimensionObservation); 7] {
+        [
+            ("syntax", &self.syntax),
+            ("wire", &self.wire),
+            ("result", &self.result),
+            ("metadata", &self.metadata),
+            ("diagnostic", &self.diagnostic),
+            ("transactional_side_effect", &self.transactional_side_effect),
+            ("operational", &self.operational),
+        ]
+    }
+}
+
+impl RawEvidence {
+    fn validate_schema_semantics(&self, dimension: &str, side: &str) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        let Self::Artifact {
+            store_id,
+            artifact_id,
+            content_digest,
+            byte_length,
+            media_type,
+            access: _,
+        } = self
+        else {
+            return violations;
+        };
+
+        for (field, identifier) in [("store_id", store_id), ("artifact_id", artifact_id)] {
+            if !is_contract_identifier(identifier) {
+                violations.push(ContractViolation {
+                    code: "conformance.raw-artifact.identifier.invalid",
+                    message: format!(
+                        "conformance {dimension} {side} raw artifact {field} is malformed"
+                    ),
+                });
+            }
+        }
+        if !is_canonical_sha256_digest(content_digest) {
+            violations.push(ContractViolation {
+                code: "conformance.raw-artifact.digest.invalid",
+                message: format!(
+                    "conformance {dimension} {side} raw artifact requires a SHA-256 digest"
+                ),
+            });
+        }
+        if (*byte_length == 0) != (content_digest == SHA256_EMPTY_CONTENT) {
+            violations.push(ContractViolation {
+                code: "conformance.raw-artifact.empty-digest-mismatch",
+                message: format!(
+                    "conformance {dimension} {side} raw artifact zero length and empty-content digest must agree"
+                ),
+            });
+        }
+        if !has_schema_non_whitespace(media_type) {
+            violations.push(ContractViolation {
+                code: "conformance.raw-artifact.media-type.empty",
+                message: format!(
+                    "conformance {dimension} {side} raw artifact requires a media type"
+                ),
+            });
+        }
+        violations
+    }
+}
+
 impl ConformanceRecord {
     /// Validates constraints expressed by the published conformance-record schema.
     #[must_use]
@@ -2191,8 +2399,10 @@ impl ConformanceRecord {
         }
         for (field, identifier) in [
             ("case_id", self.case_id.as_str()),
+            ("feature_id", self.feature_id.as_str()),
             ("target_id", self.target_id.as_str()),
             ("provenance_id", self.provenance_id.as_str()),
+            ("runner_id", self.reproduction.runner_id.as_str()),
         ] {
             if !is_contract_identifier(identifier) {
                 violations.push(ContractViolation {
@@ -2201,31 +2411,379 @@ impl ConformanceRecord {
                 });
             }
         }
+        if self.owner_issue == 0 {
+            violations.push(ContractViolation {
+                code: "conformance.owner-issue.invalid",
+                message: "conformance owner_issue must be positive".to_owned(),
+            });
+        }
         if !is_iso_utc_timestamp(&self.observed_at) {
             violations.push(ContractViolation {
                 code: "conformance.observed-at.invalid",
                 message: "conformance observed_at must use UTC second precision".to_owned(),
             });
         }
-
-        for (dimension, observation) in [
-            ("syntax", &self.observations.syntax),
-            ("wire", &self.observations.wire),
-            ("result", &self.observations.result),
-            ("metadata", &self.observations.metadata),
-            ("diagnostic", &self.observations.diagnostic),
+        for (field, revision) in [
             (
-                "transactional_side_effect",
-                &self.observations.transactional_side_effect,
+                "runner_revision",
+                self.reproduction.runner_revision.as_str(),
             ),
-            ("operational", &self.observations.operational),
+            (
+                "subject_revision",
+                self.reproduction.subject_revision.as_str(),
+            ),
         ] {
-            if let DimensionObservation::NotObserved { reason } = observation
-                && !has_schema_non_whitespace(reason)
+            if !is_git_commit_sha(revision) {
+                violations.push(ContractViolation {
+                    code: "conformance.revision.invalid",
+                    message: format!("conformance {field} must be a lowercase Git commit SHA"),
+                });
+            }
+        }
+        for (field, digest) in [
+            ("runner_digest", self.reproduction.runner_digest.as_str()),
+            ("subject_digest", self.reproduction.subject_digest.as_str()),
+            ("input_digest", self.reproduction.input_digest.as_str()),
+        ] {
+            if !is_canonical_sha256_digest(digest) {
+                violations.push(ContractViolation {
+                    code: "conformance.reproduction.digest.invalid",
+                    message: format!("conformance {field} requires a SHA-256 digest"),
+                });
+            }
+        }
+        if !has_schema_non_whitespace(&self.reproduction.case_seed) {
+            violations.push(ContractViolation {
+                code: "conformance.case-seed.empty",
+                message: "conformance case_seed must be nonempty".to_owned(),
+            });
+        }
+        if self.reproduction.environment.is_empty() {
+            violations.push(ContractViolation {
+                code: "conformance.environment.empty",
+                message: "conformance environment requires at least one fact".to_owned(),
+            });
+        }
+        for fact in &self.reproduction.environment {
+            if !is_contract_identifier(&fact.name) {
+                violations.push(ContractViolation {
+                    code: "conformance.environment.name.invalid",
+                    message: format!(
+                        "conformance environment fact name is malformed: {}",
+                        fact.name
+                    ),
+                });
+            }
+            if !has_schema_non_whitespace(&fact.value) {
+                violations.push(ContractViolation {
+                    code: "conformance.environment.value.empty",
+                    message: format!(
+                        "conformance environment fact {} requires a value",
+                        fact.name
+                    ),
+                });
+            }
+        }
+        if has_duplicates(&self.reproduction.environment) {
+            violations.push(ContractViolation {
+                code: "conformance.environment.duplicate",
+                message: "conformance environment contains a duplicate fact".to_owned(),
+            });
+        }
+        for argument in &self.reproduction.arguments {
+            if !has_schema_non_whitespace(argument) {
+                violations.push(ContractViolation {
+                    code: "conformance.rerun-argument.empty",
+                    message: "conformance rerun arguments must be nonempty".to_owned(),
+                });
+            }
+            if argument.contains('\0') {
+                violations.push(ContractViolation {
+                    code: "conformance.rerun-argument.nul",
+                    message: "conformance rerun arguments cannot contain NUL".to_owned(),
+                });
+            }
+        }
+        for rule in &self.normalization_rules {
+            for (field, identifier) in [
+                ("id", rule.id.as_str()),
+                ("provenance_id", rule.provenance_id.as_str()),
+            ] {
+                if !is_contract_identifier(identifier) {
+                    violations.push(ContractViolation {
+                        code: "conformance.normalization-rule.identifier.invalid",
+                        message: format!(
+                            "conformance normalization rule {field} is malformed: {identifier}"
+                        ),
+                    });
+                }
+            }
+            if rule.revision == 0 {
+                violations.push(ContractViolation {
+                    code: "conformance.normalization-rule.revision.invalid",
+                    message: format!(
+                        "conformance normalization rule {} requires a positive revision",
+                        rule.id
+                    ),
+                });
+            }
+            if !has_schema_non_whitespace(&rule.description) {
+                violations.push(ContractViolation {
+                    code: "conformance.normalization-rule.description.empty",
+                    message: format!(
+                        "conformance normalization rule {} requires a description",
+                        rule.id
+                    ),
+                });
+            }
+        }
+        if has_duplicates(&self.normalization_rules) {
+            violations.push(ContractViolation {
+                code: "conformance.normalization-rule.duplicate",
+                message: "conformance normalization rules contain an exact duplicate".to_owned(),
+            });
+        }
+
+        for (dimension, observation) in self.observations.entries() {
+            match observation {
+                DimensionObservation::NotObserved { reason } => {
+                    if !has_schema_non_whitespace(reason) {
+                        violations.push(ContractViolation {
+                            code: "conformance.observation.reason.empty",
+                            message: format!("conformance {dimension} requires a reason"),
+                        });
+                    }
+                }
+                DimensionObservation::Observed {
+                    raw,
+                    normalized: _,
+                    normalization_rules,
+                    status: _,
+                } => {
+                    violations.extend(raw.oracle.validate_schema_semantics(dimension, "oracle"));
+                    violations.extend(raw.subject.validate_schema_semantics(dimension, "subject"));
+                    for rule in normalization_rules {
+                        if !is_contract_identifier(&rule.id) {
+                            violations.push(ContractViolation {
+                                code: "conformance.normalization-reference.id.invalid",
+                                message: format!(
+                                    "conformance {dimension} normalization rule id is malformed: {}",
+                                    rule.id
+                                ),
+                            });
+                        }
+                        if rule.revision == 0 {
+                            violations.push(ContractViolation {
+                                code: "conformance.normalization-reference.revision.invalid",
+                                message: format!(
+                                    "conformance {dimension} normalization rule {} requires a positive revision",
+                                    rule.id
+                                ),
+                            });
+                        }
+                    }
+                    if has_duplicates(normalization_rules) {
+                        violations.push(ContractViolation {
+                            code: "conformance.normalization-reference.duplicate",
+                            message: format!(
+                                "conformance {dimension} repeats a normalization rule"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        violations
+    }
+
+    /// Validates invariants that JSON Schema cannot express within one record.
+    #[must_use]
+    pub fn validate_document_semantics(&self) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        let mut environment_names = BTreeSet::new();
+        for fact in &self.reproduction.environment {
+            if !environment_names.insert(fact.name.as_str()) {
+                violations.push(ContractViolation {
+                    code: "conformance.environment.name.duplicate",
+                    message: format!("conformance environment repeats fact name {}", fact.name),
+                });
+            }
+        }
+
+        let mut defined_rules = BTreeSet::new();
+        for rule in &self.normalization_rules {
+            if !defined_rules.insert((rule.id.as_str(), rule.revision)) {
+                violations.push(ContractViolation {
+                    code: "conformance.normalization-rule.identity.duplicate",
+                    message: format!(
+                        "conformance repeats normalization rule {} revision {}",
+                        rule.id, rule.revision
+                    ),
+                });
+            }
+        }
+
+        let mut referenced_rules = BTreeSet::new();
+        for (dimension, observation) in self.observations.entries() {
+            let DimensionObservation::Observed {
+                raw,
+                normalized,
+                normalization_rules,
+                status,
+            } = observation
+            else {
+                continue;
+            };
+            if normalization_rules.is_empty()
+                && (!raw_evidence_is_identity(&raw.oracle, &normalized.oracle)
+                    || !raw_evidence_is_identity(&raw.subject, &normalized.subject))
             {
                 violations.push(ContractViolation {
-                    code: "conformance.observation.reason.empty",
-                    message: format!("conformance {dimension} requires a reason"),
+                    code: "conformance.normalization.unrecorded",
+                    message: format!(
+                        "conformance {dimension} changes or projects raw evidence without a normalization rule"
+                    ),
+                });
+            }
+            let normalized_values_match =
+                json_values_are_identical(&normalized.oracle, &normalized.subject);
+            if *status == ComparisonStatus::Compatible && !normalized_values_match {
+                violations.push(ContractViolation {
+                    code: "conformance.comparison.compatible-mismatch",
+                    message: format!(
+                        "conformance {dimension} marks unequal normalized values compatible"
+                    ),
+                });
+            }
+            if *status == ComparisonStatus::Divergent && normalized_values_match {
+                violations.push(ContractViolation {
+                    code: "conformance.comparison.divergent-match",
+                    message: format!(
+                        "conformance {dimension} marks equal normalized values divergent"
+                    ),
+                });
+            }
+            for rule in normalization_rules {
+                let identity = (rule.id.as_str(), rule.revision);
+                if !defined_rules.contains(&identity) {
+                    violations.push(ContractViolation {
+                        code: "conformance.normalization-reference.unknown",
+                        message: format!(
+                            "conformance {dimension} references unknown normalization rule {} revision {}",
+                            rule.id, rule.revision
+                        ),
+                    });
+                }
+                referenced_rules.insert(identity);
+            }
+        }
+        for rule in &self.normalization_rules {
+            if !referenced_rules.contains(&(rule.id.as_str(), rule.revision)) {
+                violations.push(ContractViolation {
+                    code: "conformance.normalization-rule.unused",
+                    message: format!(
+                        "conformance normalization rule {} revision {} is unused",
+                        rule.id, rule.revision
+                    ),
+                });
+            }
+        }
+
+        violations
+    }
+
+    /// Validates target, feature, owner, and provenance references.
+    #[must_use]
+    pub fn validate_references(
+        &self,
+        targets: &TargetMatrix,
+        features: &FeatureMatrix,
+        provenance: &ProvenanceLedger,
+    ) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        let mut matching_targets = targets
+            .targets
+            .iter()
+            .filter(|target| target.id == self.target_id);
+        match (matching_targets.next(), matching_targets.next()) {
+            (None, _) => violations.push(ContractViolation {
+                code: "conformance.target.unknown",
+                message: format!("unknown conformance target: {}", self.target_id),
+            }),
+            (Some(_), Some(_)) => violations.push(ContractViolation {
+                code: "conformance.target.ambiguous",
+                message: format!("conformance target {} is not unique", self.target_id),
+            }),
+            (Some(_), None) => {}
+        }
+
+        let mut matching_features = features
+            .features
+            .iter()
+            .filter(|feature| feature.id == self.feature_id);
+        match (matching_features.next(), matching_features.next()) {
+            (Some(feature), None) => {
+                if feature.status == CompatibilityStatus::BlockedLegal {
+                    violations.push(ContractViolation {
+                        code: "conformance.feature.blocked-legal",
+                        message: format!(
+                            "conformance feature {} is blocked by legal review",
+                            feature.id
+                        ),
+                    });
+                }
+                if feature.owner_issue != self.owner_issue {
+                    violations.push(ContractViolation {
+                        code: "conformance.feature.owner-mismatch",
+                        message: format!(
+                            "conformance feature {} is owned by issue {}, not {}",
+                            feature.id, feature.owner_issue, self.owner_issue
+                        ),
+                    });
+                }
+                if !feature.oracle_targets.contains(&self.target_id) {
+                    violations.push(ContractViolation {
+                        code: "conformance.feature.target-mismatch",
+                        message: format!(
+                            "conformance feature {} does not include target {}",
+                            feature.id, self.target_id
+                        ),
+                    });
+                }
+            }
+            (None, _) => violations.push(ContractViolation {
+                code: "conformance.feature.unknown",
+                message: format!("unknown conformance feature: {}", self.feature_id),
+            }),
+            (Some(_), Some(_)) => violations.push(ContractViolation {
+                code: "conformance.feature.ambiguous",
+                message: format!("conformance feature {} is not unique", self.feature_id),
+            }),
+        }
+
+        let provenance_ids = provenance
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if !provenance_ids.contains(self.provenance_id.as_str()) {
+            violations.push(ContractViolation {
+                code: "conformance.provenance.unknown",
+                message: format!(
+                    "conformance references unknown provenance {}",
+                    self.provenance_id
+                ),
+            });
+        }
+        for rule in &self.normalization_rules {
+            if !provenance_ids.contains(rule.provenance_id.as_str()) {
+                violations.push(ContractViolation {
+                    code: "conformance.normalization-rule.provenance.unknown",
+                    message: format!(
+                        "conformance normalization rule {} references unknown provenance {}",
+                        rule.id, rule.provenance_id
+                    ),
                 });
             }
         }
@@ -2238,33 +2796,41 @@ impl ConformanceRecord {
     pub fn validate_governance(
         &self,
         targets: &TargetMatrix,
+        features: &FeatureMatrix,
         provenance: &ProvenanceLedger,
         legal_reviews: &LegalReviewLedger,
         legal_verification: Option<LegalDecisionVerificationContext<'_>>,
     ) -> Vec<ContractViolation> {
-        let Some(target) = targets
+        let mut violations = self.validate_schema_semantics();
+        violations.extend(self.validate_document_semantics());
+        violations.extend(self.validate_references(targets, features, provenance));
+
+        if let Some(target) = targets
             .targets
             .iter()
             .find(|target| target.id == self.target_id)
-        else {
-            return vec![ContractViolation {
-                code: "conformance.target.unknown",
-                message: format!("unknown conformance target: {}", self.target_id),
-            }];
-        };
-
-        let mut violations = provenance.validate_use(
-            legal_reviews,
-            legal_verification,
-            &target.provenance_id,
-            ProvenanceUse::OracleOperation,
+        {
+            violations.extend(provenance.validate_use(
+                legal_reviews,
+                legal_verification,
+                &target.provenance_id,
+                ProvenanceUse::OracleOperation,
+            ));
+        }
+        let mut evidence_ids = BTreeSet::from([self.provenance_id.as_str()]);
+        evidence_ids.extend(
+            self.normalization_rules
+                .iter()
+                .map(|rule| rule.provenance_id.as_str()),
         );
-        violations.extend(provenance.validate_use(
-            legal_reviews,
-            legal_verification,
-            &self.provenance_id,
-            ProvenanceUse::ConformanceEvidence,
-        ));
+        for provenance_id in evidence_ids {
+            violations.extend(provenance.validate_use(
+                legal_reviews,
+                legal_verification,
+                provenance_id,
+                ProvenanceUse::ConformanceEvidence,
+            ));
+        }
         violations
     }
 }
@@ -2322,6 +2888,38 @@ fn has_equal_duplicates<T: PartialEq>(values: &[T]) -> bool {
         .iter()
         .enumerate()
         .any(|(index, value)| values[..index].contains(value))
+}
+
+fn raw_evidence_is_identity(raw: &RawEvidence, normalized: &Value) -> bool {
+    matches!(
+        raw,
+        RawEvidence::Inline { value } if json_values_are_identical(value, normalized)
+    )
+}
+
+fn json_values_are_identical(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => left.to_string() == right.to_string(),
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| json_values_are_identical(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| json_values_are_identical(left, right))
+                })
+        }
+        _ => false,
+    }
 }
 
 fn is_iso_date(value: &str) -> bool {
@@ -2624,7 +3222,7 @@ impl FeatureMatrix {
     pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
         let mut violations = Vec::new();
 
-        if self.schema_version != CONFORMANCE_SCHEMA_VERSION {
+        if self.schema_version != COMPATIBILITY_SCHEMA_VERSION {
             violations.push(ContractViolation {
                 code: "feature.schema-version.unsupported",
                 message: format!(
@@ -2701,69 +3299,198 @@ mod tests {
         ProvenanceLedger, ProvenanceRecord, ProvenanceSourceKind, ProvenanceUse, TargetMatrix,
         validate_governance_references,
     };
+    use serde_json::{Value, json};
 
     #[test]
     fn conformance_record_requires_every_dimension() {
-        let missing_operational = r#"
-        {
-          "schema_version": "1.0.0",
-          "case_id": "select.literal.integer",
-          "target_id": "sqlserver-2022-cu18-linux",
-          "observed_at": "2026-08-02T00:00:00Z",
-          "provenance_id": "prov-select-literal-integer",
-          "behavior_class": "documented",
-          "observations": {
-            "syntax": { "state": "not-observed", "reason": "pending" },
-            "wire": { "state": "not-observed", "reason": "pending" },
-            "result": { "state": "not-observed", "reason": "pending" },
-            "metadata": { "state": "not-observed", "reason": "pending" },
-            "diagnostic": { "state": "not-observed", "reason": "pending" },
-            "transactional_side_effect": {
-              "state": "not-observed",
-              "reason": "pending"
-            }
-          }
-        }
-        "#;
+        let mut missing_operational = valid_conformance_document();
+        let removed = missing_operational
+            .get_mut("observations")
+            .and_then(Value::as_object_mut)
+            .and_then(|observations| observations.remove("operational"));
+        assert!(removed.is_some());
 
-        let result = serde_json::from_str::<ConformanceRecord>(missing_operational);
+        let result = serde_json::from_value::<ConformanceRecord>(missing_operational);
 
         assert!(result.is_err());
     }
 
     #[test]
     fn observed_dimension_rejects_feature_only_status() {
-        let blocked_observation = r#"
-                {
-                    "schema_version": "1.0.0",
-                    "case_id": "select.literal.integer",
-                    "target_id": "sqlserver-2022-cu26-linux-x86_64-developer-compat160",
-                    "observed_at": "2026-08-02T00:00:00Z",
-                    "provenance_id": "prov-select-literal-integer",
-                    "behavior_class": "documented",
-                    "observations": {
-                        "syntax": {
-                            "state": "observed",
-                            "oracle": "accepted",
-                            "subject": "accepted",
-                            "status": "blocked-legal"
-                        },
-                        "wire": { "state": "not-observed", "reason": "pending" },
-                        "result": { "state": "not-observed", "reason": "pending" },
-                        "metadata": { "state": "not-observed", "reason": "pending" },
-                        "diagnostic": { "state": "not-observed", "reason": "pending" },
-                        "transactional_side_effect": {
-                            "state": "not-observed",
-                            "reason": "pending"
-                        },
-                        "operational": { "state": "not-observed", "reason": "pending" }
-                    }
-                }
-                "#;
+        let mut blocked_observation = valid_conformance_document();
+        let replaced = blocked_observation
+            .pointer_mut("/observations/syntax")
+            .map(|observation| {
+                *observation = json!({
+                    "state": "observed",
+                    "raw": {
+                        "oracle": { "kind": "inline", "value": "accepted" },
+                        "subject": { "kind": "inline", "value": "accepted" }
+                    },
+                    "normalized": {
+                        "oracle": "accepted",
+                        "subject": "accepted"
+                    },
+                    "normalization_rules": [],
+                    "status": "blocked-legal"
+                });
+            })
+            .is_some();
+        assert!(replaced);
 
-        let result = serde_json::from_str::<ConformanceRecord>(blocked_observation);
+        let result = serde_json::from_value::<ConformanceRecord>(blocked_observation);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn conformance_record_rejects_unknown_rules_and_duplicate_environment_names()
+    -> Result<(), serde_json::Error> {
+        let mut unknown_rule_document = valid_conformance_document();
+        let replaced = unknown_rule_document
+            .pointer_mut("/observations/result")
+            .map(|observation| {
+                *observation = json!({
+                    "state": "observed",
+                    "raw": {
+                        "oracle": { "kind": "inline", "value": 1 },
+                        "subject": { "kind": "inline", "value": 1 }
+                    },
+                    "normalized": { "oracle": 1, "subject": 1 },
+                    "normalization_rules": [
+                        { "id": "normalize.unknown", "revision": 1 }
+                    ],
+                    "status": "compatible"
+                });
+            })
+            .is_some();
+        assert!(replaced);
+        let unknown_rule: ConformanceRecord = serde_json::from_value(unknown_rule_document)?;
+        let unknown_rule_violations = unknown_rule.validate_document_semantics();
+
+        let mut duplicate_environment_document = valid_conformance_document();
+        let environment = duplicate_environment_document
+            .pointer_mut("/reproduction/environment")
+            .and_then(Value::as_array_mut);
+        assert!(environment.is_some());
+        if let Some(environment) = environment {
+            environment.push(json!({
+                "name": "subject.architecture",
+                "value": "different"
+            }));
+        }
+        let duplicate_environment: ConformanceRecord =
+            serde_json::from_value(duplicate_environment_document)?;
+        let duplicate_environment_violations = duplicate_environment.validate_document_semantics();
+
+        assert!(
+            unknown_rule_violations.iter().any(|violation| {
+                violation.code == "conformance.normalization-reference.unknown"
+            })
+        );
+        assert!(
+            duplicate_environment_violations
+                .iter()
+                .any(|violation| { violation.code == "conformance.environment.name.duplicate" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conformance_record_resolves_feature_owner_target_and_provenance()
+    -> Result<(), serde_json::Error> {
+        let record: ConformanceRecord = serde_json::from_value(valid_conformance_document())?;
+        let targets = TargetMatrix {
+            schema_version: "1.0.0".to_owned(),
+            baseline_target_id: "baseline".to_owned(),
+            targets: vec![oracle_target("baseline", "2022-CU26-ubuntu-22.04")],
+            expansion_order: Vec::new(),
+        };
+        let features = FeatureMatrix {
+            schema_version: "1.0.0".to_owned(),
+            features: vec![FeatureRecord {
+                id: "language.select".to_owned(),
+                title: "SELECT".to_owned(),
+                category: FeatureCategory::Language,
+                status: CompatibilityStatus::NotTested,
+                oracle_targets: vec!["baseline".to_owned()],
+                evidence: vec!["prov-public-specification".to_owned()],
+                differences: Vec::new(),
+                owner_issue: 8,
+                legal_review_id: None,
+            }],
+        };
+        let provenance = provenance_ledger();
+
+        let valid = record.validate_references(&targets, &features, &provenance);
+        let mut blocked_features = features.clone();
+        blocked_features.features[0].status = CompatibilityStatus::BlockedLegal;
+        blocked_features.features[0].legal_review_id =
+            Some("legal-review-public-specification".to_owned());
+        let blocked_references =
+            record.validate_references(&targets, &blocked_features, &provenance);
+        let mut duplicate_features = features.clone();
+        duplicate_features
+            .features
+            .push(blocked_features.features[0].clone());
+        let duplicate_feature_references =
+            record.validate_references(&targets, &duplicate_features, &provenance);
+        let mut duplicate_targets = targets.clone();
+        duplicate_targets
+            .targets
+            .push(oracle_target("baseline", "2022-CU26-ubuntu-22.04"));
+        let duplicate_target_references =
+            record.validate_references(&duplicate_targets, &features, &provenance);
+        let mut wrong_owner = record.clone();
+        wrong_owner.owner_issue = 9;
+        let mut unknown_feature = record.clone();
+        unknown_feature.feature_id = "language.unknown".to_owned();
+        let mut unknown_target = record.clone();
+        unknown_target.target_id = "target.unknown".to_owned();
+        let mut unknown_provenance = record;
+        unknown_provenance.provenance_id = "prov-unknown".to_owned();
+
+        assert!(valid.is_empty(), "{valid:#?}");
+        assert!(
+            blocked_references
+                .iter()
+                .any(|violation| violation.code == "conformance.feature.blocked-legal")
+        );
+        assert!(
+            duplicate_feature_references
+                .iter()
+                .any(|violation| violation.code == "conformance.feature.ambiguous")
+        );
+        assert!(
+            duplicate_target_references
+                .iter()
+                .any(|violation| violation.code == "conformance.target.ambiguous")
+        );
+        assert!(
+            wrong_owner
+                .validate_references(&targets, &features, &provenance)
+                .iter()
+                .any(|violation| violation.code == "conformance.feature.owner-mismatch")
+        );
+        assert!(
+            unknown_feature
+                .validate_references(&targets, &features, &provenance)
+                .iter()
+                .any(|violation| violation.code == "conformance.feature.unknown")
+        );
+        assert!(
+            unknown_target
+                .validate_references(&targets, &features, &provenance)
+                .iter()
+                .any(|violation| violation.code == "conformance.target.unknown")
+        );
+        assert!(
+            unknown_provenance
+                .validate_references(&targets, &features, &provenance)
+                .iter()
+                .any(|violation| violation.code == "conformance.provenance.unknown")
+        );
+        Ok(())
     }
 
     #[test]
@@ -3783,6 +4510,46 @@ mod tests {
                 .count(),
             17
         );
+    }
+
+    fn valid_conformance_document() -> Value {
+        json!({
+            "schema_version": "2.0.0",
+            "case_id": "select.literal.integer",
+            "feature_id": "language.select",
+            "owner_issue": 8,
+            "target_id": "baseline",
+            "observed_at": "2026-08-02T00:00:00Z",
+            "provenance_id": "prov-public-specification",
+            "behavior_class": "documented",
+            "reproduction": {
+                "runner_id": "ntsql-testkit.synthetic",
+                "runner_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "runner_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "subject_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "subject_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "case_seed": "seed.select-literal-integer",
+                "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "environment": [
+                    { "name": "subject.operating-system", "value": "synthetic" },
+                    { "name": "subject.architecture", "value": "synthetic" }
+                ],
+                "arguments": ["--case", "select.literal.integer"]
+            },
+            "normalization_rules": [],
+            "observations": {
+                "syntax": { "state": "not-observed", "reason": "pending" },
+                "wire": { "state": "not-observed", "reason": "pending" },
+                "result": { "state": "not-observed", "reason": "pending" },
+                "metadata": { "state": "not-observed", "reason": "pending" },
+                "diagnostic": { "state": "not-observed", "reason": "pending" },
+                "transactional_side_effect": {
+                    "state": "not-observed",
+                    "reason": "pending"
+                },
+                "operational": { "state": "not-observed", "reason": "pending" }
+            }
+        })
     }
 
     fn oracle_target(id: &str, tag: &str) -> OracleTarget {

@@ -145,6 +145,17 @@
       "legal_review_id": null
     },
     {
+      "id": "transactions-concurrency.commit-lifecycle",
+      "title": "Transaction commit lifecycle and durability outcome",
+      "category": "transactions-concurrency",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 7,
+      "legal_review_id": null
+    },
+    {
       "id": "category.security",
       "title": "Security inventory root",
       "category": "security",

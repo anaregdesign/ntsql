@@ -31,6 +31,10 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
         allowed_dependencies: &["ntsql-contract"],
     },
     PackagePolicy {
+        package: "ntsql-transaction",
+        allowed_dependencies: &["ntsql-wal"],
+    },
+    PackagePolicy {
         package: "ntsql-wal",
         allowed_dependencies: &[],
     },
@@ -253,6 +257,8 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n",
         )?;
 
@@ -281,6 +287,8 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n",
         )?;
 
@@ -319,6 +327,8 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n\
              0ntsql-unreviewed v0.1.0\n",
         )?;
@@ -344,6 +354,8 @@ mod tests {
              1ntsql-contract v0.1.0\n\
              1ntsql-server v0.1.0\n\
              1serde_json v1.0.0\n\
+             0ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n",
         )?;
 
@@ -373,7 +385,9 @@ mod tests {
              1ntsql-filesystem-adapter v0.1.0\n\
              1ntsql-protocol-host v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
-             1serde v1.0.0\n",
+             1serde v1.0.0\n\
+             0ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n",
         )?;
 
         let violations = validate_graph(&graph, PACKAGE_POLICIES);
@@ -387,6 +401,43 @@ mod tests {
         ] {
             assert!(violations.iter().any(|violation| violation
                 == &format!("package ntsql-wal has forbidden direct dependency {dependency}")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_domain_dependencies_are_enforced() -> Result<(), ArchitectureCheckError> {
+        let graph = parse_dependency_tree(
+            "0ntsql-architecture-check v0.1.0\n\
+             0ntsql-compatibility v0.1.0\n\
+             0ntsql-diagnostics v0.1.0\n\
+             0ntsql-contract v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
+             1serde v1.0.0\n\
+             1serde_json v1.0.0\n\
+             0ntsql-testkit v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             0ntsql-transaction v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             1ntsql-filesystem-adapter v0.1.0\n\
+             1ntsql-protocol-host v0.1.0\n\
+             1serde v1.0.0\n\
+             0ntsql-wal v0.1.0\n",
+        )?;
+
+        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+
+        for dependency in [
+            "ntsql-contract",
+            "ntsql-filesystem-adapter",
+            "ntsql-protocol-host",
+            "serde",
+        ] {
+            assert!(violations.iter().any(|violation| violation
+                == &format!(
+                    "package ntsql-transaction has forbidden direct dependency {dependency}"
+                )));
         }
         Ok(())
     }

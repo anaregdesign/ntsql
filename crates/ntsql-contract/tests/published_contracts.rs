@@ -112,6 +112,28 @@ fn first_wal_surface_inventory_is_explicit() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn first_transaction_surface_inventory_is_explicit() -> Result<(), Box<dyn Error>> {
+    let features: FeatureMatrix = serde_json::from_str(FEATURES)?;
+    let feature = features
+        .features
+        .iter()
+        .find(|feature| feature.id == "transactions-concurrency.commit-lifecycle")
+        .ok_or_else(|| invalid_data("missing transaction commit feature".to_owned()))?;
+
+    assert_eq!(feature.category, FeatureCategory::TransactionsConcurrency);
+    assert_eq!(feature.status, CompatibilityStatus::NotTested);
+    assert_eq!(
+        feature.oracle_targets,
+        ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"]
+    );
+    assert_eq!(feature.evidence, ["prov-ms-sql-engine-overview-2022"]);
+    assert!(feature.differences.is_empty());
+    assert_eq!(feature.owner_issue, 7);
+    assert_eq!(feature.legal_review_id, None);
+    Ok(())
+}
+
+#[test]
 fn published_governance_ledgers_are_structurally_valid() -> Result<(), Box<dyn Error>> {
     let legal_reviews: LegalReviewLedger = serde_json::from_str(LEGAL_REVIEWS)?;
     let provenance: ProvenanceLedger = serde_json::from_str(PROVENANCE)?;

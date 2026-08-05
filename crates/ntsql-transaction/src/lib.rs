@@ -8,7 +8,38 @@ use std::{
     sync::Arc,
 };
 
-use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber, commit_durability};
+use ntsql_wal::{CommitError, CommitLog, LogLineage, LogSequenceNumber, commit_durability};
+
+/// Persistence-owned source of nonzero coordinator epochs.
+///
+/// Implementations are responsible for never reissuing an epoch within one
+/// persistence lineage. The transaction domain validates live token ownership
+/// independently and does not infer source correctness from safe Rust alone.
+pub trait TransactionEpochSource {
+    /// Source-specific failure to allocate a fresh epoch.
+    type Error;
+
+    /// Allocates one epoch paired with the lineage in which it is unique.
+    fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error>;
+}
+
+/// Opaque persistence-lineage epoch assigned to one coordinator.
+///
+/// ```compile_fail
+/// use ntsql_transaction::TransactionEpoch;
+///
+/// let forged = TransactionEpoch::new(1);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TransactionEpoch(NonZeroU64);
+
+impl TransactionEpoch {
+    /// Returns the source-assigned numeric epoch for adapter bookkeeping.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 /// Opaque ntsql-internal transaction identity assigned by its coordinator.
 ///
@@ -17,16 +48,31 @@ use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber, commit_durability};
 /// ```compile_fail
 /// use ntsql_transaction::TransactionId;
 ///
-/// let reconstructed = TransactionId::new(1);
+/// let reconstructed = TransactionId::new(1, 1);
 /// ```
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct TransactionId(NonZeroU64);
+pub struct TransactionId {
+    epoch: TransactionEpoch,
+    sequence: NonZeroU64,
+}
 
 impl TransactionId {
-    /// Returns the opaque numeric identity for internal adapter bookkeeping.
+    /// Returns the persistence-lineage coordinator epoch.
     #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0.get()
+    pub const fn epoch(self) -> TransactionEpoch {
+        self.epoch
+    }
+
+    /// Returns the coordinator-local sequence for adapter bookkeeping.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence.get()
+    }
+}
+
+impl fmt::Display for TransactionId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:{}", self.epoch.get(), self.sequence.get())
     }
 }
 
@@ -63,8 +109,7 @@ impl fmt::Display for TransactionIssueError {
             }
             Self::IdentityAlreadyIssued(transaction_id) => write!(
                 formatter,
-                "transaction identity {} was already issued",
-                transaction_id.get()
+                "transaction identity {transaction_id} was already issued"
             ),
         }
     }
@@ -81,25 +126,45 @@ impl Error for TransactionIssueError {}
 /// ```compile_fail
 /// use ntsql_transaction::TransactionCoordinator;
 ///
-/// let coordinator = TransactionCoordinator::new();
+/// fn cannot_clone(coordinator: TransactionCoordinator) {
 /// let duplicate = coordinator.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::TransactionCoordinator;
+///
+/// let bypass = TransactionCoordinator::new();
 /// ```
 #[derive(Debug)]
 pub struct TransactionCoordinator {
+    epoch: TransactionEpoch,
     identity: Arc<()>,
+    log_lineage: LogLineage,
     next_transaction_id: Option<NonZeroU64>,
     lifecycles: BTreeMap<TransactionId, TransactionLifecycleStatus>,
 }
 
 impl TransactionCoordinator {
-    /// Creates an empty in-process coordinator.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
+    /// Opens an empty coordinator with one source-assigned lineage epoch.
+    pub fn open<Source>(source: &mut Source) -> Result<Self, Source::Error>
+    where
+        Source: TransactionEpochSource + ?Sized,
+    {
+        let (epoch, log_lineage) = source.allocate_transaction_epoch()?;
+        Ok(Self {
+            epoch: TransactionEpoch(epoch),
             identity: Arc::new(()),
+            log_lineage,
             next_transaction_id: Some(NonZeroU64::MIN),
             lifecycles: BTreeMap::new(),
-        }
+        })
+    }
+
+    /// Returns this coordinator's persistence-lineage epoch.
+    #[must_use]
+    pub const fn epoch(&self) -> TransactionEpoch {
+        self.epoch
     }
 
     /// Issues one fresh active transaction token.
@@ -107,7 +172,10 @@ impl TransactionCoordinator {
         let Some(next_transaction_id) = self.next_transaction_id else {
             return Err(TransactionIssueError::IdentitySpaceExhausted);
         };
-        let transaction_id = TransactionId(next_transaction_id);
+        let transaction_id = TransactionId {
+            epoch: self.epoch,
+            sequence: next_transaction_id,
+        };
         match self.lifecycles.entry(transaction_id) {
             Entry::Vacant(entry) => {
                 entry.insert(TransactionLifecycleStatus::Active);
@@ -160,6 +228,14 @@ impl TransactionCoordinator {
                 },
             ));
         }
+        if !self.log_lineage.same_lineage(log.lineage()) {
+            return Err(CoordinatedCommitError::Rejected(
+                TransactionCommitRejection {
+                    transaction,
+                    reason: TransactionCommitRejectionReason::ForeignLogLineage,
+                },
+            ));
+        }
 
         let transaction_id = transaction.transaction_id();
         let status = match self.lifecycles.get_mut(&transaction_id) {
@@ -197,12 +273,6 @@ impl TransactionCoordinator {
                 Err(CoordinatedCommitError::Indeterminate(error))
             }
         }
-    }
-}
-
-impl Default for TransactionCoordinator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -288,6 +358,8 @@ impl ActiveTransaction {
 pub enum TransactionCommitRejectionReason {
     /// The active token belongs to another coordinator runtime identity.
     ForeignCoordinator,
+    /// The commit-log port does not match the epoch source lineage.
+    ForeignLogLineage,
     /// The issuing coordinator did not retain the expected active phase.
     LifecycleMismatch {
         /// Recorded phase, or `None` when the registry entry is absent.
@@ -328,12 +400,17 @@ impl fmt::Display for TransactionCommitRejection {
             TransactionCommitRejectionReason::ForeignCoordinator => write!(
                 formatter,
                 "transaction {} belongs to another coordinator",
-                self.transaction_id().get()
+                self.transaction_id()
+            ),
+            TransactionCommitRejectionReason::ForeignLogLineage => write!(
+                formatter,
+                "transaction {} belongs to another commit-log lineage",
+                self.transaction_id()
             ),
             TransactionCommitRejectionReason::LifecycleMismatch { actual } => write!(
                 formatter,
                 "transaction {} is not active in its coordinator registry: {actual:?}",
-                self.transaction_id().get()
+                self.transaction_id()
             ),
         }
     }
@@ -458,7 +535,7 @@ impl<E: fmt::Display> fmt::Display for TransactionCommitError<E> {
         write!(
             formatter,
             "transaction {} commit outcome is indeterminate: {}",
-            self.transaction.transaction_id().get(),
+            self.transaction.transaction_id(),
             self.source
         )
     }
@@ -477,13 +554,35 @@ where
 mod tests {
     use super::*;
 
+    struct TestEpochSource {
+        lineage: LogLineage,
+        next_epoch: Option<NonZeroU64>,
+    }
+
+    impl TransactionEpochSource for TestEpochSource {
+        type Error = TransactionIssueError;
+
+        fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error> {
+            let epoch = self
+                .next_epoch
+                .ok_or(TransactionIssueError::IdentitySpaceExhausted)?;
+            self.next_epoch = epoch.get().checked_add(1).and_then(NonZeroU64::new);
+            Ok((epoch, self.lineage.clone()))
+        }
+    }
+
     #[test]
     fn identity_exhaustion_is_terminal_without_wrapping() -> Result<(), TransactionIssueError> {
-        let mut coordinator = TransactionCoordinator::new();
+        let mut source = TestEpochSource {
+            lineage: LogLineage::new(),
+            next_epoch: Some(NonZeroU64::MIN),
+        };
+        let mut coordinator = TransactionCoordinator::open(&mut source)?;
         coordinator.next_transaction_id = Some(NonZeroU64::MAX);
 
         let last = coordinator.begin()?;
-        assert_eq!(last.transaction_id().get(), u64::MAX);
+        assert_eq!(last.transaction_id().epoch().get(), 1);
+        assert_eq!(last.transaction_id().sequence(), u64::MAX);
         assert_eq!(
             coordinator.begin().err(),
             Some(TransactionIssueError::IdentitySpaceExhausted)

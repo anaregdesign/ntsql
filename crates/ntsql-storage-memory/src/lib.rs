@@ -1,9 +1,9 @@
 //! Deterministic in-memory persistence adapter for transaction/WAL tests.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, num::NonZeroU64};
 
-use ntsql_transaction::{TransactionCommitRecord, TransactionId};
-use ntsql_wal::{CommitLog, LogSequenceNumber};
+use ntsql_transaction::{TransactionCommitRecord, TransactionEpochSource, TransactionId};
+use ntsql_wal::{CommitLog, LogLineage, LogSequenceNumber};
 
 /// One-shot physical-effect boundary for the next matching log operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,6 +119,25 @@ impl fmt::Display for FaultAlreadyArmed {
 
 impl Error for FaultAlreadyArmed {}
 
+/// Failure to allocate a fresh coordinator epoch in this model lineage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryTransactionEpochError {
+    /// Every nonzero `u64` epoch has already been issued.
+    EpochSpaceExhausted,
+}
+
+impl fmt::Display for InMemoryTransactionEpochError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EpochSpaceExhausted => {
+                formatter.write_str("transaction epoch space is exhausted")
+            }
+        }
+    }
+}
+
+impl Error for InMemoryTransactionEpochError {}
+
 /// Inspectable in-memory implementation of the transaction commit-log port.
 ///
 /// This adapter models only repository-authored physical effects. Its durable
@@ -126,8 +145,10 @@ impl Error for FaultAlreadyArmed {}
 /// outcome.
 #[derive(Debug)]
 pub struct InMemoryCommitLog {
+    lineage: LogLineage,
     records: Vec<InMemoryLogRecord>,
     durable_len: usize,
+    next_epoch: Option<NonZeroU64>,
     next_position: Option<u64>,
     armed_fault: Option<FaultPoint>,
 }
@@ -135,10 +156,12 @@ pub struct InMemoryCommitLog {
 impl InMemoryCommitLog {
     /// Creates an empty log whose first assigned position is one.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            lineage: LogLineage::new(),
             records: Vec::new(),
             durable_len: 0,
+            next_epoch: Some(NonZeroU64::MIN),
             next_position: Some(1),
             armed_fault: None,
         }
@@ -212,8 +235,24 @@ impl Default for InMemoryCommitLog {
     }
 }
 
+impl TransactionEpochSource for InMemoryCommitLog {
+    type Error = InMemoryTransactionEpochError;
+
+    fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error> {
+        let epoch = self
+            .next_epoch
+            .ok_or(InMemoryTransactionEpochError::EpochSpaceExhausted)?;
+        self.next_epoch = epoch.get().checked_add(1).and_then(NonZeroU64::new);
+        Ok((epoch, self.lineage.clone()))
+    }
+}
+
 impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
     type Error = InMemoryCommitLogError;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
 
     fn append_commit(
         &mut self,
@@ -286,8 +325,8 @@ mod tests {
 
     #[test]
     fn position_exhaustion_is_explicit_after_assigning_max() -> Result<(), Box<dyn Error>> {
-        let mut coordinator = TransactionCoordinator::new();
         let mut log = InMemoryCommitLog::new();
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
         log.next_position = Some(u64::MAX);
 
         let last = coordinator.begin()?;
@@ -307,6 +346,26 @@ mod tests {
             &CommitError::Append {
                 source: InMemoryCommitLogError::PositionSpaceExhausted,
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn epoch_exhaustion_survives_restart_without_reissue() -> Result<(), Box<dyn Error>> {
+        let mut log = InMemoryCommitLog::new();
+        log.next_epoch = Some(NonZeroU64::MAX);
+
+        let coordinator = TransactionCoordinator::open(&mut log)?;
+        assert_eq!(coordinator.epoch().get(), u64::MAX);
+
+        let mut restarted = log.restart();
+        assert_eq!(
+            TransactionCoordinator::open(&mut restarted).err(),
+            Some(InMemoryTransactionEpochError::EpochSpaceExhausted)
+        );
+        assert_eq!(
+            TransactionCoordinator::open(&mut restarted).err(),
+            Some(InMemoryTransactionEpochError::EpochSpaceExhausted)
         );
         Ok(())
     }

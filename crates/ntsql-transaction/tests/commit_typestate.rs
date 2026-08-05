@@ -1,14 +1,15 @@
-use std::{error::Error, fmt, io};
+use std::{error::Error, fmt, io, num::NonZeroU64};
 
 use ntsql_transaction::{
     CoordinatedCommitError, TransactionCommitRecord, TransactionCommitRejectionReason,
-    TransactionCoordinator, TransactionId, TransactionLifecycleStatus,
+    TransactionCoordinator, TransactionEpochSource, TransactionId, TransactionLifecycleStatus,
 };
-use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber};
+use ntsql_wal::{CommitError, CommitLog, LogLineage, LogSequenceNumber};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FakeError {
     Append,
+    Epoch,
     Flush,
 }
 
@@ -16,12 +17,47 @@ impl fmt::Display for FakeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Append => formatter.write_str("append failure"),
+            Self::Epoch => formatter.write_str("epoch failure"),
             Self::Flush => formatter.write_str("flush failure"),
         }
     }
 }
 
 impl Error for FakeError {}
+
+struct FakeEpochSource {
+    lineage: LogLineage,
+    next_epoch: Option<NonZeroU64>,
+}
+
+impl FakeEpochSource {
+    fn new(lineage: LogLineage) -> Self {
+        Self {
+            lineage,
+            next_epoch: Some(NonZeroU64::MIN),
+        }
+    }
+}
+
+impl TransactionEpochSource for FakeEpochSource {
+    type Error = FakeError;
+
+    fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error> {
+        let epoch = self.next_epoch.ok_or(FakeError::Epoch)?;
+        self.next_epoch = epoch.get().checked_add(1).and_then(NonZeroU64::new);
+        Ok((epoch, self.lineage.clone()))
+    }
+}
+
+struct FailingEpochSource;
+
+impl TransactionEpochSource for FailingEpochSource {
+    type Error = FakeError;
+
+    fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error> {
+        Err(FakeError::Epoch)
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 enum Call {
@@ -30,6 +66,7 @@ enum Call {
 }
 
 struct FakeCommitLog {
+    lineage: LogLineage,
     position: LogSequenceNumber,
     append_fails: bool,
     flush_fails: bool,
@@ -37,8 +74,9 @@ struct FakeCommitLog {
 }
 
 impl FakeCommitLog {
-    fn succeeds_at(position: u64) -> Self {
+    fn succeeds_at(position: u64, lineage: LogLineage) -> Self {
         Self {
+            lineage,
             position: LogSequenceNumber::new(position),
             append_fails: false,
             flush_fails: false,
@@ -49,6 +87,10 @@ impl FakeCommitLog {
 
 impl CommitLog<TransactionCommitRecord> for FakeCommitLog {
     type Error = FakeError;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
 
     fn append_commit(
         &mut self,
@@ -74,8 +116,10 @@ impl CommitLog<TransactionCommitRecord> for FakeCommitLog {
 
 #[test]
 fn durable_commit_consumes_active_state_and_preserves_identity() -> Result<(), Box<dyn Error>> {
-    let mut coordinator = TransactionCoordinator::new();
-    let mut log = FakeCommitLog::succeeds_at(41);
+    let lineage = LogLineage::new();
+    let mut epochs = FakeEpochSource::new(lineage.clone());
+    let mut coordinator = TransactionCoordinator::open(&mut epochs)?;
+    let mut log = FakeCommitLog::succeeds_at(41, lineage);
     let transaction = coordinator.begin()?;
     let transaction_id = transaction.transaction_id();
 
@@ -99,10 +143,12 @@ fn durable_commit_consumes_active_state_and_preserves_identity() -> Result<(), B
 
 #[test]
 fn append_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dyn Error>> {
-    let mut coordinator = TransactionCoordinator::new();
+    let lineage = LogLineage::new();
+    let mut epochs = FakeEpochSource::new(lineage.clone());
+    let mut coordinator = TransactionCoordinator::open(&mut epochs)?;
     let mut log = FakeCommitLog {
         append_fails: true,
-        ..FakeCommitLog::succeeds_at(41)
+        ..FakeCommitLog::succeeds_at(41, lineage)
     };
     let transaction = coordinator.begin()?;
     let transaction_id = transaction.transaction_id();
@@ -133,10 +179,12 @@ fn append_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<d
 
 #[test]
 fn flush_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dyn Error>> {
-    let mut coordinator = TransactionCoordinator::new();
+    let lineage = LogLineage::new();
+    let mut epochs = FakeEpochSource::new(lineage.clone());
+    let mut coordinator = TransactionCoordinator::open(&mut epochs)?;
     let mut log = FakeCommitLog {
         flush_fails: true,
-        ..FakeCommitLog::succeeds_at(83)
+        ..FakeCommitLog::succeeds_at(83, lineage)
     };
     let transaction = coordinator.begin()?;
     let transaction_id = transaction.transaction_id();
@@ -174,14 +222,17 @@ fn flush_failure_consumes_active_state_into_indeterminate() -> Result<(), Box<dy
 
 #[test]
 fn coordinator_issues_distinct_active_transactions() -> Result<(), Box<dyn Error>> {
-    let mut coordinator = TransactionCoordinator::new();
+    let mut epochs = FakeEpochSource::new(LogLineage::new());
+    let mut coordinator = TransactionCoordinator::open(&mut epochs)?;
 
     let first = coordinator.begin()?;
     let second = coordinator.begin()?;
 
     assert_ne!(first.transaction_id(), second.transaction_id());
-    assert_ne!(first.transaction_id().get(), 0);
-    assert_ne!(second.transaction_id().get(), 0);
+    assert_eq!(first.transaction_id().epoch(), coordinator.epoch());
+    assert_eq!(second.transaction_id().epoch(), coordinator.epoch());
+    assert_eq!(first.transaction_id().sequence(), 1);
+    assert_eq!(second.transaction_id().sequence(), 2);
     assert_eq!(
         coordinator.status(first.transaction_id()),
         Some(TransactionLifecycleStatus::Active)
@@ -195,11 +246,13 @@ fn coordinator_issues_distinct_active_transactions() -> Result<(), Box<dyn Error
 
 #[test]
 fn foreign_coordinator_rejects_before_wal_and_returns_token() -> Result<(), Box<dyn Error>> {
-    let mut owner = TransactionCoordinator::new();
-    let mut foreign = TransactionCoordinator::new();
+    let lineage = LogLineage::new();
+    let mut epochs = FakeEpochSource::new(lineage.clone());
+    let mut owner = TransactionCoordinator::open(&mut epochs)?;
+    let mut foreign = TransactionCoordinator::open(&mut epochs)?;
     let transaction = owner.begin()?;
     let transaction_id = transaction.transaction_id();
-    let mut log = FakeCommitLog::succeeds_at(41);
+    let mut log = FakeCommitLog::succeeds_at(41, lineage);
 
     assert!(owner.owns(&transaction));
     assert!(!foreign.owns(&transaction));
@@ -226,6 +279,48 @@ fn foreign_coordinator_rejects_before_wal_and_returns_token() -> Result<(), Box<
         Some(TransactionLifecycleStatus::Committed)
     );
     Ok(())
+}
+
+#[test]
+fn foreign_log_lineage_rejects_before_wal_and_returns_token() -> Result<(), Box<dyn Error>> {
+    let owner_lineage = LogLineage::new();
+    let mut epochs = FakeEpochSource::new(owner_lineage.clone());
+    let mut coordinator = TransactionCoordinator::open(&mut epochs)?;
+    let transaction = coordinator.begin()?;
+    let transaction_id = transaction.transaction_id();
+    let mut foreign_log = FakeCommitLog::succeeds_at(41, LogLineage::new());
+
+    let error = coordinator
+        .commit(transaction, &mut foreign_log)
+        .err()
+        .ok_or_else(|| invalid_data("foreign log unexpectedly committed"))?;
+    let CoordinatedCommitError::Rejected(rejection) = error else {
+        return Err(invalid_data("foreign log reached the WAL").into());
+    };
+
+    assert_eq!(
+        rejection.reason(),
+        TransactionCommitRejectionReason::ForeignLogLineage
+    );
+    assert!(foreign_log.calls.is_empty());
+    assert_eq!(
+        coordinator.status(transaction_id),
+        Some(TransactionLifecycleStatus::Active)
+    );
+
+    let mut owner_log = FakeCommitLog::succeeds_at(41, owner_lineage);
+    let committed = coordinator.commit(rejection.into_transaction(), &mut owner_log)?;
+    assert_eq!(committed.transaction_id(), transaction_id);
+    Ok(())
+}
+
+#[test]
+fn coordinator_open_preserves_epoch_source_failure() {
+    let mut source = FailingEpochSource;
+
+    let error = TransactionCoordinator::open(&mut source).err();
+
+    assert_eq!(error, Some(FakeError::Epoch));
 }
 
 fn invalid_data(message: &'static str) -> io::Error {

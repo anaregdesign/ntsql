@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #50
 - Extends: ADR 0001
+- Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009
 
 ## Context
 
@@ -24,8 +25,9 @@ until both operations succeed.
 
 - `LogSequenceNumber`, an opaque ntsql-internal adapter-assigned position with
   no SQL Server, wire, or persistent byte representation;
+- `LogLineage`, an opaque runtime identity shared by ports for one logical log;
 - `CommitLog<Record>`, the inward port for appending a caller-owned record and
-  flushing through a position;
+  flushing through a position, together with its lineage identity;
 - `CommitError`, which distinguishes append failure from flush failure and
   retains the unacknowledged position on the latter; and
 - `CommitAcknowledgement`, whose private, generatively branded value exists only
@@ -38,6 +40,11 @@ composition layer may run the complete synchronous fence on a blocking worker.
 `flush_through` may return success only after durable completion; merely
 enqueueing, scheduling, or batching future I/O is not success. No fallback
 treats an append or flush failure as success.
+
+ADR 0009 uses `LogLineage` to reject a transaction coordinator paired with a
+different log before append. This runtime check complements epoch-qualified
+transaction identities; it does not persist or brand raw `LogSequenceNumber`
+values.
 
 The intended dependency direction is:
 
@@ -77,6 +84,8 @@ fault-injection decisions.
 - Compile-fail doctests prove safe downstream code cannot construct, clone, or
   return an acknowledgement from its generative attempt callback.
 - Architecture tests reject any direct dependency from `ntsql-wal`.
+- Transaction tests reject a mismatched log lineage before either port method is
+  called and retain the active token.
 
 ## Consequences
 

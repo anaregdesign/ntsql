@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-08-04
 - Issue: #32
-- Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008
+- Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009
 
 ## Context
 
@@ -87,16 +87,17 @@ acknowledgement can exist. It owns no filesystem, byte format, transaction
 semantics, recovery policy, or client diagnostic.
 
 `ntsql-transaction` owns I/O-free transaction coordination and lifecycle state.
-Its coordinator issues monotonic nonzero identities, binds active tokens to one
-private runtime identity, records every commit attempt before crossing the WAL
-port, and never reconstructs terminal state as active. Commit consumes active
-state once, creates committed state inside the durable callback, and otherwise
-returns indeterminate state with no transition back to active.
+Its coordinator requires an injected persistence-lineage epoch, issues monotonic
+nonzero sequences within that epoch, binds active tokens to one separate private
+runtime identity, records every commit attempt before crossing the WAL port, and
+never reconstructs terminal state as active. Commit consumes active state once,
+creates committed state inside the durable callback, and otherwise returns
+indeterminate state with no transition back to active.
 
 `ntsql-storage-memory` is an outer synthetic persistence adapter. It implements
-the transaction commit-log port, depends inward on both domain crates, and
-provides deterministic before/after-effect fault injection. Neither domain
-crate may depend on it.
+the transaction commit-log and epoch-source ports, depends inward on both domain
+crates, and provides deterministic before/after-effect fault injection. Neither
+domain crate may depend on it.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and

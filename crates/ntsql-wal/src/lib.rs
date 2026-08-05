@@ -1,6 +1,34 @@
 //! I/O-free write-ahead durability invariants.
 
-use std::{error::Error, fmt, marker::PhantomData};
+use std::{error::Error, fmt, marker::PhantomData, sync::Arc};
+
+/// Opaque runtime identity for one commit-log lineage.
+///
+/// Persistence adapters clone this value when one logical log is exposed
+/// through multiple ports. Independent calls to [`LogLineage::new`] produce
+/// identities that do not match without randomness, clocks, or global state.
+#[derive(Clone, Debug)]
+pub struct LogLineage(Arc<()>);
+
+impl LogLineage {
+    /// Creates a fresh runtime identity for one logical log lineage.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    /// Returns whether both values identify the same logical log lineage.
+    #[must_use]
+    pub fn same_lineage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Default for LogLineage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Opaque ntsql-internal position assigned by a commit-log adapter.
 ///
@@ -31,6 +59,9 @@ impl LogSequenceNumber {
 pub trait CommitLog<Record: ?Sized> {
     /// Adapter-specific failure retained by [`CommitError`].
     type Error;
+
+    /// Returns the opaque runtime identity of this logical log lineage.
+    fn lineage(&self) -> &LogLineage;
 
     /// Appends one commit record and returns its exact assigned position.
     fn append_commit(&mut self, record: &Record) -> Result<LogSequenceNumber, Self::Error>;

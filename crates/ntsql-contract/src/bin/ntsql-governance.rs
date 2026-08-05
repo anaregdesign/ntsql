@@ -9,8 +9,9 @@ use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ntsql_contract::{
-    FixtureArtifact, LegalDecisionAuthority, LegalDecisionVerificationContext, LegalReviewLedger,
-    ProvenanceLedger, ProvenanceSourceKind, ProvenanceUse,
+    BehaviorSpecificationAdmissionLedger, FeatureMatrix, FixtureArtifact,
+    ImplementationAdmissionContext, LegalDecisionAuthority, LegalDecisionVerificationContext,
+    LegalReviewLedger, ProvenanceLedger, ProvenanceSourceKind, ProvenanceUse, TargetMatrix,
 };
 use serde_json::Value;
 
@@ -110,32 +111,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let command = arguments.next().ok_or_else(|| {
         invalid_data(
-            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
+            "expected `fixtures [<authority> <repository> <commit>]`, `implementation-admission <feature> <target> [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
         )
     })?;
 
     match command.as_str() {
         "fixtures" => {
-            let authority_path = arguments.next();
-            let candidate_repository = arguments.next();
-            let candidate_commit_sha = arguments.next();
-            ensure_no_more_arguments(arguments)?;
-            let authority_input = match (authority_path, candidate_repository, candidate_commit_sha)
-            {
-                (None, None, None) => None,
-                (Some(path), Some(candidate_repository), Some(candidate_commit_sha)) => {
-                    Some(AuthorityInput {
-                        path: PathBuf::from(path),
-                        candidate_repository,
-                        candidate_commit_sha,
-                    })
-                }
-                _ => {
-                    return Err(invalid_data(
-                        "fixtures requires authority, repository, and commit together",
-                    ));
-                }
-            };
+            let authority_input = parse_optional_authority(arguments, "fixtures")?;
             validate_repository_fixtures(authority_input.as_ref())
         }
         "legal-reviews" => {
@@ -155,6 +137,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 &candidate_commit_sha,
             )
         }
+        "implementation-admission" => {
+            let feature_id = arguments.next().ok_or_else(|| {
+                invalid_data("implementation-admission requires an exact feature id")
+            })?;
+            let target_id = arguments.next().ok_or_else(|| {
+                invalid_data("implementation-admission requires an exact target id")
+            })?;
+            let authority_input = parse_optional_authority(arguments, "implementation-admission")?;
+            validate_implementation_admission(&feature_id, &target_id, authority_input.as_ref())
+        }
         "provenance-offline" => {
             ensure_no_more_arguments(arguments)?;
             validate_offline_provenance()
@@ -171,8 +163,31 @@ fn run() -> Result<(), Box<dyn Error>> {
             validate_sbom(Path::new(&path))
         }
         _ => Err(invalid_data(
-            "expected `fixtures [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
+            "expected `fixtures [<authority> <repository> <commit>]`, `implementation-admission <feature> <target> [<authority> <repository> <commit>]`, `legal-reviews <authority> <repository> <commit>`, `provenance-offline`, `provenance-online`, or `sbom <path>`",
         )),
+    }
+}
+
+fn parse_optional_authority(
+    mut arguments: impl Iterator<Item = String>,
+    command: &str,
+) -> Result<Option<AuthorityInput>, Box<dyn Error>> {
+    let authority_path = arguments.next();
+    let candidate_repository = arguments.next();
+    let candidate_commit_sha = arguments.next();
+    ensure_no_more_arguments(arguments)?;
+    match (authority_path, candidate_repository, candidate_commit_sha) {
+        (None, None, None) => Ok(None),
+        (Some(path), Some(candidate_repository), Some(candidate_commit_sha)) => {
+            Ok(Some(AuthorityInput {
+                path: PathBuf::from(path),
+                candidate_repository,
+                candidate_commit_sha,
+            }))
+        }
+        _ => Err(invalid_data(format!(
+            "{command} requires authority, repository, and commit together"
+        ))),
     }
 }
 
@@ -269,6 +284,61 @@ fn validate_legal_reviews(
     }
 
     println!("authenticated legal-review governance ok");
+    Ok(())
+}
+
+fn validate_implementation_admission(
+    feature_id: &str,
+    target_id: &str,
+    authority_input: Option<&AuthorityInput>,
+) -> Result<(), Box<dyn Error>> {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let admissions: BehaviorSpecificationAdmissionLedger = read_json(
+        &workspace_root.join("contracts/compatibility/behavior-specification-admissions.json"),
+    )?;
+    let targets: TargetMatrix =
+        read_json(&workspace_root.join("contracts/compatibility/targets.json"))?;
+    let features: FeatureMatrix =
+        read_json(&workspace_root.join("contracts/compatibility/features.json"))?;
+    let provenance: ProvenanceLedger =
+        read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
+    let legal_reviews: LegalReviewLedger =
+        read_json(&workspace_root.join("contracts/compatibility/legal-reviews.json"))?;
+    let authority = authority_input
+        .map(|input| read_external_authority(&workspace_root, &input.path))
+        .transpose()?;
+    let verification = authority_input
+        .zip(authority.as_ref())
+        .map(|(input, authority)| LegalDecisionVerificationContext {
+            authority,
+            candidate_repository: &input.candidate_repository,
+            candidate_commit_sha: &input.candidate_commit_sha,
+        });
+    let violations = features.validate_implementation_inputs(
+        feature_id,
+        target_id,
+        ImplementationAdmissionContext {
+            targets: &targets,
+            admissions: &admissions,
+            provenance: &provenance,
+            legal_reviews: &legal_reviews,
+            legal_verification: verification,
+        },
+    );
+
+    if !violations.is_empty() {
+        for violation in &violations {
+            eprintln!("{}: {}", violation.code, violation.message);
+        }
+        return Err(invalid_data(format!(
+            "implementation admission found {} violation(s)",
+            violations.len()
+        )));
+    }
+
+    println!("implementation admission is valid for {feature_id} on {target_id}");
     Ok(())
 }
 

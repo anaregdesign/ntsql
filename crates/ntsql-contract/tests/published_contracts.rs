@@ -1,16 +1,24 @@
 use std::{collections::BTreeSet, error::Error, io};
 
 use ntsql_contract::{
-    CompatibilityStatus, FeatureCategory, FeatureMatrix, LegalReviewLedger, ProvenanceLedger,
-    TargetMatrix, validate_governance_references,
+    BehaviorSpecificationAdmissionLedger, CompatibilityStatus, FeatureCategory, FeatureMatrix,
+    LegalReviewLedger, ProvenanceLedger, TargetMatrix, validate_governance_references,
 };
 use serde_json::Value;
 
+const BEHAVIOR_ADMISSIONS: &str =
+    include_str!("../../../contracts/compatibility/behavior-specification-admissions.json");
 const FEATURES: &str = include_str!("../../../contracts/compatibility/features.json");
 const LEGAL_REVIEWS: &str = include_str!("../../../contracts/compatibility/legal-reviews.json");
 const PROVENANCE: &str = include_str!("../../../contracts/compatibility/provenance.json");
 const TARGETS: &str = include_str!("../../../contracts/compatibility/targets.json");
-const SCHEMAS: [(&str, &str); 6] = [
+const SCHEMAS: [(&str, &str); 7] = [
+    (
+        "behavior-specification-admission-ledger",
+        include_str!(
+            "../../../contracts/schemas/behavior-specification-admission-ledger.schema.json"
+        ),
+    ),
     (
         "conformance-record",
         include_str!("../../../contracts/schemas/conformance-record.schema.json"),
@@ -52,6 +60,22 @@ fn published_feature_matrix_is_valid() -> Result<(), Box<dyn Error>> {
     let features: FeatureMatrix = serde_json::from_str(FEATURES)?;
     let violations = features.validate(&targets);
 
+    assert!(violations.is_empty(), "{violations:#?}");
+    Ok(())
+}
+
+#[test]
+fn published_behavior_admission_ledger_is_empty_and_valid() -> Result<(), Box<dyn Error>> {
+    let targets: TargetMatrix = serde_json::from_str(TARGETS)?;
+    let features: FeatureMatrix = serde_json::from_str(FEATURES)?;
+    let provenance: ProvenanceLedger = serde_json::from_str(PROVENANCE)?;
+    let legal_reviews: LegalReviewLedger = serde_json::from_str(LEGAL_REVIEWS)?;
+    let admissions: BehaviorSpecificationAdmissionLedger =
+        serde_json::from_str(BEHAVIOR_ADMISSIONS)?;
+
+    assert!(admissions.admissions.is_empty());
+    let violations =
+        admissions.validate_references(&targets, &features, &provenance, &legal_reviews);
     assert!(violations.is_empty(), "{violations:#?}");
     Ok(())
 }

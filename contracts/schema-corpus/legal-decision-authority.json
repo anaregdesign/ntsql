@@ -3,7 +3,7 @@
   "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/legal-decision-authority.schema.json",
   "base_document": {
     "inline": {
-      "schema_version": "1.0.0",
+      "schema_version": "2.0.0",
       "candidate_repository": "anaregdesign/ntsql",
       "candidate_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "trusted_reviewer_account_ids": [4242],
@@ -25,6 +25,7 @@
               "reviewed_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
               "state": "approved",
               "submitted_at": "2026-08-02T12:34:56Z",
+              "last_edited_at": null,
               "attestations": [
                 {
                   "attestation_id": "legal-review-public-specification:v1",
@@ -177,6 +178,39 @@
       "constraint": "UTC second-precision timestamp",
       "patch": [
         { "op": "replace", "path": "/pull_requests/0/authenticated_reviews/0/submitted_at", "value": "2026-08-02T12:34:56.000Z" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.review-last-edited-at.required-nullable",
+      "constraint": "review last-edit timestamp is required even when null",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/pull_requests/0/authenticated_reviews/0/last_edited_at"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "authority.review-last-edited-at.lexically-malformed",
+      "constraint": "non-null review last-edit timestamps use UTC second precision",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/0/last_edited_at",
+          "value": "2026-08-02T12:34:56.000Z"
+        }
       ],
       "expected": {
         "json_schema": false,

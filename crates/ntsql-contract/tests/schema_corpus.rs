@@ -1,14 +1,15 @@
 use std::{collections::BTreeSet, error::Error, io};
 
 use ntsql_contract::{
-    ConformanceRecord, FeatureMatrix, LegalDecisionAuthority, LegalReviewLedger, ProvenanceLedger,
-    TargetMatrix, validate_governance_references,
+    BehaviorSpecificationAdmissionLedger, ConformanceRecord, FeatureMatrix, LegalDecisionAuthority,
+    LegalReviewLedger, ProvenanceLedger, TargetMatrix, validate_governance_references,
 };
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 const CORPUS_VERSION: &str = "1.0.0";
-const PUBLISHED_SCHEMAS: [&str; 6] = [
+const PUBLISHED_SCHEMAS: [&str; 7] = [
+    include_str!("../../../contracts/schemas/behavior-specification-admission-ledger.schema.json"),
     include_str!("../../../contracts/schemas/conformance-record.schema.json"),
     include_str!("../../../contracts/schemas/feature-matrix.schema.json"),
     include_str!("../../../contracts/schemas/legal-decision-authority.schema.json"),
@@ -20,7 +21,10 @@ const TARGETS: &str = include_str!("../../../contracts/compatibility/targets.jso
 const FEATURES: &str = include_str!("../../../contracts/compatibility/features.json");
 const LEGAL_REVIEWS: &str = include_str!("../../../contracts/compatibility/legal-reviews.json");
 const PROVENANCE: &str = include_str!("../../../contracts/compatibility/provenance.json");
-const CORPORA: [&str; 6] = [
+const BEHAVIOR_ADMISSIONS: &str =
+    include_str!("../../../contracts/compatibility/behavior-specification-admissions.json");
+const CORPORA: [&str; 7] = [
+    include_str!("../../../contracts/schema-corpus/behavior-specification-admission-ledger.json"),
     include_str!("../../../contracts/schema-corpus/target-matrix.json"),
     include_str!("../../../contracts/schema-corpus/feature-matrix.json"),
     include_str!("../../../contracts/schema-corpus/provenance-ledger.json"),
@@ -195,6 +199,7 @@ fn load_base_document(base: &CorpusBase) -> Result<Value, Box<dyn Error>> {
             "../compatibility/features.json" => FEATURES,
             "../compatibility/legal-reviews.json" => LEGAL_REVIEWS,
             "../compatibility/provenance.json" => PROVENANCE,
+            "../compatibility/behavior-specification-admissions.json" => BEHAVIOR_ADMISSIONS,
             other => return Err(invalid_data(format!("unknown corpus source: {other}")).into()),
         },
         CorpusBase::Inline(inline) => return Ok(inline.inline.clone()),
@@ -453,6 +458,9 @@ fn evaluate_rust_contract(
     case: &CorpusCase,
 ) -> Result<RustResults, Box<dyn Error>> {
     match schema_id {
+        "https://github.com/anaregdesign/ntsql/contracts/schemas/behavior-specification-admission-ledger.schema.json" => {
+            Ok(evaluate_behavior_admissions(instance))
+        }
         "https://github.com/anaregdesign/ntsql/contracts/schemas/target-matrix.schema.json" => {
             let features = serde_json::from_str(FEATURES)?;
             let provenance = serde_json::from_str(PROVENANCE)?;
@@ -502,6 +510,17 @@ fn evaluate_rust_contract(
             ))
         }
         _ => Err(invalid_data(format!("unknown corpus schema id: {schema_id}")).into()),
+    }
+}
+
+fn evaluate_behavior_admissions(instance: Value) -> RustResults {
+    let Ok(contract) = deserialize_wire::<BehaviorSpecificationAdmissionLedger>(&instance) else {
+        return rejected_at_deserialization();
+    };
+    RustResults {
+        deserialize: true,
+        schema_semantics: contract.validate_schema_semantics().is_empty(),
+        full_validation: contract.validate().is_empty(),
     }
 }
 

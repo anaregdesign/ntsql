@@ -27,7 +27,10 @@ pub const CONFORMANCE_SCHEMA_VERSION: &str = "2.0.0";
 pub const LEGAL_REVIEW_SCHEMA_VERSION: &str = "2.0.0";
 
 /// Current version of authenticated legal-decision authority input.
-pub const LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION: &str = "1.0.0";
+pub const LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION: &str = "2.0.0";
+
+/// Current version of the clean-room behavior-specification admission ledger.
+pub const BEHAVIOR_SPECIFICATION_ADMISSION_SCHEMA_VERSION: &str = "1.0.0";
 
 const SHA256_EMPTY_CONTENT: &str =
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -226,6 +229,9 @@ pub struct AuthenticatedPullRequestReview {
     pub state: AuthenticatedReviewState,
     /// UTC timestamp at which GitHub recorded the review.
     pub submitted_at: String,
+    /// UTC timestamp of the latest review-body edit, or null when never edited.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub last_edited_at: Option<String>,
     /// Legal decisions explicitly attested in the review body.
     pub attestations: Vec<LegalDecisionAttestation>,
 }
@@ -400,6 +406,273 @@ pub struct LegalReviewLedger {
     pub schema_version: String,
     /// Human legal-review records.
     pub reviews: Vec<LegalReviewRecord>,
+}
+
+/// Stable GitHub identity assigned to one clean-room role.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GovernanceActorIdentity {
+    /// Stable numeric GitHub account identifier.
+    pub github_account_id: u64,
+    /// GitHub login recorded for audit readability.
+    pub github_login: String,
+}
+
+/// One human role assigned before observation begins.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanRoomRoleAssignment {
+    /// Human assigned to the role.
+    pub actor: GovernanceActorIdentity,
+    /// ISO 8601 UTC assignment timestamp.
+    pub assigned_at: String,
+}
+
+/// Human separation required for one behavior case.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanRoomRoles {
+    /// Source custodian who observes approved material or an approved oracle.
+    pub observer: CleanRoomRoleAssignment,
+    /// Reviewer who sanitizes the factual behavior specification.
+    pub specification_reviewer: CleanRoomRoleAssignment,
+    /// Engineer who receives only the approved specification.
+    pub implementer: CleanRoomRoleAssignment,
+    /// Reviewer who independently evaluates conformance evidence.
+    pub conformance_reviewer: CleanRoomRoleAssignment,
+}
+
+/// One exact process invocation recorded without a shell.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedCommand {
+    /// Executable or stable runner identifier.
+    pub program: String,
+    /// Exact argument vector, excluding the executable.
+    pub arguments: Vec<String>,
+}
+
+/// Reproducible facts captured during the approved observation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorObservationAudit {
+    /// ISO 8601 UTC time at which observation began.
+    pub started_at: String,
+    /// ISO 8601 UTC time at which observation ended.
+    pub completed_at: String,
+    /// Exact argv-form commands used for the observation.
+    pub commands: Vec<RecordedCommand>,
+    /// Exact session settings applied before the case.
+    pub session_settings: Vec<ConformanceEnvironmentFact>,
+    /// Bounded environment facts required to reproduce the observation.
+    pub environment: Vec<ConformanceEnvironmentFact>,
+    /// SHA-256 digest of the exact input bytes.
+    pub input_digest: String,
+    /// Exact input byte length.
+    pub input_byte_length: u64,
+}
+
+/// Final disposition of raw evidence outside the repository.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum RawEvidenceDisposition {
+    /// Evidence remains in an access-controlled external store.
+    Protected {
+        /// Stable evidence-store boundary.
+        store_id: String,
+        /// Stable artifact identifier within the store.
+        artifact_id: String,
+        /// ISO 8601 UTC time at which protected retention was confirmed.
+        confirmed_at: String,
+    },
+    /// All retained raw-evidence copies were deleted.
+    Deleted {
+        /// ISO 8601 UTC time at which deletion was confirmed.
+        deleted_at: String,
+    },
+}
+
+/// Auditable cleanup action applied to raw evidence or observer access.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupEventKind {
+    /// A working copy of raw evidence was deleted.
+    WorkingCopyDeleted,
+    /// Observer access to retained evidence was revoked.
+    AccessRevoked,
+    /// Protected retention was confirmed at the named store boundary.
+    ProtectedRetentionConfirmed,
+}
+
+/// One timestamped cleanup action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupEvent {
+    /// Cleanup action that occurred.
+    pub kind: CleanupEventKind,
+    /// ISO 8601 UTC event timestamp.
+    pub occurred_at: String,
+    /// Human who performed or verified the action.
+    pub actor: GovernanceActorIdentity,
+}
+
+/// Digest and cleanup metadata for raw evidence kept outside the repository.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawEvidenceAudit {
+    /// SHA-256 digest of the exact raw-evidence bytes.
+    pub content_digest: String,
+    /// Exact raw-evidence byte length.
+    pub byte_length: u64,
+    /// Final retained-or-deleted state.
+    pub disposition: RawEvidenceDisposition,
+    /// Timestamped cleanup actions, without sensitive paths or bytes.
+    pub cleanup_events: Vec<CleanupEvent>,
+}
+
+/// Technical disposition of a sanitized behavior specification.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpecificationReviewStatus {
+    /// No specification reviewer has made a decision.
+    Pending,
+    /// The named reviewer accepted the sanitized factual specification.
+    Approved,
+    /// The named reviewer rejected the specification.
+    Rejected,
+}
+
+/// Candidate-recorded review reference requiring out-of-branch authentication.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationReviewEvidenceReference {
+    /// Repository in `owner/name` form.
+    pub repository: String,
+    /// Pull request containing the reviewed specification and admission.
+    pub pull_request_number: u64,
+    /// Identifier repeated in authenticated review evidence.
+    pub attestation_id: String,
+}
+
+/// Human technical review of one sanitized behavior specification.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpecificationTechnicalReview {
+    /// Current technical decision.
+    pub status: SpecificationReviewStatus,
+    /// Reviewer identity, present only after a decision.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub reviewed_by: Option<GovernanceActorIdentity>,
+    /// ISO 8601 UTC decision timestamp, present only after a decision.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub decided_at: Option<String>,
+    /// Immutable review reference, present only after a decision.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub decision_evidence: Option<SpecificationReviewEvidenceReference>,
+    /// Non-sensitive explanation of the current review state.
+    pub rationale: String,
+}
+
+/// Sanitized behavior specification and its exact provenance identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorSpecificationReference {
+    /// Behavior-specification provenance record.
+    pub provenance_id: String,
+    /// Repository-relative specification path.
+    pub artifact_path: String,
+    /// SHA-256 digest of the specification bytes.
+    pub content_digest: String,
+    /// Exact direct provenance parents used to derive the specification.
+    pub parent_provenance_ids: Vec<String>,
+    /// Technical review of the sanitized specification.
+    pub technical_review: SpecificationTechnicalReview,
+}
+
+/// Controlled handoff of one approved specification to its implementer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationHandoff {
+    /// Specification supplied to the implementer.
+    pub specification_provenance_id: String,
+    /// Digest supplied to the implementer.
+    pub specification_digest: String,
+    /// Implementer who received the specification.
+    pub implementer: GovernanceActorIdentity,
+    /// ISO 8601 UTC handoff timestamp.
+    pub handed_off_at: String,
+}
+
+/// Repository test derived from one sanitized behavior specification.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DerivedTestReference {
+    /// Test provenance record.
+    pub provenance_id: String,
+    /// Repository-relative test path.
+    pub artifact_path: String,
+    /// SHA-256 digest of the test bytes.
+    pub content_digest: String,
+    /// Exact direct provenance parents used to derive the test.
+    pub parent_provenance_ids: Vec<String>,
+}
+
+/// Audit record required before a behavior specification may guide implementation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorSpecificationAdmissionRecord {
+    /// Stable admission identifier.
+    pub id: String,
+    /// Stable behavior-case identifier.
+    pub case_id: String,
+    /// GitHub issue that owns the case.
+    pub owner_issue: u64,
+    /// Exact feature inventory entries covered by the specification.
+    pub feature_ids: Vec<String>,
+    /// Exact oracle target observed for this case.
+    pub target_id: String,
+    /// Human clean-room role assignments.
+    pub roles: CleanRoomRoles,
+    /// Direct source records used by the observer and specification reviewer.
+    pub source_provenance_ids: Vec<String>,
+    /// Exact legal-review records reached by every admission artifact.
+    pub legal_review_ids: Vec<String>,
+    /// Reproducible observation audit.
+    pub observation: BehaviorObservationAudit,
+    /// Raw-evidence digest and cleanup audit.
+    pub raw_evidence: RawEvidenceAudit,
+    /// Sanitized behavior specification.
+    pub specification: BehaviorSpecificationReference,
+    /// Approved handoff, or `None` before technical approval.
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub implementation_handoff: Option<ImplementationHandoff>,
+    /// Repository tests derived from the sanitized specification.
+    pub derived_tests: Vec<DerivedTestReference>,
+}
+
+/// Published inventory of clean-room behavior-specification admissions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BehaviorSpecificationAdmissionLedger {
+    /// Contract version used to interpret this ledger.
+    pub schema_version: String,
+    /// Behavior cases admitted or awaiting admission.
+    pub admissions: Vec<BehaviorSpecificationAdmissionRecord>,
+}
+
+/// Exact ledgers and authority used to decide one implementation admission.
+#[derive(Clone, Copy)]
+pub struct ImplementationAdmissionContext<'a> {
+    /// Exact target inventory.
+    pub targets: &'a TargetMatrix,
+    /// Clean-room behavior-specification admissions.
+    pub admissions: &'a BehaviorSpecificationAdmissionLedger,
+    /// Complete provenance inventory.
+    pub provenance: &'a ProvenanceLedger,
+    /// Human legal-review ledger.
+    pub legal_reviews: &'a LegalReviewLedger,
+    /// Authenticated legal authority, when non-pending decisions exist.
+    pub legal_verification: Option<LegalDecisionVerificationContext<'a>>,
 }
 
 /// Whether externally stored raw evidence may be redistributed.
@@ -1107,6 +1380,20 @@ impl LegalDecisionEvidenceReference {
     }
 }
 
+impl GovernanceActorIdentity {
+    fn is_well_formed(&self) -> bool {
+        self.github_account_id > 0 && is_github_login(&self.github_login)
+    }
+}
+
+impl SpecificationReviewEvidenceReference {
+    fn is_well_formed(&self) -> bool {
+        is_github_repository(&self.repository)
+            && self.pull_request_number > 0
+            && is_contract_identifier(&self.attestation_id)
+    }
+}
+
 impl LegalDecisionAuthority {
     /// Validates constraints expressed by the published legal-decision authority schema.
     #[must_use]
@@ -1171,6 +1458,10 @@ impl LegalDecisionAuthority {
                     || !review.reviewer.is_well_formed()
                     || !is_git_commit_sha(&review.reviewed_commit_sha)
                     || !is_iso_utc_timestamp(&review.submitted_at)
+                    || review
+                        .last_edited_at
+                        .as_deref()
+                        .is_some_and(|timestamp| !is_iso_utc_timestamp(timestamp))
                 {
                     violations.push(ContractViolation {
                         code: "legal-review.evidence.malformed",
@@ -1341,6 +1632,14 @@ impl LegalDecisionAuthority {
             .extend(self.validate_trusted_candidate(candidate_repository, candidate_commit_sha));
         violations
     }
+}
+
+fn authenticated_review_effective_at(review: &AuthenticatedPullRequestReview) -> &str {
+    review
+        .last_edited_at
+        .as_deref()
+        .filter(|last_edited_at| *last_edited_at > review.submitted_at.as_str())
+        .unwrap_or(&review.submitted_at)
 }
 
 impl LegalReviewRecord {
@@ -1751,7 +2050,7 @@ impl LegalReviewLedger {
                 });
             }
 
-            if evidence.submitted_at.get(..10) != Some(decided_on) {
+            if authenticated_review_effective_at(evidence).get(..10) != Some(decided_on) {
                 violations.push(ContractViolation {
                     code: "legal-review.evidence.date-mismatch",
                     message: format!(
@@ -1764,6 +2063,1079 @@ impl LegalReviewLedger {
 
         violations
     }
+}
+
+impl BehaviorSpecificationAdmissionRecord {
+    /// Validates constraints expressed by the published admission schema.
+    #[must_use]
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+
+        if !is_contract_identifier(&self.id)
+            || !is_contract_identifier(&self.case_id)
+            || !is_contract_identifier(&self.target_id)
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.identifier.invalid",
+                message: format!("admission {} contains a malformed identifier", self.id),
+            });
+        }
+        if self.owner_issue == 0 {
+            violations.push(ContractViolation {
+                code: "behavior-admission.owner-issue.invalid",
+                message: format!("admission {} requires a positive owner issue", self.id),
+            });
+        }
+
+        for (field, identifiers) in [
+            ("feature_ids", &self.feature_ids),
+            ("source_provenance_ids", &self.source_provenance_ids),
+            ("legal_review_ids", &self.legal_review_ids),
+        ] {
+            if identifiers.is_empty()
+                || identifiers
+                    .iter()
+                    .any(|identifier| !is_contract_identifier(identifier))
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.reference.invalid",
+                    message: format!("admission {} has invalid {field}", self.id),
+                });
+            }
+            if has_duplicates(identifiers) {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.reference.duplicate",
+                    message: format!("admission {} repeats a {field} entry", self.id),
+                });
+            }
+        }
+
+        for assignment in admission_role_assignments(&self.roles) {
+            if !assignment.actor.is_well_formed() || !is_iso_utc_timestamp(&assignment.assigned_at)
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.role.invalid",
+                    message: format!("admission {} has malformed role metadata", self.id),
+                });
+            }
+        }
+
+        if !is_iso_utc_timestamp(&self.observation.started_at)
+            || !is_iso_utc_timestamp(&self.observation.completed_at)
+            || !is_canonical_sha256_digest(&self.observation.input_digest)
+            || !digest_length_is_consistent(
+                &self.observation.input_digest,
+                self.observation.input_byte_length,
+            )
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.observation.invalid",
+                message: format!("admission {} has malformed observation metadata", self.id),
+            });
+        }
+        if self.observation.commands.is_empty()
+            || has_equal_duplicates(&self.observation.commands)
+            || self.observation.commands.iter().any(|command| {
+                !has_schema_non_whitespace(&command.program)
+                    || command.program.contains('\0')
+                    || command.arguments.iter().any(|argument| {
+                        !has_schema_non_whitespace(argument) || argument.contains('\0')
+                    })
+            })
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.command.invalid",
+                message: format!("admission {} requires unique argv-form commands", self.id),
+            });
+        }
+        for (field, facts) in [
+            ("session_settings", &self.observation.session_settings),
+            ("environment", &self.observation.environment),
+        ] {
+            if facts.is_empty()
+                || has_duplicates(facts)
+                || facts.iter().any(|fact| {
+                    !is_contract_identifier(&fact.name) || !has_schema_non_whitespace(&fact.value)
+                })
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.environment.invalid",
+                    message: format!("admission {} has invalid {field}", self.id),
+                });
+            }
+        }
+
+        if !is_canonical_sha256_digest(&self.raw_evidence.content_digest)
+            || !digest_length_is_consistent(
+                &self.raw_evidence.content_digest,
+                self.raw_evidence.byte_length,
+            )
+            || self.raw_evidence.cleanup_events.is_empty()
+            || has_equal_duplicates(&self.raw_evidence.cleanup_events)
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.raw-evidence.invalid",
+                message: format!("admission {} has malformed raw-evidence metadata", self.id),
+            });
+        }
+        match &self.raw_evidence.disposition {
+            RawEvidenceDisposition::Protected {
+                store_id,
+                artifact_id,
+                confirmed_at,
+            } => {
+                if !is_contract_identifier(store_id)
+                    || !is_contract_identifier(artifact_id)
+                    || !is_iso_utc_timestamp(confirmed_at)
+                {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.disposition.invalid",
+                        message: format!(
+                            "admission {} has invalid protected evidence disposition",
+                            self.id
+                        ),
+                    });
+                }
+            }
+            RawEvidenceDisposition::Deleted { deleted_at } => {
+                if !is_iso_utc_timestamp(deleted_at) {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.disposition.invalid",
+                        message: format!(
+                            "admission {} has invalid deleted evidence disposition",
+                            self.id
+                        ),
+                    });
+                }
+            }
+        }
+        for event in &self.raw_evidence.cleanup_events {
+            if !is_iso_utc_timestamp(&event.occurred_at) || !event.actor.is_well_formed() {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.cleanup-event.invalid",
+                    message: format!("admission {} has malformed cleanup metadata", self.id),
+                });
+            }
+        }
+
+        let specification = &self.specification;
+        if !is_contract_identifier(&specification.provenance_id)
+            || !is_repository_relative_path(&specification.artifact_path)
+            || !is_canonical_sha256_digest(&specification.content_digest)
+            || specification.parent_provenance_ids.is_empty()
+            || specification
+                .parent_provenance_ids
+                .iter()
+                .any(|identifier| !is_contract_identifier(identifier))
+            || has_duplicates(&specification.parent_provenance_ids)
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.specification.invalid",
+                message: format!("admission {} has malformed specification metadata", self.id),
+            });
+        }
+
+        let review = &specification.technical_review;
+        let has_valid_decision_metadata = review
+            .reviewed_by
+            .as_ref()
+            .is_some_and(GovernanceActorIdentity::is_well_formed)
+            && review
+                .decided_at
+                .as_deref()
+                .is_some_and(is_iso_utc_timestamp)
+            && review
+                .decision_evidence
+                .as_ref()
+                .is_some_and(SpecificationReviewEvidenceReference::is_well_formed);
+        if !has_schema_non_whitespace(&review.rationale) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review.rationale-empty",
+                message: format!("admission {} requires a review rationale", self.id),
+            });
+        }
+        match review.status {
+            SpecificationReviewStatus::Pending => {
+                if review.reviewed_by.is_some()
+                    || review.decided_at.is_some()
+                    || review.decision_evidence.is_some()
+                {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review.pending-has-decision",
+                        message: format!(
+                            "pending admission {} cannot contain review decision metadata",
+                            self.id
+                        ),
+                    });
+                }
+            }
+            SpecificationReviewStatus::Approved | SpecificationReviewStatus::Rejected => {
+                if !has_valid_decision_metadata {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.review.decision-metadata-missing",
+                        message: format!(
+                            "decided admission {} requires reviewer, time, and evidence",
+                            self.id
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let Some(handoff) = &self.implementation_handoff
+            && (!is_contract_identifier(&handoff.specification_provenance_id)
+                || !is_canonical_sha256_digest(&handoff.specification_digest)
+                || !handoff.implementer.is_well_formed()
+                || !is_iso_utc_timestamp(&handoff.handed_off_at))
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.handoff.invalid",
+                message: format!("admission {} has malformed handoff metadata", self.id),
+            });
+        }
+
+        if has_equal_duplicates(&self.derived_tests) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.derived-test.duplicate",
+                message: format!("admission {} repeats a derived test", self.id),
+            });
+        }
+        for derived_test in &self.derived_tests {
+            if !is_contract_identifier(&derived_test.provenance_id)
+                || !is_repository_relative_path(&derived_test.artifact_path)
+                || !is_canonical_sha256_digest(&derived_test.content_digest)
+                || derived_test.parent_provenance_ids.is_empty()
+                || derived_test
+                    .parent_provenance_ids
+                    .iter()
+                    .any(|identifier| !is_contract_identifier(identifier))
+                || has_duplicates(&derived_test.parent_provenance_ids)
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.derived-test.invalid",
+                    message: format!("admission {} has malformed derived-test metadata", self.id),
+                });
+            }
+        }
+
+        violations
+    }
+
+    /// Validates clean-room role, chronology, disposition, and handoff invariants.
+    #[must_use]
+    pub fn validate_document_semantics(&self) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        let assignments = admission_role_assignments(&self.roles);
+        let mut actor_ids = BTreeSet::new();
+        let mut timestamps = assignments
+            .iter()
+            .map(|assignment| assignment.assigned_at.as_str())
+            .chain([
+                self.observation.started_at.as_str(),
+                self.observation.completed_at.as_str(),
+            ])
+            .chain(
+                self.raw_evidence
+                    .cleanup_events
+                    .iter()
+                    .map(|event| event.occurred_at.as_str()),
+            )
+            .collect::<Vec<_>>();
+        match &self.raw_evidence.disposition {
+            RawEvidenceDisposition::Protected { confirmed_at, .. } => {
+                timestamps.push(confirmed_at);
+            }
+            RawEvidenceDisposition::Deleted { deleted_at } => timestamps.push(deleted_at),
+        }
+        if let Some(decided_at) = self.specification.technical_review.decided_at.as_deref() {
+            timestamps.push(decided_at);
+        }
+        if let Some(handoff) = &self.implementation_handoff {
+            timestamps.push(&handoff.handed_off_at);
+        }
+        if timestamps
+            .iter()
+            .any(|timestamp| !is_valid_iso_utc_timestamp(timestamp))
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.timestamp.out-of-range",
+                message: format!("admission {} contains an invalid UTC timestamp", self.id),
+            });
+        }
+
+        if assignments
+            .iter()
+            .any(|assignment| !actor_ids.insert(assignment.actor.github_account_id))
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.role.not-separated",
+                message: format!(
+                    "admission {} requires four distinct clean-room actors",
+                    self.id
+                ),
+            });
+        }
+        if assignments
+            .iter()
+            .any(|assignment| assignment.assigned_at >= self.observation.started_at)
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.role.assigned-late",
+                message: format!(
+                    "admission {} assigned a role after observation began",
+                    self.id
+                ),
+            });
+        }
+        if self.observation.completed_at < self.observation.started_at {
+            violations.push(ContractViolation {
+                code: "behavior-admission.observation.time-order",
+                message: format!("admission {} observation ends before it starts", self.id),
+            });
+        }
+        for (field, facts) in [
+            ("session settings", &self.observation.session_settings),
+            ("environment", &self.observation.environment),
+        ] {
+            let mut names = BTreeSet::new();
+            if facts.iter().any(|fact| !names.insert(fact.name.as_str())) {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.environment.name-duplicate",
+                    message: format!("admission {} repeats a {field} name", self.id),
+                });
+            }
+        }
+
+        let raw_evidence_actors = [
+            &self.roles.observer.actor,
+            &self.roles.specification_reviewer.actor,
+        ];
+        if self.raw_evidence.cleanup_events.iter().any(|event| {
+            event.occurred_at <= self.observation.completed_at
+                || !raw_evidence_actors.contains(&&event.actor)
+        }) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.cleanup-event.invalid-actor-or-time",
+                message: format!(
+                    "admission {} cleanup must follow observation and use a raw-evidence role",
+                    self.id
+                ),
+            });
+        }
+
+        let (disposition_time, required_cleanup_kind) = match &self.raw_evidence.disposition {
+            RawEvidenceDisposition::Protected { confirmed_at, .. } => {
+                (confirmed_at, CleanupEventKind::ProtectedRetentionConfirmed)
+            }
+            RawEvidenceDisposition::Deleted { deleted_at } => {
+                (deleted_at, CleanupEventKind::WorkingCopyDeleted)
+            }
+        };
+        if disposition_time <= &self.observation.completed_at
+            || !self.raw_evidence.cleanup_events.iter().any(|event| {
+                event.kind == required_cleanup_kind && &event.occurred_at == disposition_time
+            })
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.disposition.unconfirmed",
+                message: format!(
+                    "admission {} lacks cleanup confirmation for its evidence disposition",
+                    self.id
+                ),
+            });
+        }
+
+        if set_of_strings(&self.specification.parent_provenance_ids)
+            != set_of_strings(&self.source_provenance_ids)
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.specification.parent-mismatch",
+                message: format!(
+                    "admission {} specification parents do not equal its sources",
+                    self.id
+                ),
+            });
+        }
+
+        let review = &self.specification.technical_review;
+        if let Some(reviewed_by) = &review.reviewed_by
+            && reviewed_by != &self.roles.specification_reviewer.actor
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review.reviewer-mismatch",
+                message: format!(
+                    "admission {} review was not made by its assigned reviewer",
+                    self.id
+                ),
+            });
+        }
+        if review
+            .decided_at
+            .as_deref()
+            .is_some_and(|decided_at| decided_at <= self.observation.completed_at.as_str())
+        {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review.decided-before-observation",
+                message: format!(
+                    "admission {} review predates completed observation",
+                    self.id
+                ),
+            });
+        }
+        if review.decided_at.as_deref().is_some_and(|decided_at| {
+            disposition_time.as_str() >= decided_at
+                || self
+                    .raw_evidence
+                    .cleanup_events
+                    .iter()
+                    .any(|event| event.occurred_at.as_str() >= decided_at)
+        }) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.review.before-cleanup",
+                message: format!(
+                    "admission {} review predates evidence disposition or cleanup",
+                    self.id
+                ),
+            });
+        }
+
+        match review.status {
+            SpecificationReviewStatus::Pending | SpecificationReviewStatus::Rejected => {
+                if self.implementation_handoff.is_some() {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.handoff.not-approved",
+                        message: format!(
+                            "admission {} cannot hand off an unapproved specification",
+                            self.id
+                        ),
+                    });
+                }
+            }
+            SpecificationReviewStatus::Approved => {
+                if self.implementation_handoff.is_none() {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.handoff.missing",
+                        message: format!(
+                            "approved admission {} requires a controlled handoff",
+                            self.id
+                        ),
+                    });
+                }
+                if self.derived_tests.is_empty() {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.derived-test.missing",
+                        message: format!(
+                            "approved admission {} requires an independently derived test",
+                            self.id
+                        ),
+                    });
+                }
+            }
+        }
+
+        if let Some(handoff) = &self.implementation_handoff {
+            if handoff.specification_provenance_id != self.specification.provenance_id
+                || handoff.specification_digest != self.specification.content_digest
+                || handoff.implementer != self.roles.implementer.actor
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.handoff.mismatch",
+                    message: format!(
+                        "admission {} handoff does not match specification and implementer",
+                        self.id
+                    ),
+                });
+            }
+            if review
+                .decided_at
+                .as_deref()
+                .is_none_or(|decided_at| handoff.handed_off_at.as_str() <= decided_at)
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.handoff.time-order",
+                    message: format!("admission {} handoff predates technical approval", self.id),
+                });
+            }
+        }
+
+        let mut test_ids = BTreeSet::new();
+        let mut test_paths = BTreeSet::new();
+        for derived_test in &self.derived_tests {
+            if !test_ids.insert(derived_test.provenance_id.as_str())
+                || !test_paths.insert(derived_test.artifact_path.as_str())
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.derived-test.identity-duplicate",
+                    message: format!(
+                        "admission {} repeats a derived-test identity or path",
+                        self.id
+                    ),
+                });
+            }
+            if !derived_test
+                .parent_provenance_ids
+                .contains(&self.specification.provenance_id)
+            {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.derived-test.specification-parent-missing",
+                    message: format!(
+                        "admission {} derived test does not name the specification parent",
+                        self.id
+                    ),
+                });
+            }
+        }
+
+        violations
+    }
+}
+
+impl BehaviorSpecificationAdmissionLedger {
+    /// Validates constraints expressed by the published admission-ledger schema.
+    #[must_use]
+    pub fn validate_schema_semantics(&self) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        if self.schema_version != BEHAVIOR_SPECIFICATION_ADMISSION_SCHEMA_VERSION {
+            violations.push(ContractViolation {
+                code: "behavior-admission.schema-version.unsupported",
+                message: format!(
+                    "unsupported behavior admission schema version: {}",
+                    self.schema_version
+                ),
+            });
+        }
+        for admission in &self.admissions {
+            violations.extend(admission.validate_schema_semantics());
+        }
+        violations
+    }
+
+    /// Validates standalone admission identities and clean-room invariants.
+    #[must_use]
+    pub fn validate(&self) -> Vec<ContractViolation> {
+        let mut violations = self.validate_schema_semantics();
+        let mut admission_ids = BTreeSet::new();
+        let mut case_ids = BTreeSet::new();
+
+        for admission in &self.admissions {
+            violations.extend(admission.validate_document_semantics());
+            if !admission_ids.insert(admission.id.as_str()) {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.id.duplicate",
+                    message: format!("duplicate behavior admission id: {}", admission.id),
+                });
+            }
+            if !case_ids.insert(admission.case_id.as_str()) {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.case-id.duplicate",
+                    message: format!("duplicate behavior case id: {}", admission.case_id),
+                });
+            }
+        }
+
+        violations
+    }
+
+    /// Validates exact feature, target, provenance, and legal-ledger references.
+    #[must_use]
+    pub fn validate_references(
+        &self,
+        targets: &TargetMatrix,
+        features: &FeatureMatrix,
+        provenance: &ProvenanceLedger,
+        legal_reviews: &LegalReviewLedger,
+    ) -> Vec<ContractViolation> {
+        let mut violations = self.validate();
+
+        for admission in &self.admissions {
+            violations.extend(admission.validate_references(
+                targets,
+                features,
+                provenance,
+                legal_reviews,
+            ));
+        }
+
+        violations
+    }
+
+    /// Validates whether one exact feature and target may guide implementation.
+    ///
+    /// Candidate-authored specification-review metadata is never sufficient
+    /// authority. Until a protected review authority is added, an otherwise
+    /// approved admission remains fail closed.
+    #[must_use]
+    fn validate_exact_implementation(
+        &self,
+        feature_id: &str,
+        target_id: &str,
+        context: ImplementationAdmissionContext<'_>,
+    ) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        let matches = self
+            .admissions
+            .iter()
+            .filter(|admission| {
+                admission.target_id == target_id
+                    && admission.feature_ids.iter().any(|id| id == feature_id)
+            })
+            .collect::<Vec<_>>();
+        let [admission] = matches.as_slice() else {
+            violations.push(ContractViolation {
+                code: if matches.is_empty() {
+                    "behavior-admission.missing"
+                } else {
+                    "behavior-admission.ambiguous"
+                },
+                message: format!(
+                    "implementation requires exactly one admission for feature {feature_id} and target {target_id}"
+                ),
+            });
+            return violations;
+        };
+
+        match admission.specification.technical_review.status {
+            SpecificationReviewStatus::Pending => violations.push(ContractViolation {
+                code: "behavior-admission.review.pending",
+                message: format!("admission {} technical review is pending", admission.id),
+            }),
+            SpecificationReviewStatus::Rejected => violations.push(ContractViolation {
+                code: "behavior-admission.review.rejected",
+                message: format!("admission {} technical review was rejected", admission.id),
+            }),
+            SpecificationReviewStatus::Approved => violations.push(ContractViolation {
+                code: "behavior-admission.review-authority.required",
+                message: format!(
+                    "admission {} requires protected specification-review authority",
+                    admission.id
+                ),
+            }),
+        }
+        let observation_deadline = AdmissionUseDeadline {
+            timestamp: &admission.observation.started_at,
+            boundary: "observation",
+        };
+
+        if let Some(target) = context
+            .targets
+            .targets
+            .iter()
+            .find(|target| target.id == admission.target_id)
+        {
+            violations.extend(validate_admission_closure_uses(
+                context,
+                &admission.id,
+                &target.provenance_id,
+                ProvenanceUse::OracleOperation,
+                Some(observation_deadline),
+            ));
+        }
+        for source_id in &admission.source_provenance_ids {
+            violations.extend(validate_admission_closure_uses(
+                context,
+                &admission.id,
+                source_id,
+                ProvenanceUse::ImplementationInput,
+                Some(observation_deadline),
+            ));
+        }
+        let specification_deadline = admission
+            .specification
+            .technical_review
+            .decided_at
+            .as_deref()
+            .map(|timestamp| AdmissionUseDeadline {
+                timestamp,
+                boundary: "technical review",
+            });
+        violations.extend(validate_admission_closure_uses(
+            context,
+            &admission.id,
+            &admission.specification.provenance_id,
+            ProvenanceUse::ImplementationInput,
+            specification_deadline,
+        ));
+        let derived_test_deadline =
+            admission
+                .implementation_handoff
+                .as_ref()
+                .map(|handoff| AdmissionUseDeadline {
+                    timestamp: &handoff.handed_off_at,
+                    boundary: "implementation handoff",
+                });
+        for derived_test in &admission.derived_tests {
+            violations.extend(validate_admission_closure_uses(
+                context,
+                &admission.id,
+                &derived_test.provenance_id,
+                ProvenanceUse::ConformanceEvidence,
+                derived_test_deadline,
+            ));
+        }
+
+        violations
+    }
+}
+
+impl BehaviorSpecificationAdmissionRecord {
+    fn validate_references(
+        &self,
+        targets: &TargetMatrix,
+        features: &FeatureMatrix,
+        provenance: &ProvenanceLedger,
+        legal_reviews: &LegalReviewLedger,
+    ) -> Vec<ContractViolation> {
+        let mut violations = Vec::new();
+        let target_matches = targets
+            .targets
+            .iter()
+            .filter(|target| target.id == self.target_id)
+            .collect::<Vec<_>>();
+        let target = match target_matches.as_slice() {
+            [target] => Some(*target),
+            _ => {
+                violations.push(ContractViolation {
+                    code: if target_matches.is_empty() {
+                        "behavior-admission.target.unknown"
+                    } else {
+                        "behavior-admission.target.duplicate"
+                    },
+                    message: format!(
+                        "admission {} requires one target {}",
+                        self.id, self.target_id
+                    ),
+                });
+                None
+            }
+        };
+
+        for feature_id in &self.feature_ids {
+            let feature_matches = features
+                .features
+                .iter()
+                .filter(|feature| feature.id == *feature_id)
+                .collect::<Vec<_>>();
+            let [feature] = feature_matches.as_slice() else {
+                violations.push(ContractViolation {
+                    code: if feature_matches.is_empty() {
+                        "behavior-admission.feature.unknown"
+                    } else {
+                        "behavior-admission.feature.duplicate"
+                    },
+                    message: format!("admission {} requires one feature {feature_id}", self.id),
+                });
+                continue;
+            };
+            if !feature.oracle_targets.contains(&self.target_id) {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.feature.target-mismatch",
+                    message: format!(
+                        "feature {feature_id} does not name admission target {}",
+                        self.target_id
+                    ),
+                });
+            }
+            if !feature.evidence.contains(&self.specification.provenance_id) {
+                violations.push(ContractViolation {
+                    code: "behavior-admission.feature.specification-unlinked",
+                    message: format!(
+                        "feature {feature_id} does not name specification {}",
+                        self.specification.provenance_id
+                    ),
+                });
+            }
+        }
+
+        let mut referenced_records = Vec::new();
+        if let Some(target) = target {
+            match find_exact_provenance(provenance, &target.provenance_id, "target", &self.id) {
+                Ok(record) => referenced_records.push(record),
+                Err(violation) => violations.push(violation),
+            }
+        }
+        for source_id in &self.source_provenance_ids {
+            match find_exact_provenance(provenance, source_id, "source", &self.id) {
+                Ok(record) => {
+                    referenced_records.push(record);
+                    if !matches!(
+                        record.source_kind,
+                        ProvenanceSourceKind::PublicDocumentation
+                            | ProvenanceSourceKind::OpenSpecification
+                            | ProvenanceSourceKind::Standard
+                            | ProvenanceSourceKind::PublicApi
+                            | ProvenanceSourceKind::OracleObservation
+                    ) {
+                        violations.push(ContractViolation {
+                            code: "behavior-admission.source.kind-invalid",
+                            message: format!(
+                                "admission {} source {} has unsupported kind",
+                                self.id, source_id
+                            ),
+                        });
+                    }
+                }
+                Err(violation) => violations.push(violation),
+            }
+        }
+
+        let specification_record = find_exact_provenance(
+            provenance,
+            &self.specification.provenance_id,
+            "specification",
+            &self.id,
+        );
+        match specification_record {
+            Ok(record) => {
+                referenced_records.push(record);
+                if record.source_kind != ProvenanceSourceKind::BehaviorSpecification
+                    || record.artifact_path.as_deref() != Some(&self.specification.artifact_path)
+                    || record.content_digest != self.specification.content_digest
+                    || set_of_strings(&record.parent_provenance_ids)
+                        != set_of_strings(&self.specification.parent_provenance_ids)
+                {
+                    violations.push(ContractViolation {
+                        code: "behavior-admission.specification.provenance-mismatch",
+                        message: format!(
+                            "admission {} does not exactly match specification provenance {}",
+                            self.id, record.id
+                        ),
+                    });
+                }
+            }
+            Err(violation) => violations.push(violation),
+        }
+
+        for derived_test in &self.derived_tests {
+            let test_record = find_exact_provenance(
+                provenance,
+                &derived_test.provenance_id,
+                "derived test",
+                &self.id,
+            );
+            match test_record {
+                Ok(record) => {
+                    referenced_records.push(record);
+                    if record.source_kind != ProvenanceSourceKind::Test
+                        || record.artifact_path.as_deref() != Some(&derived_test.artifact_path)
+                        || record.content_digest != derived_test.content_digest
+                        || set_of_strings(&record.parent_provenance_ids)
+                            != set_of_strings(&derived_test.parent_provenance_ids)
+                    {
+                        violations.push(ContractViolation {
+                            code: "behavior-admission.derived-test.provenance-mismatch",
+                            message: format!(
+                                "admission {} does not exactly match test provenance {}",
+                                self.id, record.id
+                            ),
+                        });
+                    }
+                }
+                Err(violation) => violations.push(violation),
+            }
+        }
+
+        let roots = referenced_records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect::<Vec<_>>();
+        let expected_legal_ids =
+            provenance_closure_ids(&roots, &provenance.records).map(|closure| {
+                closure
+                    .iter()
+                    .filter_map(|id| {
+                        provenance
+                            .records
+                            .iter()
+                            .find(|record| record.id == *id)
+                            .map(|record| record.legal_review_id.as_str())
+                    })
+                    .collect::<BTreeSet<_>>()
+            });
+        if expected_legal_ids.as_ref() != Some(&set_of_strings(&self.legal_review_ids)) {
+            violations.push(ContractViolation {
+                code: "behavior-admission.legal-review-set.mismatch",
+                message: format!(
+                    "admission {} legal reviews do not equal its provenance closure",
+                    self.id
+                ),
+            });
+        }
+        for legal_review_id in &self.legal_review_ids {
+            let count = legal_reviews
+                .reviews
+                .iter()
+                .filter(|review| review.id == *legal_review_id)
+                .count();
+            if count != 1 {
+                violations.push(ContractViolation {
+                    code: if count == 0 {
+                        "behavior-admission.legal-review.unknown"
+                    } else {
+                        "behavior-admission.legal-review.duplicate"
+                    },
+                    message: format!(
+                        "admission {} requires one legal review {}",
+                        self.id, legal_review_id
+                    ),
+                });
+            }
+        }
+
+        violations
+    }
+}
+
+fn authenticated_legal_review_time<'a>(
+    review: &LegalReviewRecord,
+    provenance: &ProvenanceLedger,
+    verification: LegalDecisionVerificationContext<'a>,
+) -> Option<&'a str> {
+    let reference = review.decision_evidence.as_ref()?;
+    let matches = verification
+        .authority
+        .pull_requests
+        .iter()
+        .filter(|pull_request| {
+            pull_request.repository == reference.repository
+                && pull_request.pull_request_number == reference.pull_request_number
+        })
+        .flat_map(|pull_request| {
+            pull_request
+                .authenticated_reviews
+                .iter()
+                .filter(move |evidence| {
+                    evidence.repository == pull_request.repository
+                        && evidence.pull_request_number == pull_request.pull_request_number
+                        && evidence.reviewed_commit_sha == pull_request.candidate_commit_sha
+                        && evidence.attestations.iter().any(|attestation| {
+                            attestation.attestation_id == reference.attestation_id
+                                && attestation.decision == *review
+                                && provenance_snapshot_matches(
+                                    provenance,
+                                    review,
+                                    &attestation.provenance_records,
+                                )
+                        })
+                })
+        })
+        .collect::<Vec<_>>();
+    let [evidence] = matches.as_slice() else {
+        return None;
+    };
+    Some(authenticated_review_effective_at(evidence))
+}
+
+#[derive(Clone, Copy)]
+struct AdmissionUseDeadline<'a> {
+    timestamp: &'a str,
+    boundary: &'static str,
+}
+
+fn validate_admission_closure_uses(
+    context: ImplementationAdmissionContext<'_>,
+    admission_id: &str,
+    root_id: &str,
+    requested_use: ProvenanceUse,
+    deadline: Option<AdmissionUseDeadline<'_>>,
+) -> Vec<ContractViolation> {
+    let roots = [root_id.to_owned()];
+    let Some(closure) = provenance_closure_ids(&roots, &context.provenance.records) else {
+        return vec![ContractViolation {
+            code: "behavior-admission.provenance-closure.invalid",
+            message: format!("cannot validate governed uses for provenance closure {root_id}"),
+        }];
+    };
+    let mut violations = Vec::new();
+    for provenance_id in closure {
+        violations.extend(context.provenance.validate_use(
+            context.legal_reviews,
+            context.legal_verification,
+            provenance_id,
+            requested_use,
+        ));
+        let Some(deadline) = deadline else {
+            continue;
+        };
+        let Some(verification) = context.legal_verification else {
+            continue;
+        };
+        let Some(record) = context
+            .provenance
+            .records
+            .iter()
+            .find(|record| record.id == provenance_id)
+        else {
+            continue;
+        };
+        let reviews = context
+            .legal_reviews
+            .reviews
+            .iter()
+            .filter(|review| review.id == record.legal_review_id)
+            .collect::<Vec<_>>();
+        let [review] = reviews.as_slice() else {
+            continue;
+        };
+        let Some(effective_at) =
+            authenticated_legal_review_time(review, context.provenance, verification)
+        else {
+            continue;
+        };
+        if !is_valid_iso_utc_timestamp(effective_at) || effective_at >= deadline.timestamp {
+            violations.push(ContractViolation {
+                code: "behavior-admission.legal-review.not-prior",
+                message: format!(
+                    "admission {admission_id} legal review {} for provenance {provenance_id} does not predate {}",
+                    review.id, deadline.boundary
+                ),
+            });
+        }
+    }
+    violations
+}
+
+fn find_exact_provenance<'a>(
+    provenance: &'a ProvenanceLedger,
+    provenance_id: &str,
+    role: &str,
+    admission_id: &str,
+) -> Result<&'a ProvenanceRecord, ContractViolation> {
+    let matches = provenance
+        .records
+        .iter()
+        .filter(|record| record.id == provenance_id)
+        .collect::<Vec<_>>();
+    let [record] = matches.as_slice() else {
+        return Err(ContractViolation {
+            code: if matches.is_empty() {
+                "behavior-admission.provenance.unknown"
+            } else {
+                "behavior-admission.provenance.duplicate"
+            },
+            message: format!(
+                "admission {} requires one {role} provenance {provenance_id}",
+                admission_id
+            ),
+        });
+    };
+    Ok(*record)
+}
+
+fn admission_role_assignments(roles: &CleanRoomRoles) -> [&CleanRoomRoleAssignment; 4] {
+    [
+        &roles.observer,
+        &roles.specification_reviewer,
+        &roles.implementer,
+        &roles.conformance_reviewer,
+    ]
+}
+
+fn set_of_strings(values: &[String]) -> BTreeSet<&str> {
+    values.iter().map(String::as_str).collect()
+}
+
+fn digest_length_is_consistent(digest: &str, byte_length: u64) -> bool {
+    (byte_length == 0) == (digest == SHA256_EMPTY_CONTENT)
 }
 
 impl ProvenanceRecord {
@@ -2844,40 +4216,49 @@ impl FeatureMatrix {
     pub fn validate_implementation_inputs(
         &self,
         feature_id: &str,
-        provenance: &ProvenanceLedger,
-        legal_reviews: &LegalReviewLedger,
-        legal_verification: Option<LegalDecisionVerificationContext<'_>>,
+        target_id: &str,
+        context: ImplementationAdmissionContext<'_>,
     ) -> Vec<ContractViolation> {
-        let Some(feature) = self
+        let mut violations = context.targets.validate();
+        violations.extend(self.validate(context.targets));
+        violations.extend(validate_governance_references(
+            context.targets,
+            self,
+            context.provenance,
+            context.legal_reviews,
+        ));
+        violations.extend(context.admissions.validate_references(
+            context.targets,
+            self,
+            context.provenance,
+            context.legal_reviews,
+        ));
+
+        let feature_matches = self
             .features
             .iter()
-            .find(|feature| feature.id == feature_id)
-        else {
-            return vec![ContractViolation {
+            .filter(|feature| feature.id == feature_id)
+            .collect::<Vec<_>>();
+        match feature_matches.as_slice() {
+            [] => violations.push(ContractViolation {
                 code: "feature.id.unknown",
                 message: format!("unknown feature: {feature_id}"),
-            }];
-        };
-
-        if feature.status == CompatibilityStatus::BlockedLegal {
-            return vec![ContractViolation {
-                code: "feature.implementation.blocked-legal",
-                message: format!("feature {} is blocked by legal review", feature.id),
-            }];
+            }),
+            [feature] if feature.status == CompatibilityStatus::BlockedLegal => {
+                violations.push(ContractViolation {
+                    code: "feature.implementation.blocked-legal",
+                    message: format!("feature {} is blocked by legal review", feature.id),
+                });
+            }
+            [_, _, ..] => {}
+            [_] => violations.extend(
+                context
+                    .admissions
+                    .validate_exact_implementation(feature_id, target_id, context),
+            ),
         }
 
-        feature
-            .evidence
-            .iter()
-            .flat_map(|provenance_id| {
-                provenance.validate_use(
-                    legal_reviews,
-                    legal_verification,
-                    provenance_id,
-                    ProvenanceUse::ImplementationInput,
-                )
-            })
-            .collect()
+        violations
     }
 }
 
@@ -2950,6 +4331,43 @@ fn is_iso_utc_timestamp(value: &str) -> bool {
         && value.bytes().enumerate().all(|(index, byte)| {
             matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
         })
+}
+
+fn is_valid_iso_utc_timestamp(value: &str) -> bool {
+    if !is_iso_utc_timestamp(value) {
+        return false;
+    }
+    let Some(year) = value[0..4].parse::<u32>().ok() else {
+        return false;
+    };
+    let Some(month) = value[5..7].parse::<u8>().ok() else {
+        return false;
+    };
+    let Some(day) = value[8..10].parse::<u8>().ok() else {
+        return false;
+    };
+    let Some(hour) = value[11..13].parse::<u8>().ok() else {
+        return false;
+    };
+    let Some(minute) = value[14..16].parse::<u8>().ok() else {
+        return false;
+    };
+    let Some(second) = value[17..19].parse::<u8>().ok() else {
+        return false;
+    };
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return false,
+    };
+
+    day > 0 && day <= days_in_month && hour < 24 && minute < 60 && second < 60
+}
+
+const fn is_leap_year(year: u32) -> bool {
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 fn is_git_commit_sha(value: &str) -> bool {
@@ -3300,14 +4718,24 @@ impl FeatureMatrix {
 mod tests {
     use super::{
         AuthenticatedPullRequest, AuthenticatedPullRequestReview, AuthenticatedReviewState,
-        CompatibilityStatus, ConformanceRecord, FeatureCategory, FeatureMatrix, FeatureRecord,
-        FixtureArtifact, LegalDecisionAttestation, LegalDecisionAuthority,
-        LegalDecisionEvidenceReference, LegalDecisionVerificationContext, LegalReviewLedger,
-        LegalReviewRecord, LegalReviewStatus, LegalReviewerIdentity, OracleTarget,
-        ProvenanceLedger, ProvenanceRecord, ProvenanceSourceKind, ProvenanceUse, TargetMatrix,
+        BehaviorSpecificationAdmissionLedger, CompatibilityStatus, ConformanceRecord,
+        FEATURE_CATEGORIES, FeatureCategory, FeatureMatrix, FeatureRecord, FixtureArtifact,
+        ImplementationAdmissionContext, LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION,
+        LegalDecisionAttestation, LegalDecisionAuthority, LegalDecisionEvidenceReference,
+        LegalDecisionVerificationContext, LegalReviewLedger, LegalReviewRecord, LegalReviewStatus,
+        LegalReviewerIdentity, OracleTarget, ProvenanceLedger, ProvenanceRecord,
+        ProvenanceSourceKind, ProvenanceUse, SpecificationReviewStatus, TargetMatrix,
         validate_governance_references,
     };
     use serde_json::{Value, json};
+
+    struct BehaviorAdmissionContracts {
+        admissions: BehaviorSpecificationAdmissionLedger,
+        targets: TargetMatrix,
+        features: FeatureMatrix,
+        provenance: ProvenanceLedger,
+        legal_reviews: LegalReviewLedger,
+    }
 
     #[test]
     fn conformance_record_requires_every_dimension() {
@@ -4444,6 +5872,355 @@ mod tests {
     }
 
     #[test]
+    fn behavior_admission_references_resolve_exactly() -> Result<(), serde_json::Error> {
+        let contracts = approved_behavior_admission_contracts()?;
+
+        let violations = contracts.admissions.validate_references(
+            &contracts.targets,
+            &contracts.features,
+            &contracts.provenance,
+            &contracts.legal_reviews,
+        );
+
+        assert!(violations.is_empty(), "{violations:#?}");
+        Ok(())
+    }
+
+    #[test]
+    fn behavior_admission_rejects_cross_ledger_drift() -> Result<(), serde_json::Error> {
+        let mut contracts = approved_behavior_admission_contracts()?;
+        contracts.features.features[0].oracle_targets[0] = "different-target".to_owned();
+        if let Some(record) = contracts
+            .provenance
+            .records
+            .iter_mut()
+            .find(|record| record.id == "prov-synthetic-specification")
+        {
+            record.content_digest = format!("sha256:{}", "e".repeat(64));
+        }
+        contracts.admissions.admissions[0].derived_tests[0]
+            .parent_provenance_ids
+            .clear();
+        contracts.admissions.admissions[0].legal_review_ids[0] =
+            "different-legal-review".to_owned();
+
+        let violations = contracts.admissions.validate_references(
+            &contracts.targets,
+            &contracts.features,
+            &contracts.provenance,
+            &contracts.legal_reviews,
+        );
+
+        for code in [
+            "behavior-admission.feature.target-mismatch",
+            "behavior-admission.specification.provenance-mismatch",
+            "behavior-admission.derived-test.specification-parent-missing",
+            "behavior-admission.legal-review-set.mismatch",
+            "behavior-admission.legal-review.unknown",
+        ] {
+            assert!(
+                violations.iter().any(|violation| violation.code == code),
+                "missing {code}: {violations:#?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn implementation_admission_requires_protected_specification_review_authority()
+    -> Result<(), serde_json::Error> {
+        let contracts = approved_behavior_admission_contracts()?;
+        let authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+
+        let violations = contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &contracts.targets,
+                admissions: &contracts.admissions,
+                provenance: &contracts.provenance,
+                legal_reviews: &contracts.legal_reviews,
+                legal_verification: Some(legal_decision_verification(&authority)),
+            },
+        );
+
+        assert!(
+            violations.iter().any(|violation| {
+                violation.code == "behavior-admission.review-authority.required"
+            }),
+            "{violations:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn implementation_admission_validates_every_governance_ledger() -> Result<(), serde_json::Error>
+    {
+        let mut contracts = approved_behavior_admission_contracts()?;
+        contracts.targets.schema_version = "invalid".to_owned();
+        contracts.features.schema_version = "invalid".to_owned();
+        contracts.provenance.schema_version = "invalid".to_owned();
+        contracts.legal_reviews.schema_version = "invalid".to_owned();
+
+        let violations = contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &contracts.targets,
+                admissions: &contracts.admissions,
+                provenance: &contracts.provenance,
+                legal_reviews: &contracts.legal_reviews,
+                legal_verification: None,
+            },
+        );
+
+        for code in [
+            "target.schema-version.unsupported",
+            "feature.schema-version.unsupported",
+            "provenance.schema-version.unsupported",
+            "legal-review.schema-version.unsupported",
+        ] {
+            assert!(
+                violations.iter().any(|violation| violation.code == code),
+                "missing {code}: {violations:#?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn implementation_admission_rejects_legal_approval_after_observation()
+    -> Result<(), serde_json::Error> {
+        let mut contracts = approved_behavior_admission_contracts()?;
+        contracts.legal_reviews.reviews[0].decided_on = Some("2026-01-01".to_owned());
+        let authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+
+        let violations = contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &contracts.targets,
+                admissions: &contracts.admissions,
+                provenance: &contracts.provenance,
+                legal_reviews: &contracts.legal_reviews,
+                legal_verification: Some(legal_decision_verification(&authority)),
+            },
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "behavior-admission.legal-review.not-prior"),
+            "{violations:#?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn implementation_admission_uses_legal_review_last_edit_time() -> Result<(), serde_json::Error>
+    {
+        let contracts = approved_behavior_admission_contracts()?;
+        let mut authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+        authority.pull_requests[0].authenticated_reviews[0].last_edited_at =
+            Some("2026-01-01T01:00:00Z".to_owned());
+
+        let violations = contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &contracts.targets,
+                admissions: &contracts.admissions,
+                provenance: &contracts.provenance,
+                legal_reviews: &contracts.legal_reviews,
+                legal_verification: Some(legal_decision_verification(&authority)),
+            },
+        );
+
+        assert!(violations.iter().any(|violation| {
+            violation.code == "behavior-admission.legal-review.not-prior"
+                && violation.message.contains("observation")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn legal_review_chronology_uses_each_artifact_boundary() -> Result<(), serde_json::Error> {
+        let mut contracts = approved_behavior_admission_contracts()?;
+        contracts.legal_reviews.reviews[0].decided_on = Some("2026-01-01".to_owned());
+        let mut authority = legal_decision_authority_for_provenance(
+            &contracts.legal_reviews.reviews[0],
+            &contracts.provenance,
+        );
+        authority.pull_requests[0].authenticated_reviews[0].submitted_at =
+            "2026-01-01T01:03:30Z".to_owned();
+        let context = ImplementationAdmissionContext {
+            targets: &contracts.targets,
+            admissions: &contracts.admissions,
+            provenance: &contracts.provenance,
+            legal_reviews: &contracts.legal_reviews,
+            legal_verification: Some(legal_decision_verification(&authority)),
+        };
+
+        let derived_test_violations = super::validate_admission_closure_uses(
+            context,
+            "admission.synthetic.select",
+            "prov-synthetic-test",
+            ProvenanceUse::ConformanceEvidence,
+            Some(super::AdmissionUseDeadline {
+                timestamp: "2026-01-01T01:04:00Z",
+                boundary: "implementation handoff",
+            }),
+        );
+        assert!(
+            !derived_test_violations
+                .iter()
+                .any(|violation| violation.code == "behavior-admission.legal-review.not-prior"),
+            "{derived_test_violations:#?}"
+        );
+
+        let source_violations = super::validate_admission_closure_uses(
+            context,
+            "admission.synthetic.select",
+            "prov-synthetic-source",
+            ProvenanceUse::ImplementationInput,
+            Some(super::AdmissionUseDeadline {
+                timestamp: "2026-01-01T01:00:00Z",
+                boundary: "observation",
+            }),
+        );
+        assert!(source_violations.iter().any(|violation| {
+            violation.code == "behavior-admission.legal-review.not-prior"
+                && violation.message.contains("observation")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn implementation_admission_validates_governed_use_across_provenance_ancestors()
+    -> Result<(), serde_json::Error> {
+        let mut target_contracts = approved_behavior_admission_contracts()?;
+        let target = target_contracts
+            .provenance
+            .records
+            .iter_mut()
+            .find(|record| record.id == "prov-synthetic-target");
+        assert!(target.is_some());
+        if let Some(target) = target {
+            target.parent_provenance_ids = vec!["prov-synthetic-source".to_owned()];
+        }
+        let target_authority = legal_decision_authority_for_provenance(
+            &target_contracts.legal_reviews.reviews[0],
+            &target_contracts.provenance,
+        );
+
+        let target_violations = target_contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &target_contracts.targets,
+                admissions: &target_contracts.admissions,
+                provenance: &target_contracts.provenance,
+                legal_reviews: &target_contracts.legal_reviews,
+                legal_verification: Some(legal_decision_verification(&target_authority)),
+            },
+        );
+
+        assert!(target_violations.iter().any(|violation| {
+            violation.code == "provenance.use.undeclared"
+                && violation.message.contains("prov-synthetic-source")
+                && violation.message.contains("OracleOperation")
+        }));
+
+        let mut test_contracts = approved_behavior_admission_contracts()?;
+        let source = test_contracts
+            .provenance
+            .records
+            .iter_mut()
+            .find(|record| record.id == "prov-synthetic-source");
+        assert!(source.is_some());
+        if let Some(source) = source {
+            source
+                .intended_uses
+                .retain(|use_kind| *use_kind != ProvenanceUse::ConformanceEvidence);
+        }
+        let test_authority = legal_decision_authority_for_provenance(
+            &test_contracts.legal_reviews.reviews[0],
+            &test_contracts.provenance,
+        );
+
+        let test_violations = test_contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &test_contracts.targets,
+                admissions: &test_contracts.admissions,
+                provenance: &test_contracts.provenance,
+                legal_reviews: &test_contracts.legal_reviews,
+                legal_verification: Some(legal_decision_verification(&test_authority)),
+            },
+        );
+
+        assert!(test_violations.iter().any(|violation| {
+            violation.code == "provenance.use.undeclared"
+                && violation.message.contains("prov-synthetic-source")
+                && violation.message.contains("ConformanceEvidence")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_behavior_admission_cannot_authorize_implementation() -> Result<(), serde_json::Error>
+    {
+        let mut contracts = approved_behavior_admission_contracts()?;
+        let admission = &mut contracts.admissions.admissions[0];
+        admission.specification.technical_review.status = SpecificationReviewStatus::Pending;
+        admission.specification.technical_review.reviewed_by = None;
+        admission.specification.technical_review.decided_at = None;
+        admission.specification.technical_review.decision_evidence = None;
+        admission.implementation_handoff = None;
+        admission.derived_tests.clear();
+        let legal_review = &mut contracts.legal_reviews.reviews[0];
+        legal_review.status = LegalReviewStatus::Pending;
+        legal_review.approved_uses.clear();
+        legal_review.reviewed_by = None;
+        legal_review.decided_on = None;
+        legal_review.decision_evidence = None;
+
+        let violations = contracts.features.validate_implementation_inputs(
+            "language.query.select",
+            "target.synthetic",
+            ImplementationAdmissionContext {
+                targets: &contracts.targets,
+                admissions: &contracts.admissions,
+                provenance: &contracts.provenance,
+                legal_reviews: &contracts.legal_reviews,
+                legal_verification: None,
+            },
+        );
+
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "behavior-admission.review.pending")
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "provenance.legal-review.pending")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn blocked_feature_rejects_implementation() {
         let features = FeatureMatrix {
             schema_version: "1.0.0".to_owned(),
@@ -4459,16 +6236,34 @@ mod tests {
                 legal_review_id: Some("legal-review-native-file-formats".to_owned()),
             }],
         };
+        let targets = TargetMatrix {
+            schema_version: "1.0.0".to_owned(),
+            baseline_target_id: "baseline".to_owned(),
+            targets: vec![oracle_target("baseline", "2022-CU26-ubuntu-22.04")],
+            expansion_order: Vec::new(),
+        };
+        let admissions = BehaviorSpecificationAdmissionLedger {
+            schema_version: "1.0.0".to_owned(),
+            admissions: Vec::new(),
+        };
 
         let violations = features.validate_implementation_inputs(
             "storage.native-file-formats",
-            &provenance_ledger(),
-            &pending_legal_reviews(),
-            None,
+            "baseline",
+            ImplementationAdmissionContext {
+                targets: &targets,
+                admissions: &admissions,
+                provenance: &provenance_ledger(),
+                legal_reviews: &pending_legal_reviews(),
+                legal_verification: None,
+            },
         );
 
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].code, "feature.implementation.blocked-legal");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.code == "feature.implementation.blocked-legal")
+        );
     }
 
     #[test]
@@ -4583,6 +6378,164 @@ mod tests {
         }
     }
 
+    fn approved_behavior_admission_contracts()
+    -> Result<BehaviorAdmissionContracts, serde_json::Error> {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../contracts/schema-corpus/behavior-specification-admission-ledger.json"
+        ))?;
+        let admissions = serde_json::from_value(corpus["base_document"]["inline"].clone())?;
+        let legal_review_id = "legal-review-synthetic";
+        let source = ProvenanceRecord {
+            id: "prov-synthetic-source".to_owned(),
+            source_kind: ProvenanceSourceKind::OpenSpecification,
+            title: "Synthetic source".to_owned(),
+            source_url: Some("https://example.invalid/synthetic-source".to_owned()),
+            artifact_path: None,
+            revision: "synthetic".to_owned(),
+            retrieved_on: "2026-01-01".to_owned(),
+            author: "ntsql tests".to_owned(),
+            generation_method: "Repository-authored synthetic test data".to_owned(),
+            environment: None,
+            license: "Synthetic".to_owned(),
+            content_digest: format!("sha256:{}", "a".repeat(64)),
+            intended_uses: vec![
+                ProvenanceUse::ImplementationInput,
+                ProvenanceUse::ConformanceEvidence,
+            ],
+            parent_provenance_ids: Vec::new(),
+            legal_review_id: legal_review_id.to_owned(),
+        };
+        let target_provenance = ProvenanceRecord {
+            id: "prov-synthetic-target".to_owned(),
+            source_kind: ProvenanceSourceKind::OracleObservation,
+            title: "Synthetic target".to_owned(),
+            source_url: None,
+            artifact_path: Some("contracts/synthetic-target.json".to_owned()),
+            revision: "synthetic".to_owned(),
+            retrieved_on: "2026-01-01".to_owned(),
+            author: "ntsql tests".to_owned(),
+            generation_method: "Repository-authored synthetic test data".to_owned(),
+            environment: Some("synthetic".to_owned()),
+            license: "Synthetic".to_owned(),
+            content_digest: format!("sha256:{}", "b".repeat(64)),
+            intended_uses: vec![ProvenanceUse::OracleOperation],
+            parent_provenance_ids: Vec::new(),
+            legal_review_id: legal_review_id.to_owned(),
+        };
+        let specification = ProvenanceRecord {
+            id: "prov-synthetic-specification".to_owned(),
+            source_kind: ProvenanceSourceKind::BehaviorSpecification,
+            title: "Synthetic behavior specification".to_owned(),
+            source_url: None,
+            artifact_path: Some("specifications/synthetic-select.json".to_owned()),
+            revision: "synthetic".to_owned(),
+            retrieved_on: "2026-01-01".to_owned(),
+            author: "ntsql tests".to_owned(),
+            generation_method: "Repository-authored synthetic test data".to_owned(),
+            environment: None,
+            license: "Synthetic".to_owned(),
+            content_digest: format!("sha256:{}", "c".repeat(64)),
+            intended_uses: vec![
+                ProvenanceUse::ImplementationInput,
+                ProvenanceUse::ConformanceEvidence,
+            ],
+            parent_provenance_ids: vec![source.id.clone()],
+            legal_review_id: legal_review_id.to_owned(),
+        };
+        let derived_test = ProvenanceRecord {
+            id: "prov-synthetic-test".to_owned(),
+            source_kind: ProvenanceSourceKind::Test,
+            title: "Synthetic derived test".to_owned(),
+            source_url: None,
+            artifact_path: Some("tests/synthetic-select.rs".to_owned()),
+            revision: "synthetic".to_owned(),
+            retrieved_on: "2026-01-01".to_owned(),
+            author: "ntsql tests".to_owned(),
+            generation_method: "Repository-authored synthetic test data".to_owned(),
+            environment: None,
+            license: "Synthetic".to_owned(),
+            content_digest: format!("sha256:{}", "d".repeat(64)),
+            intended_uses: vec![ProvenanceUse::ConformanceEvidence],
+            parent_provenance_ids: vec![specification.id.clone()],
+            legal_review_id: legal_review_id.to_owned(),
+        };
+        let provenance = ProvenanceLedger {
+            schema_version: "1.0.0".to_owned(),
+            records: vec![source, target_provenance, specification, derived_test],
+        };
+        let legal_reviews = LegalReviewLedger {
+            schema_version: "2.0.0".to_owned(),
+            reviews: vec![LegalReviewRecord {
+                id: legal_review_id.to_owned(),
+                subject: "Synthetic governed uses".to_owned(),
+                status: LegalReviewStatus::Approved,
+                approved_uses: vec![
+                    ProvenanceUse::ImplementationInput,
+                    ProvenanceUse::OracleOperation,
+                    ProvenanceUse::ConformanceEvidence,
+                ],
+                prohibited_uses: Vec::new(),
+                individual_review_uses: Vec::new(),
+                source_provenance_ids: provenance
+                    .records
+                    .iter()
+                    .map(|record| record.id.clone())
+                    .collect(),
+                reviewed_by: Some(reviewer_identity()),
+                decided_on: Some("2025-12-31".to_owned()),
+                decision_evidence: Some(decision_evidence_reference()),
+                rationale: "Synthetic schema and validation test only".to_owned(),
+            }],
+        };
+        let mut target = oracle_target("target.synthetic", "2022-CU26-synthetic");
+        target.provenance_id = "prov-synthetic-target".to_owned();
+        let targets = TargetMatrix {
+            schema_version: "1.0.0".to_owned(),
+            baseline_target_id: target.id.clone(),
+            targets: vec![target],
+            expansion_order: Vec::new(),
+        };
+        let mut features = FeatureMatrix {
+            schema_version: "1.0.0".to_owned(),
+            features: vec![FeatureRecord {
+                id: "language.query.select".to_owned(),
+                title: "Synthetic SELECT".to_owned(),
+                category: FeatureCategory::Language,
+                status: CompatibilityStatus::NotTested,
+                oracle_targets: vec!["target.synthetic".to_owned()],
+                evidence: vec!["prov-synthetic-specification".to_owned()],
+                differences: Vec::new(),
+                owner_issue: 8,
+                legal_review_id: None,
+            }],
+        };
+        features.features.extend(
+            FEATURE_CATEGORIES
+                .into_iter()
+                .filter(|category| *category != FeatureCategory::Language)
+                .enumerate()
+                .map(|(index, category)| FeatureRecord {
+                    id: format!("synthetic.category.{index}"),
+                    title: format!("Synthetic category {index}"),
+                    category,
+                    status: CompatibilityStatus::NotTested,
+                    oracle_targets: vec!["target.synthetic".to_owned()],
+                    evidence: vec!["prov-synthetic-specification".to_owned()],
+                    differences: Vec::new(),
+                    owner_issue: 54,
+                    legal_review_id: None,
+                }),
+        );
+
+        Ok(BehaviorAdmissionContracts {
+            admissions,
+            targets,
+            features,
+            provenance,
+            legal_reviews,
+        })
+    }
+
     fn provenance_ledger() -> ProvenanceLedger {
         ProvenanceLedger {
             schema_version: "1.0.0".to_owned(),
@@ -4666,8 +6619,12 @@ mod tests {
         decision: &LegalReviewRecord,
         provenance: &ProvenanceLedger,
     ) -> LegalDecisionAuthority {
+        let submitted_at = decision.decided_on.as_deref().map_or_else(
+            || "2026-08-02T12:34:56Z".to_owned(),
+            |decided_on| format!("{decided_on}T12:34:56Z"),
+        );
         LegalDecisionAuthority {
-            schema_version: "1.0.0".to_owned(),
+            schema_version: LEGAL_DECISION_AUTHORITY_SCHEMA_VERSION.to_owned(),
             candidate_repository: "anaregdesign/ntsql".to_owned(),
             candidate_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             trusted_reviewer_account_ids: vec![4242],
@@ -4683,7 +6640,8 @@ mod tests {
                     reviewer: reviewer_identity(),
                     reviewed_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
                     state: AuthenticatedReviewState::Approved,
-                    submitted_at: "2026-08-02T12:34:56Z".to_owned(),
+                    submitted_at,
+                    last_edited_at: None,
                     attestations: vec![LegalDecisionAttestation {
                         attestation_id: "legal-review-public-specification:v1".to_owned(),
                         decision: decision.clone(),

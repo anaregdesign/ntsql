@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #59
 - Extends: ADR 0001, ADR 0005, ADR 0006
-- Extended by: ADR 0009
+- Extended by: ADR 0009, ADR 0010
 
 ## Context
 
@@ -49,6 +49,14 @@ pre-product in-process model. A bounded or persistent registry requires a
 separate owned recovery design and must fail closed if an expected entry is
 absent.
 
+ADR 0010 adds coordinator-owned resolution for the existing indeterminate phase.
+It checks the private runtime brand and retained phase before querying recovery,
+then accepts only an atomically lineage-paired authoritative result. Presence
+changes the phase to committed; authoritative absence changes it to
+`NoDurableCommitRecord`. Source failure, foreign lineage, and other rejection
+paths retain both the token and indeterminate phase. Neither terminal phase can
+be reconstructed as active.
+
 ## Dependency Direction
 
 The direct dependency graph is unchanged:
@@ -89,6 +97,8 @@ lineages may reuse epoch values; global uniqueness is not claimed.
   `ntsql-transaction -> ntsql-wal` edge.
 - Source-backed construction and memory-adapter tests prove distinct epochs
   across coordinator and model-restart boundaries.
+- Recovery tests prove that only the issuing coordinator can resolve an
+  indeterminate token and that lifecycle mismatches are rejected before lookup.
 
 ## Consequences
 
@@ -97,5 +107,6 @@ identity, or active state, and an attempted token cannot be replayed through
 another coordinator. Epoch uniqueness remains a persistence-port obligation. A
 panic in an outer WAL adapter would leave the in-memory registry at
 `CommitAttempted`, which is fail-closed but is not a recovery verdict. The future
-recovery protocol must reconcile epoch-qualified attempted identities with
-durable log state before permitting any external outcome or retry.
+recovery protocol introduced by ADR 0010 reconciles an existing indeterminate
+token with epoch-qualified durable evidence, but remains in-process and defines
+no external outcome or retry.

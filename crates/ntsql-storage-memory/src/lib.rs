@@ -2,7 +2,10 @@
 
 use std::{error::Error, fmt, num::NonZeroU64};
 
-use ntsql_transaction::{TransactionCommitRecord, TransactionEpochSource, TransactionId};
+use ntsql_transaction::{
+    DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
+    TransactionRecoverySource,
+};
 use ntsql_wal::{CommitLog, LogLineage, LogSequenceNumber};
 
 /// One-shot physical-effect boundary for the next matching log operation.
@@ -138,6 +141,32 @@ impl fmt::Display for InMemoryTransactionEpochError {
 
 impl Error for InMemoryTransactionEpochError {}
 
+/// Failure to establish an authoritative transaction outcome from this model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryTransactionRecoveryError {
+    /// The matching record exists only in the volatile suffix.
+    VolatileCommitRecord(TransactionId),
+    /// More than one physical record carries the same complete identity.
+    DuplicateCommitRecord(TransactionId),
+}
+
+impl fmt::Display for InMemoryTransactionRecoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VolatileCommitRecord(transaction_id) => write!(
+                formatter,
+                "transaction {transaction_id} has a volatile commit record"
+            ),
+            Self::DuplicateCommitRecord(transaction_id) => write!(
+                formatter,
+                "transaction {transaction_id} has duplicate commit records"
+            ),
+        }
+    }
+}
+
+impl Error for InMemoryTransactionRecoveryError {}
+
 /// Inspectable in-memory implementation of the transaction commit-log port.
 ///
 /// This adapter models only repository-authored physical effects. Its durable
@@ -247,6 +276,40 @@ impl TransactionEpochSource for InMemoryCommitLog {
     }
 }
 
+impl TransactionRecoverySource for InMemoryCommitLog {
+    type Error = InMemoryTransactionRecoveryError;
+
+    fn lookup_durable_commit(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> Result<(LogLineage, DurableCommitLookup), Self::Error> {
+        let mut matching_record = None;
+
+        for (index, record) in self.records.iter().enumerate() {
+            if record.transaction_id() != transaction_id {
+                continue;
+            }
+            if matching_record.is_some() {
+                return Err(InMemoryTransactionRecoveryError::DuplicateCommitRecord(
+                    transaction_id,
+                ));
+            }
+            matching_record = Some((record.position(), index < self.durable_len));
+        }
+
+        let lookup = match matching_record {
+            Some((position, true)) => DurableCommitLookup::Found { position },
+            None => DurableCommitLookup::Absent,
+            Some((_, false)) => {
+                return Err(InMemoryTransactionRecoveryError::VolatileCommitRecord(
+                    transaction_id,
+                ));
+            }
+        };
+        Ok((self.lineage.clone(), lookup))
+    }
+}
+
 impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
     type Error = InMemoryCommitLogError;
 
@@ -318,7 +381,10 @@ impl CommitLog<TransactionCommitRecord> for InMemoryCommitLog {
 mod tests {
     use std::{error::Error, io};
 
-    use ntsql_transaction::{CoordinatedCommitError, TransactionCoordinator};
+    use ntsql_transaction::{
+        CoordinatedCommitError, TransactionCoordinator, TransactionLifecycleStatus,
+        TransactionResolutionFailure,
+    };
     use ntsql_wal::CommitError;
 
     use super::*;
@@ -366,6 +432,48 @@ mod tests {
         assert_eq!(
             TransactionCoordinator::open(&mut restarted).err(),
             Some(InMemoryTransactionEpochError::EpochSpaceExhausted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_commit_records_retain_indeterminate_resolution() -> Result<(), Box<dyn Error>> {
+        let mut log = InMemoryCommitLog::new();
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        log.arm_fault(FaultPoint::AfterFlush)?;
+        let active = coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        let error = coordinator
+            .commit(active, &mut log)
+            .err()
+            .ok_or_else(|| io::Error::other("faulted commit unexpectedly succeeded"))?;
+        let CoordinatedCommitError::Indeterminate(error) = error else {
+            return Err(io::Error::other("faulted commit was rejected before WAL").into());
+        };
+        let (indeterminate, _) = error.into_parts();
+        let record = log
+            .records
+            .first()
+            .copied()
+            .ok_or_else(|| io::Error::other("durable record is missing"))?;
+        log.records.push(record);
+        log.durable_len = 2;
+
+        let error = coordinator
+            .resolve(indeterminate, &mut log)
+            .err()
+            .ok_or_else(|| io::Error::other("duplicate records produced a resolution"))?;
+
+        assert_eq!(
+            error.failure(),
+            &TransactionResolutionFailure::Source(
+                InMemoryTransactionRecoveryError::DuplicateCommitRecord(transaction_id)
+            )
+        );
+        assert_eq!(error.transaction_id(), transaction_id);
+        assert_eq!(
+            coordinator.status(transaction_id),
+            Some(TransactionLifecycleStatus::Indeterminate)
         );
         Ok(())
     }

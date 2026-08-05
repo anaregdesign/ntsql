@@ -3,6 +3,7 @@ members = [
 	"crates/ntsql-compatibility",
 	"crates/ntsql-contract",
 	"crates/ntsql-diagnostics",
+	"crates/ntsql-storage-file",
 	"crates/ntsql-storage-memory",
 	"crates/ntsql-testkit",
 	"crates/ntsql-transaction",

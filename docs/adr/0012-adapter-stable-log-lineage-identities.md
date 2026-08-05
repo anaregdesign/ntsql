@@ -4,6 +4,7 @@
 - Date: 2026-08-05
 - Issue: #74
 - Extends: ADR 0001, ADR 0005, ADR 0008, ADR 0009, ADR 0010, ADR 0011
+- Extended by: ADR 0013
 
 ## Context
 
@@ -62,10 +63,10 @@ authorization token, checksum, or secret. Reusing one ID for independent logs
 causes them to compare as the same lineage and is a trusted adapter violation.
 The nonzero `u128` space reduces no such contractual responsibility.
 
-No endianness, byte width on disk, header, version, checksum, atomic creation,
-directory flush, or migration behavior is defined. A filesystem adapter must
-make those choices in a separately reviewed format ADR before claiming that the
-ID survives a real crash or process restart.
+This ADR defines no endianness, byte width on disk, header, version, checksum,
+atomic creation, directory flush, or migration behavior. ADR 0013 makes those
+choices for the first ntsql-owned transaction commit-log format before its
+adapter reconstructs this capability.
 
 ## Compatibility Boundary
 
@@ -88,6 +89,7 @@ behavior, diagnostic, or compatibility status.
 ## Consequences
 
 The domain now has the stable identity primitive required by a later filesystem
-format without taking ownership of generation or I/O. Persistent encoding,
-durable epoch allocation, WAL record framing, checksums, barriers, recovery scan
-cutoffs, checkpoints, and redo/undo remain Issue #9 work.
+format without taking ownership of generation or I/O. ADR 0013 owns the first
+persistent encoding, durable epoch allocation, commit framing, checksums,
+barriers, and recovered durable frontier. Page WAL, checkpoints, and redo/undo
+remain Issue #9 work.

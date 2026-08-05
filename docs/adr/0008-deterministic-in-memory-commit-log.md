@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #63
 - Extends: ADR 0001, ADR 0005, ADR 0006, ADR 0007
-- Extended by: ADR 0009, ADR 0010, ADR 0011, ADR 0012
+- Extended by: ADR 0009, ADR 0010, ADR 0011, ADR 0012, ADR 0013
 
 ## Context
 
@@ -120,5 +120,6 @@ remain blocked by the legal contract.
 Subsequent recovery tests have a deterministic shared adapter instead of
 reimplementing ambiguous fakes. The model is intentionally synchronous and
 in-memory. Its authoritative lookup is only a model of durable-record presence;
-persistent lineages and epochs, WAL encoding, filesystem barriers, checkpoints,
-redo/undo, group commit, and client-visible outcomes remain later Issue #9 work.
+ADR 0013 separately persists lineages, epoch allocation, commit records, and the
+durable frontier. Page WAL, checkpoints, redo/undo, group commit, and
+client-visible outcomes remain later Issue #9 work.

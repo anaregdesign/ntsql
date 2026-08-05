@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #72
 - Extends: ADR 0001, ADR 0005, ADR 0007, ADR 0008, ADR 0009, ADR 0010
-- Extended by: ADR 0012
+- Extended by: ADR 0012, ADR 0013
 
 ## Context
 
@@ -70,9 +70,10 @@ malicious adapter can violate its port contract. Branding prevents accidental
 foreign-lineage substitution and makes validation explicit; it is not an
 authorization or cryptographic mechanism.
 
-No lineage ID or branded position has a persistent byte representation yet. A
-filesystem adapter must define, persist, validate, and recover its stable ID
-before translating stored numeric positions into these runtime capabilities.
+ADR 0013 defines the first ntsql-owned byte representation for the persistent ID
+and numeric positions. Its file adapter validates the complete stream before
+translating numbers back into runtime capabilities. Those bytes remain
+ntsql-internal and are not SQL Server LSNs.
 
 ## Compatibility Boundary
 
@@ -98,6 +99,6 @@ does not alter any compatibility feature status or client-visible behavior.
 ## Consequences
 
 Current WAL, transaction, recovery, and memory ports no longer treat a bare
-number as a transferable log position. Persistent lineage encoding, WAL record
-formats, filesystem barriers, checkpoints, redo/undo, and SQL Server-visible LSN
-semantics remain later Issue #9 work.
+number as a transferable log position. ADR 0013 supplies one transaction
+commit-log encoding and barrier implementation. Page WAL, checkpoints, redo/undo,
+and SQL Server-visible LSN semantics remain later Issue #9 work.

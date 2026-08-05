@@ -4,7 +4,7 @@
 - Date: 2026-08-04
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
-  ADR 0010, ADR 0011, ADR 0012
+  ADR 0010, ADR 0011, ADR 0012, ADR 0013
 
 ## Context
 
@@ -65,6 +65,8 @@ ntsql-transaction ------> ntsql-wal
 
 ntsql-wal --------------> standard library only
 
+ntsql-storage-file -----> ntsql-transaction, ntsql-wal
+
 ntsql-storage-memory ---> ntsql-transaction, ntsql-wal
 
 ntsql-architecture-check -------> standard library only
@@ -106,6 +108,12 @@ resolved state.
 the transaction commit-log, epoch-source, and recovery-lookup ports, depends
 inward on both domain crates, and provides deterministic before/after-effect
 fault injection. Neither domain crate may depend on it.
+
+`ntsql-storage-file` is the first outer filesystem persistence adapter. It owns
+the ntsql-specific transaction commit-log bytes and synchronous file barriers,
+implements the same three domain ports, and depends inward on the same exact two
+domain crates. It owns no SQL Server file format, client diagnostic, or domain
+policy. Neither domain crate may depend on it.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and

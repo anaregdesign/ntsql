@@ -1,15 +1,19 @@
 use std::{error::Error, io};
 
-use ntsql_page::{PageAddress, PageImage, PageNumber, PageVersion, stage_page_write};
+use ntsql_page::{
+    PageAddress, PageImage, PageNumber, PageVersion, flush_dirty_page, stage_page_write,
+};
 use ntsql_storage_memory::{
     FaultPoint, InMemoryCommitLog, InMemoryCommitLogError, InMemoryPageStore,
     InMemoryPageStoreError, InMemoryTransactionRecoveryError, PageStoreFaultPoint,
 };
 use ntsql_transaction::{
-    CoordinatedCommitError, DurableCommitLookup, DurableTransactionPageCommitClassification,
+    CoordinatedCommitError, DurableCommitLookup, DurableCommittedTransactionPageReconciliation,
+    DurableCommittedTransactionPageReconciliationError, DurableTransactionPageCommitClassification,
     TransactionCommitResolution, TransactionCommittedFlushError, TransactionCoordinator,
     TransactionLifecycleStatus, TransactionPageStageError, TransactionPageStageRejectionReason,
     TransactionRecoverySource, classify_durable_transaction_page, flush_committed_page,
+    reconcile_committed_transaction_page,
 };
 use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
 
@@ -660,6 +664,244 @@ fn durable_prefix_projection_classifies_memory_pages_across_restart_and_reopen()
             page_position: reopened.lineage().position(3),
         }
     );
+    Ok(())
+}
+
+#[test]
+fn committed_reconciliation_uses_one_memory_prefix_after_restart_and_reopen()
+-> Result<(), Box<dyn Error>> {
+    let persistent_id = persistent_log_id(17)?;
+    let mut log = InMemoryCommitLog::<2>::with_persistent_lineage_id(persistent_id);
+    let lineage = log.lineage().clone();
+    let number = page_number(80)?;
+    let mut behind_store = InMemoryPageStore::new(&log);
+    let mut exact_store = InMemoryPageStore::new(&log);
+    let missing_store = InMemoryPageStore::new(&log);
+    let mut raw_store = InMemoryPageStore::new(&log);
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+
+    let stored_active = coordinator.begin()?;
+    let stored_page = unlogged_page(log.lineage(), 80, 10, [1, 2])?;
+    let (stored_active, stored_dirty) =
+        coordinator.stage_page_write(stored_active, stored_page, &mut log)?;
+    let stored_commit = coordinator.commit(stored_active, &mut log)?;
+    flush_committed_page(&stored_commit, &mut log, &mut behind_store, stored_dirty)?;
+    assert_eq!(stored_commit.log_position().get(), 2);
+
+    let latest_active = coordinator.begin()?;
+    let latest_page = unlogged_page(log.lineage(), 80, 1, [3, 4])?;
+    let (latest_active, latest_dirty) =
+        coordinator.stage_page_write(latest_active, latest_page, &mut log)?;
+    let latest_commit = coordinator.commit(latest_active, &mut log)?;
+    flush_committed_page(&latest_commit, &mut log, &mut exact_store, latest_dirty)?;
+    assert_eq!(latest_commit.log_position().get(), 4);
+
+    let uncommitted_active = coordinator.begin()?;
+    let uncommitted_page = unlogged_page(log.lineage(), 80, 20, [5, 6])?;
+    let (uncommitted_active, uncommitted_dirty) =
+        coordinator.stage_page_write(uncommitted_active, uncommitted_page, &mut log)?;
+    assert_eq!(uncommitted_dirty.required_position().get(), 5);
+    log.flush_through(uncommitted_dirty.required_position())?;
+
+    let raw_page = unlogged_page(log.lineage(), 80, 30, [7, 8])?;
+    let raw_dirty = stage_page_write(&mut log, raw_page)?;
+    assert_eq!(raw_dirty.required_position().get(), 6);
+    flush_dirty_page(&mut log, &mut raw_store, raw_dirty)?;
+
+    log.arm_fault(FaultPoint::BeforeFlush)?;
+    let volatile_commit = coordinator
+        .commit(uncommitted_active, &mut log)
+        .err()
+        .ok_or_else(|| io::Error::other("volatile commit unexpectedly became durable"))?;
+    assert!(matches!(
+        volatile_commit,
+        CoordinatedCommitError::Indeterminate(_)
+    ));
+    assert_eq!(log.records().len(), 7);
+    assert_eq!(log.durable_records().len(), 6);
+
+    let exact_snapshot = exact_store
+        .page(number)
+        .ok_or_else(|| io::Error::other("exact memory snapshot is missing"))?
+        .page_recovery_observation()?;
+    let mut all_physical = Vec::new();
+    let mut all_owned = Vec::new();
+    let mut all_commits = Vec::new();
+    for record in log.records() {
+        if let Some(observation) = record.page_recovery_observation()? {
+            all_physical.push(observation);
+        }
+        if let Some(observation) = record.transaction_page_recovery_observation()? {
+            all_owned.push(observation);
+        }
+        if let Some(observation) = record.transaction_commit_recovery_observation()? {
+            all_commits.push(observation);
+        }
+    }
+    let all_result = reconcile_committed_transaction_page(
+        log.lineage(),
+        number,
+        Some(&exact_snapshot),
+        &all_physical,
+        &all_owned,
+        &all_commits,
+    )?;
+    let DurableCommittedTransactionPageReconciliation::StoreBehind {
+        stored_page_position,
+        stored_commit_position,
+        latest_committed,
+    } = all_result
+    else {
+        return Err(io::Error::other("all memory records did not expose volatile commit").into());
+    };
+    assert_eq!(stored_page_position, log.lineage().position(3));
+    assert_eq!(stored_commit_position, log.lineage().position(4));
+    assert_eq!(latest_committed.observation().position().get(), 5);
+    assert_eq!(latest_committed.commit_position().get(), 7);
+
+    drop(uncommitted_dirty);
+    let mut reopened = log.restart();
+    reopened.reopen()?;
+    assert!(reopened.lineage().same_lineage(&lineage));
+    assert_eq!(reopened.records().len(), 6);
+    assert_eq!(reopened.durable_records().len(), 6);
+
+    let mut physical = Vec::new();
+    let mut owned = Vec::new();
+    let mut commits = Vec::new();
+    for record in reopened.durable_records() {
+        if let Some(observation) = record.page_recovery_observation()? {
+            physical.push(observation);
+        }
+        if let Some(observation) = record.transaction_page_recovery_observation()? {
+            owned.push(observation);
+        }
+        if let Some(observation) = record.transaction_commit_recovery_observation()? {
+            commits.push(observation);
+        }
+    }
+    assert_eq!(
+        physical
+            .iter()
+            .map(|observation| observation.position().get())
+            .collect::<Vec<_>>(),
+        [1, 3, 5, 6]
+    );
+    assert_eq!(
+        owned
+            .iter()
+            .map(|observation| observation.position().get())
+            .collect::<Vec<_>>(),
+        [1, 3, 5]
+    );
+    assert_eq!(
+        commits
+            .iter()
+            .map(|observation| observation.position().get())
+            .collect::<Vec<_>>(),
+        [2, 4]
+    );
+    assert!(
+        physical
+            .iter()
+            .all(|observation| { observation.position().lineage().same_lineage(&lineage) })
+    );
+    assert!(
+        owned
+            .iter()
+            .all(|observation| { observation.position().lineage().same_lineage(&lineage) })
+    );
+    assert!(
+        commits
+            .iter()
+            .all(|observation| { observation.position().lineage().same_lineage(&lineage) })
+    );
+
+    let behind_snapshot = behind_store
+        .page(number)
+        .ok_or_else(|| io::Error::other("behind memory snapshot is missing"))?
+        .page_recovery_observation()?;
+    let behind = reconcile_committed_transaction_page(
+        reopened.lineage(),
+        number,
+        Some(&behind_snapshot),
+        &physical,
+        &owned,
+        &commits,
+    )?;
+    let DurableCommittedTransactionPageReconciliation::StoreBehind {
+        stored_page_position,
+        stored_commit_position,
+        latest_committed,
+    } = behind
+    else {
+        return Err(io::Error::other("memory store was not behind").into());
+    };
+    assert_eq!(stored_page_position, reopened.lineage().position(1));
+    assert_eq!(stored_commit_position, reopened.lineage().position(2));
+    assert!(std::ptr::eq(latest_committed.observation(), &owned[1]));
+    assert_eq!(
+        latest_committed.observation().page().page_version().get(),
+        1
+    );
+    assert_eq!(latest_committed.commit_position().get(), 4);
+
+    let exact = reconcile_committed_transaction_page(
+        reopened.lineage(),
+        number,
+        Some(&exact_snapshot),
+        &physical,
+        &owned,
+        &commits,
+    )?;
+    let DurableCommittedTransactionPageReconciliation::ExactCurrent { latest_committed } = exact
+    else {
+        return Err(io::Error::other("memory store was not exact committed state").into());
+    };
+    assert!(std::ptr::eq(latest_committed.observation(), &owned[1]));
+
+    let missing_snapshot = missing_store
+        .page(number)
+        .map(|page| page.page_recovery_observation())
+        .transpose()?;
+    let missing = reconcile_committed_transaction_page(
+        reopened.lineage(),
+        number,
+        missing_snapshot.as_ref(),
+        &physical,
+        &owned,
+        &commits,
+    )?;
+    let DurableCommittedTransactionPageReconciliation::StoreMissing { latest_committed } = missing
+    else {
+        return Err(io::Error::other("memory store was not missing").into());
+    };
+    assert!(std::ptr::eq(latest_committed.observation(), &owned[1]));
+
+    let raw_snapshot = raw_store
+        .page(number)
+        .ok_or_else(|| io::Error::other("raw memory snapshot is missing"))?
+        .page_recovery_observation()?;
+    assert_eq!(
+        reconcile_committed_transaction_page(
+            reopened.lineage(),
+            number,
+            Some(&raw_snapshot),
+            &physical,
+            &owned,
+            &commits,
+        ),
+        Err(
+            DurableCommittedTransactionPageReconciliationError::SnapshotBackedByRawPage {
+                page_number: number,
+                position: reopened.lineage().position(6),
+            }
+        )
+    );
+
+    let later_page = unlogged_page(reopened.lineage(), 81, 1, [9, 10])?;
+    let later_dirty = stage_page_write(&mut reopened, later_page)?;
+    assert_eq!(later_dirty.required_position().get(), 8);
     Ok(())
 }
 

@@ -3,6 +3,7 @@ members = [
 	"crates/ntsql-compatibility",
 	"crates/ntsql-contract",
 	"crates/ntsql-diagnostics",
+	"crates/ntsql-testkit",
 	"tools/ntsql-architecture-check",
 ]
 resolver = "3"
@@ -15,6 +16,7 @@ rust-version = "1.97.1"
 
 [workspace.dependencies]
 ntsql-compatibility = { path = "crates/ntsql-compatibility" }
+ntsql-contract = { path = "crates/ntsql-contract" }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0.142", default-features = false, features = ["arbitrary_precision", "std"] }
 

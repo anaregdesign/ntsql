@@ -1,7 +1,9 @@
 //! Versioned filesystem-backed commit-log adapter for ntsql transaction records.
 //!
-//! The caller supplies one existing parent directory, one file path, one stable
-//! [`PersistentLogId`], and an exclusive single-writer trust boundary.
+//! The caller supplies one existing parent directory, one trusted file path, and
+//! one stable [`PersistentLogId`]. The adapter holds a nonblocking advisory
+//! exclusive file lock for its lifetime; excluding non-cooperating writers
+//! remains an outer trust boundary.
 //!
 //! ## Format v1
 //!
@@ -146,6 +148,7 @@ impl Error for FaultAlreadyArmed {}
 pub enum FileIoStage {
     CreateFile,
     OpenFile,
+    AcquireExclusiveLock,
     OpenParentDirectory,
     ReadMetadata,
     ReadHeader,
@@ -170,6 +173,9 @@ impl fmt::Display for FileIoStage {
         match self {
             Self::CreateFile => formatter.write_str("creating the commit-log file"),
             Self::OpenFile => formatter.write_str("opening the commit-log file"),
+            Self::AcquireExclusiveLock => {
+                formatter.write_str("acquiring the exclusive commit-log file lock")
+            }
             Self::OpenParentDirectory => formatter.write_str("opening the parent directory"),
             Self::ReadMetadata => formatter.write_str("reading commit-log metadata"),
             Self::ReadHeader => formatter.write_str("reading the commit-log header"),
@@ -652,6 +658,12 @@ impl FileCommitLog {
             .map_err(|source| {
                 FileCreateError::Io(FileIoError::new(FileIoStage::CreateFile, source))
             })?;
+        file.try_lock().map_err(|source| {
+            FileCreateError::Io(FileIoError::new(
+                FileIoStage::AcquireExclusiveLock,
+                source.into(),
+            ))
+        })?;
 
         let header = build_header(persistent_id);
         file.write_all(&header).map_err(|source| {
@@ -690,6 +702,12 @@ impl FileCommitLog {
             .write(true)
             .open(path)
             .map_err(|source| FileOpenError::Io(FileIoError::new(FileIoStage::OpenFile, source)))?;
+        file.try_lock().map_err(|source| {
+            FileOpenError::Io(FileIoError::new(
+                FileIoStage::AcquireExclusiveLock,
+                source.into(),
+            ))
+        })?;
         file.sync_all().map_err(|source| {
             FileOpenError::Io(FileIoError::new(FileIoStage::SyncOpenedFile, source))
         })?;
@@ -1510,6 +1528,58 @@ mod tests {
         let reopened = FileCommitLog::open(&path)?;
         assert_eq!(reopened.persistent_id(), persistent_id);
         assert!(reopened.records().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_lock_blocks_reopen_before_tail_repair_and_releases_on_drop()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("exclusive-lock")?;
+        let path = directory.path().join("commit-log.bin");
+        let log = FileCommitLog::create_new(&path, persistent_id(9)?)?;
+        append_bytes(&path, &[1, 2, 3])?;
+        let bytes_before_open = fs::read(&path)?;
+
+        let error = FileCommitLog::open(&path)
+            .err()
+            .ok_or_else(|| io::Error::other("second writer acquired the file lock"))?;
+
+        let FileOpenError::Io(source) = error else {
+            return Err(io::Error::other("lock contention was not reported as I/O").into());
+        };
+        assert_eq!(source.stage(), FileIoStage::AcquireExclusiveLock);
+        assert_eq!(source.io_source().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(&path)?, bytes_before_open);
+
+        drop(log);
+        let reopened = FileCommitLog::open(&path)?;
+        assert_eq!(fs::metadata(&path)?.len(), HEADER_LENGTH_U64);
+        drop(reopened);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_alias_cannot_bypass_exclusive_lock() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("hard-link-lock")?;
+        let path = directory.path().join("commit-log.bin");
+        let alias = directory.path().join("commit-log-alias.bin");
+        let log = FileCommitLog::create_new(&path, persistent_id(10)?)?;
+        fs::hard_link(&path, &alias)?;
+
+        let error = FileCommitLog::open(&alias)
+            .err()
+            .ok_or_else(|| io::Error::other("hard-link alias bypassed the file lock"))?;
+
+        let FileOpenError::Io(source) = error else {
+            return Err(io::Error::other("alias lock contention was not reported as I/O").into());
+        };
+        assert_eq!(source.stage(), FileIoStage::AcquireExclusiveLock);
+        assert_eq!(source.io_source().kind(), io::ErrorKind::WouldBlock);
+
+        drop(log);
+        let reopened = FileCommitLog::open(&alias)?;
+        assert_eq!(reopened.persistent_id(), persistent_id(10)?);
         Ok(())
     }
 

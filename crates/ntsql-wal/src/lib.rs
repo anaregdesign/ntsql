@@ -1,26 +1,87 @@
 //! I/O-free write-ahead durability invariants.
 
-use std::{error::Error, fmt, marker::PhantomData, sync::Arc};
+use std::{error::Error, fmt, marker::PhantomData, num::NonZeroU128, sync::Arc};
 
-/// Opaque runtime identity for one commit-log lineage.
+/// Nonzero adapter-supplied identity for reconstructing one persistent lineage.
 ///
-/// Persistence adapters clone this value when one logical log is exposed
-/// through multiple ports. Independent calls to [`LogLineage::new`] produce
-/// identities that do not match without randomness, clocks, or global state.
+/// Allocation, durable storage, and uniqueness belong to the outer persistence
+/// adapter. This domain value defines no byte encoding or SQL Server identity.
+///
+/// ```compile_fail
+/// use std::num::NonZeroU128;
+/// use ntsql_wal::PersistentLogId;
+///
+/// let forged = PersistentLogId(NonZeroU128::MIN);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct PersistentLogId(NonZeroU128);
+
+impl PersistentLogId {
+    /// Wraps one nonzero adapter-owned identity.
+    #[must_use]
+    pub const fn new(value: u128) -> Option<Self> {
+        match NonZeroU128::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the numeric identity for adapter bookkeeping.
+    #[must_use]
+    pub const fn get(self) -> u128 {
+        self.0.get()
+    }
+}
+
 #[derive(Clone, Debug)]
-pub struct LogLineage(Arc<()>);
+enum LogLineageIdentity {
+    Ephemeral(Arc<()>),
+    Persistent(PersistentLogId),
+}
+
+/// Opaque identity for one commit-log lineage.
+///
+/// Ephemeral identities compare by runtime pointer. Persistent identities compare
+/// by their adapter-supplied stable ID so a later runtime can reconstruct the
+/// same capability.
+#[derive(Clone, Debug)]
+pub struct LogLineage(LogLineageIdentity);
 
 impl LogLineage {
     /// Creates a fresh runtime identity for one logical log lineage.
     #[must_use]
     pub fn new() -> Self {
-        Self(Arc::new(()))
+        Self(LogLineageIdentity::Ephemeral(Arc::new(())))
+    }
+
+    /// Reconstructs a lineage from one trusted persistent identity.
+    #[must_use]
+    pub const fn persistent(id: PersistentLogId) -> Self {
+        Self(LogLineageIdentity::Persistent(id))
+    }
+
+    /// Returns the persistent identity when this lineage is reconstructable.
+    #[must_use]
+    pub const fn persistent_id(&self) -> Option<PersistentLogId> {
+        match self.0 {
+            LogLineageIdentity::Ephemeral(_) => None,
+            LogLineageIdentity::Persistent(id) => Some(id),
+        }
     }
 
     /// Returns whether both values identify the same logical log lineage.
     #[must_use]
     pub fn same_lineage(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        match (&self.0, &other.0) {
+            (LogLineageIdentity::Ephemeral(left), LogLineageIdentity::Ephemeral(right)) => {
+                Arc::ptr_eq(left, right)
+            }
+            (LogLineageIdentity::Persistent(left), LogLineageIdentity::Persistent(right)) => {
+                left == right
+            }
+            (LogLineageIdentity::Ephemeral(_), LogLineageIdentity::Persistent(_))
+            | (LogLineageIdentity::Persistent(_), LogLineageIdentity::Ephemeral(_)) => false,
+        }
     }
 
     /// Binds one adapter-assigned numeric position to this lineage.

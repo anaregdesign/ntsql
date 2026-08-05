@@ -1,14 +1,15 @@
 use std::{error::Error, io};
 
 use ntsql_storage_memory::{
-    FaultPoint, InMemoryCommitLog, InMemoryCommitLogError, InMemoryTransactionRecoveryError,
+    FaultPoint, InMemoryCommitLog, InMemoryCommitLogError, InMemoryLogReopenError,
+    InMemoryTransactionRecoveryError,
 };
 use ntsql_transaction::{
     CoordinatedCommitError, IndeterminateTransaction, TransactionCommitRejectionReason,
     TransactionCommitResolution, TransactionCoordinator, TransactionLifecycleStatus,
     TransactionResolutionFailure,
 };
-use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber};
+use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber, PersistentLogId};
 
 #[test]
 fn successful_commit_appends_and_flushes_exact_record() -> Result<(), Box<dyn Error>> {
@@ -362,6 +363,61 @@ fn restart_preserves_log_lineage_and_advances_coordinator_epoch() -> Result<(), 
     first_coordinator.commit(first, &mut restarted)?;
     second_coordinator.commit(second, &mut restarted)?;
     assert_eq!(restarted.durable_records().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn persistent_reopen_reconstructs_lineage_and_preserves_high_water_marks()
+-> Result<(), Box<dyn Error>> {
+    let persistent_id = PersistentLogId::new(1)
+        .ok_or_else(|| io::Error::other("nonzero persistent ID was rejected"))?;
+    let mut log = InMemoryCommitLog::with_persistent_lineage(persistent_id);
+    let mut first_coordinator = TransactionCoordinator::open(&mut log)?;
+
+    let first = first_coordinator.begin()?;
+    let first_position = first_coordinator
+        .commit(first, &mut log)?
+        .log_position()
+        .clone();
+
+    log.arm_fault(FaultPoint::AfterAppend)?;
+    let second = first_coordinator.begin()?;
+    let _ = indeterminate_parts(first_coordinator.commit(second, &mut log))?;
+    let third = first_coordinator.begin()?;
+    log.arm_fault(FaultPoint::BeforeFlush)?;
+
+    log.reopen()?;
+
+    assert_eq!(log.records().len(), 1);
+    assert_eq!(log.durable_records().len(), 1);
+    assert_eq!(log.armed_fault(), None);
+    assert_eq!(first_position, log.lineage().position(1));
+
+    let third_commit = first_coordinator.commit(third, &mut log)?;
+    assert_eq!(third_commit.log_position().get(), 3);
+    let second_coordinator = TransactionCoordinator::open(&mut log)?;
+    assert_eq!(second_coordinator.epoch().get(), 2);
+    Ok(())
+}
+
+#[test]
+fn ephemeral_reopen_rejects_before_discarding_state() -> Result<(), Box<dyn Error>> {
+    let mut log = InMemoryCommitLog::new();
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    log.arm_fault(FaultPoint::AfterAppend)?;
+    let active = coordinator.begin()?;
+    let _ = indeterminate_parts(coordinator.commit(active, &mut log))?;
+    log.arm_fault(FaultPoint::BeforeFlush)?;
+
+    let error = log
+        .reopen()
+        .err()
+        .ok_or_else(|| io::Error::other("ephemeral lineage unexpectedly reopened"))?;
+
+    assert_eq!(error, InMemoryLogReopenError::EphemeralLineage);
+    assert_eq!(log.records().len(), 1);
+    assert_eq!(log.durable_records().len(), 0);
+    assert_eq!(log.armed_fault(), Some(FaultPoint::BeforeFlush));
     Ok(())
 }
 

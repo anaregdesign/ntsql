@@ -4,7 +4,8 @@
 - Date: 2026-08-05
 - Issue: #50
 - Extends: ADR 0001
-- Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009, ADR 0010, ADR 0011
+- Extended by: ADR 0006, ADR 0007, ADR 0008, ADR 0009, ADR 0010, ADR 0011,
+  ADR 0012
 
 ## Context
 
@@ -26,7 +27,9 @@ until both operations succeed.
 - `LogSequenceNumber`, an opaque ntsql-internal adapter-assigned position bound
   to one runtime lineage, with no SQL Server, wire, or persistent byte
   representation;
-- `LogLineage`, an opaque runtime identity shared by ports for one logical log;
+- `LogLineage`, an opaque identity shared by ports for one logical log, using
+  either ephemeral runtime pointer identity or an adapter-supplied persistent
+  ID;
 - `CommitLog<Record>`, the inward port for appending a caller-owned record and
   flushing through a position, together with its lineage identity;
 - `CommitError`, which distinguishes append failure from flush failure and
@@ -57,6 +60,11 @@ The durability fence snapshots the log lineage before append. It rejects both a
 position from another lineage and a log whose lineage changes during append,
 before calling flush or constructing an acknowledgement. This is fail-closed
 adapter validation, not proof that an arbitrary adapter is honest.
+
+ADR 0012 adds `PersistentLogId` so a later storage runtime can reconstruct the
+same lineage capability. The WAL domain neither allocates nor encodes this ID;
+the outer adapter must durably store it and prevent reuse across independent
+logs.
 
 The intended dependency direction is:
 

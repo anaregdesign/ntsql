@@ -6,7 +6,7 @@ use ntsql_transaction::{
     DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
     TransactionRecoverySource,
 };
-use ntsql_wal::{CommitLog, LogLineage, LogSequenceNumber};
+use ntsql_wal::{CommitLog, LogLineage, LogSequenceNumber, PersistentLogId};
 
 /// One-shot physical-effect boundary for the next matching log operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,6 +174,25 @@ impl fmt::Display for InMemoryTransactionRecoveryError {
 
 impl Error for InMemoryTransactionRecoveryError {}
 
+/// Failure to reconstruct a memory log as a later storage runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryLogReopenError {
+    /// Ephemeral pointer identity has no stable value to reconstruct.
+    EphemeralLineage,
+}
+
+impl fmt::Display for InMemoryLogReopenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EphemeralLineage => {
+                formatter.write_str("ephemeral commit-log lineage cannot be reopened")
+            }
+        }
+    }
+}
+
+impl Error for InMemoryLogReopenError {}
+
 /// Inspectable in-memory implementation of the transaction commit-log port.
 ///
 /// This adapter models only repository-authored physical effects. Its durable
@@ -193,8 +212,18 @@ impl InMemoryCommitLog {
     /// Creates an empty log whose first assigned position is one.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_lineage(LogLineage::new())
+    }
+
+    /// Creates an empty log with one adapter-supplied persistent identity.
+    #[must_use]
+    pub fn with_persistent_lineage(id: PersistentLogId) -> Self {
+        Self::with_lineage(LogLineage::persistent(id))
+    }
+
+    fn with_lineage(lineage: LogLineage) -> Self {
         Self {
-            lineage: LogLineage::new(),
+            lineage,
             records: Vec::new(),
             durable_len: 0,
             next_epoch: Some(NonZeroU64::MIN),
@@ -254,6 +283,28 @@ impl InMemoryCommitLog {
         self.records.truncate(self.durable_len);
         self.armed_fault = None;
         self
+    }
+
+    /// Simulates reopening durable state after runtime lineage identity is lost.
+    ///
+    /// The persistent ID is validated before any volatile state or fault is
+    /// discarded. Durable positions are reconstructed from the reopened
+    /// capability while allocator high-water marks remain unchanged.
+    pub fn reopen(&mut self) -> Result<(), InMemoryLogReopenError> {
+        let id = self
+            .lineage
+            .persistent_id()
+            .ok_or(InMemoryLogReopenError::EphemeralLineage)?;
+        let lineage = LogLineage::persistent(id);
+
+        self.records.truncate(self.durable_len);
+        for record in &mut self.records {
+            let value = record.position.get();
+            record.position = lineage.position(value);
+        }
+        self.lineage = lineage;
+        self.armed_fault = None;
+        Ok(())
     }
 
     fn consume_fault(&mut self, point: FaultPoint) -> bool {

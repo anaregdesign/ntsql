@@ -1,6 +1,8 @@
 use std::{cell::Cell, error::Error, fmt};
 
-use ntsql_wal::{CommitError, CommitLog, LogLineage, LogSequenceNumber, commit_durability};
+use ntsql_wal::{
+    CommitError, CommitLog, LogLineage, LogSequenceNumber, PersistentLogId, commit_durability,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FakeError {
@@ -193,4 +195,25 @@ fn flush_failure_preserves_unacknowledged_position_and_cause() {
         ]
     );
     assert!(!callback_called.get());
+}
+
+#[test]
+fn persistent_id_reconstructs_lineage_and_position_identity() -> Result<(), Box<dyn Error>> {
+    assert_eq!(PersistentLogId::new(0), None);
+    let id = PersistentLogId::new(7)
+        .ok_or_else(|| std::io::Error::other("nonzero persistent ID was rejected"))?;
+    let other_id = PersistentLogId::new(8)
+        .ok_or_else(|| std::io::Error::other("nonzero persistent ID was rejected"))?;
+    let first = LogLineage::persistent(id);
+    let reopened = LogLineage::persistent(id);
+    let other = LogLineage::persistent(other_id);
+    let ephemeral = LogLineage::new();
+
+    assert_eq!(first.persistent_id(), Some(id));
+    assert!(first.same_lineage(&reopened));
+    assert!(!first.same_lineage(&other));
+    assert!(!first.same_lineage(&ephemeral));
+    assert_eq!(first.position(41), reopened.position(41));
+    assert_ne!(first.position(41), other.position(41));
+    Ok(())
 }

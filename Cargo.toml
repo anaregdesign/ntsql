@@ -3,6 +3,7 @@ members = [
 	"crates/ntsql-compatibility",
 	"crates/ntsql-contract",
 	"crates/ntsql-diagnostics",
+	"crates/ntsql-page",
 	"crates/ntsql-storage-file",
 	"crates/ntsql-storage-memory",
 	"crates/ntsql-testkit",
@@ -21,6 +22,7 @@ rust-version = "1.97.1"
 [workspace.dependencies]
 ntsql-compatibility = { version = "0.1.0", path = "crates/ntsql-compatibility" }
 ntsql-contract = { version = "0.1.0", path = "crates/ntsql-contract" }
+ntsql-page = { version = "0.1.0", path = "crates/ntsql-page" }
 ntsql-transaction = { version = "0.1.0", path = "crates/ntsql-transaction" }
 ntsql-wal = { version = "0.1.0", path = "crates/ntsql-wal" }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }

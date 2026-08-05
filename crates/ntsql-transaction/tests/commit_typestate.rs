@@ -6,7 +6,7 @@ use ntsql_transaction::{
     TransactionEpochSource, TransactionId, TransactionLifecycleStatus, TransactionRecoverySource,
     TransactionResolutionFailure,
 };
-use ntsql_wal::{CommitError, CommitLog, LogLineage, LogSequenceNumber};
+use ntsql_wal::{CommitError, CommitLog, LogDurability, LogLineage, LogSequenceNumber};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FakeError {
@@ -90,13 +90,24 @@ impl FakeCommitLog {
     }
 }
 
-impl CommitLog<TransactionCommitRecord> for FakeCommitLog {
+impl LogDurability for FakeCommitLog {
     type Error = FakeError;
 
     fn lineage(&self) -> &LogLineage {
         &self.lineage
     }
 
+    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
+        self.calls.push(Call::Flush(position.clone()));
+        if self.flush_fails {
+            Err(FakeError::Flush)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CommitLog<TransactionCommitRecord> for FakeCommitLog {
     fn append_commit(
         &mut self,
         record: &TransactionCommitRecord,
@@ -106,15 +117,6 @@ impl CommitLog<TransactionCommitRecord> for FakeCommitLog {
             Err(FakeError::Append)
         } else {
             Ok(self.position.clone())
-        }
-    }
-
-    fn flush_through(&mut self, position: &LogSequenceNumber) -> Result<(), Self::Error> {
-        self.calls.push(Call::Flush(position.clone()));
-        if self.flush_fails {
-            Err(FakeError::Flush)
-        } else {
-            Ok(())
         }
     }
 }

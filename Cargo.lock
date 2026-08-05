@@ -36,6 +36,13 @@ name = "ntsql-diagnostics"
 version = "0.1.0"
 
 [[package]]
+name = "ntsql-page"
+version = "0.1.0"
+dependencies = [
+ "ntsql-wal",
+]
+
+[[package]]
 name = "ntsql-storage-file"
 version = "0.1.0"
 dependencies = [

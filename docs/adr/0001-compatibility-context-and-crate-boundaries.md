@@ -4,7 +4,7 @@
 - Date: 2026-08-04
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
-  ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014
+  ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014, ADR 0015
 
 ## Context
 
@@ -63,6 +63,8 @@ ntsql-testkit ----------> ntsql-contract
 
 ntsql-transaction ------> ntsql-wal
 
+ntsql-page -------------> ntsql-wal
+
 ntsql-wal --------------> standard library only
 
 ntsql-storage-file -----> ntsql-transaction, ntsql-wal
@@ -104,6 +106,12 @@ lookup port and validates coordinator ownership, retained lifecycle, and log
 lineage before authoritative durable-record evidence can create terminal
 resolved state.
 
+`ntsql-page` owns the I/O-free page lifecycle and write-ahead ordering boundary.
+It binds internal page addresses to one log lineage, retains the exact WAL
+position required by a dirty image, and permits a page-store write only after
+that position reports durable. It owns no filesystem, persistent page format,
+checkpoint, buffer replacement, redo/undo, or client diagnostic.
+
 `ntsql-storage-memory` is an outer synthetic persistence adapter. It implements
 the transaction commit-log, epoch-source, and recovery-lookup ports, depends
 inward on both domain crates, and provides deterministic before/after-effect
@@ -121,7 +129,9 @@ compares every workspace package's complete set of direct normal, build, and
 development dependencies with the reviewed allowlist. It rejects reverse
 edges, unregistered workspace packages, missing required edges, and unreviewed
 external dependencies. Its negative self-test proves that a
-`ntsql-compatibility -> ntsql-contract` edge is rejected.
+`ntsql-compatibility -> ntsql-contract` edge is rejected. Focused tests also
+reject extra `ntsql-page` dependencies and the reverse `ntsql-wal ->
+ntsql-page` edge.
 
 ## Package Evolution Rules
 
@@ -148,6 +158,10 @@ catch-all package solely to avoid an explicit dependency.
   target selection at the adapter boundary.
 - `ntsql-testkit` tests use repository-authored in-memory sources and explicit
   timestamps, input identities, and normalization plans.
+- `ntsql-page` tests prove exact WAL-before-page call ordering, lineage
+  rejection before either port call, and terminal store-write ambiguity.
+  Compile-fail tests reject construction of the private write permit and clean
+  or retryable states.
 - External conformance tests may enter later only through approved, sanitized,
   provenance-linked behavior specifications.
 - The architecture checker runs in local verification and CI before engine

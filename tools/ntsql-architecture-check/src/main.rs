@@ -27,6 +27,10 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
         allowed_dependencies: &["ntsql-compatibility", "serde", "serde_json"],
     },
     PackagePolicy {
+        package: "ntsql-page",
+        allowed_dependencies: &["ntsql-wal"],
+    },
+    PackagePolicy {
         package: "ntsql-storage-file",
         allowed_dependencies: &["ntsql-transaction", "ntsql-wal"],
     },
@@ -265,6 +269,8 @@ mod tests {
              1ntsql-compatibility v0.1.0\n\
              1serde v1.0.0\n\
              1serde_json v1.0.0\n\
+             0ntsql-page v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
              0ntsql-storage-file v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
@@ -411,6 +417,7 @@ mod tests {
              0ntsql-wal v0.1.0\n\
              1ntsql-contract v0.1.0\n\
              1ntsql-filesystem-adapter v0.1.0\n\
+             1ntsql-page v0.1.0\n\
              1ntsql-protocol-host v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
              1serde v1.0.0\n\
@@ -423,12 +430,33 @@ mod tests {
         for dependency in [
             "ntsql-contract",
             "ntsql-filesystem-adapter",
+            "ntsql-page",
             "ntsql-protocol-host",
             "ntsql-transaction",
             "serde",
         ] {
             assert!(violations.iter().any(|violation| violation
                 == &format!("package ntsql-wal has forbidden direct dependency {dependency}")));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn page_domain_dependencies_are_enforced() -> Result<(), ArchitectureCheckError> {
+        let graph = parse_dependency_tree(
+            "0ntsql-page v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             1ntsql-storage-file v0.1.0\n\
+             1ntsql-wal v0.1.0\n\
+             1serde v1.0.0\n\
+             0ntsql-wal v0.1.0\n",
+        )?;
+
+        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+
+        for dependency in ["ntsql-contract", "ntsql-storage-file", "serde"] {
+            assert!(violations.iter().any(|violation| violation
+                == &format!("package ntsql-page has forbidden direct dependency {dependency}")));
         }
         Ok(())
     }

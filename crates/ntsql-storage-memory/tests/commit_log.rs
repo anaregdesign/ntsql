@@ -9,7 +9,7 @@ use ntsql_transaction::{
     TransactionCommitResolution, TransactionCoordinator, TransactionLifecycleStatus,
     TransactionResolutionFailure,
 };
-use ntsql_wal::{CommitError, CommitLog, LogSequenceNumber, PersistentLogId};
+use ntsql_wal::{CommitError, LogDurability, LogSequenceNumber, PersistentLogId};
 
 #[test]
 fn successful_commit_appends_and_flushes_exact_record() -> Result<(), Box<dyn Error>> {

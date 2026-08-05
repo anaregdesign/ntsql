@@ -5,7 +5,7 @@
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
   ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014, ADR 0015, ADR 0016,
-  ADR 0017
+  ADR 0017, ADR 0018
 
 ## Context
 
@@ -120,11 +120,11 @@ provides deterministic before/after-effect fault injection. No domain crate may
 depend on it.
 
 `ntsql-storage-file` is the outer filesystem persistence adapter. It owns
-versioned ntsql-specific transaction/page WAL bytes and synchronous file
-barriers, implements transaction and page domain ports, and depends inward on
-their three owning crates. It holds a standard-library advisory exclusive lock
-while open but owns no SQL Server file format, client diagnostic, or domain
-policy. No domain crate may depend on it.
+versioned ntsql-specific transaction/page WAL and page-store bytes plus
+synchronous file barriers, implements transaction and page domain ports, and
+depends inward on their three owning crates. It holds a standard-library
+advisory exclusive lock on each open file but owns no SQL Server file format,
+client diagnostic, or domain policy. No domain crate may depend on it.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and

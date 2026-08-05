@@ -4,7 +4,7 @@
 - Date: 2026-08-05
 - Issue: #63
 - Extends: ADR 0001, ADR 0005, ADR 0006, ADR 0007
-- Extended by: ADR 0009, ADR 0010, ADR 0011, ADR 0012, ADR 0013
+- Extended by: ADR 0009, ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0016
 
 ## Context
 
@@ -24,6 +24,7 @@ Add `ntsql-storage-memory` as a standard-library-only synthetic persistence
 adapter with these exact direct dependencies:
 
 ```text
+ntsql-storage-memory -> ntsql-page
 ntsql-storage-memory -> ntsql-transaction
 ntsql-storage-memory -> ntsql-wal
 ```
@@ -64,6 +65,13 @@ ADR 0012 adds a separate `reopen` transformation for logs created with a
 suffix, clears the transient fault, and reconstructs every durable position from
 a fresh lineage value carrying the same ID. Epoch and position high-water marks
 remain unchanged. An ephemeral log rejects reopen without discarding state.
+
+ADR 0016 generalizes the synthetic log over one const-sized internal page image.
+Transaction commits and full page-image records use the same lineage, position
+allocator, physical record order, durable prefix, and restart/reopen
+transformations. It also adds a separate in-memory page store for the same
+lineage. This is a deterministic model only; it does not define persistent page
+bytes or operating-system barriers.
 
 ## Ambiguity and Recovery Boundary
 
@@ -112,7 +120,7 @@ remain blocked by the legal contract.
 - Resolution distinguishes the four fault boundaries, retains an indeterminate
   token for volatile or duplicate records, and uses the complete transaction
   identity rather than its coordinator-local sequence.
-- Architecture tests allow exactly the two inward dependencies and reject
+- Architecture tests allow exactly the three inward dependencies and reject
   reverse adapter dependencies.
 
 ## Consequences
@@ -121,5 +129,6 @@ Subsequent recovery tests have a deterministic shared adapter instead of
 reimplementing ambiguous fakes. The model is intentionally synchronous and
 in-memory. Its authoritative lookup is only a model of durable-record presence;
 ADR 0013 separately persists lineages, epoch allocation, commit records, and the
-durable frontier. Page WAL, checkpoints, redo/undo, group commit, and
+durable frontier. ADR 0016 adds only synthetic full-image page WAL and page-store
+effects. Persistent page records, checkpoints, redo/undo, group commit, and
 client-visible outcomes remain later Issue #9 work.

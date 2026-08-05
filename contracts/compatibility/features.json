@@ -189,6 +189,17 @@
       "legal_review_id": null
     },
     {
+      "id": "storage-recovery.write-ahead-commit",
+      "title": "Write-ahead commit durability and recovery outcome",
+      "category": "storage-recovery",
+      "status": "not-tested",
+      "oracle_targets": ["sqlserver-2022-cu26-linux-x86_64-developer-compat160"],
+      "evidence": ["prov-ms-sql-engine-overview-2022"],
+      "differences": [],
+      "owner_issue": 9,
+      "legal_review_id": null
+    },
+    {
       "id": "storage.native-file-formats",
       "title": "Native MDF, NDF, LDF, and BAK format compatibility",
       "category": "storage-recovery",

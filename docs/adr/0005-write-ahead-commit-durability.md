@@ -1,0 +1,87 @@
+# ADR 0005: Write-Ahead Commit Durability Fence
+
+- Status: Accepted
+- Date: 2026-08-05
+- Issue: #50
+- Extends: ADR 0001
+
+## Context
+
+A transaction coordinator must not acknowledge a commit before its commit record
+is durable. Filesystem APIs, WAL bytes, transaction identity, checkpoints, and
+recovery algorithms are not yet owned by concrete components, and choosing them
+in the first change would mix several responsibilities. Native SQL Server file
+and log formats also remain outside the authorized scope.
+
+The first storage behavior can nevertheless make one independent safety
+property explicit: append a caller-owned commit record, flush the log through
+the exact returned position, and make acknowledgement construction impossible
+until both operations succeed.
+
+## Decision
+
+`ntsql-wal` is an I/O-free domain crate with no direct dependencies. It owns:
+
+- `LogSequenceNumber`, an opaque ntsql-internal adapter-assigned position with
+  no SQL Server, wire, or persistent byte representation;
+- `CommitLog<Record>`, the inward port for appending a caller-owned record and
+  flushing through a position;
+- `CommitError`, which distinguishes append failure from flush failure and
+  retains the unacknowledged position on the latter; and
+- `CommitAcknowledgement`, whose private, generatively branded value exists only
+  in a callback reached after append and exact-position flush both report
+  success.
+
+The port is synchronous for this deterministic domain boundary. That does not
+require a persistence adapter to block an async runtime thread: a future outer
+composition layer may run the complete synchronous fence on a blocking worker.
+`flush_through` may return success only after durable completion; merely
+enqueueing, scheduling, or batching future I/O is not success. No fallback
+treats an append or flush failure as success.
+
+The intended dependency direction is:
+
+```text
+future ntsql-transaction ------> ntsql-wal <------ future persistence adapter
+                                      |
+                                      v
+                              standard library only
+```
+
+The transaction component will own its commit-record type and pass it to a
+generic `CommitLog<Record>` implementation. A concrete persistence adapter will
+depend on `ntsql-wal` to implement that port. `ntsql-wal` never depends on
+transaction, filesystem, protocol, contract, serialization, or adapter crates.
+
+## Evidence Boundary
+
+The feature inventory record `storage-recovery.write-ahead-commit` remains
+`not-tested`. It names future externally observable durability/recovery work but
+does not claim a SQL Server commit point, LSN value, crash outcome, diagnostic,
+or compatibility status. The repository-authored call-order tests establish
+only this internal safety invariant.
+
+WAL/page formats, checksum coverage, flush/barrier semantics for a concrete
+platform, checkpoints, redo/undo, group commit, transaction lifecycle, and
+crash-recovery outcomes require their own behavior, format, provenance, and
+fault-injection decisions.
+
+## Test Boundaries
+
+- An in-memory fake records every port call and proves success is exactly
+  append followed by flush of the returned position.
+- Append failure proves no flush occurs.
+- Append and flush failure prove the branded callback is not entered. Append
+  failure does not assume whether the adapter changed physical state.
+- Flush failure preserves the exact appended position and original cause.
+- Compile-fail doctests prove safe downstream code cannot construct, clone, or
+  return an acknowledgement from its generative attempt callback.
+- Architecture tests reject any direct dependency from `ntsql-wal`.
+
+## Consequences
+
+Future transaction code can require a durable acknowledgement rather than a
+boolean or convention. Persistence choices remain outside the domain and may be
+tested with deterministic fault injection later. This fence alone is not a
+complete WAL, transaction, or recovery implementation and supports no external
+compatibility claim.

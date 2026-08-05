@@ -30,6 +30,10 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
         package: "ntsql-testkit",
         allowed_dependencies: &["ntsql-contract"],
     },
+    PackagePolicy {
+        package: "ntsql-wal",
+        allowed_dependencies: &[],
+    },
 ];
 
 const CARGO_TREE_ARGS: &[&str] = &[
@@ -248,7 +252,8 @@ mod tests {
              1serde v1.0.0\n\
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
-             1ntsql-contract v0.1.0\n",
+             1ntsql-contract v0.1.0\n\
+             0ntsql-wal v0.1.0\n",
         )?;
 
         assert!(validate_graph(&graph, PACKAGE_POLICIES).is_empty());
@@ -275,7 +280,8 @@ mod tests {
              1serde v1.0.0\n\
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
-             1ntsql-contract v0.1.0\n",
+             1ntsql-contract v0.1.0\n\
+             0ntsql-wal v0.1.0\n",
         )?;
 
         let violations = validate_graph(&graph, PACKAGE_POLICIES);
@@ -313,6 +319,7 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
+             0ntsql-wal v0.1.0\n\
              0ntsql-unreviewed v0.1.0\n",
         )?;
 
@@ -336,7 +343,8 @@ mod tests {
              0ntsql-testkit v0.1.0\n\
              1ntsql-contract v0.1.0\n\
              1ntsql-server v0.1.0\n\
-             1serde_json v1.0.0\n",
+             1serde_json v1.0.0\n\
+             0ntsql-wal v0.1.0\n",
         )?;
 
         let violations = validate_graph(&graph, PACKAGE_POLICIES);
@@ -345,6 +353,41 @@ mod tests {
             == "package ntsql-testkit has forbidden direct dependency ntsql-server"));
         assert!(violations.iter().any(|violation| violation
             == "package ntsql-testkit has forbidden direct dependency serde_json"));
+        Ok(())
+    }
+
+    #[test]
+    fn wal_domain_dependencies_are_enforced() -> Result<(), ArchitectureCheckError> {
+        let graph = parse_dependency_tree(
+            "0ntsql-architecture-check v0.1.0\n\
+             0ntsql-compatibility v0.1.0\n\
+             0ntsql-diagnostics v0.1.0\n\
+             0ntsql-contract v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
+             1serde v1.0.0\n\
+             1serde_json v1.0.0\n\
+             0ntsql-testkit v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             0ntsql-wal v0.1.0\n\
+             1ntsql-contract v0.1.0\n\
+             1ntsql-filesystem-adapter v0.1.0\n\
+             1ntsql-protocol-host v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
+             1serde v1.0.0\n",
+        )?;
+
+        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+
+        for dependency in [
+            "ntsql-contract",
+            "ntsql-filesystem-adapter",
+            "ntsql-protocol-host",
+            "ntsql-transaction",
+            "serde",
+        ] {
+            assert!(violations.iter().any(|violation| violation
+                == &format!("package ntsql-wal has forbidden direct dependency {dependency}")));
+        }
         Ok(())
     }
 }

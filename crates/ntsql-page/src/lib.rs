@@ -1205,6 +1205,97 @@ impl<const N: usize> fmt::Display for PageRecoveryObservationError<N> {
 
 impl<const N: usize> Error for PageRecoveryObservationError<N> {}
 
+/// Why raw adapter fields could not become a page-recovery observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PageRecoveryObservationBytesErrorReason {
+    /// The supplied byte array cannot represent a nonempty fixed-size page.
+    ZeroPageWidth,
+    /// Durable page WAL positions and stored required positions must be nonzero.
+    ZeroPosition,
+}
+
+/// Failed projection of exact raw adapter fields into a page-recovery
+/// observation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct PageRecoveryObservationBytesError<const N: usize> {
+    page_number: PageNumber,
+    page_version: PageVersion,
+    bytes: [u8; N],
+    position: LogSequenceNumber,
+    reason: PageRecoveryObservationBytesErrorReason,
+}
+
+impl<const N: usize> PageRecoveryObservationBytesError<N> {
+    /// Returns the retained page number.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.page_number
+    }
+
+    /// Returns the retained page version.
+    #[must_use]
+    pub const fn page_version(&self) -> PageVersion {
+        self.page_version
+    }
+
+    /// Returns the retained raw page bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; N] {
+        &self.bytes
+    }
+
+    /// Returns the retained lineage-bound position.
+    #[must_use]
+    pub const fn position(&self) -> &LogSequenceNumber {
+        &self.position
+    }
+
+    /// Returns the exact projection failure.
+    #[must_use]
+    pub const fn reason(&self) -> PageRecoveryObservationBytesErrorReason {
+        self.reason
+    }
+
+    /// Returns every retained input.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        PageNumber,
+        PageVersion,
+        [u8; N],
+        LogSequenceNumber,
+        PageRecoveryObservationBytesErrorReason,
+    ) {
+        (
+            self.page_number,
+            self.page_version,
+            self.bytes,
+            self.position,
+            self.reason,
+        )
+    }
+}
+
+impl<const N: usize> fmt::Display for PageRecoveryObservationBytesError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason {
+            PageRecoveryObservationBytesErrorReason::ZeroPageWidth => write!(
+                formatter,
+                "page {} recovery observation has zero-width bytes",
+                self.page_number.get()
+            ),
+            PageRecoveryObservationBytesErrorReason::ZeroPosition => write!(
+                formatter,
+                "page {} recovery observation has zero as its WAL position",
+                self.page_number.get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for PageRecoveryObservationBytesError<N> {}
+
 #[derive(Debug, Eq, PartialEq)]
 struct PageRecoveryObservation<const N: usize> {
     page_number: PageNumber,
@@ -1236,6 +1327,36 @@ impl<const N: usize> PageRecoveryObservation<N> {
             position,
         })
     }
+
+    fn from_bytes(
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: [u8; N],
+        position: LogSequenceNumber,
+    ) -> Result<Self, PageRecoveryObservationBytesError<N>> {
+        let reason = if N == 0 {
+            Some(PageRecoveryObservationBytesErrorReason::ZeroPageWidth)
+        } else if position.get() == 0 {
+            Some(PageRecoveryObservationBytesErrorReason::ZeroPosition)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(PageRecoveryObservationBytesError {
+                page_number,
+                page_version,
+                bytes,
+                position,
+                reason,
+            });
+        }
+        Ok(Self {
+            page_number,
+            page_version,
+            image: PageImage { bytes },
+            position,
+        })
+    }
 }
 
 /// Adapter-neutral observation of one complete durable full-image page WAL
@@ -1258,6 +1379,18 @@ impl<const N: usize> DurablePageWalObservation<N> {
         position: LogSequenceNumber,
     ) -> Result<Self, PageRecoveryObservationError<N>> {
         PageRecoveryObservation::new(page_number, page_version, image, position)
+            .map(|observation| Self { observation })
+    }
+
+    /// Projects exact raw adapter fields into one observed durable page WAL
+    /// record.
+    pub fn from_bytes(
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: [u8; N],
+        position: LogSequenceNumber,
+    ) -> Result<Self, PageRecoveryObservationBytesError<N>> {
+        PageRecoveryObservation::from_bytes(page_number, page_version, bytes, position)
             .map(|observation| Self { observation })
     }
 
@@ -1304,6 +1437,17 @@ impl<const N: usize> StoredPageSnapshotObservation<N> {
         required_position: LogSequenceNumber,
     ) -> Result<Self, PageRecoveryObservationError<N>> {
         PageRecoveryObservation::new(page_number, page_version, image, required_position)
+            .map(|observation| Self { observation })
+    }
+
+    /// Projects exact raw adapter fields into one observed stored snapshot.
+    pub fn from_bytes(
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: [u8; N],
+        required_position: LogSequenceNumber,
+    ) -> Result<Self, PageRecoveryObservationBytesError<N>> {
+        PageRecoveryObservation::from_bytes(page_number, page_version, bytes, required_position)
             .map(|observation| Self { observation })
     }
 
@@ -2430,6 +2574,69 @@ mod tests {
         assert_eq!(image.bytes(), &bytes);
         assert_eq!(actual_position, position);
         assert_eq!(reason, PageRecoveryObservationErrorReason::ZeroPosition);
+    }
+
+    #[test]
+    fn raw_recovery_observation_projection_is_exact_and_retains_invalid_inputs() {
+        let lineage = LogLineage::new();
+        let number = page_number(43);
+        let version = PageVersion::new(8);
+        let valid_position = lineage.position(5);
+
+        let valid = DurablePageWalObservation::from_bytes(
+            number,
+            version,
+            [41_u8, 42],
+            valid_position.clone(),
+        );
+        assert!(valid.is_ok());
+        let Ok(valid) = valid else {
+            return;
+        };
+        assert_eq!(valid.page_number(), number);
+        assert_eq!(valid.page_version(), version);
+        assert_eq!(valid.image().bytes(), &[41_u8, 42]);
+        assert_eq!(valid.position(), &valid_position);
+
+        let zero_position = StoredPageSnapshotObservation::from_bytes(
+            number,
+            version,
+            [43_u8, 44],
+            lineage.position(0),
+        );
+        assert!(zero_position.is_err());
+        let Err(zero_position) = zero_position else {
+            return;
+        };
+        assert_eq!(
+            zero_position.reason(),
+            PageRecoveryObservationBytesErrorReason::ZeroPosition
+        );
+        assert_eq!(zero_position.bytes(), &[43_u8, 44]);
+        let (actual_number, actual_version, bytes, position, reason) = zero_position.into_parts();
+        assert_eq!(actual_number, number);
+        assert_eq!(actual_version, version);
+        assert_eq!(bytes, [43_u8, 44]);
+        assert_eq!(position, lineage.position(0));
+        assert_eq!(
+            reason,
+            PageRecoveryObservationBytesErrorReason::ZeroPosition
+        );
+
+        let zero_width =
+            DurablePageWalObservation::<0>::from_bytes(number, version, [], lineage.position(7));
+        assert!(zero_width.is_err());
+        let Err(zero_width) = zero_width else {
+            return;
+        };
+        assert_eq!(
+            zero_width.reason(),
+            PageRecoveryObservationBytesErrorReason::ZeroPageWidth
+        );
+        assert_eq!(zero_width.page_number(), number);
+        assert_eq!(zero_width.page_version(), version);
+        assert_eq!(zero_width.bytes(), &[]);
+        assert_eq!(zero_width.position(), &lineage.position(7));
     }
 
     #[test]

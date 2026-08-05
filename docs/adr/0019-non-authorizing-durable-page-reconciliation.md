@@ -142,6 +142,31 @@ workspace-owned format observations. It does not consult an external product,
 driver, SDK, fixture, oracle, or native MDF/NDF/LDF/BAK format. Its outcomes are
 internal physical states and make no compatibility claim.
 
+## Adapter Projection Extension
+
+Issue #90 adds allocation-free raw-byte constructors for both observation roles.
+They validate zero width and zero position before constructing `PageImage<N>`
+and retain the exact page number, version, `[u8; N]`, and lineage-bound position
+in a typed error. The existing `PageImage`-based constructors and reconciliation
+rules do not change.
+
+`InMemoryLogRecord` and `FileLogRecord` project a page record by copying its
+exact fields and cloning its existing `LogSequenceNumber`. A transaction record
+returns `Ok(None)` explicitly. Projection does not itself prove durability;
+callers must select the adapter's validated durable prefix.
+
+`InMemoryStoredPage` and `FileStoredPage` project their exact current snapshot,
+including the existing required-position lineage. No projection reconstructs a
+position from its numeric value, substitutes another lineage, reads a file,
+allocates a collection, or infers absent data.
+
+Memory restart and filesystem reopen integration tests project complete durable
+prefixes and current snapshots into this ADR's domain function. They establish
+exact-current state, a store behind a later WAL-only full image across an
+interleaved transaction record, and a missing snapshot from an empty store.
+These adapter integrations remain observational and grant no mutation
+authority.
+
 ## Test Boundaries
 
 - Exact-current tests require equality at the latest durable position.
@@ -156,6 +181,11 @@ internal physical states and make no compatibility claim.
 - Identical duplicate, contradictory duplicate, and decreasing WAL positions
   have distinct typed failures.
 - Zero-position construction retains all supplied values.
+- Raw-byte projection tests retain zero-width and zero-position inputs.
+- Memory and filesystem tests preserve exact record/snapshot lineages through
+  restart or reopen before reconciliation.
+- Interleaved transaction records project to `None` and do not disturb page
+  position ordering.
 - Compile-fail tests prove comparison cannot create a permit or dirty page.
 - Architecture validation proves the dependency graph did not change.
 
@@ -163,7 +193,7 @@ internal physical states and make no compatibility claim.
 
 The domain can now establish whether supplied durable page evidence is
 physically current, behind, missing, absent, or contradictory without granting
-write authority. A follow-up adapter slice must project validated memory and
-filesystem records into these observations and exercise reopen/rewrite
+write authority. The memory and filesystem adapters can project their validated
+records and snapshots into these observations and exercise restart/reopen
 comparisons. Mutation-capable recovery remains blocked on explicit
 transaction-owned page records and visibility/undo semantics.

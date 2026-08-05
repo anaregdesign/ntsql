@@ -1,9 +1,9 @@
 use std::{error::Error, io};
 
 use ntsql_page::{
-    FlushDirtyPageError, FlushDirtyPageRejectionReason, PageAddress, PageImage, PageLog,
-    PageNumber, PageVersion, StagePageWriteError, StagePageWriteRejectionReason, flush_dirty_page,
-    stage_page_write,
+    DurablePageReconciliation, FlushDirtyPageError, FlushDirtyPageRejectionReason, PageAddress,
+    PageImage, PageLog, PageNumber, PageVersion, StagePageWriteError,
+    StagePageWriteRejectionReason, flush_dirty_page, reconcile_durable_page, stage_page_write,
 };
 use ntsql_storage_memory::{
     FaultPoint, InMemoryCommitLog, InMemoryCommitLogError, InMemoryPageStore,
@@ -420,6 +420,101 @@ fn foreign_log_and_store_lineages_are_rejected_before_mutation() -> Result<(), B
         FlushDirtyPageRejectionReason::ForeignStore
     );
     assert!(foreign_store.pages().is_empty());
+    Ok(())
+}
+
+#[test]
+fn projected_memory_evidence_reconciles_current_behind_and_missing() -> Result<(), Box<dyn Error>> {
+    let persistent_id = persistent_log_id(8)?;
+    let mut log = InMemoryCommitLog::<2>::with_persistent_lineage_id(persistent_id);
+    let mut store = InMemoryPageStore::new(&log);
+    let number = page_number(70)?;
+    let first = unlogged_page(log.lineage(), 70, 9, [1_u8, 2])?;
+    let first_dirty = stage_page_write(&mut log, first)?;
+    let first_clean = flush_dirty_page(&mut log, &mut store, first_dirty)?;
+    assert_eq!(first_clean.required_position().get(), 1);
+
+    let first_record = log
+        .durable_records()
+        .next()
+        .ok_or_else(|| io::Error::other("first durable page record is missing"))?
+        .page_recovery_observation()?
+        .ok_or_else(|| io::Error::other("first durable record projected as transaction"))?;
+    let first_snapshot = store
+        .page(number)
+        .ok_or_else(|| io::Error::other("first stored snapshot is missing"))?
+        .page_recovery_observation()?;
+    assert_eq!(
+        reconcile_durable_page(
+            log.lineage(),
+            number,
+            Some(&first_snapshot),
+            std::iter::once(&first_record),
+        )?,
+        DurablePageReconciliation::ExactCurrent {
+            durable_position: log.lineage().position(1),
+        }
+    );
+
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    let transaction = coordinator.begin()?;
+    let commit = coordinator.commit(transaction, &mut log)?;
+    assert_eq!(commit.log_position().get(), 2);
+    let second = unlogged_page(log.lineage(), 70, 3, [3_u8, 4])?;
+    let second_dirty = stage_page_write(&mut log, second)?;
+    log.flush_through(second_dirty.required_position())?;
+    assert_eq!(second_dirty.required_position().get(), 3);
+    drop(second_dirty);
+
+    log.reopen()?;
+    assert_eq!(log.records().len(), 3);
+    let mut durable_records = log.durable_records();
+    let first_record = durable_records
+        .next()
+        .ok_or_else(|| io::Error::other("reopened durable prefix lost its first record"))?
+        .page_recovery_observation()?
+        .ok_or_else(|| io::Error::other("reopened first page record is missing"))?;
+    let transaction_record = durable_records
+        .next()
+        .ok_or_else(|| io::Error::other("reopened durable prefix lost its transaction record"))?;
+    assert!(transaction_record.page_recovery_observation()?.is_none());
+    let second_record = durable_records
+        .next()
+        .ok_or_else(|| io::Error::other("reopened durable prefix lost its second page record"))?
+        .page_recovery_observation()?
+        .ok_or_else(|| io::Error::other("reopened second page record is missing"))?;
+    assert!(durable_records.next().is_none());
+    let observations = [first_record, second_record];
+    let snapshot = store
+        .page(number)
+        .ok_or_else(|| io::Error::other("stored snapshot disappeared"))?
+        .page_recovery_observation()?;
+
+    assert_eq!(
+        reconcile_durable_page(log.lineage(), number, Some(&snapshot), observations.iter(),)?,
+        DurablePageReconciliation::StoreBehind {
+            stored_position: log.lineage().position(1),
+            latest_durable_position: log.lineage().position(3),
+        }
+    );
+
+    let empty_store = InMemoryPageStore::<2>::with_lineage(log.lineage().clone());
+    let empty_snapshot = empty_store
+        .page(number)
+        .map(|page| page.page_recovery_observation())
+        .transpose()?;
+    assert!(empty_snapshot.is_none());
+    assert_eq!(
+        reconcile_durable_page(
+            log.lineage(),
+            number,
+            empty_snapshot.as_ref(),
+            observations.iter(),
+        )?,
+        DurablePageReconciliation::StoreMissing {
+            latest_durable_position: log.lineage().position(3),
+        }
+    );
     Ok(())
 }
 

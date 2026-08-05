@@ -2,7 +2,10 @@
 
 use std::{error::Error, fmt, num::NonZeroU64};
 
-use ntsql_page::{PageLog, PageNumber, PageStore, PageVersion, PageWritePermit, UnloggedPage};
+use ntsql_page::{
+    DurablePageWalObservation, PageLog, PageNumber, PageRecoveryObservationBytesError, PageStore,
+    PageVersion, PageWritePermit, StoredPageSnapshotObservation, UnloggedPage,
+};
 use ntsql_transaction::{
     DurableCommitLookup, TransactionCommitRecord, TransactionEpochSource, TransactionId,
     TransactionRecoverySource,
@@ -137,6 +140,25 @@ impl<const N: usize> InMemoryLogRecord<N> {
     #[must_use]
     pub const fn page_write(&self) -> Option<&InMemoryPageWriteRecord<N>> {
         self.kind.page_write()
+    }
+
+    /// Projects a page record into adapter-neutral recovery evidence.
+    ///
+    /// Callers must select records from a commit log's durable prefix before
+    /// treating the result as durable. Transaction records return `Ok(None)`.
+    pub fn page_recovery_observation(
+        &self,
+    ) -> Result<Option<DurablePageWalObservation<N>>, PageRecoveryObservationBytesError<N>> {
+        match self.page_write() {
+            Some(record) => DurablePageWalObservation::from_bytes(
+                record.page_number(),
+                record.page_version(),
+                *record.bytes(),
+                self.position.clone(),
+            )
+            .map(Some),
+            None => Ok(None),
+        }
     }
 }
 
@@ -315,6 +337,18 @@ impl<const N: usize> InMemoryStoredPage<N> {
     #[must_use]
     pub const fn required_position(&self) -> &LogSequenceNumber {
         &self.required_position
+    }
+
+    /// Projects this durable snapshot into adapter-neutral recovery evidence.
+    pub fn page_recovery_observation(
+        &self,
+    ) -> Result<StoredPageSnapshotObservation<N>, PageRecoveryObservationBytesError<N>> {
+        StoredPageSnapshotObservation::from_bytes(
+            self.page_number,
+            self.page_version,
+            self.bytes,
+            self.required_position.clone(),
+        )
     }
 
     /// Returns the owned page bytes.

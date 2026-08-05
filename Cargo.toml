@@ -16,7 +16,7 @@ rust-version = "1.88"
 [workspace.dependencies]
 ntsql-compatibility = { path = "crates/ntsql-compatibility" }
 serde = { version = "1.0.219", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1.0.142", default-features = false, features = ["std"] }
+serde_json = { version = "1.0.142", default-features = false, features = ["arbitrary_precision", "std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

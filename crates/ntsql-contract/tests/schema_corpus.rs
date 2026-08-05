@@ -4,7 +4,7 @@ use ntsql_contract::{
     ConformanceRecord, FeatureMatrix, LegalDecisionAuthority, LegalReviewLedger, ProvenanceLedger,
     TargetMatrix, validate_governance_references,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 const CORPUS_VERSION: &str = "1.0.0";
@@ -485,7 +485,15 @@ fn evaluate_rust_contract(
             Ok(evaluate_provenance(instance, &legal_reviews))
         }
         "https://github.com/anaregdesign/ntsql/contracts/schemas/conformance-record.schema.json" => {
-            Ok(evaluate_conformance(instance))
+            let targets = serde_json::from_str(TARGETS)?;
+            let features = serde_json::from_str(FEATURES)?;
+            let provenance = serde_json::from_str(PROVENANCE)?;
+            Ok(evaluate_conformance(
+                instance,
+                &targets,
+                &features,
+                &provenance,
+            ))
         }
         "https://github.com/anaregdesign/ntsql/contracts/schemas/legal-decision-authority.schema.json" => {
             Ok(evaluate_authority(
@@ -503,7 +511,7 @@ fn evaluate_target_matrix(
     provenance: &ProvenanceLedger,
     legal_reviews: &LegalReviewLedger,
 ) -> RustResults {
-    let Ok(contract) = serde_json::from_value::<TargetMatrix>(instance) else {
+    let Ok(contract) = deserialize_wire::<TargetMatrix>(&instance) else {
         return rejected_at_deserialization();
     };
     let schema_semantics = contract.validate_schema_semantics().is_empty();
@@ -528,7 +536,7 @@ fn evaluate_feature_matrix(
     provenance: &ProvenanceLedger,
     legal_reviews: &LegalReviewLedger,
 ) -> RustResults {
-    let Ok(contract) = serde_json::from_value::<FeatureMatrix>(instance) else {
+    let Ok(contract) = deserialize_wire::<FeatureMatrix>(&instance) else {
         return rejected_at_deserialization();
     };
     let schema_semantics = contract.validate_schema_semantics().is_empty();
@@ -547,7 +555,7 @@ fn evaluate_feature_matrix(
 }
 
 fn evaluate_legal_reviews(instance: Value, provenance: &ProvenanceLedger) -> RustResults {
-    let Ok(contract) = serde_json::from_value::<LegalReviewLedger>(instance) else {
+    let Ok(contract) = deserialize_wire::<LegalReviewLedger>(&instance) else {
         return rejected_at_deserialization();
     };
     let schema_semantics = contract.validate_schema_semantics().is_empty();
@@ -561,7 +569,7 @@ fn evaluate_legal_reviews(instance: Value, provenance: &ProvenanceLedger) -> Rus
 }
 
 fn evaluate_provenance(instance: Value, legal_reviews: &LegalReviewLedger) -> RustResults {
-    let Ok(contract) = serde_json::from_value::<ProvenanceLedger>(instance) else {
+    let Ok(contract) = deserialize_wire::<ProvenanceLedger>(&instance) else {
         return rejected_at_deserialization();
     };
     RustResults {
@@ -571,20 +579,30 @@ fn evaluate_provenance(instance: Value, legal_reviews: &LegalReviewLedger) -> Ru
     }
 }
 
-fn evaluate_conformance(instance: Value) -> RustResults {
-    let Ok(contract) = serde_json::from_value::<ConformanceRecord>(instance) else {
+fn evaluate_conformance(
+    instance: Value,
+    targets: &TargetMatrix,
+    features: &FeatureMatrix,
+    provenance: &ProvenanceLedger,
+) -> RustResults {
+    let Ok(contract) = deserialize_wire::<ConformanceRecord>(&instance) else {
         return rejected_at_deserialization();
     };
     let schema_semantics = contract.validate_schema_semantics().is_empty();
+    let full_validation = schema_semantics
+        && contract.validate_document_semantics().is_empty()
+        && contract
+            .validate_references(targets, features, provenance)
+            .is_empty();
     RustResults {
         deserialize: true,
         schema_semantics,
-        full_validation: schema_semantics,
+        full_validation,
     }
 }
 
 fn evaluate_authority(instance: Value, trusted: Option<&TrustedCandidate>) -> RustResults {
-    let Ok(contract) = serde_json::from_value::<LegalDecisionAuthority>(instance) else {
+    let Ok(contract) = deserialize_wire::<LegalDecisionAuthority>(&instance) else {
         return rejected_at_deserialization();
     };
     let schema_semantics = contract.validate_schema_semantics().is_empty();
@@ -604,6 +622,11 @@ fn evaluate_authority(instance: Value, trusted: Option<&TrustedCandidate>) -> Ru
         schema_semantics,
         full_validation,
     }
+}
+
+fn deserialize_wire<T: DeserializeOwned>(instance: &Value) -> Result<T, serde_json::Error> {
+    let encoded = serde_json::to_vec(instance)?;
+    serde_json::from_slice(&encoded)
 }
 
 const fn rejected_at_deserialization() -> RustResults {

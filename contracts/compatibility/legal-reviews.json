@@ -117,6 +117,7 @@
       "source_provenance_ids": [
         "prov-crates-serde-1.0.229",
         "prov-crates-serde-json-1.0.151",
+        "prov-rust-toolchain-1.97.1",
         "prov-crates-cargo-deny-0.20.2",
         "prov-crates-cargo-audit-0.22.2",
         "prov-crates-cargo-cyclonedx-0.5.9",

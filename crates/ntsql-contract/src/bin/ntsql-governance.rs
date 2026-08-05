@@ -16,6 +16,9 @@ use serde_json::Value;
 
 const CARGO_CYCLONEDX_VERSION: &str = "0.5.9";
 const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const RUST_DIST_MANIFEST_PREFIX: &str = "https://static.rust-lang.org/dist/channel-rust-";
+const REQUIRED_TOOLCHAIN_COMPONENTS: [&str; 2] = ["clippy", "rustfmt"];
+const REQUIRED_TOOLCHAIN_PROFILE: &str = "minimal";
 
 struct AuthorityInput {
     path: PathBuf,
@@ -27,6 +30,7 @@ struct AuthorityInput {
 enum RemoteArchiveKind {
     GovernanceTool,
     GitHubAction,
+    ToolchainManifest,
 }
 
 impl RemoteArchiveKind {
@@ -34,8 +38,16 @@ impl RemoteArchiveKind {
         match self {
             Self::GovernanceTool => "governance tool",
             Self::GitHubAction => "GitHub Action",
+            Self::ToolchainManifest => "Rust toolchain manifest",
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PinnedToolchain {
+    channel: String,
+    profile: String,
+    components: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -268,9 +280,14 @@ fn validate_offline_provenance() -> Result<(), Box<dyn Error>> {
         read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
     let repository_artifacts = verify_repository_artifacts(&workspace_root, &provenance)?;
     let direct_dependencies = verify_direct_dependency_provenance(&workspace_root, &provenance)?;
+    let toolchain = validate_pinned_toolchain(&workspace_root)?;
+    let workflow = fs::read_to_string(workspace_root.join(".github/workflows/governance.yml"))?;
+    let remote_archives = resolve_remote_archive_records(&workflow, &toolchain, &provenance)?;
 
     println!(
-        "offline provenance ok ({repository_artifacts} repository artifacts, {direct_dependencies} direct dependencies)"
+        "offline provenance ok ({repository_artifacts} repository artifacts, {direct_dependencies} direct dependencies, {} remote archives, Rust {})",
+        remote_archives.len(),
+        toolchain.channel
     );
     Ok(())
 }
@@ -590,6 +607,195 @@ fn parse_toml_string(value: &str, description: &str) -> Result<String, Box<dyn E
     Ok(literal.to_owned())
 }
 
+fn validate_pinned_toolchain(workspace_root: &Path) -> Result<PinnedToolchain, Box<dyn Error>> {
+    match fs::symlink_metadata(workspace_root.join("rust-toolchain")) {
+        Ok(_) => {
+            return Err(invalid_data(
+                "legacy rust-toolchain is forbidden because it can override rust-toolchain.toml",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let toolchain_document = fs::read_to_string(workspace_root.join("rust-toolchain.toml"))?;
+    let toolchain = parse_pinned_toolchain(&toolchain_document)?;
+    let cargo_manifest = fs::read_to_string(workspace_root.join("Cargo.toml"))?;
+    validate_workspace_rust_version(&cargo_manifest, &toolchain.channel)?;
+    Ok(toolchain)
+}
+
+fn parse_pinned_toolchain(document: &str) -> Result<PinnedToolchain, Box<dyn Error>> {
+    let mut in_toolchain_section = false;
+    let mut saw_toolchain_section = false;
+    let mut channel = None;
+    let mut profile = None;
+    let mut components = None;
+
+    for (line_index, source_line) in document.lines().enumerate() {
+        let line = source_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            if line != "[toolchain]" || saw_toolchain_section {
+                return Err(invalid_data(format!(
+                    "rust-toolchain.toml line {} contains an unsupported or duplicate section",
+                    line_index + 1
+                )));
+            }
+            saw_toolchain_section = true;
+            in_toolchain_section = true;
+            continue;
+        }
+        if !in_toolchain_section {
+            return Err(invalid_data(format!(
+                "rust-toolchain.toml line {} appears outside [toolchain]",
+                line_index + 1
+            )));
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            invalid_data(format!(
+                "rust-toolchain.toml line {} requires key = value",
+                line_index + 1
+            ))
+        })?;
+        let key = key.trim();
+        let value = value.trim();
+        match key {
+            "channel" => {
+                let parsed = parse_toml_string(value, "rust-toolchain.toml channel")?;
+                if channel.replace(parsed).is_some() {
+                    return Err(invalid_data("rust-toolchain.toml repeats channel"));
+                }
+            }
+            "profile" => {
+                let parsed = parse_toml_string(value, "rust-toolchain.toml profile")?;
+                if profile.replace(parsed).is_some() {
+                    return Err(invalid_data("rust-toolchain.toml repeats profile"));
+                }
+            }
+            "components" => {
+                let parsed = parse_toml_string_array(value, "rust-toolchain.toml components")?;
+                if components.replace(parsed).is_some() {
+                    return Err(invalid_data("rust-toolchain.toml repeats components"));
+                }
+            }
+            _ => {
+                return Err(invalid_data(format!(
+                    "rust-toolchain.toml contains unsupported key: {key}"
+                )));
+            }
+        }
+    }
+
+    let channel = channel.ok_or_else(|| invalid_data("rust-toolchain.toml requires channel"))?;
+    if !is_exact_rust_release(&channel) {
+        return Err(invalid_data(
+            "rust-toolchain.toml channel must be an exact stable x.y.z release",
+        ));
+    }
+    let profile = profile.ok_or_else(|| invalid_data("rust-toolchain.toml requires profile"))?;
+    if profile != REQUIRED_TOOLCHAIN_PROFILE {
+        return Err(invalid_data(format!(
+            "rust-toolchain.toml profile must be {REQUIRED_TOOLCHAIN_PROFILE}"
+        )));
+    }
+    let components =
+        components.ok_or_else(|| invalid_data("rust-toolchain.toml requires components"))?;
+    if !components
+        .iter()
+        .map(String::as_str)
+        .eq(REQUIRED_TOOLCHAIN_COMPONENTS)
+    {
+        return Err(invalid_data(
+            "rust-toolchain.toml components must be exactly [\"clippy\", \"rustfmt\"]",
+        ));
+    }
+
+    Ok(PinnedToolchain {
+        channel,
+        profile,
+        components,
+    })
+}
+
+fn parse_toml_string_array(value: &str, description: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    let inner = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .ok_or_else(|| invalid_data(format!("{description} must be a literal string array")))?;
+    if inner.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|item| parse_toml_string(item.trim(), description))
+        .collect()
+}
+
+fn is_exact_rust_release(value: &str) -> bool {
+    let mut components = value.split('.');
+    let Some(major) = components.next() else {
+        return false;
+    };
+    let Some(minor) = components.next() else {
+        return false;
+    };
+    let Some(patch) = components.next() else {
+        return false;
+    };
+    components.next().is_none()
+        && major == "1"
+        && [minor, patch].iter().all(|component| {
+            !component.is_empty()
+                && (component.len() == 1 || !component.starts_with('0'))
+                && component.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn validate_workspace_rust_version(
+    cargo_manifest: &str,
+    expected: &str,
+) -> Result<(), Box<dyn Error>> {
+    let mut in_workspace_package = false;
+    let mut rust_version = None;
+
+    for source_line in cargo_manifest.lines() {
+        let line = source_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_workspace_package = line == "[workspace.package]";
+            continue;
+        }
+        if !in_workspace_package {
+            continue;
+        }
+        let Some(value) = line.strip_prefix("rust-version") else {
+            continue;
+        };
+        let value = value
+            .trim_start()
+            .strip_prefix('=')
+            .ok_or_else(|| invalid_data("workspace rust-version requires ="))?
+            .trim();
+        let parsed = parse_toml_string(value, "workspace rust-version")?;
+        if rust_version.replace(parsed).is_some() {
+            return Err(invalid_data("workspace repeats rust-version"));
+        }
+    }
+
+    let rust_version =
+        rust_version.ok_or_else(|| invalid_data("workspace requires rust-version"))?;
+    if rust_version != expected {
+        return Err(invalid_data(format!(
+            "workspace rust-version {rust_version} does not match pinned toolchain {expected}"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_locked_packages(lockfile: &str) -> Result<Vec<LockedPackage>, Box<dyn Error>> {
     let mut packages = Vec::new();
     let mut current: Option<LockedPackageBuilder> = None;
@@ -669,7 +875,8 @@ fn validate_online_provenance() -> Result<(), Box<dyn Error>> {
     let provenance: ProvenanceLedger =
         read_json(&workspace_root.join("contracts/compatibility/provenance.json"))?;
     let workflow = fs::read_to_string(workspace_root.join(".github/workflows/governance.yml"))?;
-    let archives = resolve_remote_archive_records(&workflow, &provenance)?;
+    let toolchain = validate_pinned_toolchain(&workspace_root)?;
+    let archives = resolve_remote_archive_records(&workflow, &toolchain, &provenance)?;
 
     verify_remote_archives(OsStr::new("curl"), &archives)?;
     println!("online provenance ok ({} remote archives)", archives.len());
@@ -678,9 +885,11 @@ fn validate_online_provenance() -> Result<(), Box<dyn Error>> {
 
 fn resolve_remote_archive_records(
     workflow: &str,
+    toolchain: &PinnedToolchain,
     provenance: &ProvenanceLedger,
 ) -> Result<Vec<RemoteArchive>, Box<dyn Error>> {
-    let expected_archives = discover_workflow_archives(workflow)?;
+    let mut expected_archives = discover_workflow_archives(workflow)?;
+    expected_archives.push(toolchain_manifest_archive(toolchain));
     let provenance_records = provenance
         .records
         .iter()
@@ -809,6 +1018,19 @@ fn discover_workflow_archives(
         }
     }
     Ok(archives)
+}
+
+fn toolchain_manifest_archive(toolchain: &PinnedToolchain) -> ExpectedRemoteArchive {
+    ExpectedRemoteArchive {
+        kind: RemoteArchiveKind::ToolchainManifest,
+        description: format!(
+            "Rust {} profile {} with {}",
+            toolchain.channel,
+            toolchain.profile,
+            toolchain.components.join(",")
+        ),
+        source_url: format!("{RUST_DIST_MANIFEST_PREFIX}{}.toml", toolchain.channel),
+    }
 }
 
 fn github_action_archive(reference: &str) -> Result<ExpectedRemoteArchive, Box<dyn Error>> {
@@ -1429,26 +1651,71 @@ mod tests {
     }
 
     #[test]
+    fn pinned_toolchain_rejects_mutable_or_drifting_configuration() -> Result<(), Box<dyn Error>> {
+        let valid = parse_pinned_toolchain(test_toolchain_file())?;
+        let mutable_channel = result_error(parse_pinned_toolchain(
+            "[toolchain]\nchannel = \"stable\"\nprofile = \"minimal\"\ncomponents = [\"clippy\", \"rustfmt\"]\n",
+        ))?;
+        let wrong_profile = result_error(parse_pinned_toolchain(
+            "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"default\"\ncomponents = [\"clippy\", \"rustfmt\"]\n",
+        ))?;
+        let missing_component = result_error(parse_pinned_toolchain(
+            "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"minimal\"\ncomponents = [\"clippy\"]\n",
+        ))?;
+        let unsupported_key = result_error(parse_pinned_toolchain(
+            "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"minimal\"\ncomponents = [\"clippy\", \"rustfmt\"]\ntargets = [\"x86_64-unknown-linux-gnu\"]\n",
+        ))?;
+        let drifting_msrv = result_error(validate_workspace_rust_version(
+            "[workspace.package]\nrust-version = \"1.96.0\"\n",
+            &valid.channel,
+        ))?;
+        let test_root = temporary_test_root("legacy-rust-toolchain")?;
+        fs::write(test_root.join("rust-toolchain.toml"), test_toolchain_file())?;
+        fs::write(
+            test_root.join("Cargo.toml"),
+            "[workspace.package]\nrust-version = \"1.97.1\"\n",
+        )?;
+        fs::write(test_root.join("rust-toolchain"), "stable\n")?;
+        let legacy_file = result_error(validate_pinned_toolchain(&test_root))?;
+        fs::remove_dir_all(&test_root)?;
+
+        assert_eq!(valid.channel, "1.97.1");
+        assert!(mutable_channel.contains("exact stable x.y.z release"));
+        assert!(wrong_profile.contains("profile must be minimal"));
+        assert!(missing_component.contains("components must be exactly"));
+        assert!(unsupported_key.contains("unsupported key"));
+        assert!(drifting_msrv.contains("does not match pinned toolchain"));
+        assert!(legacy_file.contains("legacy rust-toolchain is forbidden"));
+        Ok(())
+    }
+
+    #[test]
     fn workflow_archive_inventory_accepts_exact_tools_and_actions() -> Result<(), Box<dyn Error>> {
         let provenance = test_supply_chain_provenance();
+        let toolchain = parse_pinned_toolchain(test_toolchain_file())?;
 
-        let archives = resolve_remote_archive_records(test_governance_workflow(), &provenance)?;
+        let archives =
+            resolve_remote_archive_records(test_governance_workflow(), &toolchain, &provenance)?;
 
-        assert_eq!(archives.len(), 2);
+        assert_eq!(archives.len(), 3);
         assert_eq!(archives[0].kind, RemoteArchiveKind::GitHubAction);
         assert_eq!(archives[1].kind, RemoteArchiveKind::GovernanceTool);
+        assert_eq!(archives[2].kind, RemoteArchiveKind::ToolchainManifest);
         Ok(())
     }
 
     #[test]
     fn workflow_archive_inventory_rejects_mutable_missing_and_unknown_entries()
     -> Result<(), Box<dyn Error>> {
+        let toolchain = parse_pinned_toolchain(test_toolchain_file())?;
         let mutable_action_error = result_error(resolve_remote_archive_records(
             "steps:\n  - uses: actions/checkout@v4\n  - run: cargo install cargo-deny --version 0.20.2 --locked\n",
+            &toolchain,
             &test_supply_chain_provenance(),
         ))?;
         let mutable_tool_error = result_error(resolve_remote_archive_records(
             "steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  - run: cargo install cargo-deny --locked\n",
+            &toolchain,
             &test_supply_chain_provenance(),
         ))?;
 
@@ -1456,6 +1723,7 @@ mod tests {
         missing.records.remove(0);
         let missing_error = result_error(resolve_remote_archive_records(
             test_governance_workflow(),
+            &toolchain,
             &missing,
         ))?;
 
@@ -1468,6 +1736,7 @@ mod tests {
         ));
         let unknown_error = result_error(resolve_remote_archive_records(
             test_governance_workflow(),
+            &toolchain,
             &unknown,
         ))?;
 
@@ -1613,6 +1882,10 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
         "steps:\n  - uses: actions/checkout@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  - run: cargo install cargo-deny --version 0.20.2 --locked\n"
     }
 
+    fn test_toolchain_file() -> &'static str {
+        "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"minimal\"\ncomponents = [\"clippy\", \"rustfmt\"]\n"
+    }
+
     fn test_supply_chain_provenance() -> ProvenanceLedger {
         test_provenance_ledger(vec![
             test_dependency_record(
@@ -1624,6 +1897,12 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
             test_dependency_record(
                 "prov-tool",
                 "https://static.crates.io/crates/cargo-deny/cargo-deny-0.20.2.crate",
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ProvenanceUse::SupplyChainVerification,
+            ),
+            test_dependency_record(
+                "prov-toolchain",
+                "https://static.rust-lang.org/dist/channel-rust-1.97.1.toml",
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 ProvenanceUse::SupplyChainVerification,
             ),

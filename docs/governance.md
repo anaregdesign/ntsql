@@ -192,6 +192,25 @@ checkout, no protected authority producer or prebuilt verifier is installed,
 and all legal decisions remain pending. Weakening the failure to obtain a green
 check is prohibited.
 
+## Pinned Rust Toolchain
+
+`rust-toolchain.toml` is the sole development and CI channel/profile/component
+configuration. Cargo's workspace `rust-version` must equal that exact channel;
+`provenance-offline` rejects drift and any higher-precedence legacy
+`rust-toolchain` file. The Rust 1.97.1 distribution channel manifest is
+inventoried in the provenance ledger with the SHA-256 value published by the
+adjacent official `.sha256` resource. `provenance-online` derives the manifest
+URL from the repository pin, downloads it without redirects, and verifies the
+retained digest before accepting the inventory.
+
+Rustup installs the selected host components and validates their hashes from the
+channel manifest. The preinstalled rustup executable, host runner image,
+operating-system trust store, HTTPS transport, and Rust distribution service
+remain external bootstrap trust boundaries. The candidate-built verifier does
+not independently authenticate those systems and does not convert inventory
+metadata into a legal decision. Toolchain execution remains covered by
+`legal-review-third-party-dependencies`; that review stays pending.
+
 ## Input Classes
 
 Inventory-only metadata may be recorded while review is pending: title, public

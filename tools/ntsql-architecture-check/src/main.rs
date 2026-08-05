@@ -44,7 +44,7 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
     },
     PackagePolicy {
         package: "ntsql-transaction",
-        allowed_dependencies: &["ntsql-wal"],
+        allowed_dependencies: &["ntsql-page", "ntsql-wal"],
     },
     PackagePolicy {
         package: "ntsql-wal",
@@ -285,6 +285,7 @@ mod tests {
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-transaction v0.1.0\n\
+             1ntsql-page v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-wal v0.1.0\n",
         )?;
@@ -450,6 +451,7 @@ mod tests {
              1ntsql-contract v0.1.0\n\
              1ntsql-storage-file v0.1.0\n\
             1ntsql-storage-memory v0.1.0\n\
+            1ntsql-transaction v0.1.0\n\
             1ntsql-wal v0.1.0\n\
              1serde v1.0.0\n\
              0ntsql-wal v0.1.0\n",
@@ -461,6 +463,7 @@ mod tests {
             "ntsql-contract",
             "ntsql-storage-file",
             "ntsql-storage-memory",
+            "ntsql-transaction",
             "serde",
         ] {
             assert!(violations.iter().any(|violation| violation

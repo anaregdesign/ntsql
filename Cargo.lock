@@ -71,6 +71,7 @@ dependencies = [
 name = "ntsql-transaction"
 version = "0.1.0"
 dependencies = [
+ "ntsql-page",
  "ntsql-wal",
 ]
 

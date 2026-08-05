@@ -1,0 +1,1293 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/conformance-record.schema.json",
+  "base_document": {
+    "inline": {
+      "schema_version": "2.0.0",
+      "case_id": "case.schema-corpus",
+      "feature_id": "category.language",
+      "owner_issue": 8,
+      "target_id": "sqlserver-2022-cu26-linux-x86_64-developer-compat160",
+      "observed_at": "2025-01-01T00:00:00Z",
+      "provenance_id": "prov-ms-sql-engine-overview-2022",
+      "behavior_class": "documented",
+      "reproduction": {
+        "runner_id": "ntsql-testkit.synthetic",
+        "runner_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "runner_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "subject_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "subject_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "case_seed": "seed.schema-corpus",
+        "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "environment": [
+          { "name": "subject.operating-system", "value": "synthetic" },
+          { "name": "subject.architecture", "value": "synthetic" }
+        ],
+        "arguments": ["--case", "case.schema-corpus"]
+      },
+      "normalization_rules": [],
+      "observations": {
+        "syntax": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "wire": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "result": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "metadata": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "diagnostic": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "transactional_side_effect": { "state": "not-observed", "reason": "Synthetic schema-boundary case." },
+        "operational": { "state": "not-observed", "reason": "Synthetic schema-boundary case." }
+      }
+    }
+  },
+  "cases": [
+    {
+      "case_id": "conformance.base.valid",
+      "constraint": "complete synthetic conformance record",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.required.dimension-missing",
+      "constraint": "seven required observation dimensions",
+      "patch": [
+        { "op": "remove", "path": "/observations/operational" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        { "op": "add", "path": "/unexpected", "value": true }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.identifier.maximum.accepted",
+      "constraint": "identifier maxLength 128",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/case_id",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.identifier.too-long",
+      "constraint": "identifier maxLength 128",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/case_id",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.required.feature-id",
+      "constraint": "feature linkage is required",
+      "patch": [
+        { "op": "remove", "path": "/feature_id" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.owner-issue.zero",
+      "constraint": "owner issue is positive",
+      "patch": [
+        { "op": "replace", "path": "/owner_issue", "value": 0 }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.timestamp.fractional-seconds-rejected",
+      "constraint": "UTC second-precision timestamp",
+      "patch": [
+        { "op": "replace", "path": "/observed_at", "value": "2025-01-01T00:00:00.000Z" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.timestamp.offset-rejected",
+      "constraint": "UTC Z suffix",
+      "patch": [
+        { "op": "replace", "path": "/observed_at", "value": "2025-01-01T00:00:00+00:00" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.timestamp.lexical-calendar-not-asserted",
+      "constraint": "format annotation with lexical timestamp pattern",
+      "patch": [
+        { "op": "replace", "path": "/observed_at", "value": "2025-99-99T99:99:99Z" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.behavior-class.enum-rejected",
+      "constraint": "behavior class enum",
+      "patch": [
+        { "op": "replace", "path": "/behavior_class", "value": "unknown" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.runner-id-missing",
+      "constraint": "runner identity is required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/runner_id" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.runner-revision-missing",
+      "constraint": "runner revision is required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/runner_revision" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.runner-digest-missing",
+      "constraint": "runner artifact digest is required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/runner_digest" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.subject-revision-missing",
+      "constraint": "subject revision is required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/subject_revision" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.subject-digest-missing",
+      "constraint": "subject artifact digest is required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/subject_digest" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.case-seed-missing",
+      "constraint": "deterministic case seed is required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/case_seed" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.input-digest-missing",
+      "constraint": "input identity is required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/input_digest" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.environment-missing",
+      "constraint": "exact environment facts are required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/environment" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.arguments-missing",
+      "constraint": "shell-free runner arguments are required",
+      "patch": [
+        { "op": "remove", "path": "/reproduction/arguments" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.revision-invalid",
+      "constraint": "runner revision is an exact lowercase Git commit",
+      "patch": [
+        { "op": "replace", "path": "/reproduction/runner_revision", "value": "main" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.input-digest-invalid",
+      "constraint": "input bytes require a SHA-256 digest",
+      "patch": [
+        { "op": "replace", "path": "/reproduction/input_digest", "value": "sha256:bad" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.subject-digest-invalid",
+      "constraint": "subject artifact bytes require a SHA-256 digest",
+      "patch": [
+        { "op": "replace", "path": "/reproduction/subject_digest", "value": "sha256:bad" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.digest-uppercase",
+      "constraint": "conformance digests use canonical lowercase hexadecimal",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/reproduction/runner_digest",
+          "value": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.environment-empty",
+      "constraint": "at least one environment fact",
+      "patch": [
+        { "op": "replace", "path": "/reproduction/environment", "value": [] }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.environment-exact-duplicate",
+      "constraint": "environment fact uniqueItems",
+      "patch": [
+        {
+          "op": "copy",
+          "from": "/reproduction/environment/0",
+          "path": "/reproduction/environment/-"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.environment-name-duplicate",
+      "constraint": "environment fact names are unique as a Rust-only document invariant",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/reproduction/environment/-",
+          "value": { "name": "subject.architecture", "value": "different" }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.argument-whitespace",
+      "constraint": "rerun arguments are non-whitespace strings",
+      "patch": [
+        { "op": "replace", "path": "/reproduction/arguments/0", "value": "   " }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reproduction.argument-nul",
+      "constraint": "rerun arguments exclude OS-inexpressible NUL characters",
+      "patch": [
+        { "op": "replace", "path": "/reproduction/arguments/0", "value": "\u0000" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.inline-raw-valid",
+      "constraint": "observed dimension retains inline raw and normalized pairs",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": [1, null, "value"] },
+              "subject": { "kind": "inline", "value": [1, null, "value"] }
+            },
+            "normalized": {
+              "oracle": [1, null, "value"],
+              "subject": [1, null, "value"]
+            },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.normalization.unrecorded",
+      "constraint": "empty rule lists permit only exact inline identity",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 1 },
+              "subject": { "kind": "inline", "value": 1 }
+            },
+            "normalized": { "oracle": 2, "subject": 2 },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.normalization.signed-zero-unrecorded",
+      "constraint": "empty rule lists preserve IEEE signed zero",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": -0.0 },
+              "subject": { "kind": "inline", "value": -0.0 }
+            },
+            "normalized": { "oracle": 0.0, "subject": 0.0 },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.normalization.numeric-kind-unrecorded",
+      "constraint": "empty rule lists preserve integer and floating-point JSON kinds",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 1 },
+              "subject": { "kind": "inline", "value": 1 }
+            },
+            "normalized": { "oracle": 1.0, "subject": 1.0 },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.comparison.compatible-mismatch",
+      "constraint": "compatible requires equal normalized oracle and subject values",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 1 },
+              "subject": { "kind": "inline", "value": 2 }
+            },
+            "normalized": { "oracle": 1, "subject": 2 },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.comparison.divergent-match",
+      "constraint": "divergent requires unequal normalized oracle and subject values",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 1 },
+              "subject": { "kind": "inline", "value": 1 }
+            },
+            "normalized": { "oracle": 1, "subject": 1 },
+            "normalization_rules": [],
+            "status": "divergent"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.comparison.arbitrary-precision-integers-differ",
+      "constraint": "distinct integers beyond u64 retain distinct lexical identities",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 18446744073709551616 },
+              "subject": { "kind": "inline", "value": 18446744073709551617 }
+            },
+            "normalized": {
+              "oracle": 18446744073709551616,
+              "subject": 18446744073709551617
+            },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.artifact-raw-valid",
+      "constraint": "protected and public raw artifacts remain immutable references",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.wire-transcript",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Project a retained wire transcript into an ordered token list."
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/observations/wire",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": {
+                "kind": "artifact",
+                "store_id": "protected.oracle-evidence",
+                "artifact_id": "wire.oracle.case-schema-corpus",
+                "content_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "byte_length": 128,
+                "media_type": "application/vnd.ntsql.tds-transcript",
+                "access": "protected"
+              },
+              "subject": {
+                "kind": "artifact",
+                "store_id": "ci.public-evidence",
+                "artifact_id": "wire.subject.case-schema-corpus",
+                "content_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+                "byte_length": 128,
+                "media_type": "application/vnd.ntsql.tds-transcript",
+                "access": "public"
+              }
+            },
+            "normalized": {
+              "oracle": { "tokens": [] },
+              "subject": { "tokens": [] }
+            },
+            "normalization_rules": [
+              { "id": "normalize.wire-transcript", "revision": 1 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.observation.raw-pair-missing",
+      "constraint": "every observed dimension requires raw oracle and subject evidence",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 1 },
+              "subject": { "kind": "inline", "value": 1 }
+            },
+            "normalized": { "oracle": 1, "subject": 1 },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        },
+        { "op": "remove", "path": "/observations/result/raw" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.artifact-digest-missing",
+      "constraint": "external raw evidence requires its digest",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/wire",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": {
+                "kind": "artifact",
+                "store_id": "protected.oracle-evidence",
+                "artifact_id": "wire.oracle.case-schema-corpus",
+                "content_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "byte_length": 128,
+                "media_type": "application/octet-stream",
+                "access": "protected"
+              },
+              "subject": { "kind": "inline", "value": [] }
+            },
+            "normalized": { "oracle": [], "subject": [] },
+            "normalization_rules": [],
+            "status": "compatible"
+          }
+        },
+        { "op": "remove", "path": "/observations/wire/raw/oracle/content_digest" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.artifact-empty-valid",
+      "constraint": "an immutable zero-byte artifact records a legitimate empty raw output",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.empty-artifact",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Project a retained empty artifact into an empty typed value."
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/observations/wire",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": {
+                "kind": "artifact",
+                "store_id": "protected.oracle-evidence",
+                "artifact_id": "wire.oracle.case-schema-corpus",
+                "content_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "byte_length": 0,
+                "media_type": "application/octet-stream",
+                "access": "protected"
+              },
+              "subject": { "kind": "inline", "value": [] }
+            },
+            "normalized": { "oracle": [], "subject": [] },
+            "normalization_rules": [
+              { "id": "normalize.empty-artifact", "revision": 1 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.observation.artifact-zero-length-digest-mismatch",
+      "constraint": "zero-byte artifacts require the SHA-256 digest of empty content",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.empty-artifact",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Project a retained empty artifact into an empty typed value."
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/observations/wire",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": {
+                "kind": "artifact",
+                "store_id": "protected.oracle-evidence",
+                "artifact_id": "wire.oracle.case-schema-corpus",
+                "content_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "byte_length": 0,
+                "media_type": "application/octet-stream",
+                "access": "protected"
+              },
+              "subject": { "kind": "inline", "value": [] }
+            },
+            "normalized": { "oracle": [], "subject": [] },
+            "normalization_rules": [
+              { "id": "normalize.empty-artifact", "revision": 1 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.artifact-empty-digest-length-mismatch",
+      "constraint": "the SHA-256 digest of empty content requires zero byte length",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.empty-artifact",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Project a retained empty artifact into an empty typed value."
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/observations/wire",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": {
+                "kind": "artifact",
+                "store_id": "protected.oracle-evidence",
+                "artifact_id": "wire.oracle.case-schema-corpus",
+                "content_digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "byte_length": 1,
+                "media_type": "application/octet-stream",
+                "access": "protected"
+              },
+              "subject": { "kind": "inline", "value": [] }
+            },
+            "normalized": { "oracle": [], "subject": [] },
+            "normalization_rules": [
+              { "id": "normalize.empty-artifact", "revision": 1 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.normalization.rule-valid",
+      "constraint": "observed dimensions reference exact defined rule revisions",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.generated-id",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Replace a generated identifier with a stable typed placeholder."
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": { "id": "oracle-generated" } },
+              "subject": { "kind": "inline", "value": { "id": "subject-generated" } }
+            },
+            "normalized": {
+              "oracle": { "id": "<generated>" },
+              "subject": { "id": "<generated>" }
+            },
+            "normalization_rules": [
+              { "id": "normalize.generated-id", "revision": 1 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.normalization.reference-unknown",
+      "constraint": "rule references resolve within the immutable record",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 1 },
+              "subject": { "kind": "inline", "value": 1 }
+            },
+            "normalized": { "oracle": 1, "subject": 1 },
+            "normalization_rules": [
+              { "id": "normalize.unknown", "revision": 1 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.normalization.multiple-rules-valid",
+      "constraint": "multiple exact rule revisions are applied in recorded order",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.generated-id",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Replace a generated identifier with a stable typed placeholder."
+          }
+        },
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.generated-time",
+            "revision": 2,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Replace a generated timestamp with a stable typed placeholder."
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": {
+                "kind": "inline",
+                "value": { "id": "oracle-generated", "time": "oracle-time" }
+              },
+              "subject": {
+                "kind": "inline",
+                "value": { "id": "subject-generated", "time": "subject-time" }
+              }
+            },
+            "normalized": {
+              "oracle": { "id": "<generated>", "time": "<generated>" },
+              "subject": { "id": "<generated>", "time": "<generated>" }
+            },
+            "normalization_rules": [
+              { "id": "normalize.generated-id", "revision": 1 },
+              { "id": "normalize.generated-time", "revision": 2 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.normalization.rule-unused",
+      "constraint": "rule definitions cannot be unrelated metadata",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.unused",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Unused synthetic rule."
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.normalization.rule-identity-duplicate",
+      "constraint": "rule id and revision pairs are unique as a Rust-only document invariant",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.same",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "First definition."
+          }
+        },
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.same",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Conflicting definition."
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.normalization.rule-exact-duplicate",
+      "constraint": "normalization rule uniqueItems",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.same",
+            "revision": 1,
+            "provenance_id": "prov-ms-sql-engine-overview-2022",
+            "description": "Exact duplicate definition."
+          }
+        },
+        {
+          "op": "copy",
+          "from": "/normalization_rules/0",
+          "path": "/normalization_rules/-"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reference.feature-unknown",
+      "constraint": "feature references resolve against the feature matrix",
+      "patch": [
+        { "op": "replace", "path": "/feature_id", "value": "feature.unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reference.feature-blocked-legal",
+      "constraint": "blocked-legal features cannot produce conformance evidence",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/feature_id",
+          "value": "storage.native-file-formats"
+        },
+        { "op": "replace", "path": "/owner_issue", "value": 3 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reference.owner-mismatch",
+      "constraint": "captured owner issue matches the feature record",
+      "patch": [
+        { "op": "replace", "path": "/owner_issue", "value": 999 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reference.target-unknown",
+      "constraint": "target references resolve against the exact target matrix",
+      "patch": [
+        { "op": "replace", "path": "/target_id", "value": "target.unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.reference.provenance-unknown",
+      "constraint": "case provenance resolves against the provenance ledger",
+      "patch": [
+        { "op": "replace", "path": "/provenance_id", "value": "prov-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.normalization.provenance-unknown",
+      "constraint": "normalization rule provenance resolves against the provenance ledger",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/normalization_rules/-",
+          "value": {
+            "id": "normalize.unknown-provenance",
+            "revision": 1,
+            "provenance_id": "prov-unknown",
+            "description": "Synthetic unknown-provenance rule."
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": 1 },
+              "subject": { "kind": "inline", "value": 1 }
+            },
+            "normalized": { "oracle": 1, "subject": 1 },
+            "normalization_rules": [
+              { "id": "normalize.unknown-provenance", "revision": 1 }
+            ],
+            "status": "compatible"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason-whitespace",
+      "constraint": "non-whitespace not-observed reason",
+      "patch": [
+        { "op": "replace", "path": "/observations/syntax/reason", "value": "   " }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason.next-line-non-whitespace",
+      "constraint": "U+0085 is not ECMAScript whitespace",
+      "patch": [
+        { "op": "replace", "path": "/observations/syntax/reason", "value": "\u0085" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason.byte-order-mark-whitespace",
+      "constraint": "U+FEFF is ECMAScript whitespace",
+      "patch": [
+        { "op": "replace", "path": "/observations/syntax/reason", "value": "\ufeff" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.reason-missing",
+      "constraint": "not-observed union branch required property",
+      "patch": [
+        { "op": "remove", "path": "/observations/syntax/reason" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observation.status-enum-rejected",
+      "constraint": "comparison status enum",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/observations/result",
+          "value": {
+            "state": "observed",
+            "raw": {
+              "oracle": { "kind": "inline", "value": null },
+              "subject": { "kind": "inline", "value": null }
+            },
+            "normalized": { "oracle": null, "subject": null },
+            "normalization_rules": [],
+            "status": "unknown"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "conformance.observations.additional-dimension-rejected",
+      "constraint": "closed seven-dimension object",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/observations/unexpected",
+          "value": { "state": "not-observed", "reason": "Unexpected dimension." }
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,216 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/feature-matrix.schema.json",
+  "base_document": {
+    "source": "../compatibility/features.json"
+  },
+  "cases": [
+    {
+      "case_id": "feature.base.valid",
+      "constraint": "published feature matrix",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "feature.required.nullable-legal-review-missing",
+      "constraint": "required nullable property",
+      "patch": [
+        { "op": "remove", "path": "/features/0/legal_review_id" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        { "op": "add", "path": "/features/0/unexpected", "value": true }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.owner-issue.maximum.accepted",
+      "constraint": "u64 maximum",
+      "patch": [
+        { "op": "replace", "path": "/features/0/owner_issue", "value": 18446744073709551615 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "feature.owner-issue.overflow",
+      "constraint": "u64 maximum",
+      "patch": [
+        { "op": "replace", "path": "/features/0/owner_issue", "value": 18446744073709551616 }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.owner-issue.integral-decimal-prefilter",
+      "constraint": "JSON Schema integer accepts an integral decimal representation",
+      "patch": [
+        { "op": "replace", "path": "/features/0/owner_issue", "value": 8.0 }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.category.enum-rejected",
+      "constraint": "category enum",
+      "patch": [
+        { "op": "replace", "path": "/features/0/category", "value": "unknown" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.evidence.duplicate",
+      "constraint": "uniqueItems",
+      "patch": [
+        { "op": "copy", "from": "/features/0/evidence/0", "path": "/features/0/evidence/-" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.compatible.has-difference",
+      "constraint": "compatible status conditional",
+      "patch": [
+        { "op": "replace", "path": "/features/0/status", "value": "compatible" },
+        { "op": "add", "path": "/features/0/differences/-", "value": "synthetic difference" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.partial.difference-missing",
+      "constraint": "partial status conditional",
+      "patch": [
+        { "op": "replace", "path": "/features/0/status", "value": "partial" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.blocked-legal.review-missing",
+      "constraint": "blocked-legal status conditional",
+      "patch": [
+        { "op": "replace", "path": "/features/0/status", "value": "blocked-legal" }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.id.duplicate-rust-only",
+      "constraint": "semantic identifier uniqueness",
+      "patch": [
+        { "op": "copy", "from": "/features/0", "path": "/features/-" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.category.missing-rust-only",
+      "constraint": "18-category coverage",
+      "patch": [
+        { "op": "remove", "path": "/features/0" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.oracle-target.unknown-rust-only",
+      "constraint": "target reference",
+      "patch": [
+        { "op": "replace", "path": "/features/0/oracle_targets/0", "value": "target.unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.evidence.unknown-rust-only",
+      "constraint": "provenance reference",
+      "patch": [
+        { "op": "replace", "path": "/features/0/evidence/0", "value": "prov-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "feature.legal-review.unknown-rust-only",
+      "constraint": "legal-review reference",
+      "patch": [
+        { "op": "replace", "path": "/features/3/legal_review_id", "value": "legal-review-unknown" }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

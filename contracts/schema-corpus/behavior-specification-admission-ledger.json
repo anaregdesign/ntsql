@@ -1,0 +1,553 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/behavior-specification-admission-ledger.schema.json",
+  "base_document": {
+    "inline": {
+      "schema_version": "2.0.0",
+      "admissions": [
+        {
+          "id": "admission.synthetic.select",
+          "case_id": "case.synthetic.select",
+          "owner_issue": 54,
+          "feature_ids": ["language.query.select"],
+          "target_id": "target.synthetic",
+          "roles": {
+            "observer": {
+              "actor": {
+                "github_account_id": 1001,
+                "github_login": "synthetic-observer"
+              },
+              "assigned_at": "2026-01-01T00:00:00Z"
+            },
+            "specification_reviewer": {
+              "actor": {
+                "github_account_id": 1002,
+                "github_login": "synthetic-spec-reviewer"
+              },
+              "assigned_at": "2026-01-01T00:01:00Z"
+            },
+            "implementer": {
+              "actor": {
+                "github_account_id": 1003,
+                "github_login": "synthetic-implementer"
+              },
+              "assigned_at": "2026-01-01T00:02:00Z"
+            },
+            "conformance_reviewer": {
+              "actor": {
+                "github_account_id": 1004,
+                "github_login": "synthetic-conformance-reviewer"
+              },
+              "assigned_at": "2026-01-01T00:03:00Z"
+            }
+          },
+          "source_provenance_ids": ["prov-synthetic-source"],
+          "legal_review_ids": ["legal-review-synthetic"],
+          "observation": {
+            "started_at": "2026-01-01T01:00:00Z",
+            "completed_at": "2026-01-01T01:01:00Z",
+            "commands": [
+              {
+                "program": "synthetic-observer",
+                "arguments": ["--case", "case.synthetic.select"]
+              }
+            ],
+            "session_settings": [
+              {
+                "name": "compatibility-level",
+                "value": "synthetic"
+              }
+            ],
+            "environment": [
+              {
+                "name": "environment",
+                "value": "synthetic"
+              }
+            ],
+            "input_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "input_byte_length": 1
+          },
+          "raw_evidence": {
+            "content_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "byte_length": 1,
+            "disposition": {
+              "state": "protected",
+              "store_id": "synthetic-store",
+              "artifact_id": "synthetic-artifact",
+              "confirmed_at": "2026-01-01T01:02:00Z"
+            },
+            "cleanup_events": [
+              {
+                "kind": "protected-retention-confirmed",
+                "occurred_at": "2026-01-01T01:02:00Z",
+                "actor": {
+                  "github_account_id": 1001,
+                  "github_login": "synthetic-observer"
+                }
+              }
+            ]
+          },
+          "specification": {
+            "provenance_id": "prov-synthetic-specification",
+            "artifact_path": "specifications/synthetic-select.json",
+            "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "parent_provenance_ids": ["prov-synthetic-source"],
+            "technical_review": {
+              "status": "approved",
+              "reviewed_by": {
+                "github_account_id": 1002,
+                "github_login": "synthetic-spec-reviewer"
+              },
+              "decided_at": "2026-01-01T01:03:00Z",
+              "decision_evidence": {
+                "repository": "anaregdesign/ntsql",
+                "pull_request_number": 1,
+                "reviewed_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "attestation_id": "attestation.synthetic.select"
+              },
+              "rationale": "Synthetic schema-boundary approval only."
+            }
+          },
+          "implementation_handoff": {
+            "specification_provenance_id": "prov-synthetic-specification",
+            "specification_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "implementer": {
+              "github_account_id": 1003,
+              "github_login": "synthetic-implementer"
+            },
+            "handed_off_at": "2026-01-01T01:04:00Z"
+          },
+          "derived_tests": [
+            {
+              "provenance_id": "prov-synthetic-test",
+              "artifact_path": "tests/synthetic-select.rs",
+              "content_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "parent_provenance_ids": ["prov-synthetic-specification"]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "case_id": "admission.base.synthetic-valid",
+      "constraint": "synthetic approved admission shape",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "admission.review-evidence.reviewed-commit-required",
+      "constraint": "non-pending review evidence requires the exact reviewed subject commit",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/admissions/0/specification/technical_review/decision_evidence/reviewed_commit_sha"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.required.nullable-handoff-missing",
+      "constraint": "required nullable implementation_handoff property",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/admissions/0/implementation_handoff"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.derived-test.exact-parent-set-rust-only",
+      "constraint": "derived tests name exactly the sanitized specification as their direct parent",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/admissions/0/derived_tests/0/parent_provenance_ids/-",
+          "value": "prov-unrelated"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.pending.valid-with-null-decision",
+      "constraint": "pending technical review has explicit null decision metadata and no handoff",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/technical_review/status",
+          "value": "pending"
+        },
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/technical_review/reviewed_by",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/technical_review/decided_at",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/technical_review/decision_evidence",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/admissions/0/implementation_handoff",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/admissions/0/derived_tests",
+          "value": []
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "admission.pending.decision-metadata-forbidden",
+      "constraint": "pending technical review cannot name a reviewer or decision evidence",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/technical_review/status",
+          "value": "pending"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.roles.distinct-rust-only",
+      "constraint": "clean-room role identities are pairwise distinct",
+      "patch": [
+        {
+          "op": "copy",
+          "from": "/admissions/0/roles/observer/actor",
+          "path": "/admissions/0/roles/implementer/actor"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.roles.precede-observation-rust-only",
+      "constraint": "role assignment precedes observation",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/roles/observer/assigned_at",
+          "value": "2026-01-01T01:00:00Z"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.timestamp.lexically-malformed",
+      "constraint": "UTC second-precision timestamp",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/observation/started_at",
+          "value": "2026/01/01 01:00:00"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.timestamp.calendar-invalid-rust-only",
+      "constraint": "authoritative chronology rejects out-of-range date and time components",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/observation/started_at",
+          "value": "2026-99-99T99:99:99Z"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.digest.canonical-lowercase",
+      "constraint": "admission SHA-256 digests use canonical lowercase hexadecimal",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/observation/input_digest",
+          "value": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.actor.consecutive-hyphens",
+      "constraint": "GitHub login excludes consecutive hyphens",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/roles/observer/actor/github_login",
+          "value": "synthetic--observer"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.environment.name-duplicate-rust-only",
+      "constraint": "environment fact names are unique even when values differ",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/admissions/0/observation/environment/-",
+          "value": {
+            "name": "environment",
+            "value": "different-synthetic-environment"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.cleanup.nonempty",
+      "constraint": "raw evidence requires a cleanup event",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/raw_evidence/cleanup_events",
+          "value": []
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.cleanup.raw-role-only",
+      "constraint": "only the observer or specification reviewer can confirm raw-evidence cleanup",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/raw_evidence/cleanup_events/0/actor",
+          "value": {
+            "github_account_id": 1003,
+            "github_login": "synthetic-implementer"
+          }
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.cleanup.after-observation",
+      "constraint": "raw-evidence disposition and cleanup strictly follow completed observation",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/raw_evidence/disposition/confirmed_at",
+          "value": "2026-01-01T01:01:00Z"
+        },
+        {
+          "op": "replace",
+          "path": "/admissions/0/raw_evidence/cleanup_events/0/occurred_at",
+          "value": "2026-01-01T01:01:00Z"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.review.after-cleanup",
+      "constraint": "technical review follows raw-evidence disposition and every cleanup event",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/technical_review/decided_at",
+          "value": "2026-01-01T01:01:30Z"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.review.strictly-after-cleanup",
+      "constraint": "technical review cannot share a second with disposition or cleanup",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/technical_review/decided_at",
+          "value": "2026-01-01T01:02:00Z"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.handoff.strictly-after-review",
+      "constraint": "implementation handoff cannot share a second with technical approval",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/implementation_handoff/handed_off_at",
+          "value": "2026-01-01T01:03:00Z"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.specification.safe-path",
+      "constraint": "repository-relative specification path",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/specification/artifact_path",
+          "value": "../outside.json"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.approved.handoff-required-rust-only",
+      "constraint": "approved specification requires controlled handoff",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/admissions/0/implementation_handoff",
+          "value": null
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.id.duplicate-rust-only",
+      "constraint": "admission and case identifiers are unique",
+      "patch": [
+        {
+          "op": "copy",
+          "from": "/admissions/0",
+          "path": "/admissions/-"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "admission.additional-property.rejected",
+      "constraint": "additionalProperties false",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/admissions/0/unexpected",
+          "value": true
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    }
+  ]
+}

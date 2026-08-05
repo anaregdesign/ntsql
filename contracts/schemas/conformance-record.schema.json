@@ -1,0 +1,292 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anaregdesign/ntsql/contracts/schemas/conformance-record.schema.json",
+  "title": "ntsql conformance record",
+  "description": "One reproducible, lossless comparison between an exact SQL Server oracle target and ntsql.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "case_id",
+    "feature_id",
+    "owner_issue",
+    "target_id",
+    "observed_at",
+    "provenance_id",
+    "behavior_class",
+    "reproduction",
+    "normalization_rules",
+    "observations"
+  ],
+  "properties": {
+    "schema_version": { "const": "2.0.0" },
+    "case_id": { "$ref": "#/$defs/identifier" },
+    "feature_id": { "$ref": "#/$defs/identifier" },
+    "owner_issue": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "target_id": { "$ref": "#/$defs/identifier" },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "provenance_id": { "$ref": "#/$defs/identifier" },
+    "behavior_class": {
+      "enum": [
+        "documented",
+        "version-dependent",
+        "unspecified",
+        "implementation-dependent"
+      ]
+    },
+    "reproduction": { "$ref": "#/$defs/reproduction" },
+    "normalization_rules": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/normalizationRule" }
+    },
+    "observations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "syntax",
+        "wire",
+        "result",
+        "metadata",
+        "diagnostic",
+        "transactional_side_effect",
+        "operational"
+      ],
+      "properties": {
+        "syntax": { "$ref": "#/$defs/observation" },
+        "wire": { "$ref": "#/$defs/observation" },
+        "result": { "$ref": "#/$defs/observation" },
+        "metadata": { "$ref": "#/$defs/observation" },
+        "diagnostic": { "$ref": "#/$defs/observation" },
+        "transactional_side_effect": { "$ref": "#/$defs/observation" },
+        "operational": { "$ref": "#/$defs/observation" }
+      }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "nonWhitespaceString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\u0009-\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]"
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "gitCommit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "comparisonStatus": {
+      "enum": ["compatible", "partial", "divergent"]
+    },
+    "environmentFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "value": { "$ref": "#/$defs/nonWhitespaceString" }
+      }
+    },
+    "reproduction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runner_id",
+        "runner_revision",
+        "runner_digest",
+        "subject_revision",
+        "subject_digest",
+        "case_seed",
+        "input_digest",
+        "environment",
+        "arguments"
+      ],
+      "properties": {
+        "runner_id": { "$ref": "#/$defs/identifier" },
+        "runner_revision": { "$ref": "#/$defs/gitCommit" },
+        "runner_digest": { "$ref": "#/$defs/sha256Digest" },
+        "subject_revision": { "$ref": "#/$defs/gitCommit" },
+        "subject_digest": { "$ref": "#/$defs/sha256Digest" },
+        "case_seed": { "$ref": "#/$defs/nonWhitespaceString" },
+        "input_digest": { "$ref": "#/$defs/sha256Digest" },
+        "environment": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/environmentFact" }
+        },
+        "arguments": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/nonWhitespaceString" },
+              { "not": { "pattern": "\\u0000" } }
+            ]
+          }
+        }
+      }
+    },
+    "normalizationRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "provenance_id", "description"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "provenance_id": { "$ref": "#/$defs/identifier" },
+        "description": { "$ref": "#/$defs/nonWhitespaceString" }
+      }
+    },
+    "normalizationRuleReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision"],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      }
+    },
+    "rawEvidence": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "inline" },
+            "value": {}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "store_id",
+            "artifact_id",
+            "content_digest",
+            "byte_length",
+            "media_type",
+            "access"
+          ],
+          "properties": {
+            "kind": { "const": "artifact" },
+            "store_id": { "$ref": "#/$defs/identifier" },
+            "artifact_id": { "$ref": "#/$defs/identifier" },
+            "content_digest": { "$ref": "#/$defs/sha256Digest" },
+            "byte_length": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18446744073709551615
+            },
+            "media_type": { "$ref": "#/$defs/nonWhitespaceString" },
+            "access": { "enum": ["public", "protected"] }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "byte_length": { "const": 0 } }
+              },
+              "then": {
+                "properties": {
+                  "content_digest": {
+                    "const": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  }
+                }
+              }
+            },
+            {
+              "if": {
+                "properties": {
+                  "content_digest": {
+                    "const": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                  }
+                }
+              },
+              "then": {
+                "properties": { "byte_length": { "const": 0 } }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "rawObservationPair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["oracle", "subject"],
+      "properties": {
+        "oracle": { "$ref": "#/$defs/rawEvidence" },
+        "subject": { "$ref": "#/$defs/rawEvidence" }
+      }
+    },
+    "normalizedObservationPair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["oracle", "subject"],
+      "properties": {
+        "oracle": {},
+        "subject": {}
+      }
+    },
+    "observation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "raw",
+            "normalized",
+            "normalization_rules",
+            "status"
+          ],
+          "properties": {
+            "state": { "const": "observed" },
+            "raw": { "$ref": "#/$defs/rawObservationPair" },
+            "normalized": { "$ref": "#/$defs/normalizedObservationPair" },
+            "normalization_rules": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/normalizationRuleReference" }
+            },
+            "status": { "$ref": "#/$defs/comparisonStatus" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "reason"],
+          "properties": {
+            "state": { "const": "not-observed" },
+            "reason": { "$ref": "#/$defs/nonWhitespaceString" }
+          }
+        }
+      ]
+    }
+  }
+}

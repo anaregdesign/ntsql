@@ -1,0 +1,91 @@
+name: Governance
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  governance:
+    name: Contracts and supply chain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Install and select pinned Rust toolchain
+        run: |
+          rustup show active-toolchain | grep '^1\.97\.1-'
+          rustc --version --verbose | grep '^release: 1\.97\.1$'
+          cargo --version --verbose | grep '^release: 1\.97\.1$'
+          rustup component list --installed
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test workspace
+        run: cargo test --workspace --all-features --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Check first-party dependency boundaries
+        run: cargo run --locked -p ntsql-architecture-check
+
+      - name: Check offline provenance
+        run: >-
+          cargo run --locked -p ntsql-contract --bin ntsql-governance --
+          provenance-offline
+
+      - name: Revalidate remote supply-chain archives
+        run: >-
+          cargo run --locked -p ntsql-contract --bin ntsql-governance --
+          provenance-online
+
+      - name: Install governance tools
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Check dependency licenses and sources
+        run: cargo deny check
+
+      - name: Check dependency advisories
+        run: cargo audit --deny warnings
+
+      - name: Check fixture provenance
+        run: >-
+          cargo run --locked -p ntsql-contract --bin ntsql-governance --
+          fixtures
+
+      - name: Generate CycloneDX SBOM
+        run: >-
+          cargo cyclonedx
+          --format json
+          --spec-version 1.5
+          --all
+          --all-features
+          --target all
+          --license-strict
+          --override-filename ntsql-contract.cdx
+
+      - name: Require and validate CycloneDX SBOM
+        run: |
+          test -s crates/ntsql-contract/ntsql-contract.cdx.json
+          cargo run --locked -p ntsql-contract --bin ntsql-governance -- \
+            sbom crates/ntsql-contract/ntsql-contract.cdx.json
+
+      - name: Upload CycloneDX SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: ntsql-cyclonedx-sbom
+          path: crates/ntsql-contract/ntsql-contract.cdx.json
+          if-no-files-found: error
+          retention-days: 90

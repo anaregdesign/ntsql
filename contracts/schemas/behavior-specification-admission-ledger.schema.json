@@ -1,0 +1,466 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anaregdesign/ntsql/contracts/schemas/behavior-specification-admission-ledger.schema.json",
+  "title": "ntsql behavior specification admission ledger",
+  "description": "Clean-room role, evidence, specification, review, and handoff records required before externally sourced behavior may guide implementation.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "admissions"],
+  "properties": {
+    "schema_version": { "const": "2.0.0" },
+    "admissions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/admission" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "nonWhitespaceString": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "[^\\u0009-\\u000D\\u0020\\u00A0\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000\\uFEFF]"
+    },
+    "sha256Digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "repositoryPath": {
+      "allOf": [
+        { "$ref": "#/$defs/nonWhitespaceString" },
+        {
+          "pattern": "^[^/\\\\][^\\\\]*$",
+          "not": { "pattern": "(^|/)\\.\\.(/|$)" }
+        }
+      ]
+    },
+    "githubLogin": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 39,
+      "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9]|-[A-Za-z0-9])*$"
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["github_account_id", "github_login"],
+      "properties": {
+        "github_account_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "github_login": { "$ref": "#/$defs/githubLogin" }
+      }
+    },
+    "roleAssignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["actor", "assigned_at"],
+      "properties": {
+        "actor": { "$ref": "#/$defs/actor" },
+        "assigned_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observer",
+        "specification_reviewer",
+        "implementer",
+        "conformance_reviewer"
+      ],
+      "properties": {
+        "observer": { "$ref": "#/$defs/roleAssignment" },
+        "specification_reviewer": { "$ref": "#/$defs/roleAssignment" },
+        "implementer": { "$ref": "#/$defs/roleAssignment" },
+        "conformance_reviewer": { "$ref": "#/$defs/roleAssignment" }
+      }
+    },
+    "environmentFact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": { "$ref": "#/$defs/identifier" },
+        "value": { "$ref": "#/$defs/nonWhitespaceString" }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "arguments"],
+      "properties": {
+        "program": {
+          "allOf": [
+            { "$ref": "#/$defs/nonWhitespaceString" },
+            { "not": { "pattern": "\\u0000" } }
+          ]
+        },
+        "arguments": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              { "$ref": "#/$defs/nonWhitespaceString" },
+              { "not": { "pattern": "\\u0000" } }
+            ]
+          }
+        }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_at",
+        "completed_at",
+        "commands",
+        "session_settings",
+        "environment",
+        "input_digest",
+        "input_byte_length"
+      ],
+      "properties": {
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "completed_at": { "$ref": "#/$defs/timestamp" },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/command" }
+        },
+        "session_settings": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/environmentFact" }
+        },
+        "environment": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/environmentFact" }
+        },
+        "input_digest": { "$ref": "#/$defs/sha256Digest" },
+        "input_byte_length": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "input_byte_length": { "const": 0 } }
+          },
+          "then": {
+            "properties": {
+              "input_digest": {
+                "const": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "input_digest": {
+                "const": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              }
+            }
+          },
+          "then": {
+            "properties": { "input_byte_length": { "const": 0 } }
+          }
+        }
+      ]
+    },
+    "disposition": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "store_id", "artifact_id", "confirmed_at"],
+          "properties": {
+            "state": { "const": "protected" },
+            "store_id": { "$ref": "#/$defs/identifier" },
+            "artifact_id": { "$ref": "#/$defs/identifier" },
+            "confirmed_at": { "$ref": "#/$defs/timestamp" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["state", "deleted_at"],
+          "properties": {
+            "state": { "const": "deleted" },
+            "deleted_at": { "$ref": "#/$defs/timestamp" }
+          }
+        }
+      ]
+    },
+    "cleanupEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "occurred_at", "actor"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "working-copy-deleted",
+            "access-revoked",
+            "protected-retention-confirmed"
+          ]
+        },
+        "occurred_at": { "$ref": "#/$defs/timestamp" },
+        "actor": { "$ref": "#/$defs/actor" }
+      }
+    },
+    "rawEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "content_digest",
+        "byte_length",
+        "disposition",
+        "cleanup_events"
+      ],
+      "properties": {
+        "content_digest": { "$ref": "#/$defs/sha256Digest" },
+        "byte_length": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615
+        },
+        "disposition": { "$ref": "#/$defs/disposition" },
+        "cleanup_events": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/cleanupEvent" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "byte_length": { "const": 0 } }
+          },
+          "then": {
+            "properties": {
+              "content_digest": {
+                "const": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "content_digest": {
+                "const": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+              }
+            }
+          },
+          "then": {
+            "properties": { "byte_length": { "const": 0 } }
+          }
+        }
+      ]
+    },
+    "reviewEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "pull_request_number", "reviewed_commit_sha", "attestation_id"],
+      "properties": {
+        "repository": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+        },
+        "pull_request_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "reviewed_commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "attestation_id": { "$ref": "#/$defs/identifier" }
+      }
+    },
+    "technicalReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "reviewed_by",
+        "decided_at",
+        "decision_evidence",
+        "rationale"
+      ],
+      "properties": {
+        "status": { "enum": ["pending", "approved", "rejected"] },
+        "reviewed_by": {
+          "oneOf": [{ "$ref": "#/$defs/actor" }, { "type": "null" }]
+        },
+        "decided_at": {
+          "oneOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+        },
+        "decision_evidence": {
+          "oneOf": [{ "$ref": "#/$defs/reviewEvidence" }, { "type": "null" }]
+        },
+        "rationale": { "$ref": "#/$defs/nonWhitespaceString" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "const": "pending" } },
+            "required": ["status"]
+          },
+          "then": {
+            "properties": {
+              "reviewed_by": { "type": "null" },
+              "decided_at": { "type": "null" },
+              "decision_evidence": { "type": "null" }
+            }
+          },
+          "else": {
+            "properties": {
+              "reviewed_by": { "$ref": "#/$defs/actor" },
+              "decided_at": { "$ref": "#/$defs/timestamp" },
+              "decision_evidence": { "$ref": "#/$defs/reviewEvidence" }
+            }
+          }
+        }
+      ]
+    },
+    "specification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance_id",
+        "artifact_path",
+        "content_digest",
+        "parent_provenance_ids",
+        "technical_review"
+      ],
+      "properties": {
+        "provenance_id": { "$ref": "#/$defs/identifier" },
+        "artifact_path": { "$ref": "#/$defs/repositoryPath" },
+        "content_digest": { "$ref": "#/$defs/sha256Digest" },
+        "parent_provenance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "technical_review": { "$ref": "#/$defs/technicalReview" }
+      }
+    },
+    "handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "specification_provenance_id",
+        "specification_digest",
+        "implementer",
+        "handed_off_at"
+      ],
+      "properties": {
+        "specification_provenance_id": { "$ref": "#/$defs/identifier" },
+        "specification_digest": { "$ref": "#/$defs/sha256Digest" },
+        "implementer": { "$ref": "#/$defs/actor" },
+        "handed_off_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "derivedTest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provenance_id",
+        "artifact_path",
+        "content_digest",
+        "parent_provenance_ids"
+      ],
+      "properties": {
+        "provenance_id": { "$ref": "#/$defs/identifier" },
+        "artifact_path": { "$ref": "#/$defs/repositoryPath" },
+        "content_digest": { "$ref": "#/$defs/sha256Digest" },
+        "parent_provenance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        }
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "case_id",
+        "owner_issue",
+        "feature_ids",
+        "target_id",
+        "roles",
+        "source_provenance_ids",
+        "legal_review_ids",
+        "observation",
+        "raw_evidence",
+        "specification",
+        "implementation_handoff",
+        "derived_tests"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "case_id": { "$ref": "#/$defs/identifier" },
+        "owner_issue": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615
+        },
+        "feature_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "target_id": { "$ref": "#/$defs/identifier" },
+        "roles": { "$ref": "#/$defs/roles" },
+        "source_provenance_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "legal_review_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/identifier" }
+        },
+        "observation": { "$ref": "#/$defs/observation" },
+        "raw_evidence": { "$ref": "#/$defs/rawEvidence" },
+        "specification": { "$ref": "#/$defs/specification" },
+        "implementation_handoff": {
+          "oneOf": [{ "$ref": "#/$defs/handoff" }, { "type": "null" }]
+        },
+        "derived_tests": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/derivedTest" }
+        }
+      }
+    }
+  }
+}

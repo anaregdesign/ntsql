@@ -1,0 +1,12 @@
+[package]
+name = "ntsql-architecture-check"
+version = "0.1.0"
+description = "First-party dependency boundary checker for ntsql"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true

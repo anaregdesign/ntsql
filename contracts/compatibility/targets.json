@@ -1,0 +1,81 @@
+{
+  "schema_version": "1.0.0",
+  "baseline_target_id": "sqlserver-2022-cu26-linux-x86_64-developer-compat160",
+  "targets": [
+    {
+      "id": "sqlserver-2022-cu26-linux-x86_64-developer-compat160",
+      "provenance_id": "prov-oracle-sqlserver-2022-cu26",
+      "product_release": "2022",
+      "servicing_update": "CU26",
+      "product_version": "16.0.4265.3",
+      "edition": "Developer",
+      "operating_system": "Ubuntu 22.04 container on Linux",
+      "architecture": "x86_64",
+      "container_repository": "mcr.microsoft.com/mssql/server",
+      "container_tag": "2022-CU26-ubuntu-22.04",
+      "container_digest": "sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89",
+      "compatibility_level": 160,
+      "collation": "SQL_Latin1_General_CP1_CI_AS",
+      "language": "us_english",
+      "lcid": 1033,
+      "timezone": "UTC",
+      "session_settings": [
+        "SET ANSI_NULLS ON",
+        "SET ANSI_PADDING ON",
+        "SET ANSI_WARNINGS ON",
+        "SET ARITHABORT ON",
+        "SET CONCAT_NULL_YIELDS_NULL ON",
+        "SET QUOTED_IDENTIFIER ON",
+        "SET NUMERIC_ROUNDABORT OFF",
+        "SET LANGUAGE us_english",
+        "SET DATEFIRST 7",
+        "SET DATEFORMAT mdy",
+        "SET DEADLOCK_PRIORITY NORMAL",
+        "SET LOCK_TIMEOUT -1",
+        "SET IMPLICIT_TRANSACTIONS OFF",
+        "SET XACT_ABORT OFF",
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        "SET NOCOUNT OFF",
+        "SET ROWCOUNT 0",
+        "SET TEXTSIZE 2147483647"
+      ]
+    }
+  ],
+  "expansion_order": [
+    {
+      "sequence": 1,
+      "scope": "Certify the SQL Server 2022 CU26 Linux Developer compatibility-level 160 baseline",
+      "admission_criteria": "Verify image digest, product build, edition, collation, language, timezone, and every explicit session setting at runtime"
+    },
+    {
+      "sequence": 2,
+      "scope": "Add every compatibility level supported by the baseline build",
+      "admission_criteria": "Create one immutable target per level and pass the complete conformance corpus"
+    },
+    {
+      "sequence": 3,
+      "scope": "Add SQL Server 2022 Enterprise, Standard, Web, and Express edition behavior",
+      "admission_criteria": "Record a legally approved oracle and classify every documented edition difference"
+    },
+    {
+      "sequence": 4,
+      "scope": "Add Windows Server targets for SQL Server 2022",
+      "admission_criteria": "Pin the OS image and SQL Server media, then pass platform-neutral and Windows-specific conformance suites"
+    },
+    {
+      "sequence": 5,
+      "scope": "Add SQL Server 2025, 2019, 2017, and 2016 Database Engine releases",
+      "admission_criteria": "Pin one supported servicing build per release, enumerate its supported compatibility levels, and pass the complete conformance corpus"
+    },
+    {
+      "sequence": 6,
+      "scope": "Expand collation, language, timezone, and session-option partitions",
+      "admission_criteria": "Cover every documented behavioral partition without relying on an unrecorded host default"
+    },
+    {
+      "sequence": 7,
+      "scope": "Admit later servicing builds without mutating existing target identifiers",
+      "admission_criteria": "Create a new target, rerun all evidence, publish differences, and retain historical target results"
+    }
+  ]
+}

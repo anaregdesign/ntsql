@@ -1,0 +1,442 @@
+{
+  "corpus_version": "1.0.0",
+  "schema_id": "https://github.com/anaregdesign/ntsql/contracts/schemas/specification-review-authority.schema.json",
+  "base_document": {
+    "inline": {
+      "schema_version": "1.0.0",
+      "candidate_repository": "synthetic/ntsql",
+      "candidate_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_author_account_id": 1003,
+      "trusted_reviewer_account_ids": [1002],
+      "pull_requests": [
+        {
+          "repository": "synthetic/ntsql",
+          "pull_request_number": 1,
+          "pull_request_author_account_id": 1003,
+          "candidate_commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "authenticated_reviews": [
+            {
+              "repository": "synthetic/ntsql",
+              "pull_request_number": 1,
+              "review_id": 7001,
+              "reviewer": {
+                "github_account_id": 1002,
+                "github_login": "synthetic-spec-reviewer"
+              },
+              "reviewed_commit_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "state": "approved",
+              "submitted_at": "2026-01-01T01:03:00Z",
+              "last_edited_at": null,
+              "attestations": [
+                {
+                  "attestation_id": "attestation.synthetic.select",
+                  "subject": {
+                    "id": "admission.synthetic.select",
+                    "case_id": "case.synthetic.select",
+                    "owner_issue": 54,
+                    "feature_ids": ["language.query.select"],
+                    "target_id": "target.synthetic",
+                    "roles": {
+                      "observer": {
+                        "actor": {
+                          "github_account_id": 1001,
+                          "github_login": "synthetic-observer"
+                        },
+                        "assigned_at": "2026-01-01T00:00:00Z"
+                      },
+                      "specification_reviewer": {
+                        "actor": {
+                          "github_account_id": 1002,
+                          "github_login": "synthetic-spec-reviewer"
+                        },
+                        "assigned_at": "2026-01-01T00:01:00Z"
+                      },
+                      "implementer": {
+                        "actor": {
+                          "github_account_id": 1003,
+                          "github_login": "synthetic-implementer"
+                        },
+                        "assigned_at": "2026-01-01T00:02:00Z"
+                      },
+                      "conformance_reviewer": {
+                        "actor": {
+                          "github_account_id": 1004,
+                          "github_login": "synthetic-conformance-reviewer"
+                        },
+                        "assigned_at": "2026-01-01T00:03:00Z"
+                      }
+                    },
+                    "source_provenance_ids": ["prov-synthetic-source"],
+                    "legal_review_ids": ["legal-review-synthetic"],
+                    "observation": {
+                      "started_at": "2026-01-01T01:00:00Z",
+                      "completed_at": "2026-01-01T01:01:00Z",
+                      "commands": [
+                        {
+                          "program": "synthetic-observer",
+                          "arguments": ["--case", "case.synthetic.select"]
+                        }
+                      ],
+                      "session_settings": [
+                        { "name": "compatibility-level", "value": "synthetic" }
+                      ],
+                      "environment": [
+                        { "name": "environment", "value": "synthetic" }
+                      ],
+                      "input_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "input_byte_length": 1
+                    },
+                    "raw_evidence": {
+                      "content_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                      "byte_length": 1,
+                      "disposition": {
+                        "state": "protected",
+                        "store_id": "synthetic-store",
+                        "artifact_id": "synthetic-artifact",
+                        "confirmed_at": "2026-01-01T01:02:00Z"
+                      },
+                      "cleanup_events": [
+                        {
+                          "kind": "protected-retention-confirmed",
+                          "occurred_at": "2026-01-01T01:02:00Z",
+                          "actor": {
+                            "github_account_id": 1001,
+                            "github_login": "synthetic-observer"
+                          }
+                        }
+                      ]
+                    },
+                    "specification": {
+                      "provenance_id": "prov-synthetic-specification",
+                      "artifact_path": "specifications/synthetic-select.json",
+                      "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                      "parent_provenance_ids": ["prov-synthetic-source"]
+                    }
+                  },
+                  "decision": {
+                    "status": "approved",
+                    "rationale": "Synthetic schema-boundary approval only."
+                  },
+                  "target_record": {
+                    "id": "target.synthetic",
+                    "provenance_id": "prov-synthetic-target",
+                    "product_release": "2022",
+                    "servicing_update": "CU26",
+                    "product_version": "16.0.4265.3",
+                    "edition": "Developer",
+                    "operating_system": "synthetic",
+                    "architecture": "x86_64",
+                    "container_repository": "synthetic.invalid/server",
+                    "container_tag": "2022-CU26-synthetic",
+                    "container_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "compatibility_level": 160,
+                    "collation": "SQL_Latin1_General_CP1_CI_AS",
+                    "language": "us_english",
+                    "lcid": 1033,
+                    "timezone": "UTC",
+                    "session_settings": ["ANSI_NULLS ON"]
+                  },
+                  "feature_records": [
+                    {
+                      "id": "language.query.select",
+                      "title": "Synthetic SELECT",
+                      "category": "language",
+                      "status": "not-tested",
+                      "oracle_targets": ["target.synthetic"],
+                      "evidence": ["prov-synthetic-specification"],
+                      "differences": [],
+                      "owner_issue": 8,
+                      "legal_review_id": null
+                    }
+                  ],
+                  "provenance_records": [
+                    {
+                      "id": "prov-synthetic-source",
+                      "source_kind": "open-specification",
+                      "title": "Synthetic source",
+                      "source_url": "https://example.invalid/source",
+                      "artifact_path": null,
+                      "revision": "synthetic",
+                      "retrieved_on": "2026-01-01",
+                      "author": "ntsql tests",
+                      "generation_method": "Repository-authored synthetic data",
+                      "environment": null,
+                      "license": "Synthetic",
+                      "content_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "intended_uses": ["implementation-input"],
+                      "parent_provenance_ids": [],
+                      "legal_review_id": "legal-review-synthetic"
+                    },
+                    {
+                      "id": "prov-synthetic-specification",
+                      "source_kind": "behavior-specification",
+                      "title": "Synthetic behavior specification",
+                      "source_url": null,
+                      "artifact_path": "specifications/synthetic-select.json",
+                      "revision": "synthetic",
+                      "retrieved_on": "2026-01-01",
+                      "author": "ntsql tests",
+                      "generation_method": "Repository-authored synthetic data",
+                      "environment": null,
+                      "license": "Synthetic",
+                      "content_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                      "intended_uses": ["implementation-input"],
+                      "parent_provenance_ids": ["prov-synthetic-source"],
+                      "legal_review_id": "legal-review-synthetic"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "case_id": "specification-authority.base.synthetic-valid",
+      "constraint": "synthetic technical authority shape",
+      "patch": [],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "specification-authority.last-edit.required-nullable",
+      "constraint": "last_edited_at is a required nullable property",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/pull_requests/0/authenticated_reviews/0/last_edited_at"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": false,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.attestation.pending-forbidden",
+      "constraint": "technical attestations cannot carry pending decisions",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/decision/status",
+          "value": "pending"
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.trust-anchor.unique",
+      "constraint": "the protected reviewer roster contains unique numeric account IDs",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/trusted_reviewer_account_ids",
+          "value": [1002, 1002]
+        }
+      ],
+      "expected": {
+        "json_schema": false,
+        "rust_deserialize": true,
+        "rust_schema_semantics": false,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.pull-request.current-candidate",
+      "constraint": "each pull-request context is bound to the current candidate commit",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/candidate_commit_sha",
+          "value": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.pull-request.repository-bound",
+      "constraint": "authenticated pull requests cannot cross the candidate repository boundary",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/repository",
+          "value": "synthetic/other"
+        },
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/0/repository",
+          "value": "synthetic/other"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.reviewer.stable-account-id",
+      "constraint": "a changed reviewer login does not change the stable authenticated identity",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/0/reviewer/github_login",
+          "value": "renamed-spec-reviewer"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": true
+      }
+    },
+    {
+      "case_id": "specification-authority.reviewer.trusted",
+      "constraint": "the authenticated reviewer must belong to the protected reviewer roster",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/0/reviewer/github_account_id",
+          "value": 9999
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.reviewer.independent",
+      "constraint": "the candidate author cannot authenticate their own specification review",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/candidate_author_account_id",
+          "value": 1002
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.review-state.matches-decision",
+      "constraint": "approved attestations require an authenticated approved review state",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/0/state",
+          "value": "changes-requested"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.last-edit.calendar-valid",
+      "constraint": "authenticated review edit times must be real calendar timestamps",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/0/last_edited_at",
+          "value": "2026-02-30T01:03:00Z"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.provenance.complete-closure",
+      "constraint": "the attestation contains the complete specification provenance closure",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/pull_requests/0/authenticated_reviews/0/attestations/0/provenance_records/0"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.attestation.not-replayed",
+      "constraint": "one technical attestation identity cannot be replayed across reviews",
+      "patch": [
+        {
+          "op": "copy",
+          "from": "/pull_requests/0/authenticated_reviews/0",
+          "path": "/pull_requests/0/authenticated_reviews/-"
+        },
+        {
+          "op": "replace",
+          "path": "/pull_requests/0/authenticated_reviews/1/review_id",
+          "value": 7002
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      }
+    },
+    {
+      "case_id": "specification-authority.candidate.trusted-mismatch",
+      "constraint": "authority candidate commit must equal trusted workflow commit",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/candidate_commit_sha",
+          "value": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      ],
+      "expected": {
+        "json_schema": true,
+        "rust_deserialize": true,
+        "rust_schema_semantics": true,
+        "rust_full_validation": false
+      },
+      "trusted_candidate": {
+        "repository": "synthetic/ntsql",
+        "commit_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ]
+}

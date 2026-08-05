@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/anaregdesign/ntsql/contracts/schemas/target-matrix.schema.json",
+  "title": "ntsql oracle target matrix",
+  "description": "Exact SQL Server oracle configurations and their expansion order.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "baseline_target_id",
+    "targets",
+    "expansion_order"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0.0" },
+    "baseline_target_id": { "$ref": "#/$defs/identifier" },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/target" }
+    },
+    "expansion_order": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/expansion" }
+    }
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "provenance_id",
+        "product_release",
+        "servicing_update",
+        "product_version",
+        "edition",
+        "operating_system",
+        "architecture",
+        "container_repository",
+        "container_tag",
+        "container_digest",
+        "compatibility_level",
+        "collation",
+        "language",
+        "lcid",
+        "timezone",
+        "session_settings"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/identifier" },
+        "provenance_id": { "$ref": "#/$defs/identifier" },
+        "product_release": { "type": "string", "minLength": 1 },
+        "servicing_update": { "type": "string", "minLength": 1 },
+        "product_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"
+        },
+        "edition": { "type": "string", "minLength": 1 },
+        "operating_system": { "type": "string", "minLength": 1 },
+        "architecture": { "type": "string", "minLength": 1 },
+        "container_repository": { "type": "string", "minLength": 1 },
+        "container_tag": {
+          "type": "string",
+          "minLength": 1,
+          "not": { "pattern": "latest" }
+        },
+        "container_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9A-Fa-f]{64}$"
+        },
+        "compatibility_level": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "collation": { "type": "string", "minLength": 1 },
+        "language": { "type": "string", "minLength": 1 },
+        "lcid": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "timezone": { "type": "string", "minLength": 1 },
+        "session_settings": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "expansion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "scope", "admission_criteria"],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "scope": { "type": "string", "minLength": 1 },
+        "admission_criteria": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

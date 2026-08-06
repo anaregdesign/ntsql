@@ -4471,11 +4471,8 @@ fn require_file_recovery_source_match<const N: usize>(
     }
 }
 
-impl<const N: usize> ntsql_transaction::CommittedTransactionPageRecoveryStore<N>
-    for FilePageStore<N>
-{
+impl<const N: usize> ntsql_transaction::DurablePageStoreSnapshotSource<N> for FilePageStore<N> {
     type ObservationError = FileCommittedPageRecoveryObservationError<N>;
-    type WriteError = FileCommittedPageRecoveryStoreError<N>;
 
     fn lineage(&self) -> &LogLineage {
         &self.lineage
@@ -4495,6 +4492,12 @@ impl<const N: usize> ntsql_transaction::CommittedTransactionPageRecoveryStore<N>
                 FileCommittedPageRecoveryObservationError::Projection(Box::new(source))
             })
     }
+}
+
+impl<const N: usize> ntsql_transaction::CommittedTransactionPageRecoveryStore<N>
+    for FilePageStore<N>
+{
+    type WriteError = FileCommittedPageRecoveryStoreError<N>;
 
     fn compare_and_replace(
         &mut self,
@@ -5172,9 +5175,8 @@ mod tests {
 
     struct PoisonBeforeRecoveryCompare(FilePageStore<2>);
 
-    impl ntsql_transaction::CommittedTransactionPageRecoveryStore<2> for PoisonBeforeRecoveryCompare {
+    impl ntsql_transaction::DurablePageStoreSnapshotSource<2> for PoisonBeforeRecoveryCompare {
         type ObservationError = FileCommittedPageRecoveryObservationError<2>;
-        type WriteError = FileCommittedPageRecoveryStoreError<2>;
 
         fn lineage(&self) -> &LogLineage {
             &self.0.lineage
@@ -5184,10 +5186,15 @@ mod tests {
             &self,
             page_number: PageNumber,
         ) -> Result<Option<StoredPageSnapshotObservation<2>>, Self::ObservationError> {
-            <FilePageStore<2> as ntsql_transaction::CommittedTransactionPageRecoveryStore<
-                2,
-            >>::observe_page(&self.0, page_number)
+            <FilePageStore<2> as ntsql_transaction::DurablePageStoreSnapshotSource<2>>::observe_page(
+                &self.0,
+                page_number,
+            )
         }
+    }
+
+    impl ntsql_transaction::CommittedTransactionPageRecoveryStore<2> for PoisonBeforeRecoveryCompare {
+        type WriteError = FileCommittedPageRecoveryStoreError<2>;
 
         fn compare_and_replace(
             &mut self,
@@ -5203,11 +5210,8 @@ mod tests {
 
     struct TargetAppearsBeforeRecoveryCompare(FilePageStore<2>);
 
-    impl ntsql_transaction::CommittedTransactionPageRecoveryStore<2>
-        for TargetAppearsBeforeRecoveryCompare
-    {
+    impl ntsql_transaction::DurablePageStoreSnapshotSource<2> for TargetAppearsBeforeRecoveryCompare {
         type ObservationError = FileCommittedPageRecoveryObservationError<2>;
-        type WriteError = FileCommittedPageRecoveryStoreError<2>;
 
         fn lineage(&self) -> &LogLineage {
             &self.0.lineage
@@ -5217,10 +5221,17 @@ mod tests {
             &self,
             page_number: PageNumber,
         ) -> Result<Option<StoredPageSnapshotObservation<2>>, Self::ObservationError> {
-            <FilePageStore<2> as ntsql_transaction::CommittedTransactionPageRecoveryStore<
-                2,
-            >>::observe_page(&self.0, page_number)
+            <FilePageStore<2> as ntsql_transaction::DurablePageStoreSnapshotSource<2>>::observe_page(
+                &self.0,
+                page_number,
+            )
         }
+    }
+
+    impl ntsql_transaction::CommittedTransactionPageRecoveryStore<2>
+        for TargetAppearsBeforeRecoveryCompare
+    {
+        type WriteError = FileCommittedPageRecoveryStoreError<2>;
 
         fn compare_and_replace(
             &mut self,

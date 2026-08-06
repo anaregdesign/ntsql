@@ -2028,9 +2028,8 @@ fn require_in_memory_recovery_source_match<const N: usize>(
     }
 }
 
-impl<const N: usize> CommittedTransactionPageRecoveryStore<N> for InMemoryPageStore<N> {
+impl<const N: usize> ntsql_transaction::DurablePageStoreSnapshotSource<N> for InMemoryPageStore<N> {
     type ObservationError = PageRecoveryObservationBytesError<N>;
-    type WriteError = InMemoryCommittedPageRecoveryStoreError<N>;
 
     fn lineage(&self) -> &LogLineage {
         &self.lineage
@@ -2044,6 +2043,10 @@ impl<const N: usize> CommittedTransactionPageRecoveryStore<N> for InMemoryPageSt
             .map(InMemoryStoredPage::page_recovery_observation)
             .transpose()
     }
+}
+
+impl<const N: usize> CommittedTransactionPageRecoveryStore<N> for InMemoryPageStore<N> {
+    type WriteError = InMemoryCommittedPageRecoveryStoreError<N>;
 
     fn compare_and_replace(
         &mut self,
@@ -2149,11 +2152,13 @@ mod tests {
     use ntsql_transaction::{
         CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
         CommittedTransactionPagesRecoveryError, CoordinatedCommitError,
-        DurableTransactionRestartCheckpointBaseline,
+        DurableTransactionIdentityObservation, DurableTransactionRestartCheckpointBaseline,
         DurableTransactionRestartCheckpointBaselineCurrentPublicationError,
         DurableTransactionRestartCheckpointBaselineEntryObservation,
         DurableTransactionRestartCheckpointBaselineSourceValidationError,
         DurableTransactionRestartCheckpointBaselineStateObservation,
+        DurableTransactionRestartPageState, DurableTransactionRestartReplayStart,
+        DurableTransactionRestartReplayStartCause, DurableTransactionRestartRequiredPageImage,
         DurableTransactionRestartState, RestartAnalyzedTransactionPageStorage,
         TransactionCoordinator, TransactionLifecycleStatus, TransactionResolutionFailure,
         UnrecoveredTransactionPageStorage, flush_committed_page,
@@ -3307,6 +3312,72 @@ mod tests {
         assert_eq!(newly_durable.last_owned_page_position(), Some(11));
         assert_eq!(newly_durable.owned_page_record_count(), 1);
         assert_eq!(newly_durable.state().commit_position(), Some(12));
+        assert_eq!(recovered.parts().1.pages().len(), page_count);
+
+        let completeness = recovered.analyze_current_restart_completeness()?;
+        let durable_volatile_owner = DurableTransactionIdentityObservation::new(
+            volatile_owner.epoch().get(),
+            volatile_owner.sequence(),
+        )?;
+        let durable_uncommitted_owner = DurableTransactionIdentityObservation::new(
+            uncommitted_owner.epoch().get(),
+            uncommitted_owner.sequence(),
+        )?;
+        assert_eq!(
+            completeness
+                .transaction_analysis()
+                .durable_frontier()
+                .map(LogSequenceNumber::get),
+            Some(live_frontier.get())
+        );
+        assert_eq!(
+            completeness
+                .pages()
+                .iter()
+                .map(|entry| entry.page_number().get())
+                .collect::<Vec<_>>(),
+            [81, 82, 83, 84, 85, 86, 87]
+        );
+        assert!(completeness.pages()[..3].iter().all(|entry| matches!(
+            entry.state(),
+            DurableTransactionRestartPageState::StoreCurrent { .. }
+        )));
+        assert_eq!(
+            completeness.pages()[3].state(),
+            &DurableTransactionRestartPageState::NoRequiredImage
+        );
+        assert_eq!(
+            completeness.pages()[4].state(),
+            &DurableTransactionRestartPageState::StoreMissing {
+                required: DurableTransactionRestartRequiredPageImage::Raw { page_position: 10 },
+            }
+        );
+        assert_eq!(
+            completeness.pages()[5].state(),
+            &DurableTransactionRestartPageState::StoreMissing {
+                required: DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                    transaction: durable_volatile_owner,
+                    page_position: 11,
+                    commit_position: 12,
+                },
+            }
+        );
+        assert!(matches!(
+            completeness.pages()[6].state(),
+            DurableTransactionRestartPageState::StoreCurrent {
+                required: DurableTransactionRestartRequiredPageImage::Raw { page_position: 13 },
+                stored_position: 13,
+            }
+        ));
+        assert_eq!(
+            completeness.replay_start(),
+            &DurableTransactionRestartReplayStart::AtPosition {
+                position: 9,
+                cause: DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                    transaction: durable_uncommitted_owner,
+                },
+            }
+        );
         assert_eq!(recovered.parts().1.pages().len(), page_count);
 
         let duplicate_commit = recovered

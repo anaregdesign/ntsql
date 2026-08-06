@@ -6,14 +6,19 @@ use std::{
 };
 
 use ntsql_page::{PageAddress, PageImage, PageNumber, PageVersion, UnloggedPage, stage_page_write};
-use ntsql_storage_file::{FaultPoint, FileCommitLog, FileIoStage, FileOpenError};
+use ntsql_storage_file::{
+    FaultPoint, FileCommitLog, FileIoStage, FileOpenError, FilePageStore, PageStoreIoStage,
+    PageStoreOpenError, open_transaction_page_storage,
+};
 use ntsql_transaction::{
     CoordinatedCommitError, DurableTransactionRestartAnalysis, DurableTransactionRestartEntry,
     DurableTransactionRestartObservation, DurableTransactionRestartObservationKind,
+    DurableTransactionRestartPageState, DurableTransactionRestartReplayStart,
+    DurableTransactionRestartReplayStartCause, DurableTransactionRestartRequiredPageImage,
     DurableTransactionRestartState, TransactionCoordinator, TransactionId,
-    analyze_durable_transaction_restart,
+    analyze_durable_transaction_restart, flush_committed_page,
 };
-use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
+use ntsql_wal::{LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -274,6 +279,155 @@ fn reopened_v3_prefix_stays_locked_and_excludes_unmarked_commit() -> Result<(), 
     Ok(())
 }
 
+#[test]
+fn reopened_filesystem_owner_derives_page_completeness_without_store_mutation()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("restart-completeness")?;
+    let log_path = directory.path().join("commit-log.bin");
+    let store_path = directory.path().join("page-store.bin");
+    let persistent_id = persistent_log_id(1244)?;
+    let mut log =
+        FileCommitLog::<2>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+    let mut store = FilePageStore::<2>::create_new(&store_path, persistent_id)?;
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    let lineage = log.lineage().clone();
+
+    let raw_page_number =
+        PageNumber::new(10).ok_or_else(|| io::Error::other("raw page number is zero"))?;
+    let raw_dirty = stage_page_write(
+        &mut log,
+        unlogged_page(&lineage, raw_page_number.get(), 1, [1, 0])?,
+    )?;
+    assert_eq!(raw_dirty.required_position().get(), 1);
+
+    let uncommitted_page_number =
+        PageNumber::new(20).ok_or_else(|| io::Error::other("uncommitted page number is zero"))?;
+    let uncommitted = coordinator.begin()?;
+    let uncommitted_id = uncommitted.transaction_id();
+    let (uncommitted, uncommitted_dirty) = coordinator.stage_page_write(
+        uncommitted,
+        unlogged_page(&lineage, uncommitted_page_number.get(), 2, [2, 0])?,
+        &mut log,
+    )?;
+    assert_eq!(uncommitted_dirty.required_position().get(), 2);
+
+    let current_page_number =
+        PageNumber::new(30).ok_or_else(|| io::Error::other("current page number is zero"))?;
+    let current = coordinator.begin()?;
+    let current_id = current.transaction_id();
+    let (current, current_dirty) = coordinator.stage_page_write(
+        current,
+        unlogged_page(&lineage, current_page_number.get(), 3, [3, 0])?,
+        &mut log,
+    )?;
+    assert_eq!(current_dirty.required_position().get(), 3);
+    let current = coordinator.commit(current, &mut log)?;
+    assert_eq!(current.log_position().get(), 4);
+    flush_committed_page(&current, &mut log, &mut store, current_dirty)?;
+
+    drop((
+        raw_dirty,
+        uncommitted,
+        uncommitted_dirty,
+        current,
+        coordinator,
+        log,
+        store,
+    ));
+
+    let page_recovered = open_transaction_page_storage::<2, _, _>(&log_path, &store_path)?
+        .recover()
+        .map_err(|_| io::Error::other("filesystem page recovery failed"))?;
+    let mut owner = page_recovered
+        .analyze_restart()
+        .map_err(|_| io::Error::other("filesystem restart analysis failed"))?;
+    let page_count = owner.parts().1.pages().len();
+    let store_sequence = owner
+        .parts()
+        .1
+        .page(current_page_number)
+        .ok_or_else(|| io::Error::other("current page disappeared"))?
+        .store_sequence();
+
+    let completeness = owner.analyze_current_restart_completeness()?;
+    assert_eq!(
+        completeness
+            .transaction_analysis()
+            .durable_frontier()
+            .map(LogSequenceNumber::get),
+        Some(4)
+    );
+    assert_eq!(
+        completeness
+            .pages()
+            .iter()
+            .map(|entry| entry.page_number())
+            .collect::<Vec<_>>(),
+        [
+            raw_page_number,
+            uncommitted_page_number,
+            current_page_number
+        ]
+    );
+    assert_eq!(
+        completeness.pages()[0].state(),
+        &DurableTransactionRestartPageState::StoreMissing {
+            required: DurableTransactionRestartRequiredPageImage::Raw { page_position: 1 },
+        }
+    );
+    assert_eq!(
+        completeness.pages()[1].state(),
+        &DurableTransactionRestartPageState::NoRequiredImage
+    );
+    assert!(matches!(
+        completeness.pages()[2].state(),
+        DurableTransactionRestartPageState::StoreCurrent {
+            required: DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                transaction,
+                page_position: 3,
+                commit_position: 4,
+            },
+            stored_position: 3,
+        } if transaction.matches_transaction_id(current_id)
+    ));
+    assert_eq!(
+        completeness.replay_start(),
+        &DurableTransactionRestartReplayStart::AtPosition {
+            position: 1,
+            cause: DurableTransactionRestartReplayStartCause::StoreMissing {
+                page_number: raw_page_number,
+            },
+        }
+    );
+    assert!(
+        completeness
+            .transaction_analysis()
+            .transactions()
+            .iter()
+            .any(|entry| {
+                entry.transaction().matches_transaction_id(uncommitted_id)
+                    && matches!(entry.state(), DurableTransactionRestartState::Uncommitted)
+            })
+    );
+    assert_second_opener_is_locked(&log_path)?;
+    assert_page_store_is_locked(
+        FilePageStore::<2>::open(&store_path).err().ok_or_else(|| {
+            io::Error::other("completeness analysis released the page-store lock")
+        })?,
+    )?;
+    assert_eq!(owner.parts().1.pages().len(), page_count);
+    assert_eq!(
+        owner
+            .parts()
+            .1
+            .page(current_page_number)
+            .ok_or_else(|| io::Error::other("current page changed during analysis"))?
+            .store_sequence(),
+        store_sequence
+    );
+    Ok(())
+}
+
 fn assert_commit_only_analysis(
     analysis: &DurableTransactionRestartAnalysis,
     lineage: &LogLineage,
@@ -437,6 +591,22 @@ fn assert_second_opener_is_locked(path: &Path) -> Result<(), io::Error> {
     if source.io_source().kind() != io::ErrorKind::WouldBlock {
         return Err(io::Error::other(
             "second opener lock failure was not nonblocking",
+        ));
+    }
+    Ok(())
+}
+
+fn assert_page_store_is_locked(error: PageStoreOpenError) -> Result<(), io::Error> {
+    let PageStoreOpenError::Io(source) = error else {
+        return Err(io::Error::other(
+            "second page-store opener failure was not I/O",
+        ));
+    };
+    if source.stage() != PageStoreIoStage::AcquireExclusiveLock
+        || source.io_source().kind() != io::ErrorKind::WouldBlock
+    {
+        return Err(io::Error::other(
+            "second page-store opener failed outside the lock boundary",
         ));
     }
     Ok(())

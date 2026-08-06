@@ -2157,11 +2157,22 @@ mod tests {
         DurableTransactionRestartCheckpointBaselineEntryObservation,
         DurableTransactionRestartCheckpointBaselineSourceValidationError,
         DurableTransactionRestartCheckpointBaselineStateObservation,
-        DurableTransactionRestartPageState, DurableTransactionRestartReplayStart,
-        DurableTransactionRestartReplayStartCause, DurableTransactionRestartRequiredPageImage,
-        DurableTransactionRestartState, RestartAnalyzedTransactionPageStorage,
-        TransactionCoordinator, TransactionLifecycleStatus, TransactionResolutionFailure,
-        UnrecoveredTransactionPageStorage, flush_committed_page,
+        DurableTransactionRestartCheckpointCompletenessBaseline,
+        DurableTransactionRestartCheckpointCompletenessBaselinePageObservation,
+        DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation,
+        DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation,
+        DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation,
+        DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+        DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation,
+        DurableTransactionRestartCheckpointCompletenessBaselineValidationError,
+        DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError,
+        DurableTransactionRestartCompletenessError,
+        DurableTransactionRestartCompletenessEvidenceError, DurableTransactionRestartPageState,
+        DurableTransactionRestartReplayStart, DurableTransactionRestartReplayStartCause,
+        DurableTransactionRestartRequiredPageImage, DurableTransactionRestartState,
+        OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+        RestartAnalyzedTransactionPageStorage, TransactionCoordinator, TransactionLifecycleStatus,
+        TransactionResolutionFailure, UnrecoveredTransactionPageStorage, flush_committed_page,
         recover_committed_transaction_pages,
     };
     use ntsql_wal::CommitError;
@@ -3483,6 +3494,277 @@ mod tests {
         assert!(store.page(raw_page_number).is_none());
         assert!(store.page(volatile_page_number).is_none());
         assert!(store.page(live_page_number).is_some());
+        Ok(())
+    }
+
+    fn decoded_completeness_required_image_observation(
+        required: &DurableTransactionRestartRequiredPageImage,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation {
+        match required {
+            DurableTransactionRestartRequiredPageImage::Raw { page_position } => {
+                DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation::Raw {
+                    page_position: *page_position,
+                }
+            }
+            DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                transaction,
+                page_position,
+                commit_position,
+            } => {
+                DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation::CommittedTransaction {
+                    epoch: transaction.epoch(),
+                    sequence: transaction.sequence(),
+                    page_position: *page_position,
+                    commit_position: *commit_position,
+                }
+            }
+        }
+    }
+
+    fn decoded_completeness_pages(
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> Vec<DurableTransactionRestartCheckpointCompletenessBaselinePageObservation> {
+        baseline
+            .pages()
+            .iter()
+            .map(|entry| {
+                let state = match entry.state() {
+                    DurableTransactionRestartPageState::NoRequiredImage => {
+                        DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::NoRequiredImage
+                    }
+                    DurableTransactionRestartPageState::StoreMissing { .. } => {
+                        DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreMissing
+                    }
+                    DurableTransactionRestartPageState::StoreCurrent { .. } => {
+                        DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreCurrent
+                    }
+                    DurableTransactionRestartPageState::StoreBehind { .. } => {
+                        DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreBehind
+                    }
+                };
+                let required_image = entry
+                    .state()
+                    .required_image()
+                    .map(decoded_completeness_required_image_observation);
+                DurableTransactionRestartCheckpointCompletenessBaselinePageObservation::new(
+                    entry.page_number().get(),
+                    state,
+                    required_image,
+                    entry.state().stored_position(),
+                )
+            })
+            .collect()
+    }
+
+    fn decoded_completeness_replay_observation(
+        replay: &DurableTransactionRestartReplayStart,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation {
+        let kind = match replay {
+            DurableTransactionRestartReplayStart::AfterFrontier { .. } => {
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation::AfterFrontier
+            }
+            DurableTransactionRestartReplayStart::AtPosition { .. } => {
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation::AtPosition
+            }
+        };
+        let cause = replay.cause().map(|cause| match cause {
+            DurableTransactionRestartReplayStartCause::StoreMissing { page_number } => {
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation::StoreMissingPage {
+                    page_number: page_number.get(),
+                }
+            }
+            DurableTransactionRestartReplayStartCause::StoreBehind { page_number } => {
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation::StoreBehindPage {
+                    page_number: page_number.get(),
+                }
+            }
+            DurableTransactionRestartReplayStartCause::UncommittedTransaction { transaction } => {
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation::UncommittedTransaction {
+                    epoch: transaction.epoch(),
+                    sequence: transaction.sequence(),
+                }
+            }
+        });
+        DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation::new(
+            kind,
+            replay.frontier(),
+            replay.position(),
+            cause,
+        )
+    }
+
+    /// Builds an owned decoded-like completeness observation from an
+    /// authoritative baseline, mirroring how a real codec decoder would
+    /// reconstruct untrusted fields from persisted bytes.
+    fn owned_completeness_checkpoint(
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation {
+        let transaction_entries = baseline
+            .transactions()
+            .iter()
+            .map(|entry| {
+                let state = match entry.state().commit_position() {
+                    Some(commit_position) => {
+                        DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                            commit_position,
+                        }
+                    }
+                    None => {
+                        DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted
+                    }
+                };
+                DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                    entry.transaction().epoch(),
+                    entry.transaction().sequence(),
+                    entry.first_owned_page_position(),
+                    entry.last_owned_page_position(),
+                    entry.owned_page_record_count(),
+                    state,
+                )
+            })
+            .collect::<Vec<_>>();
+        let transactions = OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+            baseline.persistent_log_id().get(),
+            baseline.durable_frontier(),
+            transaction_entries,
+        );
+        OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+            transactions,
+            decoded_completeness_pages(baseline),
+            decoded_completeness_replay_observation(baseline.replay_start()),
+        )
+    }
+
+    #[test]
+    fn completeness_checkpoint_validation_succeeds_current_and_safe_stale_but_fails_closed_after_selected_page_advances()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x1500)
+            .ok_or_else(|| io::Error::other("completeness persistent log id"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id);
+        let mut store = InMemoryPageStore::new(&log);
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+
+        let current_page_number =
+            PageNumber::new(201).ok_or_else(|| io::Error::other("current page is zero"))?;
+        let committed = coordinator.begin()?;
+        let committed_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), current_page_number),
+            PageVersion::new(1),
+            PageImage::new([0x11])?,
+        );
+        let (committed, committed_dirty) =
+            coordinator.stage_page_write(committed, committed_page, &mut log)?;
+        let committed = coordinator.commit(committed, &mut log)?;
+        flush_committed_page(&committed, &mut log, &mut store, committed_dirty)?;
+
+        let uncommitted_page_number =
+            PageNumber::new(202).ok_or_else(|| io::Error::other("uncommitted page is zero"))?;
+        let uncommitted = coordinator.begin()?;
+        let uncommitted_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), uncommitted_page_number),
+            PageVersion::new(1),
+            PageImage::new([0x12])?,
+        );
+        let (uncommitted, uncommitted_dirty) =
+            coordinator.stage_page_write(uncommitted, uncommitted_page, &mut log)?;
+        log.flush_through(uncommitted_dirty.required_position())?;
+        drop(uncommitted);
+        drop(uncommitted_dirty);
+        drop(coordinator);
+
+        let mut recovered = UnrecoveredTransactionPageStorage::new(log, store)
+            .recover()?
+            .analyze_restart()?;
+
+        let baseline =
+            recovered.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        assert_eq!(baseline.persistent_log_id(), persistent_log_id);
+        assert_eq!(baseline.pages().len(), 2);
+        let page_count = recovered.parts().1.pages().len();
+
+        let owned_checkpoint = owned_completeness_checkpoint(&baseline);
+        let decoded_checkpoint = owned_checkpoint.as_observation();
+
+        let validated = recovered
+            .validate_restart_checkpoint_completeness_baseline_against_current_prefix(
+                &decoded_checkpoint,
+            )?;
+        assert_eq!(validated, baseline);
+        assert_eq!(recovered.parts().1.pages().len(), page_count);
+
+        // Append an unrelated later WAL record; the older decoded checkpoint
+        // remains exactly valid because the unrelated suffix does not change
+        // any selected-prefix page classification.
+        let unrelated_page_number =
+            PageNumber::new(203).ok_or_else(|| io::Error::other("unrelated page is zero"))?;
+        let unrelated_page = UnloggedPage::new(
+            PageAddress::new(
+                LogDurability::lineage(recovered.parts().0),
+                unrelated_page_number,
+            ),
+            PageVersion::new(1),
+            PageImage::new([0x13])?,
+        );
+        let (log, store) = recovered.parts_mut();
+        let unrelated_dirty = ntsql_page::stage_page_write(log, unrelated_page)?;
+        ntsql_page::flush_dirty_page(log, store, unrelated_dirty)?;
+
+        let validated_stale = recovered
+            .validate_restart_checkpoint_completeness_baseline_against_current_prefix(
+                &decoded_checkpoint,
+            )?;
+        assert_eq!(validated_stale, baseline);
+        assert_eq!(recovered.parts().1.pages().len(), page_count + 1);
+
+        // Advance the selected current page beyond the decoded checkpoint's
+        // frontier: the current store snapshot no longer yields the exact
+        // selected-prefix classification, so validation must fail closed.
+        let (log, store) = recovered.parts_mut();
+        let mut advancing_coordinator = TransactionCoordinator::open(log)?;
+        let advancing_active = advancing_coordinator.begin()?;
+        let advancing_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(log), current_page_number),
+            PageVersion::new(2),
+            PageImage::new([0x21])?,
+        );
+        let (advancing_active, advancing_dirty) =
+            advancing_coordinator.stage_page_write(advancing_active, advancing_page, log)?;
+        let advancing_committed = advancing_coordinator.commit(advancing_active, log)?;
+        flush_committed_page(&advancing_committed, log, store, advancing_dirty)?;
+
+        let fail_closed = recovered
+            .validate_restart_checkpoint_completeness_baseline_against_current_prefix(
+                &decoded_checkpoint,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("advanced selected page unexpectedly validated"))?;
+        let DurableTransactionRestartCheckpointCompletenessBaselineValidationError::Evidence(
+            evidence,
+        ) = fail_closed
+        else {
+            return Err(io::Error::other("advanced selected page produced a source error").into());
+        };
+        let DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::CompletenessEvidence(
+            completeness,
+        ) = *evidence
+        else {
+            return Err(io::Error::other("advanced selected page produced the wrong stage").into());
+        };
+        let DurableTransactionRestartCompletenessError::Evidence(snapshot_evidence) = *completeness
+        else {
+            return Err(
+                io::Error::other("advanced selected page did not fail on store evidence").into(),
+            );
+        };
+        assert!(matches!(
+            *snapshot_evidence,
+            DurableTransactionRestartCompletenessEvidenceError::SnapshotBeyondFrontier {
+                page_number,
+                ..
+            } if page_number == current_page_number
+        ));
+
+        assert!(recovered.restart_analysis().durable_frontier().is_some());
         Ok(())
     }
 }

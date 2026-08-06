@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #106
 - Extends: ADR 0024, ADR 0026
-- Extended by: ADR 0028
+- Extended by: ADR 0028, ADR 0030
 
 ## Context
 
@@ -217,7 +217,6 @@ reconciliation from one explicit durable-prefix projection pass and real stored
 snapshots. Volatile commit evidence demonstrably changes the answer if callers
 select the wrong prefix.
 
-The next slice may define a non-authorizing recovery candidate from
-`StoreMissing` or `StoreBehind`. It must separately establish exact target
-identity and idempotence and still cannot create a write permit; mutation remains
-a later reviewed recovery-only gate.
+ADR 0028 defines the non-authorizing candidate, ADR 0029 defines the
+recovery-only gate, and ADR 0030 implements both trusted ports in the memory
+adapter. Filesystem mutation remains a separate reviewed slice.

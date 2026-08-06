@@ -7,6 +7,9 @@ use std::{
 };
 
 use ntsql_transaction::{
+    DurableTransactionRestartCheckpointBaseline,
+    DurableTransactionRestartCheckpointBaselinePublicationPermit,
+    DurableTransactionRestartCheckpointBaselinePublisher,
     DurableTransactionRestartCheckpointBaselineSource,
     OwnedDurableTransactionRestartCheckpointBaselineObservation, UnrecoveredTransactionPageStorage,
 };
@@ -14,12 +17,14 @@ use ntsql_wal::PersistentLogId;
 
 use super::{
     FileCommitLog, FileOpenError, FilePageStore, PageStoreOpenError,
-    RestartCheckpointBaselineDecodeError, checksum_v1, decode_restart_checkpoint_baseline,
-    read_u16, read_u32, read_u64, read_u128, write_u16, write_u32, write_u64, write_u128,
+    RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError, checksum_v1,
+    decode_restart_checkpoint_baseline, encode_restart_checkpoint_baseline, read_u16, read_u32,
+    read_u64, read_u128, write_u16, write_u32, write_u64, write_u128,
 };
 
 const CONTROL_FILE_NAME: &str = "control";
 const CURRENT_FILE_NAME: &str = "current";
+const CANDIDATE_FILE_NAME: &str = "candidate";
 const CONTROL_MAGIC: [u8; 8] = *b"NTSQCKS1";
 const CONTROL_FORMAT_VERSION: u16 = 1;
 const CONTROL_HEADER_LENGTH: usize = 64;
@@ -64,6 +69,18 @@ pub enum FileRestartCheckpointSlotIoStage {
     ReadCurrentBytes,
     /// Reading current-blob metadata after reading its bytes.
     ReadCurrentMetadataAfterRead,
+    /// Removing one stale unselected publication candidate.
+    RemoveCandidateFile,
+    /// Creating one fresh unselected publication candidate.
+    CreateCandidateFile,
+    /// Writing the complete encoded baseline to the candidate.
+    WriteCandidateFile,
+    /// Synchronizing the complete candidate file.
+    SyncCandidateFile,
+    /// Atomically replacing the selected current entry with the candidate.
+    ReplaceCurrentFile,
+    /// Synchronizing the slot directory after selected-entry replacement.
+    SyncPublishedSlotDirectory,
 }
 
 impl fmt::Display for FileRestartCheckpointSlotIoStage {
@@ -119,6 +136,24 @@ impl fmt::Display for FileRestartCheckpointSlotIoStage {
             }
             Self::ReadCurrentMetadataAfterRead => {
                 formatter.write_str("reading current restart checkpoint metadata after its bytes")
+            }
+            Self::RemoveCandidateFile => {
+                formatter.write_str("removing a stale restart checkpoint candidate")
+            }
+            Self::CreateCandidateFile => {
+                formatter.write_str("creating a fresh restart checkpoint candidate")
+            }
+            Self::WriteCandidateFile => {
+                formatter.write_str("writing the restart checkpoint candidate")
+            }
+            Self::SyncCandidateFile => {
+                formatter.write_str("synchronizing the restart checkpoint candidate")
+            }
+            Self::ReplaceCurrentFile => {
+                formatter.write_str("replacing the current restart checkpoint")
+            }
+            Self::SyncPublishedSlotDirectory => {
+                formatter.write_str("synchronizing the published restart checkpoint directory")
             }
         }
     }
@@ -406,7 +441,152 @@ impl Error for FileRestartCheckpointBaselineSourceError {
     }
 }
 
-/// Locked filesystem source for one optional current restart checkpoint baseline.
+/// Exact deterministic failure point in filesystem checkpoint publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileRestartCheckpointBaselinePublicationFaultPoint {
+    /// Fail after encoding but before stale-candidate cleanup.
+    BeforeCandidateCleanup,
+    /// Fail after stale-candidate cleanup and before candidate creation.
+    AfterCandidateCleanup,
+    /// Fail after creating an empty candidate and before writing bytes.
+    AfterCandidateCreate,
+    /// Fail after writing all bytes and before candidate synchronization.
+    AfterCandidateWrite,
+    /// Fail after synchronizing and closing the candidate, before replacement.
+    AfterCandidateSync,
+    /// Fail after replacing `current` and before directory synchronization.
+    AfterCurrentReplace,
+    /// Fail after directory synchronization instead of reporting success.
+    AfterDirectorySync,
+}
+
+impl fmt::Display for FileRestartCheckpointBaselinePublicationFaultPoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeCandidateCleanup => formatter.write_str("before stale-candidate cleanup"),
+            Self::AfterCandidateCleanup => formatter.write_str("after stale-candidate cleanup"),
+            Self::AfterCandidateCreate => formatter.write_str("after candidate creation"),
+            Self::AfterCandidateWrite => formatter.write_str("after candidate write"),
+            Self::AfterCandidateSync => formatter.write_str("after candidate synchronization"),
+            Self::AfterCurrentReplace => formatter.write_str("after current-entry replacement"),
+            Self::AfterDirectorySync => formatter.write_str("after slot-directory synchronization"),
+        }
+    }
+}
+
+/// Rejected attempt to replace an already armed publication fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileRestartCheckpointBaselinePublicationFaultAlreadyArmed {
+    armed: FileRestartCheckpointBaselinePublicationFaultPoint,
+    requested: FileRestartCheckpointBaselinePublicationFaultPoint,
+}
+
+impl FileRestartCheckpointBaselinePublicationFaultAlreadyArmed {
+    /// Returns the retained existing fault.
+    #[must_use]
+    pub const fn armed(&self) -> FileRestartCheckpointBaselinePublicationFaultPoint {
+        self.armed
+    }
+
+    /// Returns the rejected replacement fault.
+    #[must_use]
+    pub const fn requested(&self) -> FileRestartCheckpointBaselinePublicationFaultPoint {
+        self.requested
+    }
+}
+
+impl fmt::Display for FileRestartCheckpointBaselinePublicationFaultAlreadyArmed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "filesystem checkpoint publication fault {} is already armed; cannot arm {}",
+            self.armed, self.requested
+        )
+    }
+}
+
+impl Error for FileRestartCheckpointBaselinePublicationFaultAlreadyArmed {}
+
+/// Outcome-indeterminate filesystem checkpoint publication failure.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileRestartCheckpointBaselinePublicationError {
+    /// The owner permit did not identify the supplied baseline exactly.
+    PublicationPermitMismatch {
+        /// Persistent log ID carried by the authoritative baseline.
+        baseline_persistent_log_id: u128,
+        /// Persistent log ID carried by the owner permit.
+        permit_persistent_log_id: u128,
+        /// Optional frontier carried by the authoritative baseline.
+        baseline_durable_frontier: Option<u64>,
+        /// Optional frontier carried by the owner permit.
+        permit_durable_frontier: Option<u64>,
+        /// Transaction count carried by the authoritative baseline.
+        baseline_transaction_count: usize,
+        /// Transaction count carried by the owner permit.
+        permit_transaction_count: usize,
+    },
+    /// The authoritative baseline belongs to another lineaged slot.
+    SlotPersistentLogIdMismatch {
+        /// Persistent log ID bound to the immutable slot control header.
+        slot: PersistentLogId,
+        /// Persistent log ID carried by the authoritative baseline.
+        baseline: PersistentLogId,
+    },
+    /// ADR 0044 encoding failed before filesystem mutation.
+    Encode(RestartCheckpointBaselineEncodeError),
+    /// A deterministic test fault fired at one exact physical boundary.
+    InjectedFault(FileRestartCheckpointBaselinePublicationFaultPoint),
+    /// One exact filesystem operation failed.
+    Io(FileRestartCheckpointSlotIoError),
+}
+
+impl fmt::Display for FileRestartCheckpointBaselinePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PublicationPermitMismatch {
+                baseline_persistent_log_id,
+                permit_persistent_log_id,
+                baseline_durable_frontier,
+                permit_durable_frontier,
+                baseline_transaction_count,
+                permit_transaction_count,
+            } => write!(
+                formatter,
+                "filesystem checkpoint publication permit mismatch: baseline id {baseline_persistent_log_id:#034x}, frontier {baseline_durable_frontier:?}, count {baseline_transaction_count}; permit id {permit_persistent_log_id:#034x}, frontier {permit_durable_frontier:?}, count {permit_transaction_count}"
+            ),
+            Self::SlotPersistentLogIdMismatch { slot, baseline } => write!(
+                formatter,
+                "filesystem checkpoint slot persistent log ID {} does not match baseline persistent log ID {}",
+                slot.get(),
+                baseline.get()
+            ),
+            Self::Encode(source) => {
+                write!(formatter, "filesystem checkpoint encoding failed: {source}")
+            }
+            Self::InjectedFault(point) => {
+                write!(
+                    formatter,
+                    "injected filesystem checkpoint publication failure {point}"
+                )
+            }
+            Self::Io(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for FileRestartCheckpointBaselinePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Encode(source) => Some(source),
+            Self::Io(source) => Some(source),
+            Self::PublicationPermitMismatch { .. }
+            | Self::SlotPersistentLogIdMismatch { .. }
+            | Self::InjectedFault(_) => None,
+        }
+    }
+}
+
+/// Locked filesystem source and publisher for one current restart checkpoint baseline.
 ///
 /// The stable lineaged `control` file, not the replaceable `current` blob, owns
 /// the lifetime advisory lock. Loaded bytes remain untrusted and cannot be used
@@ -422,30 +602,29 @@ impl Error for FileRestartCheckpointBaselineSourceError {
 /// }
 /// ```
 ///
-/// The read source does not implement the sibling publication port:
+/// The sibling publication port still cannot be invoked without its owner permit:
 ///
 /// ```compile_fail
 /// use ntsql_storage_file::FileRestartCheckpointBaselineSource;
 /// use ntsql_transaction::{
 ///     DurableTransactionRestartCheckpointBaseline,
-///     DurableTransactionRestartCheckpointBaselinePublicationPermit,
 ///     DurableTransactionRestartCheckpointBaselinePublisher,
 /// };
 ///
-/// fn cannot_publish<'attempt>(
+/// fn cannot_publish(
 ///     source: &mut FileRestartCheckpointBaselineSource,
 ///     baseline: &DurableTransactionRestartCheckpointBaseline,
-///     permit: DurableTransactionRestartCheckpointBaselinePublicationPermit<'attempt>,
 /// ) {
-///     let _ = source.publish_restart_checkpoint_baseline(baseline, permit);
+///     let _ = source.publish_restart_checkpoint_baseline(baseline);
 /// }
 /// ```
 #[derive(Debug)]
 pub struct FileRestartCheckpointBaselineSource {
     slot_directory: PathBuf,
     _control_file: File,
-    _directory: File,
+    directory: File,
     persistent_log_id: PersistentLogId,
+    armed_publication_fault: Option<FileRestartCheckpointBaselinePublicationFaultPoint>,
 }
 
 impl FileRestartCheckpointBaselineSource {
@@ -518,8 +697,9 @@ impl FileRestartCheckpointBaselineSource {
         Ok(Self {
             slot_directory,
             _control_file: control_file,
-            _directory: directory,
+            directory,
             persistent_log_id,
+            armed_publication_fault: None,
         })
     }
 
@@ -586,8 +766,9 @@ impl FileRestartCheckpointBaselineSource {
         Ok(Self {
             slot_directory,
             _control_file: control_file,
-            _directory: directory,
+            directory,
             persistent_log_id,
+            armed_publication_fault: None,
         })
     }
 
@@ -601,6 +782,41 @@ impl FileRestartCheckpointBaselineSource {
     #[must_use]
     pub fn slot_directory(&self) -> &Path {
         &self.slot_directory
+    }
+
+    /// Arms one publication fault without replacing an existing plan.
+    pub fn arm_publication_fault(
+        &mut self,
+        fault: FileRestartCheckpointBaselinePublicationFaultPoint,
+    ) -> Result<(), FileRestartCheckpointBaselinePublicationFaultAlreadyArmed> {
+        if let Some(armed) = self.armed_publication_fault {
+            return Err(FileRestartCheckpointBaselinePublicationFaultAlreadyArmed {
+                armed,
+                requested: fault,
+            });
+        }
+        self.armed_publication_fault = Some(fault);
+        Ok(())
+    }
+
+    /// Returns the one-shot publication fault that has not reached its stage.
+    #[must_use]
+    pub const fn armed_publication_fault(
+        &self,
+    ) -> Option<FileRestartCheckpointBaselinePublicationFaultPoint> {
+        self.armed_publication_fault
+    }
+
+    fn consume_publication_fault(
+        &mut self,
+        point: FileRestartCheckpointBaselinePublicationFaultPoint,
+    ) -> bool {
+        if self.armed_publication_fault == Some(point) {
+            self.armed_publication_fault = None;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -704,6 +920,179 @@ impl DurableTransactionRestartCheckpointBaselineSource for FileRestartCheckpoint
         decode_restart_checkpoint_baseline(&bytes)
             .map(Some)
             .map_err(FileRestartCheckpointBaselineSourceError::Decode)
+    }
+}
+
+impl DurableTransactionRestartCheckpointBaselinePublisher for FileRestartCheckpointBaselineSource {
+    type Error = FileRestartCheckpointBaselinePublicationError;
+
+    fn publish_restart_checkpoint_baseline(
+        &mut self,
+        baseline: &DurableTransactionRestartCheckpointBaseline,
+        permit: DurableTransactionRestartCheckpointBaselinePublicationPermit<'_>,
+    ) -> Result<(), Self::Error> {
+        let baseline_persistent_log_id = baseline.persistent_log_id().get();
+        let permit_persistent_log_id = permit.persistent_log_id().get();
+        let baseline_durable_frontier = baseline.durable_frontier();
+        let permit_durable_frontier = permit.durable_frontier();
+        let baseline_transaction_count = baseline.transactions().len();
+        let permit_transaction_count = permit.transaction_count();
+        if baseline_persistent_log_id != permit_persistent_log_id
+            || baseline_durable_frontier != permit_durable_frontier
+            || baseline_transaction_count != permit_transaction_count
+        {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::PublicationPermitMismatch {
+                    baseline_persistent_log_id,
+                    permit_persistent_log_id,
+                    baseline_durable_frontier,
+                    permit_durable_frontier,
+                    baseline_transaction_count,
+                    permit_transaction_count,
+                },
+            );
+        }
+        if self.persistent_log_id != baseline.persistent_log_id() {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::SlotPersistentLogIdMismatch {
+                    slot: self.persistent_log_id,
+                    baseline: baseline.persistent_log_id(),
+                },
+            );
+        }
+
+        let encoded = encode_restart_checkpoint_baseline(baseline)
+            .map_err(FileRestartCheckpointBaselinePublicationError::Encode)?;
+        if self.consume_publication_fault(
+            FileRestartCheckpointBaselinePublicationFaultPoint::BeforeCandidateCleanup,
+        ) {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::InjectedFault(
+                    FileRestartCheckpointBaselinePublicationFaultPoint::BeforeCandidateCleanup,
+                ),
+            );
+        }
+
+        let candidate_path = self.slot_directory.join(CANDIDATE_FILE_NAME);
+        match fs::remove_file(&candidate_path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(FileRestartCheckpointBaselinePublicationError::Io(
+                    FileRestartCheckpointSlotIoError::new(
+                        FileRestartCheckpointSlotIoStage::RemoveCandidateFile,
+                        source,
+                    ),
+                ));
+            }
+        }
+        if self.consume_publication_fault(
+            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCleanup,
+        ) {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::InjectedFault(
+                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCleanup,
+                ),
+            );
+        }
+
+        let mut candidate_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate_path)
+            .map_err(|source| {
+                FileRestartCheckpointBaselinePublicationError::Io(
+                    FileRestartCheckpointSlotIoError::new(
+                        FileRestartCheckpointSlotIoStage::CreateCandidateFile,
+                        source,
+                    ),
+                )
+            })?;
+        if self.consume_publication_fault(
+            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCreate,
+        ) {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::InjectedFault(
+                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCreate,
+                ),
+            );
+        }
+
+        candidate_file.write_all(&encoded).map_err(|source| {
+            FileRestartCheckpointBaselinePublicationError::Io(
+                FileRestartCheckpointSlotIoError::new(
+                    FileRestartCheckpointSlotIoStage::WriteCandidateFile,
+                    source,
+                ),
+            )
+        })?;
+        if self.consume_publication_fault(
+            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateWrite,
+        ) {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::InjectedFault(
+                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateWrite,
+                ),
+            );
+        }
+
+        candidate_file.sync_all().map_err(|source| {
+            FileRestartCheckpointBaselinePublicationError::Io(
+                FileRestartCheckpointSlotIoError::new(
+                    FileRestartCheckpointSlotIoStage::SyncCandidateFile,
+                    source,
+                ),
+            )
+        })?;
+        drop(candidate_file);
+        if self.consume_publication_fault(
+            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateSync,
+        ) {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::InjectedFault(
+                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateSync,
+                ),
+            );
+        }
+
+        let current_path = self.slot_directory.join(CURRENT_FILE_NAME);
+        fs::rename(&candidate_path, &current_path).map_err(|source| {
+            FileRestartCheckpointBaselinePublicationError::Io(
+                FileRestartCheckpointSlotIoError::new(
+                    FileRestartCheckpointSlotIoStage::ReplaceCurrentFile,
+                    source,
+                ),
+            )
+        })?;
+        if self.consume_publication_fault(
+            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCurrentReplace,
+        ) {
+            return Err(
+                FileRestartCheckpointBaselinePublicationError::InjectedFault(
+                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCurrentReplace,
+                ),
+            );
+        }
+
+        self.directory.sync_all().map_err(|source| {
+            FileRestartCheckpointBaselinePublicationError::Io(
+                FileRestartCheckpointSlotIoError::new(
+                    FileRestartCheckpointSlotIoStage::SyncPublishedSlotDirectory,
+                    source,
+                ),
+            )
+        })?;
+        if self.consume_publication_fault(
+            FileRestartCheckpointBaselinePublicationFaultPoint::AfterDirectorySync,
+        ) {
+            Err(
+                FileRestartCheckpointBaselinePublicationError::InjectedFault(
+                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterDirectorySync,
+                ),
+            )
+        } else {
+            Ok(())
+        }
     }
 }
 

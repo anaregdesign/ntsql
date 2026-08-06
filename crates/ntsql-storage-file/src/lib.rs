@@ -105,7 +105,9 @@
 //! replacement of the selected blob cannot move the lock to an obsolete inode.
 //! Creating a slot synchronizes the control file, slot directory, and parent
 //! directory. Loading structurally decodes one complete current blob but returns
-//! only owned untrusted checkpoint fields.
+//! only owned untrusted checkpoint fields. Publication writes and synchronizes
+//! one fresh unselected `candidate`, closes it, renames it over `current`, and
+//! synchronizes the retained directory before reporting success.
 
 use std::{
     error::Error,
@@ -142,11 +144,13 @@ pub use restart_checkpoint_codec::{
     encode_restart_checkpoint_baseline,
 };
 pub use restart_checkpoint_file::{
-    FileRestartCheckpointBaselineSource, FileRestartCheckpointBaselineSourceError,
-    FileRestartCheckpointSlotCreateError, FileRestartCheckpointSlotFormatError,
-    FileRestartCheckpointSlotFormatErrorReason, FileRestartCheckpointSlotIoError,
-    FileRestartCheckpointSlotIoStage, FileRestartCheckpointSlotOpenError,
-    FileTransactionPageStorageCheckpointOpenError,
+    FileRestartCheckpointBaselinePublicationError,
+    FileRestartCheckpointBaselinePublicationFaultAlreadyArmed,
+    FileRestartCheckpointBaselinePublicationFaultPoint, FileRestartCheckpointBaselineSource,
+    FileRestartCheckpointBaselineSourceError, FileRestartCheckpointSlotCreateError,
+    FileRestartCheckpointSlotFormatError, FileRestartCheckpointSlotFormatErrorReason,
+    FileRestartCheckpointSlotIoError, FileRestartCheckpointSlotIoStage,
+    FileRestartCheckpointSlotOpenError, FileTransactionPageStorageCheckpointOpenError,
     UnrecoveredFileTransactionPageStorageWithCheckpoint,
     open_transaction_page_storage_with_checkpoint,
 };

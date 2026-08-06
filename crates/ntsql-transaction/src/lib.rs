@@ -3548,6 +3548,753 @@ impl<Source, Store, const N: usize> RecoveredTransactionPageStorage<Source, Stor
     }
 }
 
+/// Kind of one logical record in a complete durable restart-analysis stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartObservationKind {
+    /// A page record without transaction ownership.
+    Page,
+    /// A page record owned by one persisted transaction identity.
+    TransactionPage,
+    /// A durable transaction commit record.
+    Commit,
+}
+
+/// Adapter-neutral observation of one logical record in a durable WAL prefix.
+///
+/// The three variants cover every logical record currently exposed by the
+/// repository-authored transaction/page WAL. Values remain inert observations:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartObservation, TransactionId,
+/// };
+///
+/// fn cannot_create_transaction<const N: usize>(
+///     observation: DurableTransactionRestartObservation<N>,
+/// ) -> TransactionId {
+///     observation.into()
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartObservation<const N: usize> {
+    /// One complete nontransactional page-image record.
+    Page(DurablePageWalObservation<N>),
+    /// One complete transaction-owned page-image record.
+    TransactionPage(DurableTransactionPageObservation<N>),
+    /// One complete transaction commit record.
+    Commit(DurableTransactionCommitObservation),
+}
+
+impl<const N: usize> DurableTransactionRestartObservation<N> {
+    /// Returns the logical record kind without exposing mutation authority.
+    #[must_use]
+    pub const fn kind(&self) -> DurableTransactionRestartObservationKind {
+        match self {
+            Self::Page(_) => DurableTransactionRestartObservationKind::Page,
+            Self::TransactionPage(_) => DurableTransactionRestartObservationKind::TransactionPage,
+            Self::Commit(_) => DurableTransactionRestartObservationKind::Commit,
+        }
+    }
+
+    /// Returns the exact lineage-bound physical position of this record.
+    #[must_use]
+    pub const fn position(&self) -> &LogSequenceNumber {
+        match self {
+            Self::Page(observation) => observation.position(),
+            Self::TransactionPage(observation) => observation.position(),
+            Self::Commit(observation) => observation.position(),
+        }
+    }
+}
+
+/// Stable complete-prefix source for transaction restart analysis.
+///
+/// Implementations must project every durable logical record exactly once in
+/// strict physical order and keep that prefix stable for the callback. `None`
+/// means the logical-record prefix is authoritatively empty; a nonempty prefix
+/// must supply its exact final position.
+///
+/// The higher-ranked evidence lifetime prevents the callback input from
+/// escaping:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysisSource,
+///     DurableTransactionRestartObservation,
+/// };
+///
+/// fn cannot_escape<'source, Source, const N: usize>(
+///     source: &'source mut Source,
+/// ) -> Result<&'source [DurableTransactionRestartObservation<N>], Source::Error>
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+/// {
+///     source.with_durable_transaction_restart_observations(
+///         |_frontier, observations| observations,
+///     )
+/// }
+/// ```
+pub trait DurableTransactionRestartAnalysisSource<const N: usize> {
+    /// Source-specific failure before authoritative evidence is available.
+    type Error;
+
+    /// Returns the exact WAL lineage whose stable prefix will be projected.
+    fn lineage(&self) -> &LogLineage;
+
+    /// Runs one operation while the complete durable logical prefix is stable.
+    fn with_durable_transaction_restart_observations<Output, Operation>(
+        &mut self,
+        operation: Operation,
+    ) -> Result<Output, Self::Error>
+    where
+        Operation: for<'evidence> FnOnce(
+            Option<&'evidence LogSequenceNumber>,
+            &'evidence [DurableTransactionRestartObservation<N>],
+        ) -> Output;
+}
+
+/// Commit classification reconstructed for one persisted transaction identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartState {
+    /// No commit for this identity occurred in the complete durable prefix.
+    Uncommitted,
+    /// Exactly one commit followed every owned-page record for this identity.
+    Committed {
+        /// Exact durable position of the sole commit record.
+        commit_position: LogSequenceNumber,
+    },
+}
+
+impl DurableTransactionRestartState {
+    /// Returns the sole commit position, or `None` for an uncommitted identity.
+    #[must_use]
+    pub const fn commit_position(&self) -> Option<&LogSequenceNumber> {
+        match self {
+            Self::Uncommitted => None,
+            Self::Committed { commit_position } => Some(commit_position),
+        }
+    }
+}
+
+/// Inert restart metadata for one persisted transaction identity.
+///
+/// This entry cannot become transaction lifecycle or page-write authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransaction, DurableTransactionRestartEntry,
+/// };
+///
+/// fn cannot_authorize_commit(entry: DurableTransactionRestartEntry) -> CommittedTransaction {
+///     entry.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit, DurableTransactionRestartEntry,
+/// };
+///
+/// fn cannot_authorize_recovery<'attempt>(
+///     entry: DurableTransactionRestartEntry,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     entry.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableTransactionRestartEntry;
+///
+/// fn cannot_authorize_page_write<'attempt>(
+///     entry: DurableTransactionRestartEntry,
+/// ) -> PageWritePermit<'attempt> {
+///     entry.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableTransactionRestartEntry {
+    transaction: DurableTransactionIdentityObservation,
+    first_owned_page_position: Option<LogSequenceNumber>,
+    last_owned_page_position: Option<LogSequenceNumber>,
+    owned_page_record_count: usize,
+    state: DurableTransactionRestartState,
+}
+
+impl DurableTransactionRestartEntry {
+    /// Returns the exact persisted transaction identity.
+    #[must_use]
+    pub const fn transaction(&self) -> DurableTransactionIdentityObservation {
+        self.transaction
+    }
+
+    /// Returns the first owned-page position, if this transaction owns a page.
+    #[must_use]
+    pub const fn first_owned_page_position(&self) -> Option<&LogSequenceNumber> {
+        self.first_owned_page_position.as_ref()
+    }
+
+    /// Returns the last owned-page position, if this transaction owns a page.
+    #[must_use]
+    pub const fn last_owned_page_position(&self) -> Option<&LogSequenceNumber> {
+        self.last_owned_page_position.as_ref()
+    }
+
+    /// Returns the exact number of durable owned-page records for this identity.
+    #[must_use]
+    pub const fn owned_page_record_count(&self) -> usize {
+        self.owned_page_record_count
+    }
+
+    /// Returns the reconstructed commit classification.
+    #[must_use]
+    pub const fn state(&self) -> &DurableTransactionRestartState {
+        &self.state
+    }
+}
+
+/// Owned point-in-time restart analysis for one complete durable WAL prefix.
+///
+/// The value is metadata only. In particular, it is not a log position and
+/// cannot be passed to a durability port as truncation or flush authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartAnalysis;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_as_log_authority<Log: LogDurability>(
+///     log: &mut Log,
+///     analysis: &DurableTransactionRestartAnalysis,
+/// ) {
+///     let _ = log.flush_through(analysis);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysis, RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_forge_recovered<Source, Store, const N: usize>(
+///     analysis: DurableTransactionRestartAnalysis,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     analysis.into()
+/// }
+/// ```
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct DurableTransactionRestartAnalysis {
+    lineage: LogLineage,
+    durable_frontier: Option<LogSequenceNumber>,
+    transactions: Vec<DurableTransactionRestartEntry>,
+}
+
+impl DurableTransactionRestartAnalysis {
+    /// Returns the exact lineage analyzed by this point-in-time result.
+    #[must_use]
+    pub const fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    /// Returns the exact analyzed durable frontier, or `None` for an empty prefix.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<&LogSequenceNumber> {
+        self.durable_frontier.as_ref()
+    }
+
+    /// Returns transaction entries in strict persisted-identity order.
+    pub fn transactions(&self) -> &[DurableTransactionRestartEntry] {
+        &self.transactions
+    }
+
+    /// Consumes the analysis and returns its inert metadata.
+    pub fn into_parts(
+        self,
+    ) -> (
+        LogLineage,
+        Option<LogSequenceNumber>,
+        Vec<DurableTransactionRestartEntry>,
+    ) {
+        (self.lineage, self.durable_frontier, self.transactions)
+    }
+}
+
+/// Invalid complete-prefix evidence supplied to restart analysis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartAnalysisEvidenceError {
+    /// A nonempty observation stream omitted its durable frontier.
+    FrontierMissing {
+        /// Number of supplied logical observations.
+        record_count: usize,
+    },
+    /// A durable frontier was supplied for an empty logical-record stream.
+    FrontierWithoutRecords {
+        /// Unexpected supplied frontier.
+        frontier: LogSequenceNumber,
+    },
+    /// The durable frontier belongs to another WAL lineage.
+    ForeignFrontier {
+        /// Rejected foreign frontier.
+        frontier: LogSequenceNumber,
+    },
+    /// The nonempty durable frontier used the reserved zero position.
+    ZeroFrontier {
+        /// Rejected zero frontier.
+        frontier: LogSequenceNumber,
+    },
+    /// One logical observation belongs to another WAL lineage.
+    ForeignRecordLineage {
+        /// Zero-based observation index.
+        index: usize,
+        /// Kind of the rejected observation.
+        kind: DurableTransactionRestartObservationKind,
+        /// Rejected foreign position.
+        position: LogSequenceNumber,
+    },
+    /// Two identical adjacent observations claim one physical position.
+    DuplicateRecordPosition {
+        /// Zero-based index of the first observation.
+        previous_index: usize,
+        /// Zero-based index of the repeated observation.
+        actual_index: usize,
+        /// Kind shared by the identical observations.
+        kind: DurableTransactionRestartObservationKind,
+        /// Duplicated physical position.
+        position: LogSequenceNumber,
+    },
+    /// Two different adjacent observations claim one physical position.
+    ContradictoryRecordPosition {
+        /// Zero-based index of the prior observation.
+        previous_index: usize,
+        /// Kind of the prior observation.
+        previous_kind: DurableTransactionRestartObservationKind,
+        /// Zero-based index of the contradictory observation.
+        actual_index: usize,
+        /// Kind of the contradictory observation.
+        actual_kind: DurableTransactionRestartObservationKind,
+        /// Contradictory physical position.
+        position: LogSequenceNumber,
+    },
+    /// A later observation has a numerically lower physical position.
+    NonAdvancingRecordPosition {
+        /// Zero-based index of the prior observation.
+        previous_index: usize,
+        /// Prior physical position.
+        previous: LogSequenceNumber,
+        /// Zero-based index of the decreasing observation.
+        actual_index: usize,
+        /// Decreasing physical position.
+        actual: LogSequenceNumber,
+    },
+    /// The last projected record does not equal the supplied durable frontier.
+    TailFrontierMismatch {
+        /// Supplied durable frontier.
+        frontier: LogSequenceNumber,
+        /// Actual final observation position.
+        tail: LogSequenceNumber,
+    },
+    /// The owned transaction table could not reserve its complete upper bound.
+    TransactionCapacityExhausted {
+        /// Durable record count used as the transaction-count upper bound.
+        record_count: usize,
+    },
+    /// One persisted identity has more than one durable commit.
+    DuplicateCommit {
+        /// Identity with contradictory commit records.
+        transaction: DurableTransactionIdentityObservation,
+        /// First durable commit position.
+        first_commit_position: LogSequenceNumber,
+        /// Later duplicate commit position.
+        duplicate_commit_position: LogSequenceNumber,
+    },
+    /// A transaction-owned page occurs after the same identity's commit.
+    PageAfterCommit {
+        /// Identity whose post-commit page is invalid.
+        transaction: DurableTransactionIdentityObservation,
+        /// Earlier durable commit position.
+        commit_position: LogSequenceNumber,
+        /// Invalid later page position.
+        page_position: LogSequenceNumber,
+    },
+    /// Counting one identity's owned pages exceeded `usize`.
+    OwnedPageCountExhausted {
+        /// Identity whose record count could not advance.
+        transaction: DurableTransactionIdentityObservation,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartAnalysisEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FrontierMissing { record_count } => write!(
+                formatter,
+                "nonempty durable restart stream with {record_count} records has no frontier"
+            ),
+            Self::FrontierWithoutRecords { frontier } => write!(
+                formatter,
+                "durable restart frontier {} has no logical records",
+                frontier.get()
+            ),
+            Self::ForeignFrontier { frontier } => write!(
+                formatter,
+                "durable restart frontier {} belongs to another lineage",
+                frontier.get()
+            ),
+            Self::ZeroFrontier { .. } => {
+                formatter.write_str("nonempty durable restart frontier must be nonzero")
+            }
+            Self::ForeignRecordLineage {
+                index,
+                kind,
+                position,
+            } => write!(
+                formatter,
+                "durable restart record {index} ({kind:?}) at position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::DuplicateRecordPosition {
+                previous_index,
+                actual_index,
+                position,
+                ..
+            } => write!(
+                formatter,
+                "durable restart records {previous_index} and {actual_index} duplicate position {}",
+                position.get()
+            ),
+            Self::ContradictoryRecordPosition {
+                previous_index,
+                actual_index,
+                position,
+                ..
+            } => write!(
+                formatter,
+                "durable restart records {previous_index} and {actual_index} contradict at position {}",
+                position.get()
+            ),
+            Self::NonAdvancingRecordPosition {
+                previous_index,
+                previous,
+                actual_index,
+                actual,
+            } => write!(
+                formatter,
+                "durable restart record {actual_index} position {} does not advance beyond record {previous_index} position {}",
+                actual.get(),
+                previous.get()
+            ),
+            Self::TailFrontierMismatch { frontier, tail } => write!(
+                formatter,
+                "durable restart tail position {} does not equal frontier {}",
+                tail.get(),
+                frontier.get()
+            ),
+            Self::TransactionCapacityExhausted { record_count } => write!(
+                formatter,
+                "durable restart transaction capacity is exhausted for {record_count} records"
+            ),
+            Self::DuplicateCommit {
+                transaction,
+                first_commit_position,
+                duplicate_commit_position,
+            } => write!(
+                formatter,
+                "transaction {transaction} has duplicate commits at positions {} and {}",
+                first_commit_position.get(),
+                duplicate_commit_position.get()
+            ),
+            Self::PageAfterCommit {
+                transaction,
+                commit_position,
+                page_position,
+            } => write!(
+                formatter,
+                "transaction {transaction} page at position {} follows commit at position {}",
+                page_position.get(),
+                commit_position.get()
+            ),
+            Self::OwnedPageCountExhausted { transaction } => write!(
+                formatter,
+                "transaction {transaction} owned-page record count is exhausted"
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartAnalysisEvidenceError {}
+
+/// Failure to obtain or analyze one complete durable restart prefix.
+#[derive(Debug)]
+pub enum DurableTransactionRestartAnalysisError<SourceError> {
+    /// The source failed before returning authoritative stable-prefix evidence.
+    Source(SourceError),
+    /// The projected complete-prefix evidence was invalid.
+    Evidence(Box<DurableTransactionRestartAnalysisEvidenceError>),
+}
+
+impl<SourceError: fmt::Display> fmt::Display
+    for DurableTransactionRestartAnalysisError<SourceError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => write!(formatter, "restart-analysis source failed: {source}"),
+            Self::Evidence(source) => write!(formatter, "restart analysis failed: {source}"),
+        }
+    }
+}
+
+impl<SourceError> Error for DurableTransactionRestartAnalysisError<SourceError>
+where
+    SourceError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Evidence(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+fn analyze_durable_transaction_restart_evidence<const N: usize>(
+    lineage: &LogLineage,
+    durable_frontier: Option<&LogSequenceNumber>,
+    observations: &[DurableTransactionRestartObservation<N>],
+) -> Result<DurableTransactionRestartAnalysis, DurableTransactionRestartAnalysisEvidenceError> {
+    if let Some(frontier) = durable_frontier {
+        if !lineage.same_lineage(frontier.lineage()) {
+            return Err(
+                DurableTransactionRestartAnalysisEvidenceError::ForeignFrontier {
+                    frontier: frontier.clone(),
+                },
+            );
+        }
+        if frontier.get() == 0 {
+            return Err(
+                DurableTransactionRestartAnalysisEvidenceError::ZeroFrontier {
+                    frontier: frontier.clone(),
+                },
+            );
+        }
+    }
+
+    match (durable_frontier, observations.is_empty()) {
+        (None, false) => {
+            return Err(
+                DurableTransactionRestartAnalysisEvidenceError::FrontierMissing {
+                    record_count: observations.len(),
+                },
+            );
+        }
+        (Some(frontier), true) => {
+            return Err(
+                DurableTransactionRestartAnalysisEvidenceError::FrontierWithoutRecords {
+                    frontier: frontier.clone(),
+                },
+            );
+        }
+        (None, true) => {
+            return Ok(DurableTransactionRestartAnalysis {
+                lineage: lineage.clone(),
+                durable_frontier: None,
+                transactions: Vec::new(),
+            });
+        }
+        (Some(_), false) => {}
+    }
+
+    let mut previous: Option<(usize, &DurableTransactionRestartObservation<N>)> = None;
+    for (index, observation) in observations.iter().enumerate() {
+        let position = observation.position();
+        if !lineage.same_lineage(position.lineage()) {
+            return Err(
+                DurableTransactionRestartAnalysisEvidenceError::ForeignRecordLineage {
+                    index,
+                    kind: observation.kind(),
+                    position: position.clone(),
+                },
+            );
+        }
+        if let Some((previous_index, previous_observation)) = previous {
+            let previous_position = previous_observation.position();
+            if position.get() == previous_position.get() {
+                if observation == previous_observation {
+                    return Err(
+                        DurableTransactionRestartAnalysisEvidenceError::DuplicateRecordPosition {
+                            previous_index,
+                            actual_index: index,
+                            kind: observation.kind(),
+                            position: position.clone(),
+                        },
+                    );
+                }
+                return Err(
+                    DurableTransactionRestartAnalysisEvidenceError::ContradictoryRecordPosition {
+                        previous_index,
+                        previous_kind: previous_observation.kind(),
+                        actual_index: index,
+                        actual_kind: observation.kind(),
+                        position: position.clone(),
+                    },
+                );
+            }
+            if position.get() < previous_position.get() {
+                return Err(
+                    DurableTransactionRestartAnalysisEvidenceError::NonAdvancingRecordPosition {
+                        previous_index,
+                        previous: previous_position.clone(),
+                        actual_index: index,
+                        actual: position.clone(),
+                    },
+                );
+            }
+        }
+        previous = Some((index, observation));
+    }
+
+    let frontier = durable_frontier.ok_or(
+        DurableTransactionRestartAnalysisEvidenceError::FrontierMissing {
+            record_count: observations.len(),
+        },
+    )?;
+    let tail = observations
+        .last()
+        .map(DurableTransactionRestartObservation::position);
+    let Some(tail) = tail else {
+        return Err(
+            DurableTransactionRestartAnalysisEvidenceError::FrontierWithoutRecords {
+                frontier: frontier.clone(),
+            },
+        );
+    };
+    if tail != frontier {
+        return Err(
+            DurableTransactionRestartAnalysisEvidenceError::TailFrontierMismatch {
+                frontier: frontier.clone(),
+                tail: tail.clone(),
+            },
+        );
+    }
+
+    let mut transactions: Vec<DurableTransactionRestartEntry> = Vec::new();
+    transactions.try_reserve(observations.len()).map_err(|_| {
+        DurableTransactionRestartAnalysisEvidenceError::TransactionCapacityExhausted {
+            record_count: observations.len(),
+        }
+    })?;
+
+    for observation in observations {
+        match observation {
+            DurableTransactionRestartObservation::Page(_) => {}
+            DurableTransactionRestartObservation::TransactionPage(observation) => {
+                let transaction = observation.owner();
+                let page_position = observation.position();
+                match transactions.binary_search_by_key(&transaction, |entry| entry.transaction) {
+                    Ok(index) => {
+                        let entry = &mut transactions[index];
+                        if let DurableTransactionRestartState::Committed { commit_position } =
+                            &entry.state
+                        {
+                            return Err(
+                                DurableTransactionRestartAnalysisEvidenceError::PageAfterCommit {
+                                    transaction,
+                                    commit_position: commit_position.clone(),
+                                    page_position: page_position.clone(),
+                                },
+                            );
+                        }
+                        entry.owned_page_record_count = entry
+                            .owned_page_record_count
+                            .checked_add(1)
+                            .ok_or(
+                                DurableTransactionRestartAnalysisEvidenceError::OwnedPageCountExhausted {
+                                    transaction,
+                                },
+                            )?;
+                        entry.last_owned_page_position = Some(page_position.clone());
+                    }
+                    Err(index) => transactions.insert(
+                        index,
+                        DurableTransactionRestartEntry {
+                            transaction,
+                            first_owned_page_position: Some(page_position.clone()),
+                            last_owned_page_position: Some(page_position.clone()),
+                            owned_page_record_count: 1,
+                            state: DurableTransactionRestartState::Uncommitted,
+                        },
+                    ),
+                }
+            }
+            DurableTransactionRestartObservation::Commit(observation) => {
+                let transaction = observation.transaction();
+                let commit_position = observation.position();
+                match transactions.binary_search_by_key(&transaction, |entry| entry.transaction) {
+                    Ok(index) => {
+                        let entry = &mut transactions[index];
+                        match &entry.state {
+                            DurableTransactionRestartState::Uncommitted => {
+                                entry.state = DurableTransactionRestartState::Committed {
+                                    commit_position: commit_position.clone(),
+                                };
+                            }
+                            DurableTransactionRestartState::Committed {
+                                commit_position: first_commit_position,
+                            } => {
+                                return Err(
+                                    DurableTransactionRestartAnalysisEvidenceError::DuplicateCommit {
+                                        transaction,
+                                        first_commit_position: first_commit_position.clone(),
+                                        duplicate_commit_position: commit_position.clone(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(index) => transactions.insert(
+                        index,
+                        DurableTransactionRestartEntry {
+                            transaction,
+                            first_owned_page_position: None,
+                            last_owned_page_position: None,
+                            owned_page_record_count: 0,
+                            state: DurableTransactionRestartState::Committed {
+                                commit_position: commit_position.clone(),
+                            },
+                        },
+                    ),
+                }
+            }
+        }
+    }
+
+    Ok(DurableTransactionRestartAnalysis {
+        lineage: lineage.clone(),
+        durable_frontier: Some(frontier.clone()),
+        transactions,
+    })
+}
+
+/// Reconstructs one deterministic transaction table from a complete durable prefix.
+///
+/// The source callback is invoked at most once. Its complete unified stream is
+/// validated before table allocation or transaction-specific classification.
+pub fn analyze_durable_transaction_restart<Source, const N: usize>(
+    source: &mut Source,
+) -> Result<DurableTransactionRestartAnalysis, DurableTransactionRestartAnalysisError<Source::Error>>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    let lineage = source.lineage().clone();
+    match source.with_durable_transaction_restart_observations(|durable_frontier, observations| {
+        analyze_durable_transaction_restart_evidence(&lineage, durable_frontier, observations)
+    }) {
+        Ok(Ok(analysis)) => Ok(analysis),
+        Ok(Err(source)) => Err(DurableTransactionRestartAnalysisError::Evidence(Box::new(
+            source,
+        ))),
+        Err(source) => Err(DurableTransactionRestartAnalysisError::Source(source)),
+    }
+}
+
 /// Read-only in-process lifecycle phase recorded by the coordinator.
 ///
 /// This phase is not persistent recovery evidence and deliberately carries no
@@ -8793,6 +9540,487 @@ mod tests {
         assert_eq!(source.inventory_calls, 2);
         assert_eq!(store.current.len(), 3);
         assert_eq!(report.pages().len(), 3);
+        Ok(())
+    }
+
+    struct FakeDurableTransactionRestartSource {
+        lineage: LogLineage,
+        durable_frontier: Option<LogSequenceNumber>,
+        observations: Vec<DurableTransactionRestartObservation<1>>,
+        before_callback_error: Option<FakeFault>,
+        after_callback_error: Option<FakeFault>,
+        callbacks: usize,
+    }
+
+    impl FakeDurableTransactionRestartSource {
+        fn new(
+            lineage: LogLineage,
+            durable_frontier: Option<LogSequenceNumber>,
+            observations: Vec<DurableTransactionRestartObservation<1>>,
+        ) -> Self {
+            Self {
+                lineage,
+                durable_frontier,
+                observations,
+                before_callback_error: None,
+                after_callback_error: None,
+                callbacks: 0,
+            }
+        }
+    }
+
+    impl DurableTransactionRestartAnalysisSource<1> for FakeDurableTransactionRestartSource {
+        type Error = FakeFault;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn with_durable_transaction_restart_observations<Output, Operation>(
+            &mut self,
+            operation: Operation,
+        ) -> Result<Output, Self::Error>
+        where
+            Operation: for<'evidence> FnOnce(
+                Option<&'evidence LogSequenceNumber>,
+                &'evidence [DurableTransactionRestartObservation<1>],
+            ) -> Output,
+        {
+            if let Some(source) = self.before_callback_error.take() {
+                return Err(source);
+            }
+            self.callbacks += 1;
+            let output = operation(self.durable_frontier.as_ref(), &self.observations);
+            match self.after_callback_error.take() {
+                Some(source) => Err(source),
+                None => Ok(output),
+            }
+        }
+    }
+
+    fn restart_raw_page(
+        lineage: &LogLineage,
+        page_number: u64,
+        position: u64,
+    ) -> Result<DurableTransactionRestartObservation<1>, TestError> {
+        Ok(DurableTransactionRestartObservation::Page(
+            physical_page_observation(
+                lineage,
+                page_number,
+                position,
+                u8::try_from(page_number).map_err(|_| TestError("raw page byte"))?,
+                position,
+            )?,
+        ))
+    }
+
+    fn restart_owned_page(
+        lineage: &LogLineage,
+        transaction: DurableTransactionIdentityObservation,
+        page_number: u64,
+        position: u64,
+    ) -> Result<DurableTransactionRestartObservation<1>, TestError> {
+        Ok(DurableTransactionRestartObservation::TransactionPage(
+            durable_page_observation(
+                lineage,
+                transaction,
+                page_number,
+                position,
+                u8::try_from(page_number).map_err(|_| TestError("owned page byte"))?,
+                position,
+            )?,
+        ))
+    }
+
+    fn restart_commit(
+        lineage: &LogLineage,
+        transaction: DurableTransactionIdentityObservation,
+        position: u64,
+    ) -> Result<DurableTransactionRestartObservation<1>, TestError> {
+        Ok(DurableTransactionRestartObservation::Commit(
+            durable_commit_observation(lineage, transaction, position)?,
+        ))
+    }
+
+    fn restart_evidence_error(
+        result: Result<
+            DurableTransactionRestartAnalysis,
+            DurableTransactionRestartAnalysisError<FakeFault>,
+        >,
+    ) -> Result<DurableTransactionRestartAnalysisEvidenceError, TestError> {
+        match result {
+            Err(DurableTransactionRestartAnalysisError::Evidence(source)) => Ok(*source),
+            Err(DurableTransactionRestartAnalysisError::Source(_)) => Err(TestError(
+                "expected restart evidence error, found source error",
+            )),
+            Ok(_) => Err(TestError("expected restart evidence error")),
+        }
+    }
+
+    #[test]
+    fn restart_analysis_accepts_authoritatively_empty_prefix() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut source =
+            FakeDurableTransactionRestartSource::new(lineage.clone(), None, Vec::new());
+
+        let analysis = analyze_durable_transaction_restart(&mut source)
+            .map_err(|_| TestError("empty restart analysis"))?;
+
+        assert!(analysis.lineage().same_lineage(&lineage));
+        assert_eq!(analysis.durable_frontier(), None);
+        assert!(analysis.transactions().is_empty());
+        assert_eq!(source.callbacks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_builds_identity_sorted_table_from_interleaved_gapped_stream()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let uncommitted = durable_identity(40, 1)?;
+        let committed = durable_identity(41, 2)?;
+        let commit_only = durable_identity(42, 3)?;
+        let observations = vec![
+            restart_raw_page(&lineage, 90, 2)?,
+            restart_owned_page(&lineage, committed, 91, 4)?,
+            restart_owned_page(&lineage, uncommitted, 92, 7)?,
+            restart_owned_page(&lineage, committed, 93, 8)?,
+            restart_commit(&lineage, committed, 10)?,
+            restart_commit(&lineage, commit_only, 12)?,
+            restart_owned_page(&lineage, uncommitted, 94, 15)?,
+        ];
+        assert_eq!(
+            observations
+                .iter()
+                .map(DurableTransactionRestartObservation::kind)
+                .collect::<Vec<_>>(),
+            [
+                DurableTransactionRestartObservationKind::Page,
+                DurableTransactionRestartObservationKind::TransactionPage,
+                DurableTransactionRestartObservationKind::TransactionPage,
+                DurableTransactionRestartObservationKind::TransactionPage,
+                DurableTransactionRestartObservationKind::Commit,
+                DurableTransactionRestartObservationKind::Commit,
+                DurableTransactionRestartObservationKind::TransactionPage,
+            ]
+        );
+        let mut source = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(15)),
+            observations,
+        );
+
+        let analysis = analyze_durable_transaction_restart(&mut source)
+            .map_err(|_| TestError("interleaved restart analysis"))?;
+        assert_eq!(analysis.durable_frontier(), Some(&lineage.position(15)));
+        let transactions = analysis.transactions();
+        assert_eq!(
+            transactions
+                .iter()
+                .map(DurableTransactionRestartEntry::transaction)
+                .collect::<Vec<_>>(),
+            [uncommitted, committed, commit_only]
+        );
+
+        assert_eq!(
+            transactions[0].first_owned_page_position(),
+            Some(&lineage.position(7))
+        );
+        assert_eq!(
+            transactions[0].last_owned_page_position(),
+            Some(&lineage.position(15))
+        );
+        assert_eq!(transactions[0].owned_page_record_count(), 2);
+        assert_eq!(
+            transactions[0].state(),
+            &DurableTransactionRestartState::Uncommitted
+        );
+
+        assert_eq!(
+            transactions[1].first_owned_page_position(),
+            Some(&lineage.position(4))
+        );
+        assert_eq!(
+            transactions[1].last_owned_page_position(),
+            Some(&lineage.position(8))
+        );
+        assert_eq!(transactions[1].owned_page_record_count(), 2);
+        assert_eq!(
+            transactions[1].state().commit_position(),
+            Some(&lineage.position(10))
+        );
+
+        assert_eq!(transactions[2].first_owned_page_position(), None);
+        assert_eq!(transactions[2].last_owned_page_position(), None);
+        assert_eq!(transactions[2].owned_page_record_count(), 0);
+        assert_eq!(
+            transactions[2].state().commit_position(),
+            Some(&lineage.position(12))
+        );
+
+        let (analyzed_lineage, frontier, transactions) = analysis.into_parts();
+        assert!(analyzed_lineage.same_lineage(&lineage));
+        assert_eq!(frontier, Some(lineage.position(15)));
+        assert_eq!(transactions.len(), 3);
+        assert_eq!(source.callbacks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_rejects_every_frontier_shape_before_table_construction()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let transaction = durable_identity(43, 1)?;
+
+        let mut foreign_frontier = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(foreign.position(1)),
+            Vec::new(),
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(
+                &mut foreign_frontier
+            ))?,
+            DurableTransactionRestartAnalysisEvidenceError::ForeignFrontier { frontier }
+                if frontier == foreign.position(1)
+        ));
+
+        let mut zero_frontier = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(0)),
+            Vec::new(),
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut zero_frontier))?,
+            DurableTransactionRestartAnalysisEvidenceError::ZeroFrontier { frontier }
+                if frontier == lineage.position(0)
+        ));
+
+        let mut missing_frontier = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            None,
+            vec![restart_commit(&lineage, transaction, 1)?],
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut missing_frontier))?,
+            DurableTransactionRestartAnalysisEvidenceError::FrontierMissing { record_count: 1 }
+        ));
+
+        let mut empty_with_frontier = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(1)),
+            Vec::new(),
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(
+                &mut empty_with_frontier
+            ))?,
+            DurableTransactionRestartAnalysisEvidenceError::FrontierWithoutRecords { frontier }
+                if frontier == lineage.position(1)
+        ));
+
+        let mut stale_frontier = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(3)),
+            vec![restart_commit(&lineage, transaction, 2)?],
+        );
+        let error = analyze_durable_transaction_restart(&mut stale_frontier)
+            .err()
+            .ok_or(TestError("tail/frontier mismatch must fail"))?;
+        assert!(Error::source(&error).is_some());
+        assert!(matches!(
+            restart_evidence_error(Err(error))?,
+            DurableTransactionRestartAnalysisEvidenceError::TailFrontierMismatch {
+                frontier,
+                tail,
+            } if frontier == lineage.position(3) && tail == lineage.position(2)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_rejects_foreign_duplicate_contradictory_and_decreasing_records()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let transaction = durable_identity(44, 1)?;
+
+        let mut foreign_record = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(2)),
+            vec![restart_commit(&foreign, transaction, 2)?],
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut foreign_record))?,
+            DurableTransactionRestartAnalysisEvidenceError::ForeignRecordLineage {
+                index: 0,
+                kind: DurableTransactionRestartObservationKind::Commit,
+                position,
+            } if position == foreign.position(2)
+        ));
+
+        let mut duplicate = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(2)),
+            vec![
+                restart_raw_page(&lineage, 95, 2)?,
+                restart_raw_page(&lineage, 95, 2)?,
+            ],
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut duplicate))?,
+            DurableTransactionRestartAnalysisEvidenceError::DuplicateRecordPosition {
+                previous_index: 0,
+                actual_index: 1,
+                kind: DurableTransactionRestartObservationKind::Page,
+                position,
+            } if position == lineage.position(2)
+        ));
+
+        let mut contradictory = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(2)),
+            vec![
+                restart_raw_page(&lineage, 96, 2)?,
+                restart_commit(&lineage, transaction, 2)?,
+            ],
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut contradictory))?,
+            DurableTransactionRestartAnalysisEvidenceError::ContradictoryRecordPosition {
+                previous_index: 0,
+                previous_kind: DurableTransactionRestartObservationKind::Page,
+                actual_index: 1,
+                actual_kind: DurableTransactionRestartObservationKind::Commit,
+                position,
+            } if position == lineage.position(2)
+        ));
+
+        let mut decreasing = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(2)),
+            vec![
+                restart_raw_page(&lineage, 97, 3)?,
+                restart_commit(&lineage, transaction, 2)?,
+            ],
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut decreasing))?,
+            DurableTransactionRestartAnalysisEvidenceError::NonAdvancingRecordPosition {
+                previous_index: 0,
+                previous,
+                actual_index: 1,
+                actual,
+            } if previous == lineage.position(3) && actual == lineage.position(2)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_validates_complete_stream_before_transaction_contradictions()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let transaction = durable_identity(45, 1)?;
+        let mut source = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(2)),
+            vec![
+                restart_commit(&lineage, transaction, 1)?,
+                restart_commit(&lineage, transaction, 3)?,
+                restart_raw_page(&lineage, 98, 2)?,
+            ],
+        );
+
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut source))?,
+            DurableTransactionRestartAnalysisEvidenceError::NonAdvancingRecordPosition {
+                previous_index: 1,
+                previous,
+                actual_index: 2,
+                actual,
+            } if previous == lineage.position(3) && actual == lineage.position(2)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_rejects_duplicate_commit_and_page_after_commit() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let duplicate_owner = durable_identity(46, 1)?;
+        let mut duplicate = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(5)),
+            vec![
+                restart_owned_page(&lineage, duplicate_owner, 99, 1)?,
+                restart_commit(&lineage, duplicate_owner, 3)?,
+                restart_commit(&lineage, duplicate_owner, 5)?,
+            ],
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut duplicate))?,
+            DurableTransactionRestartAnalysisEvidenceError::DuplicateCommit {
+                transaction,
+                first_commit_position,
+                duplicate_commit_position,
+            } if transaction == duplicate_owner
+                && first_commit_position == lineage.position(3)
+                && duplicate_commit_position == lineage.position(5)
+        ));
+
+        let page_after_owner = durable_identity(46, 2)?;
+        let mut page_after = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(5)),
+            vec![
+                restart_commit(&lineage, page_after_owner, 2)?,
+                restart_raw_page(&lineage, 100, 4)?,
+                restart_owned_page(&lineage, page_after_owner, 101, 5)?,
+            ],
+        );
+        assert!(matches!(
+            restart_evidence_error(analyze_durable_transaction_restart(&mut page_after))?,
+            DurableTransactionRestartAnalysisEvidenceError::PageAfterCommit {
+                transaction,
+                commit_position,
+                page_position,
+            } if transaction == page_after_owner
+                && commit_position == lineage.position(2)
+                && page_position == lineage.position(5)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_preserves_source_failures_before_and_after_callback()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut before =
+            FakeDurableTransactionRestartSource::new(lineage.clone(), None, Vec::new());
+        before.before_callback_error = Some(FakeFault("before restart evidence"));
+        let before_error = analyze_durable_transaction_restart(&mut before)
+            .err()
+            .ok_or(TestError("before-callback source error must fail"))?;
+        assert!(matches!(
+            before_error,
+            DurableTransactionRestartAnalysisError::Source(FakeFault("before restart evidence"))
+        ));
+        assert_eq!(before.callbacks, 0);
+
+        let mut after = FakeDurableTransactionRestartSource::new(lineage, None, Vec::new());
+        after.after_callback_error = Some(FakeFault("after restart evidence"));
+        let after_error = analyze_durable_transaction_restart(&mut after)
+            .err()
+            .ok_or(TestError("after-callback source error must fail"))?;
+        assert_eq!(
+            Error::source(&after_error).map(ToString::to_string),
+            Some(String::from("after restart evidence"))
+        );
+        assert!(matches!(
+            after_error,
+            DurableTransactionRestartAnalysisError::Source(FakeFault("after restart evidence"))
+        ));
+        assert_eq!(after.callbacks, 1);
         Ok(())
     }
 }

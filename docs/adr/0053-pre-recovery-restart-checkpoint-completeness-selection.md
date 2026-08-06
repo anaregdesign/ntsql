@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #159
 - Extends: ADR 0033, ADR 0037, ADR 0050, ADR 0051, ADR 0052
+- Extended by: ADR 0054
 - Follows: #157
 
 ## Context
@@ -336,6 +337,6 @@ absence, and rejection remain distinct owning states, while every explicit
 fallback uses the unchanged complete recovery and retains the same locked source
 through final publication.
 
-The selected baseline remains inert and private. Separately reviewed work is
-still required to consume it for replay planning, page repair, transaction
-restoration, retention, or WAL reclamation.
+ADR 0054 adds the separately reviewed consuming replay-planning transition. The
+selected baseline remains private, and page repair, transaction restoration,
+retention, and WAL reclamation still require later boundaries.

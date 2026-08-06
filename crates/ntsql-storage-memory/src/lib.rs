@@ -5160,6 +5160,90 @@ mod tests {
     }
 
     #[test]
+    fn selected_completeness_checkpoint_owns_replay_window_through_durable_suffix()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x1613)
+            .ok_or_else(|| io::Error::other("replay planning persistent log id"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 220)?;
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint_frontier = baseline
+            .durable_frontier()
+            .ok_or_else(|| io::Error::other("replay checkpoint frontier is empty"))?;
+        let replay_start = baseline
+            .replay_start()
+            .position()
+            .ok_or_else(|| io::Error::other("replay checkpoint has no inclusive start"))?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+
+        let suffix_page_number =
+            PageNumber::new(222).ok_or_else(|| io::Error::other("suffix page number is zero"))?;
+        {
+            let (log, _) = owner.parts_mut();
+            let lineage = LogDurability::lineage(log).clone();
+            let mut coordinator = TransactionCoordinator::open(log)?;
+            let active = coordinator.begin()?;
+            let suffix_page = UnloggedPage::new(
+                PageAddress::new(&lineage, suffix_page_number),
+                PageVersion::new(3),
+                PageImage::new([0xA3])?,
+            );
+            let (active, dirty) = coordinator.stage_page_write(active, suffix_page, log)?;
+            let committed = coordinator.commit(active, log)?;
+            drop((committed, dirty));
+        }
+        let current_frontier = owner
+            .parts()
+            .0
+            .durable_position()
+            .ok_or_else(|| io::Error::other("suffix durable frontier is empty"))?;
+        assert!(current_frontier.get() > checkpoint_frontier);
+        let durable_record_count = owner.parts().0.durable_records().len();
+        let (log, store, _, _) = owner.into_parts();
+
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("memory replay checkpoint was not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        assert_eq!(planned.persistent_log_id(), persistent_log_id);
+        assert_eq!(planned.checkpoint_frontier(), Some(checkpoint_frontier));
+        assert_eq!(planned.current_frontier(), Some(current_frontier.get()));
+        assert_eq!(planned.inclusive_replay_start(), Some(replay_start));
+        assert_eq!(planned.replay_record_count(), 3);
+        assert_eq!(planned.current_transaction_count(), 3);
+
+        let analyzed = planned.decline_replay_plan().recover()?.analyze_restart()?;
+        assert!(analyzed.recovery_report().pages().iter().any(|page| {
+            matches!(
+                page,
+                CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+            ) && page.page_number() == suffix_page_number
+        }));
+        assert_eq!(
+            analyzed
+                .restart_analysis()
+                .durable_frontier()
+                .map(LogSequenceNumber::get),
+            Some(current_frontier.get())
+        );
+        let (log, _, _, _, checkpoint) = analyzed.into_parts();
+        assert_eq!(log.durable_records().len(), durable_record_count);
+        let retained = checkpoint
+            .slot()
+            .ok_or_else(|| io::Error::other("planned memory checkpoint disappeared"))?;
+        assert_completeness_observation_matches_baseline(retained, &baseline);
+        Ok(())
+    }
+
+    #[test]
     fn completeness_checkpoint_selection_absence_and_source_fault_use_explicit_full_recovery()
     -> Result<(), Box<dyn Error>> {
         let persistent_log_id = PersistentLogId::new(0x1594)

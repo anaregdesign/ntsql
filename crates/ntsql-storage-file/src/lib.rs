@@ -87,6 +87,15 @@
 //! The seed is `0x4e5453514c434b31`. The final stored checksum is
 //! `state ^ protected_len`, where `protected_len` is counted as a wrapping `u64`
 //! while the bytes are folded.
+//!
+//! ## Restart checkpoint baseline codec v1
+//!
+//! The pure checkpoint codec uses its own `NTSQCKP1` header and `NTSQCKE1`
+//! footer namespace. A 64-byte header is followed by fixed 64-byte transaction
+//! entries and one 16-byte footer. Explicit presence bytes preserve absent
+//! versus present-zero fields, while the final checksum protects the complete
+//! preceding blob. Decoding returns owned untrusted fields and performs no file
+//! I/O, publication, startup selection, or checkpoint validation.
 
 use std::{
     error::Error,
@@ -113,6 +122,14 @@ use ntsql_transaction::{
     compare_committed_transaction_page_recovery_candidate,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
+
+mod restart_checkpoint_codec;
+
+pub use restart_checkpoint_codec::{
+    RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,
+    RestartCheckpointBaselineEntryOptionalField, decode_restart_checkpoint_baseline,
+    encode_restart_checkpoint_baseline,
+};
 
 const HEADER_MAGIC: [u8; 8] = *b"NTSQLOG1";
 const FRAME_MAGIC: [u8; 4] = *b"NTSQ";

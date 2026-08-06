@@ -14,9 +14,10 @@ use ntsql_transaction::{
     DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
     DurableTransactionPageObservationBytesError, DurableTransactionPageRecoveryInventory,
     DurableTransactionPageRecoverySource, DurableTransactionRestartAnalysisSource,
-    DurableTransactionRestartObservation, TransactionCommitRecord, TransactionEpochSource,
-    TransactionId, TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
-    compare_committed_transaction_page_recovery_candidate,
+    DurableTransactionRestartCheckpointBaselineSource, DurableTransactionRestartObservation,
+    OwnedDurableTransactionRestartCheckpointBaselineObservation, TransactionCommitRecord,
+    TransactionEpochSource, TransactionId, TransactionPageLog, TransactionPageWriteRecord,
+    TransactionRecoverySource, compare_committed_transaction_page_recovery_candidate,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -929,6 +930,245 @@ impl<const N: usize> Error for InMemoryTransactionRestartAnalysisSourceError<N> 
     }
 }
 
+/// One-shot failure boundary for the next checkpoint baseline load.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestartCheckpointBaselineSourceFaultPoint {
+    /// Fail before inspecting or copying the optional seeded slot.
+    BeforeLoad,
+}
+
+impl fmt::Display for RestartCheckpointBaselineSourceFaultPoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeLoad => formatter.write_str("before load"),
+        }
+    }
+}
+
+/// Refusal to replace an already armed checkpoint-source fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartCheckpointBaselineSourceFaultAlreadyArmed {
+    armed: RestartCheckpointBaselineSourceFaultPoint,
+    requested: RestartCheckpointBaselineSourceFaultPoint,
+}
+
+impl RestartCheckpointBaselineSourceFaultAlreadyArmed {
+    /// Returns the fault that remains armed.
+    #[must_use]
+    pub const fn armed(&self) -> RestartCheckpointBaselineSourceFaultPoint {
+        self.armed
+    }
+
+    /// Returns the rejected replacement fault.
+    #[must_use]
+    pub const fn requested(&self) -> RestartCheckpointBaselineSourceFaultPoint {
+        self.requested
+    }
+}
+
+impl fmt::Display for RestartCheckpointBaselineSourceFaultAlreadyArmed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "checkpoint-source fault {} is already armed; cannot arm {}",
+            self.armed, self.requested
+        )
+    }
+}
+
+impl Error for RestartCheckpointBaselineSourceFaultAlreadyArmed {}
+
+/// Failure to load one complete owned checkpoint observation from memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryTransactionRestartCheckpointBaselineSourceError {
+    /// The configured deterministic one-shot failure was reached.
+    InjectedFault(RestartCheckpointBaselineSourceFaultPoint),
+    /// The returned entry vector could not reserve its exact required bound.
+    TransactionCapacityExhausted {
+        /// Exact number of entries that required reservation.
+        transaction_count: usize,
+    },
+}
+
+impl fmt::Display for InMemoryTransactionRestartCheckpointBaselineSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InjectedFault(point) => {
+                write!(formatter, "injected checkpoint-source failure {point}")
+            }
+            Self::TransactionCapacityExhausted { transaction_count } => write!(
+                formatter,
+                "in-memory checkpoint observation capacity is exhausted for {transaction_count} transaction entries"
+            ),
+        }
+    }
+}
+
+impl Error for InMemoryTransactionRestartCheckpointBaselineSourceError {}
+
+/// Deterministic read source for one constructor-seeded checkpoint slot.
+///
+/// The seed is untrusted fixture state, not publication evidence. This adapter
+/// exposes no runtime replacement operation and remains distinct from the memory
+/// WAL and page store.
+///
+/// It cannot satisfy WAL durability:
+///
+/// ```compile_fail
+/// use ntsql_storage_memory::InMemoryTransactionRestartCheckpointBaselineSource;
+/// use ntsql_wal::LogDurability;
+///
+/// fn require_log<Log: LogDurability>(_log: &mut Log) {}
+///
+/// let mut source = InMemoryTransactionRestartCheckpointBaselineSource::empty();
+/// require_log(&mut source);
+/// ```
+///
+/// It cannot satisfy page-store write authority:
+///
+/// ```compile_fail
+/// use ntsql_page::PageStore;
+/// use ntsql_storage_memory::InMemoryTransactionRestartCheckpointBaselineSource;
+///
+/// fn require_store<Store: PageStore<1>>(_store: &mut Store) {}
+///
+/// let mut source = InMemoryTransactionRestartCheckpointBaselineSource::empty();
+/// require_store(&mut source);
+/// ```
+///
+/// It cannot substitute for the authoritative WAL restart-analysis source:
+///
+/// ```compile_fail
+/// use ntsql_storage_memory::InMemoryTransactionRestartCheckpointBaselineSource;
+/// use ntsql_transaction::DurableTransactionRestartAnalysisSource;
+///
+/// fn require_wal_source<Source: DurableTransactionRestartAnalysisSource<1>>(
+///     _source: &mut Source,
+/// ) {}
+///
+/// let mut source = InMemoryTransactionRestartCheckpointBaselineSource::empty();
+/// require_wal_source(&mut source);
+/// ```
+///
+/// Its untrusted slot cannot become an authoritative baseline:
+///
+/// ```compile_fail
+/// use ntsql_storage_memory::InMemoryTransactionRestartCheckpointBaselineSource;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaseline;
+///
+/// fn cannot_authorize(
+///     source: InMemoryTransactionRestartCheckpointBaselineSource,
+/// ) -> DurableTransactionRestartCheckpointBaseline {
+///     source.into()
+/// }
+/// ```
+#[derive(Debug)]
+#[must_use]
+pub struct InMemoryTransactionRestartCheckpointBaselineSource {
+    slot: Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>,
+    armed_fault: Option<RestartCheckpointBaselineSourceFaultPoint>,
+}
+
+impl InMemoryTransactionRestartCheckpointBaselineSource {
+    /// Creates a source with no current checkpoint slot.
+    pub const fn empty() -> Self {
+        Self {
+            slot: None,
+            armed_fault: None,
+        }
+    }
+
+    /// Creates a source with one untrusted fixture snapshot.
+    pub const fn seeded(slot: OwnedDurableTransactionRestartCheckpointBaselineObservation) -> Self {
+        Self {
+            slot: Some(slot),
+            armed_fault: None,
+        }
+    }
+
+    /// Returns the exact constructor-seeded untrusted slot.
+    #[must_use]
+    pub const fn slot(
+        &self,
+    ) -> Option<&OwnedDurableTransactionRestartCheckpointBaselineObservation> {
+        self.slot.as_ref()
+    }
+
+    /// Arms one load fault without replacing an existing plan.
+    pub fn arm_fault(
+        &mut self,
+        fault: RestartCheckpointBaselineSourceFaultPoint,
+    ) -> Result<(), RestartCheckpointBaselineSourceFaultAlreadyArmed> {
+        if let Some(armed) = self.armed_fault {
+            return Err(RestartCheckpointBaselineSourceFaultAlreadyArmed {
+                armed,
+                requested: fault,
+            });
+        }
+        self.armed_fault = Some(fault);
+        Ok(())
+    }
+
+    /// Returns the one-shot fault that has not yet reached its matching stage.
+    #[must_use]
+    pub const fn armed_fault(&self) -> Option<RestartCheckpointBaselineSourceFaultPoint> {
+        self.armed_fault
+    }
+
+    fn consume_fault(&mut self, point: RestartCheckpointBaselineSourceFaultPoint) -> bool {
+        if self.armed_fault == Some(point) {
+            self.armed_fault = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for InMemoryTransactionRestartCheckpointBaselineSource {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl DurableTransactionRestartCheckpointBaselineSource
+    for InMemoryTransactionRestartCheckpointBaselineSource
+{
+    type Error = InMemoryTransactionRestartCheckpointBaselineSourceError;
+
+    fn load_restart_checkpoint_baseline(
+        &mut self,
+    ) -> Result<Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>, Self::Error>
+    {
+        if self.consume_fault(RestartCheckpointBaselineSourceFaultPoint::BeforeLoad) {
+            return Err(
+                InMemoryTransactionRestartCheckpointBaselineSourceError::InjectedFault(
+                    RestartCheckpointBaselineSourceFaultPoint::BeforeLoad,
+                ),
+            );
+        }
+
+        let Some(slot) = self.slot.as_ref() else {
+            return Ok(None);
+        };
+        let transaction_count = slot.transactions().len();
+        let mut transactions = Vec::new();
+        transactions.try_reserve_exact(transaction_count).map_err(|_| {
+            InMemoryTransactionRestartCheckpointBaselineSourceError::TransactionCapacityExhausted {
+                transaction_count,
+            }
+        })?;
+        transactions.extend_from_slice(slot.transactions());
+        Ok(Some(
+            OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+                slot.persistent_log_id(),
+                slot.durable_frontier(),
+                transactions,
+            ),
+        ))
+    }
+}
+
 /// Inspectable in-memory implementation of the transaction and page WAL ports.
 ///
 /// This adapter models only repository-authored physical effects. Its durable
@@ -1657,7 +1897,7 @@ mod tests {
         CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
         CommittedTransactionPagesRecoveryError, CoordinatedCommitError,
         DurableTransactionRestartCheckpointBaselineEntryObservation,
-        DurableTransactionRestartCheckpointBaselineObservation,
+        DurableTransactionRestartCheckpointBaselineSourceValidationError,
         DurableTransactionRestartCheckpointBaselineStateObservation,
         DurableTransactionRestartState, TransactionCoordinator, TransactionLifecycleStatus,
         TransactionResolutionFailure, UnrecoveredTransactionPageStorage, flush_committed_page,
@@ -1974,6 +2214,84 @@ mod tests {
                 record_count: usize::MAX,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_source_preserves_seed_and_retries_one_shot_fault() -> Result<(), Box<dyn Error>> {
+        let raw_entries = vec![
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                0,
+                0,
+                Some(9),
+                None,
+                0,
+                DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                    commit_position: 0,
+                },
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                7,
+                3,
+                None,
+                Some(2),
+                u64::MAX,
+                DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted,
+            ),
+        ];
+        let seeded = OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+            0,
+            Some(0),
+            raw_entries,
+        );
+        let mut source = InMemoryTransactionRestartCheckpointBaselineSource::seeded(seeded.clone());
+        assert_eq!(source.slot(), Some(&seeded));
+        assert_eq!(source.armed_fault(), None);
+
+        source.arm_fault(RestartCheckpointBaselineSourceFaultPoint::BeforeLoad)?;
+        let already_armed = source
+            .arm_fault(RestartCheckpointBaselineSourceFaultPoint::BeforeLoad)
+            .err()
+            .ok_or_else(|| io::Error::other("armed checkpoint fault was replaced"))?;
+        assert_eq!(
+            already_armed.armed(),
+            RestartCheckpointBaselineSourceFaultPoint::BeforeLoad
+        );
+        assert_eq!(
+            already_armed.requested(),
+            RestartCheckpointBaselineSourceFaultPoint::BeforeLoad
+        );
+        assert_eq!(
+            source.load_restart_checkpoint_baseline(),
+            Err(
+                InMemoryTransactionRestartCheckpointBaselineSourceError::InjectedFault(
+                    RestartCheckpointBaselineSourceFaultPoint::BeforeLoad,
+                )
+            )
+        );
+        assert_eq!(source.armed_fault(), None);
+        assert_eq!(source.slot(), Some(&seeded));
+
+        assert_eq!(
+            source.load_restart_checkpoint_baseline()?,
+            Some(seeded.clone())
+        );
+        assert_eq!(
+            source.load_restart_checkpoint_baseline()?,
+            Some(seeded.clone())
+        );
+        assert_eq!(source.slot(), Some(&seeded));
+
+        let mut empty = InMemoryTransactionRestartCheckpointBaselineSource::default();
+        assert_eq!(empty.load_restart_checkpoint_baseline()?, None);
+        assert_eq!(empty.slot(), None);
+
+        let capacity =
+            InMemoryTransactionRestartCheckpointBaselineSourceError::TransactionCapacityExhausted {
+                transaction_count: seeded.transactions().len(),
+            };
+        assert!(Error::source(&capacity).is_none());
+        assert!(capacity.to_string().contains("2 transaction entries"));
         Ok(())
     }
 
@@ -2322,11 +2640,12 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let decoded_checkpoint = DurableTransactionRestartCheckpointBaselineObservation::new(
+        let owned_checkpoint = OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
             checkpoint_baseline.persistent_log_id().get(),
             checkpoint_baseline.durable_frontier(),
-            &decoded_checkpoint_entries,
+            decoded_checkpoint_entries.clone(),
         );
+        let decoded_checkpoint = owned_checkpoint.as_observation();
         let (log, store) = recovered.parts_mut();
         let recovered_behind = store
             .page(last_page)
@@ -2379,6 +2698,18 @@ mod tests {
             .validate_restart_checkpoint_baseline_against_current_prefix(&decoded_checkpoint)?;
         assert_eq!(validated_checkpoint, checkpoint_baseline);
         assert_eq!(recovered.parts().1.pages().len(), page_count);
+        let mut checkpoint_source =
+            InMemoryTransactionRestartCheckpointBaselineSource::seeded(owned_checkpoint.clone());
+        assert_eq!(
+            recovered.validate_restart_checkpoint_baseline_from_source(&mut checkpoint_source)?,
+            Some(checkpoint_baseline.clone())
+        );
+        assert_eq!(
+            recovered.validate_restart_checkpoint_baseline_from_source(&mut checkpoint_source)?,
+            Some(checkpoint_baseline.clone())
+        );
+        assert_eq!(checkpoint_source.slot(), Some(&owned_checkpoint));
+        assert_eq!(recovered.parts().1.pages().len(), page_count);
         let current_checkpoint =
             recovered.prepare_restart_checkpoint_baseline_from_current_prefix()?;
         assert_eq!(
@@ -2401,6 +2732,82 @@ mod tests {
         assert_eq!(newly_durable.owned_page_record_count(), 1);
         assert_eq!(newly_durable.state().commit_position(), Some(12));
         assert_eq!(recovered.parts().1.pages().len(), page_count);
+
+        let duplicate_commit = recovered
+            .parts()
+            .0
+            .records()
+            .iter()
+            .find(|record| record.transaction_id().is_some())
+            .cloned()
+            .ok_or_else(|| io::Error::other("durable commit is missing"))?;
+        let durable_len = recovered.parts().0.durable_len;
+        recovered.parts_mut().0.records.push(duplicate_commit);
+        recovered.parts_mut().0.durable_len = durable_len + 1;
+
+        let mut absent_source = InMemoryTransactionRestartCheckpointBaselineSource::empty();
+        assert_eq!(
+            recovered.validate_restart_checkpoint_baseline_from_source(&mut absent_source)?,
+            None
+        );
+        let mut faulted_source =
+            InMemoryTransactionRestartCheckpointBaselineSource::seeded(owned_checkpoint.clone());
+        faulted_source.arm_fault(RestartCheckpointBaselineSourceFaultPoint::BeforeLoad)?;
+        let source_error = recovered
+            .validate_restart_checkpoint_baseline_from_source(&mut faulted_source)
+            .err()
+            .ok_or_else(|| io::Error::other("checkpoint-source fault entered the WAL source"))?;
+        let DurableTransactionRestartCheckpointBaselineSourceValidationError::CheckpointSource(
+            source_error,
+        ) = source_error
+        else {
+            return Err(io::Error::other("checkpoint-source fault changed boundary").into());
+        };
+        assert_eq!(
+            source_error,
+            InMemoryTransactionRestartCheckpointBaselineSourceError::InjectedFault(
+                RestartCheckpointBaselineSourceFaultPoint::BeforeLoad
+            )
+        );
+        assert_eq!(faulted_source.slot(), Some(&owned_checkpoint));
+
+        recovered.parts_mut().0.records.pop();
+        recovered.parts_mut().0.durable_len = durable_len;
+
+        let first = decoded_checkpoint_entries[0];
+        let mut invalid_entries = decoded_checkpoint_entries;
+        invalid_entries[0] = DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+            first.epoch(),
+            first.sequence(),
+            first.first_owned_page_position(),
+            first.last_owned_page_position(),
+            first.owned_page_record_count() + 1,
+            first.state(),
+        );
+        let mut invalid_source = InMemoryTransactionRestartCheckpointBaselineSource::seeded(
+            OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+                checkpoint_baseline.persistent_log_id().get(),
+                checkpoint_baseline.durable_frontier(),
+                invalid_entries,
+            ),
+        );
+        let invalid = recovered
+            .validate_restart_checkpoint_baseline_from_source(&mut invalid_source)
+            .err()
+            .ok_or_else(|| io::Error::other("invalid memory checkpoint was validated"))?;
+        assert!(matches!(
+            invalid,
+            DurableTransactionRestartCheckpointBaselineSourceValidationError::BaselineValidation(_)
+        ));
+        assert_eq!(
+            recovered.validate_restart_checkpoint_baseline_from_source(&mut faulted_source)?,
+            Some(checkpoint_baseline.clone())
+        );
+        assert_eq!(recovered.parts().1.pages().len(), page_count);
+        assert_eq!(
+            recovered.restart_analysis().durable_frontier(),
+            Some(&expected_restart_frontier)
+        );
 
         let (_log, store, report, analysis) = recovered.into_parts();
         assert_eq!(report.pages().len(), 4);

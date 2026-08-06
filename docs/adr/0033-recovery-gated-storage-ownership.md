@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #118
 - Extends: ADR 0029, ADR 0031, ADR 0032
-- Extended by: ADR 0034, ADR 0037, ADR 0045, ADR 0053
+- Extended by: ADR 0034, ADR 0037, ADR 0045, ADR 0053, ADR 0055
 
 ## Context
 
@@ -63,6 +63,11 @@ operation, but it exposes neither adapter and every decline, absence, or
 rejection fallback delegates back to this exact `recover` transition. Dropping
 either owner simply drops its retained adapters. Compile-fail coverage makes
 unavailable accessors load-bearing outside the owning crate.
+
+ADR 0055 later adds a read-only preparation branch after selected replay
+planning. Prepared and failed states still expose neither adapter nor recovery
+authority. Their explicit fallbacks destroy all private repair evidence before
+delegating to this same complete `recover` transition.
 
 The generic state cannot prevent a caller from deliberately bypassing it and
 using the existing low-level adapter constructors. It is the reviewed

@@ -3953,6 +3953,110 @@ where
             observation,
         )
     }
+
+    /// Loads one owned decoded completeness slot, then validates it exactly.
+    ///
+    /// Completeness retrieval completes and its borrow ends before any WAL
+    /// callback or page-store observation begins. `Ok(None)` reports an absent
+    /// slot and a checkpoint-source failure returns no candidate; both prove
+    /// zero WAL callbacks and zero page-store observations occurred.
+    ///
+    /// A present decoded slot is validated by the existing exact
+    /// [`Self::validate_restart_checkpoint_completeness_baseline_against_current_prefix`]
+    /// operation, so success returns only a newly re-derived authoritative
+    /// completeness baseline, never a value built from decoded fields. This
+    /// operation grants no startup, replay, repair, retention, or reclamation
+    /// authority.
+    pub fn validate_restart_checkpoint_completeness_baseline_from_source<CheckpointSource>(
+        &mut self,
+        checkpoint_source: &mut CheckpointSource,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationResult<
+        CheckpointSource::Error,
+        Source::Error,
+        Store::ObservationError,
+    >
+    where
+        CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+    {
+        let checkpoint = checkpoint_source
+            .load_restart_checkpoint_completeness_baseline()
+            .map_err(
+                DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource,
+            )?;
+        let Some(checkpoint) = checkpoint else {
+            return Ok(None);
+        };
+        self.validate_restart_checkpoint_completeness_baseline_against_current_prefix(
+            &checkpoint.as_observation(),
+        )
+        .map(Some)
+        .map_err(|source| {
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                Box::new(source),
+            )
+        })
+    }
+
+    /// Prepares the current completeness baseline, then publishes it exactly once.
+    ///
+    /// The baseline comes only from the existing one-window
+    /// [`Self::prepare_restart_checkpoint_completeness_baseline_from_current_prefix`]
+    /// operation. Every WAL callback and page-store borrow ends before the
+    /// permit is created, so a preparation failure proves the publisher was
+    /// never invoked and the owner remains available for a later attempt.
+    ///
+    /// Any publisher error is instead outcome-indeterminate, regardless of the
+    /// adapter's own before- or after-effect knowledge. Success returns only a
+    /// receipt, which exposes identifying metadata rather than the baseline.
+    /// The immutable startup analysis and page store are never replaced.
+    pub fn publish_restart_checkpoint_completeness_baseline_from_current_prefix<
+        CheckpointPublisher,
+    >(
+        &mut self,
+        checkpoint_publisher: &mut CheckpointPublisher,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationResult<
+        Source::Error,
+        Store::ObservationError,
+        CheckpointPublisher::Error,
+    >
+    where
+        CheckpointPublisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+    {
+        let baseline = self
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(
+                DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError::Preparation,
+            )?;
+        let persistent_log_id = baseline.persistent_log_id();
+        let durable_frontier = baseline.durable_frontier();
+        let transaction_count = baseline.transactions().len();
+        let page_count = baseline.pages().len();
+
+        with_restart_checkpoint_completeness_baseline_publication_permit(
+            persistent_log_id,
+            durable_frontier,
+            transaction_count,
+            page_count,
+            move |permit| {
+                match checkpoint_publisher
+                    .publish_restart_checkpoint_completeness_baseline(&baseline, permit)
+                {
+                    Ok(()) => Ok(
+                        DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt::from_baseline(
+                            baseline,
+                        ),
+                    ),
+                    Err(source) => Err(
+                        DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError::Publication(
+                            DurableTransactionRestartCheckpointCompletenessBaselinePublicationError::new(
+                                baseline, source,
+                            ),
+                        ),
+                    ),
+                }
+            },
+        )
+    }
 }
 
 /// Fail-closed restart-analysis state that retains the recovered storage pair.
@@ -5335,6 +5439,45 @@ impl DurableTransactionRestartCheckpointBaseline {
 ///     let _ = log.flush_through(baseline.replay_start());
 /// }
 /// ```
+///
+/// A detached baseline cannot publish itself; only the final restart-analyzed
+/// owner creates the private publication permit:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaseline;
+///
+/// fn cannot_publish_detached(
+///     mut baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) {
+///     let _ = baseline.publish_restart_checkpoint_completeness_baseline_from_current_prefix();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
+/// };
+///
+/// fn cannot_authorize_own_publication(
+///     baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'static> {
+///     baseline.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// };
+///
+/// fn cannot_become_receipt(
+///     baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt {
+///     baseline.into()
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[must_use]
 pub struct DurableTransactionRestartCheckpointCompletenessBaseline {
@@ -6385,6 +6528,46 @@ impl<'evidence> DurableTransactionRestartCheckpointCompletenessBaselineObservati
 ///     observation.into()
 /// }
 /// ```
+///
+/// A detached owned slot cannot validate or publish itself; only the final
+/// restart-analyzed owner exposes those operations:
+///
+/// ```compile_fail
+/// use ntsql_transaction::OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation;
+///
+/// fn cannot_validate_detached(
+///     mut observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) {
+///     let _ = observation.validate_restart_checkpoint_completeness_baseline_from_source();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation;
+///
+/// fn cannot_publish_detached(
+///     mut observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) {
+///     let _ =
+///         observation.publish_restart_checkpoint_completeness_baseline_from_current_prefix();
+/// }
+/// ```
+///
+/// It cannot become the completeness publication receipt or its indeterminate
+/// counterpart:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+///     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_completeness_publication(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt {
+///     observation.into()
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation {
     transactions: OwnedDurableTransactionRestartCheckpointBaselineObservation,
@@ -6892,6 +7075,740 @@ impl fmt::Debug for IndeterminateDurableTransactionRestartCheckpointBaselinePubl
             .field("persistent_log_id", &self.persistent_log_id())
             .field("durable_frontier", &self.durable_frontier())
             .field("transaction_count", &self.transaction_count())
+            .finish()
+    }
+}
+
+/// Source of one optional owned decoded restart completeness checkpoint slot.
+///
+/// This port is a sibling of
+/// [`DurableTransactionRestartCheckpointBaselineSource`], not its subtrait. It
+/// deliberately returns the wider completeness observation, which retains the
+/// decoded page table and replay lower bound the transaction-only port cannot
+/// represent. A concrete adapter may implement either, both, or neither.
+///
+/// Retrieval must complete before the returned value is validated against the
+/// current WAL prefix and page store. The slot remains untrusted data:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// };
+///
+/// fn cannot_authorize_loaded_slot<Source>(
+///     source: &mut Source,
+/// ) -> Option<DurableTransactionRestartCheckpointCompletenessBaseline>
+/// where
+///     Source: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// {
+///     source
+///         .load_restart_checkpoint_completeness_baseline()
+///         .ok()
+///         .flatten()
+///         .map(Into::into)
+/// }
+/// ```
+///
+/// The read port is not the sibling completeness publication port:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// };
+///
+/// fn require_publisher<
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// >(
+///     _publisher: &mut Publisher,
+/// ) {
+/// }
+///
+/// fn cannot_use_source_as_publisher<Source>(source: &mut Source)
+/// where
+///     Source: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// {
+///     require_publisher(source);
+/// }
+/// ```
+///
+/// It is not WAL durability authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselineSource;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_source_as_log<
+///     Source: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+///     Log: LogDurability,
+/// >(
+///     source: &mut Source,
+///     log: &mut Log,
+/// ) {
+///     let _ = log.flush_through(source);
+/// }
+/// ```
+///
+/// It is not the authoritative WAL restart-analysis source:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysisSource,
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// };
+///
+/// fn require_wal_source<Wal: DurableTransactionRestartAnalysisSource<1>>(_wal: &mut Wal) {}
+///
+/// fn cannot_use_source_as_wal_source<Source>(source: &mut Source)
+/// where
+///     Source: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// {
+///     require_wal_source(source);
+/// }
+/// ```
+///
+/// It is not page-store snapshot authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource,
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// };
+///
+/// fn require_snapshot_source<Store: DurablePageStoreSnapshotSource<1>>(_store: &Store) {}
+///
+/// fn cannot_use_source_as_page_snapshots<Source>(source: &Source)
+/// where
+///     Source: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// {
+///     require_snapshot_source(source);
+/// }
+/// ```
+///
+/// It cannot become the restart-analyzed storage owner:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+///     RestartAnalyzedTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Wal, Store, const N: usize>(
+///     source: Source,
+/// ) -> RestartAnalyzedTransactionPageStorage<Wal, Store, N>
+/// where
+///     Source: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// {
+///     source.into()
+/// }
+/// ```
+pub trait DurableTransactionRestartCheckpointCompletenessBaselineSource {
+    /// Source-specific failure to obtain an absent or complete owned slot.
+    type Error;
+
+    /// Loads the single current slot, or `None` when no checkpoint is present.
+    ///
+    /// An error returns no candidate. Generation selection, history, fallback,
+    /// persistence, retention, and source locking remain adapter
+    /// responsibilities outside this temporary single-slot port.
+    fn load_restart_checkpoint_completeness_baseline(
+        &mut self,
+    ) -> Result<
+        Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+        Self::Error,
+    >;
+}
+
+type RestartCheckpointCompletenessBaselinePublicationAttemptBrand<'attempt> =
+    (&'attempt (), fn(&'attempt ()) -> &'attempt ());
+
+/// Single-use proof that the owner authorized one completeness publication.
+///
+/// The permit identifies the owner-prepared completeness baseline through its
+/// persistent identity, optional frontier, transaction count, and page count.
+/// It deliberately exposes no page, required-image, stored-position, or replay
+/// field: those belong to the supplied baseline the publisher already borrows.
+/// The permit grants no validity, durability, replay, or retention authority.
+///
+/// Private fields and an invariant generative brand prevent construction,
+/// cloning, widening, or retention outside one owner operation:
+///
+/// ```compile_fail
+/// use std::marker::PhantomData;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit;
+/// use ntsql_wal::PersistentLogId;
+///
+/// let Some(id) = PersistentLogId::new(1) else {
+///     return;
+/// };
+/// let _forged =
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit {
+///         persistent_log_id: id,
+///         durable_frontier: None,
+///         transaction_count: 0,
+///         page_count: 0,
+///         attempt_brand: PhantomData,
+///     };
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit;
+///
+/// fn cannot_clone(
+///     permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
+/// ) {
+///     let _copy = permit.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit;
+///
+/// fn cannot_widen<'attempt>(
+///     permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'attempt>,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'static> {
+///     permit
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// };
+///
+/// struct RetainingPublisher {
+///     retained: Option<
+///         DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'static>,
+///     >,
+/// }
+///
+/// impl DurableTransactionRestartCheckpointCompletenessBaselinePublisher for RetainingPublisher {
+///     type Error = ();
+///
+///     fn publish_restart_checkpoint_completeness_baseline(
+///         &mut self,
+///         _baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+///         permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
+///     ) -> Result<(), Self::Error> {
+///         self.retained = Some(permit);
+///         Ok(())
+///     }
+/// }
+/// ```
+///
+/// The permit exposes no decoded or authoritative replay lower bound:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
+///     DurableTransactionRestartReplayStart,
+/// };
+///
+/// fn cannot_read_replay_start(
+///     permit: &DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
+/// ) -> &DurableTransactionRestartReplayStart {
+///     permit.replay_start()
+/// }
+/// ```
+///
+/// It cannot become the authoritative completeness baseline:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
+/// };
+///
+/// fn cannot_authorize_baseline(
+///     permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaseline {
+///     permit.into()
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub struct DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'attempt> {
+    persistent_log_id: PersistentLogId,
+    durable_frontier: Option<u64>,
+    transaction_count: usize,
+    page_count: usize,
+    attempt_brand:
+        PhantomData<RestartCheckpointCompletenessBaselinePublicationAttemptBrand<'attempt>>,
+}
+
+impl DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_> {
+    /// Returns the persistent log identity of the authorized baseline.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the exact optional frontier of the authorized baseline.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.durable_frontier
+    }
+
+    /// Returns the number of transaction entries in the authorized baseline.
+    #[must_use]
+    pub const fn transaction_count(&self) -> usize {
+        self.transaction_count
+    }
+
+    /// Returns the number of page entries in the authorized baseline.
+    #[must_use]
+    pub const fn page_count(&self) -> usize {
+        self.page_count
+    }
+}
+
+fn with_restart_checkpoint_completeness_baseline_publication_permit<Output, Operation>(
+    persistent_log_id: PersistentLogId,
+    durable_frontier: Option<u64>,
+    transaction_count: usize,
+    page_count: usize,
+    operation: Operation,
+) -> Output
+where
+    Operation: for<'attempt> FnOnce(
+        DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'attempt>,
+    ) -> Output,
+{
+    operation(
+        DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit {
+            persistent_log_id,
+            durable_frontier,
+            transaction_count,
+            page_count,
+            attempt_brand: PhantomData,
+        },
+    )
+}
+
+/// Publisher for one temporary durable current completeness checkpoint slot.
+///
+/// This port is a sibling of
+/// [`DurableTransactionRestartCheckpointCompletenessBaselineSource`], not its
+/// subtrait, and is independent of the transaction-only
+/// [`DurableTransactionRestartCheckpointBaselinePublisher`]. `Ok(())` must mean
+/// an all-or-nothing durable replacement selected exactly the supplied
+/// completeness baseline. That guarantee lasts only until another publication
+/// attempt is invoked; any later error makes selected state unknown.
+///
+/// Every error after this method is called is outcome-indeterminate. It does
+/// not prove whether the old value, new value, no value, or an unreadable
+/// value is current. The physical atomic-replacement mechanism is
+/// adapter-specific.
+///
+/// Safe callers cannot invoke the port without the private owner permit:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// };
+///
+/// fn cannot_publish_directly<Publisher>(
+///     publisher: &mut Publisher,
+///     baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+/// )
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     publisher.publish_restart_checkpoint_completeness_baseline(baseline);
+/// }
+/// ```
+///
+/// The publication port is not the sibling read port:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// };
+///
+/// fn require_source<Source: DurableTransactionRestartCheckpointCompletenessBaselineSource>(
+///     _source: &mut Source,
+/// ) {
+/// }
+///
+/// fn cannot_use_publisher_as_source<Publisher>(publisher: &mut Publisher)
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     require_source(publisher);
+/// }
+/// ```
+///
+/// It is not WAL durability authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePublisher;
+/// use ntsql_wal::LogDurability;
+///
+/// fn require_log<Log: LogDurability>(_log: &mut Log) {}
+///
+/// fn cannot_use_as_log<Publisher>(publisher: &mut Publisher)
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     require_log(publisher);
+/// }
+/// ```
+///
+/// It is not page-store write authority:
+///
+/// ```compile_fail
+/// use ntsql_page::PageStore;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePublisher;
+///
+/// fn require_page_store<Store: PageStore<1>>(_store: &mut Store) {}
+///
+/// fn cannot_use_as_page_store<Publisher>(publisher: &mut Publisher)
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     require_page_store(publisher);
+/// }
+/// ```
+///
+/// It is not committed-page recovery write authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// };
+///
+/// fn require_recovery_store<Store: CommittedTransactionPageRecoveryStore<1>>(
+///     _store: &mut Store,
+/// ) {}
+///
+/// fn cannot_use_as_recovery_store<Publisher>(publisher: &mut Publisher)
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     require_recovery_store(publisher);
+/// }
+/// ```
+///
+/// It cannot become transaction lifecycle state:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// };
+///
+/// fn cannot_activate<Publisher>(publisher: Publisher) -> ActiveTransaction
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     publisher.into()
+/// }
+/// ```
+///
+/// It cannot become the restart-analyzed storage owner:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+///     RestartAnalyzedTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Publisher, Wal, Store, const N: usize>(
+///     publisher: Publisher,
+/// ) -> RestartAnalyzedTransactionPageStorage<Wal, Store, N>
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     publisher.into()
+/// }
+/// ```
+pub trait DurableTransactionRestartCheckpointCompletenessBaselinePublisher {
+    /// Adapter-specific outcome-indeterminate publication failure.
+    type Error;
+
+    /// Atomically replaces the temporary current slot with the exact baseline.
+    ///
+    /// The implementation must reject identifying permit fields that do not
+    /// match the supplied baseline before any physical effect. A successful
+    /// adapter that also implements the sibling read source must later lower
+    /// the exact transaction, page, and replay fields into a fresh untrusted
+    /// observation. Loading that observation never bypasses source-relative
+    /// validation.
+    fn publish_restart_checkpoint_completeness_baseline(
+        &mut self,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+        permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Proof that the injected publisher reported one exact current-slot success.
+///
+/// This value privately retains the attempted completeness baseline but
+/// deliberately exposes only identifying metadata, never the baseline, its
+/// transaction entries, its page table, or its replay lower bound:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// };
+///
+/// fn cannot_extract_baseline(
+///     receipt: &DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// ) -> &DurableTransactionRestartCheckpointCompletenessBaseline {
+///     receipt.baseline()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+///     DurableTransactionRestartPageEntry,
+/// };
+///
+/// fn cannot_extract_pages(
+///     receipt: &DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// ) -> &[DurableTransactionRestartPageEntry] {
+///     receipt.pages()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+///     DurableTransactionRestartReplayStart,
+/// };
+///
+/// fn cannot_extract_replay_start(
+///     receipt: &DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// ) -> &DurableTransactionRestartReplayStart {
+///     receipt.replay_start()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt;
+///
+/// fn cannot_clone(
+///     receipt: DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// ) {
+///     let _copy = receipt.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// };
+///
+/// fn cannot_forge(baseline: DurableTransactionRestartCheckpointCompletenessBaseline) {
+///     let _receipt =
+///         DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt { baseline };
+/// }
+/// ```
+///
+/// It grants no startup, replay, repair, retention, or reclamation authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+///     RestartAnalyzedTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Wal, Store, const N: usize>(
+///     receipt: DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// ) -> RestartAnalyzedTransactionPageStorage<Wal, Store, N> {
+///     receipt.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_reclaim_log<Log: LogDurability>(
+///     log: &mut Log,
+///     receipt: &DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+/// ) {
+///     let _ = log.flush_through(receipt);
+/// }
+/// ```
+#[must_use]
+pub struct DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt {
+    baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+}
+
+impl DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt {
+    fn from_baseline(baseline: DurableTransactionRestartCheckpointCompletenessBaseline) -> Self {
+        Self { baseline }
+    }
+
+    /// Returns the persistent log identity reported as published.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.baseline.persistent_log_id()
+    }
+
+    /// Returns the optional frontier reported as published.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.baseline.durable_frontier()
+    }
+
+    /// Returns the number of transaction entries reported as published.
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.baseline.transactions().len()
+    }
+
+    /// Returns the number of page entries reported as published.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.baseline.pages().len()
+    }
+}
+
+impl fmt::Debug for DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct(
+                "DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt",
+            )
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("durable_frontier", &self.durable_frontier())
+            .field("transaction_count", &self.transaction_count())
+            .field("page_count", &self.page_count())
+            .finish()
+    }
+}
+
+/// Terminal attempt state after the completeness publisher returned an error.
+///
+/// It retains exact attempted metadata for diagnosis and future reviewed
+/// resolution, but exposes no baseline, page, or replay extraction and no
+/// direct retry path:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// };
+///
+/// fn cannot_retry(
+///     publication: IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaseline {
+///     publication.into_baseline()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// };
+///
+/// fn cannot_forge(baseline: DurableTransactionRestartCheckpointCompletenessBaseline) {
+///     let _publication =
+///         IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication {
+///             baseline,
+///         };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication;
+///
+/// fn cannot_clone(
+///     publication: IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// ) {
+///     let _copy = publication.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartPageEntry,
+///     IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// };
+///
+/// fn cannot_extract_pages(
+///     publication: &IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// ) -> &[DurableTransactionRestartPageEntry] {
+///     publication.pages()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartReplayStart,
+///     IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// };
+///
+/// fn cannot_extract_replay_start(
+///     publication: &IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+/// ) -> &DurableTransactionRestartReplayStart {
+///     publication.replay_start()
+/// }
+/// ```
+///
+/// The exact attempted baseline is retained behind one private indirection so
+/// this terminal error stays cheap to move; the indirection changes no exposed
+/// field and creates no additional capability.
+#[must_use]
+pub struct IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication {
+    baseline: Box<DurableTransactionRestartCheckpointCompletenessBaseline>,
+}
+
+impl IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication {
+    fn from_baseline(baseline: DurableTransactionRestartCheckpointCompletenessBaseline) -> Self {
+        Self {
+            baseline: Box::new(baseline),
+        }
+    }
+
+    /// Returns the persistent log identity of the attempted publication.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.baseline.persistent_log_id()
+    }
+
+    /// Returns the optional frontier of the attempted publication.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.baseline.durable_frontier()
+    }
+
+    /// Returns the attempted transaction-entry count.
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.baseline.transactions().len()
+    }
+
+    /// Returns the attempted page-entry count.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.baseline.pages().len()
+    }
+}
+
+impl fmt::Debug
+    for IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct(
+                "IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication",
+            )
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("durable_frontier", &self.durable_frontier())
+            .field("transaction_count", &self.transaction_count())
+            .field("page_count", &self.page_count())
             .finish()
     }
 }
@@ -7477,6 +8394,230 @@ where
         }
     }
 }
+
+/// Failure to load an owned completeness slot or validate it against evidence.
+///
+/// `CheckpointSource` proves the completeness retrieval itself failed, which
+/// invokes no WAL callback and observes no page. `BaselineValidation` boxes the
+/// exact reused ADR 0050 validation failure for a present decoded slot.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError<
+    CheckpointSourceError,
+    WalSourceError,
+    StoreError,
+> {
+    /// Loading the optional owned completeness slot failed.
+    CheckpointSource(CheckpointSourceError),
+    /// A present decoded slot failed current-prefix completeness validation.
+    BaselineValidation(
+        Box<
+            DurableTransactionRestartCheckpointCompletenessBaselineValidationError<
+                WalSourceError,
+                StoreError,
+            >,
+        >,
+    ),
+}
+
+impl<CheckpointSourceError, WalSourceError, StoreError> fmt::Display
+    for DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError<
+        CheckpointSourceError,
+        WalSourceError,
+        StoreError,
+    >
+where
+    CheckpointSourceError: fmt::Display,
+    WalSourceError: fmt::Display,
+    StoreError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CheckpointSource(source) => {
+                write!(
+                    formatter,
+                    "restart checkpoint completeness source failed: {source}"
+                )
+            }
+            Self::BaselineValidation(source) => {
+                write!(
+                    formatter,
+                    "loaded restart checkpoint completeness validation failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl<CheckpointSourceError, WalSourceError, StoreError> Error
+    for DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError<
+        CheckpointSourceError,
+        WalSourceError,
+        StoreError,
+    >
+where
+    CheckpointSourceError: Error + 'static,
+    WalSourceError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CheckpointSource(source) => Some(source),
+            Self::BaselineValidation(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+/// Result of one owned-source restart completeness validation attempt.
+pub type DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationResult<
+    CheckpointSourceError,
+    WalSourceError,
+    StoreError,
+> = Result<
+    Option<DurableTransactionRestartCheckpointCompletenessBaseline>,
+    DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError<
+        CheckpointSourceError,
+        WalSourceError,
+        StoreError,
+    >,
+>;
+
+/// Publisher failure paired with terminal outcome-indeterminate attempt state.
+///
+/// Every publisher error after invocation reaches this boundary, regardless of
+/// any adapter's own before- or after-effect knowledge.
+#[derive(Debug)]
+pub struct DurableTransactionRestartCheckpointCompletenessBaselinePublicationError<PublisherError> {
+    publication: IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication,
+    source: PublisherError,
+}
+
+impl<PublisherError>
+    DurableTransactionRestartCheckpointCompletenessBaselinePublicationError<PublisherError>
+{
+    fn new(
+        baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+        source: PublisherError,
+    ) -> Self {
+        Self {
+            publication:
+                IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication::from_baseline(
+                    baseline,
+                ),
+            source,
+        }
+    }
+
+    /// Returns the terminal attempted publication metadata.
+    pub const fn publication(
+        &self,
+    ) -> &IndeterminateDurableTransactionRestartCheckpointCompletenessBaselinePublication {
+        &self.publication
+    }
+
+    /// Returns the exact publisher failure.
+    #[must_use]
+    pub const fn cause(&self) -> &PublisherError {
+        &self.source
+    }
+}
+
+impl<PublisherError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCheckpointCompletenessBaselinePublicationError<PublisherError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "restart checkpoint completeness publication for log {} at frontier {:?} with {} transactions and {} pages is indeterminate: {}",
+            self.publication.persistent_log_id().get(),
+            self.publication.durable_frontier(),
+            self.publication.transaction_count(),
+            self.publication.page_count(),
+            self.source
+        )
+    }
+}
+
+impl<PublisherError> Error
+    for DurableTransactionRestartCheckpointCompletenessBaselinePublicationError<PublisherError>
+where
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Failure before or after the completeness publisher indeterminacy boundary.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError<
+    WalSourceError,
+    StoreError,
+    PublisherError,
+> {
+    /// One-window completeness preparation failed before publisher access.
+    Preparation(
+        DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError<
+            WalSourceError,
+            StoreError,
+        >,
+    ),
+    /// The publisher was invoked and returned an outcome-indeterminate error.
+    Publication(
+        DurableTransactionRestartCheckpointCompletenessBaselinePublicationError<PublisherError>,
+    ),
+}
+
+impl<WalSourceError, StoreError, PublisherError> fmt::Display
+    for DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError<
+        WalSourceError,
+        StoreError,
+        PublisherError,
+    >
+where
+    WalSourceError: fmt::Display,
+    StoreError: fmt::Display,
+    PublisherError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preparation(source) => source.fmt(formatter),
+            Self::Publication(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<WalSourceError, StoreError, PublisherError> Error
+    for DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError<
+        WalSourceError,
+        StoreError,
+        PublisherError,
+    >
+where
+    WalSourceError: Error + 'static,
+    StoreError: Error + 'static,
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Preparation(source) => Some(source),
+            Self::Publication(source) => Some(source),
+        }
+    }
+}
+
+/// Result of one current-prefix restart completeness publication attempt.
+pub type DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationResult<
+    WalSourceError,
+    StoreError,
+    PublisherError,
+> = Result<
+    DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt,
+    DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError<
+        WalSourceError,
+        StoreError,
+        PublisherError,
+    >,
+>;
 
 fn restart_checkpoint_entry_matches_observation(
     expected: &DurableTransactionRestartCheckpointBaselineEntry,
@@ -16968,6 +18109,615 @@ mod tests {
             owner.restart_analysis().durable_frontier(),
             Some(&startup_frontier)
         );
+        Ok(())
+    }
+
+    fn owned_decoded_completeness_checkpoint(
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation {
+        OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+            owned_decoded_checkpoint(baseline.transaction_baseline()),
+            decoded_completeness_pages(baseline),
+            decoded_completeness_replay_observation(baseline.replay_start()),
+        )
+    }
+
+    struct FakeCompletenessCheckpointSource {
+        checkpoint: Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+        fault: Option<FakeFault>,
+        calls: usize,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    impl FakeCompletenessCheckpointSource {
+        fn new(
+            checkpoint: Option<
+                OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+            >,
+        ) -> Self {
+            Self {
+                checkpoint,
+                fault: None,
+                calls: 0,
+                events: None,
+            }
+        }
+    }
+
+    impl DurableTransactionRestartCheckpointCompletenessBaselineSource
+        for FakeCompletenessCheckpointSource
+    {
+        type Error = FakeFault;
+
+        fn load_restart_checkpoint_completeness_baseline(
+            &mut self,
+        ) -> Result<
+            Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+            Self::Error,
+        > {
+            self.calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("completeness-checkpoint");
+            }
+            match self.fault.take() {
+                Some(source) => Err(source),
+                None => Ok(self.checkpoint.clone()),
+            }
+        }
+    }
+
+    struct FakeCompletenessCheckpointPublisher {
+        checkpoint: Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+        publication_fault: Option<FakeCheckpointPublicationFault>,
+        publication_calls: usize,
+        load_calls: usize,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    impl FakeCompletenessCheckpointPublisher {
+        fn new(
+            checkpoint: Option<
+                OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+            >,
+        ) -> Self {
+            Self {
+                checkpoint,
+                publication_fault: None,
+                publication_calls: 0,
+                load_calls: 0,
+                events: None,
+            }
+        }
+    }
+
+    impl DurableTransactionRestartCheckpointCompletenessBaselinePublisher
+        for FakeCompletenessCheckpointPublisher
+    {
+        type Error = FakeFault;
+
+        fn publish_restart_checkpoint_completeness_baseline(
+            &mut self,
+            baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+            permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
+        ) -> Result<(), Self::Error> {
+            self.publication_calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("completeness-checkpoint-publish");
+            }
+            if permit.persistent_log_id() != baseline.persistent_log_id()
+                || permit.durable_frontier() != baseline.durable_frontier()
+                || permit.transaction_count() != baseline.transactions().len()
+                || permit.page_count() != baseline.pages().len()
+            {
+                return Err(FakeFault("completeness publication permit mismatch"));
+            }
+
+            let checkpoint = owned_decoded_completeness_checkpoint(baseline);
+            match self.publication_fault.take() {
+                Some(FakeCheckpointPublicationFault::Before(source)) => Err(source),
+                Some(FakeCheckpointPublicationFault::After(source)) => {
+                    self.checkpoint = Some(checkpoint);
+                    Err(source)
+                }
+                None => {
+                    self.checkpoint = Some(checkpoint);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    impl DurableTransactionRestartCheckpointCompletenessBaselineSource
+        for FakeCompletenessCheckpointPublisher
+    {
+        type Error = FakeFault;
+
+        fn load_restart_checkpoint_completeness_baseline(
+            &mut self,
+        ) -> Result<
+            Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+            Self::Error,
+        > {
+            self.load_calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("completeness-checkpoint-read");
+            }
+            Ok(self.checkpoint.clone())
+        }
+    }
+
+    fn completeness_checkpoint_owner_with_two_pages(
+        lineage: &LogLineage,
+    ) -> Result<(FakeRestartAnalyzedStorage, PageNumber, PageNumber), TestError> {
+        let committed = durable_identity(160, 1)?;
+        let uncommitted = durable_identity(160, 2)?;
+        let stored_page = PageNumber::new(81).ok_or(TestError("stored page"))?;
+        let dirty_page = PageNumber::new(82).ok_or(TestError("dirty page"))?;
+        let observations = vec![
+            restart_owned_page(lineage, committed, stored_page.get(), 1)?,
+            restart_commit(lineage, committed, 2)?,
+            restart_owned_page(lineage, uncommitted, dirty_page.get(), 3)?,
+        ];
+        let mut owner =
+            restart_analyzed_checkpoint_owner(lineage, Some(lineage.position(3)), observations)?;
+        owner.parts_mut().1.current.push(FakeRecoverySnapshot {
+            page_number: stored_page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(stored_page.get()).map_err(|_| TestError("stored page byte"))?,
+            page_position: lineage.position(1),
+        });
+        Ok((owner, stored_page, dirty_page))
+    }
+
+    #[test]
+    fn owned_completeness_checkpoint_source_composition_is_sequential_optional_and_non_consuming()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1500).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let (mut owner, _stored_page, _dirty_page) =
+            completeness_checkpoint_owner_with_two_pages(&lineage)?;
+
+        let baseline = owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("prepare completeness source baseline"))?;
+        assert_eq!(baseline.pages().len(), 2);
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.parts_mut().0.restart_events = Some(Rc::clone(&events));
+        let callbacks = owner.parts().0.restart_callbacks;
+        let store_observations = owner.parts().1.observations.borrow().len();
+        let store_attempts = owner.parts().1.attempts.clone();
+        let mut exact = FakeCompletenessCheckpointSource::new(Some(
+            owned_decoded_completeness_checkpoint(&baseline),
+        ));
+        exact.events = Some(Rc::clone(&events));
+
+        let validated = owner
+            .validate_restart_checkpoint_completeness_baseline_from_source(&mut exact)
+            .map_err(|_| TestError("validate owned completeness source"))?
+            .ok_or(TestError("owned completeness source disappeared"))?;
+
+        assert_eq!(validated, baseline);
+        assert_eq!(exact.calls, 1);
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["completeness-checkpoint", "wal"]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+        assert_eq!(
+            owner.parts().1.observations.borrow().len(),
+            store_observations + baseline.pages().len()
+        );
+
+        let mut absent = FakeCompletenessCheckpointSource::new(None);
+        absent.events = Some(Rc::clone(&events));
+        assert_eq!(
+            owner
+                .validate_restart_checkpoint_completeness_baseline_from_source(&mut absent)
+                .map_err(|_| TestError("absent completeness source failed"))?,
+            None
+        );
+        assert_eq!(absent.calls, 1);
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+        assert_eq!(
+            owner.parts().1.observations.borrow().len(),
+            store_observations + baseline.pages().len()
+        );
+
+        let mut unavailable = FakeCompletenessCheckpointSource::new(Some(
+            owned_decoded_completeness_checkpoint(&baseline),
+        ));
+        unavailable.fault = Some(FakeFault("completeness checkpoint unavailable"));
+        unavailable.events = Some(Rc::clone(&events));
+        let unavailable_error = owner
+            .validate_restart_checkpoint_completeness_baseline_from_source(&mut unavailable)
+            .err()
+            .ok_or(TestError("completeness checkpoint source failure"))?;
+        assert_eq!(
+            unavailable_error.to_string(),
+            "restart checkpoint completeness source failed: completeness checkpoint unavailable"
+        );
+        assert_eq!(
+            Error::source(&unavailable_error).map(ToString::to_string),
+            Some(String::from("completeness checkpoint unavailable"))
+        );
+        assert!(matches!(
+            unavailable_error,
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
+                FakeFault("completeness checkpoint unavailable")
+            )
+        ));
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+        assert_eq!(
+            owner.parts().1.observations.borrow().len(),
+            store_observations + baseline.pages().len()
+        );
+
+        let invalid = OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+            OwnedDurableTransactionRestartCheckpointBaselineObservation::new(0, None, Vec::new()),
+            Vec::new(),
+            decoded_completeness_replay_observation(baseline.replay_start()),
+        );
+        let mut invalid_source = FakeCompletenessCheckpointSource::new(Some(invalid));
+        invalid_source.events = Some(Rc::clone(&events));
+        let invalid_error = owner
+            .validate_restart_checkpoint_completeness_baseline_from_source(&mut invalid_source)
+            .err()
+            .ok_or(TestError("invalid owned completeness source"))?;
+        assert!(matches!(
+            invalid_error,
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                source
+            ) if matches!(
+                source.as_ref(),
+                DurableTransactionRestartCheckpointCompletenessBaselineValidationError::Evidence(
+                    evidence
+                ) if matches!(
+                    evidence.as_ref(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::Baseline(
+                        baseline_evidence
+                    ) if matches!(
+                        baseline_evidence.as_ref(),
+                        DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ZeroPersistentLogId {
+                            persistent_log_id: 0
+                        }
+                    )
+                )
+            )
+        ));
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+        assert_eq!(
+            owner.parts().1.observations.borrow().len(),
+            store_observations + baseline.pages().len()
+        );
+
+        let validated_again = owner
+            .validate_restart_checkpoint_completeness_baseline_from_source(&mut exact)
+            .map_err(|_| TestError("owner unusable after completeness source failures"))?
+            .ok_or(TestError("exact completeness checkpoint disappeared"))?;
+        assert_eq!(validated_again, baseline);
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "completeness-checkpoint",
+                "wal",
+                "completeness-checkpoint",
+                "completeness-checkpoint",
+                "completeness-checkpoint",
+                "completeness-checkpoint",
+                "wal",
+            ]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 2);
+        assert_eq!(owner.parts().1.attempts, store_attempts);
+        Ok(())
+    }
+
+    #[test]
+    fn current_completeness_publication_is_sequential_and_revalidates_loaded_slot()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1501).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let (mut owner, stored_page, dirty_page) =
+            completeness_checkpoint_owner_with_two_pages(&lineage)?;
+        let startup_frontier = owner
+            .restart_analysis()
+            .durable_frontier()
+            .ok_or(TestError("completeness publication startup frontier"))?
+            .clone();
+        let expected = owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("prepare expected completeness baseline"))?;
+        assert_eq!(
+            expected
+                .pages()
+                .iter()
+                .map(DurableTransactionRestartPageEntry::page_number)
+                .collect::<Vec<_>>(),
+            [stored_page, dirty_page]
+        );
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.parts_mut().0.restart_events = Some(Rc::clone(&events));
+        let callbacks = owner.parts().0.restart_callbacks;
+        let store_observations = owner.parts().1.observations.borrow().len();
+        let store_attempts = owner.parts().1.attempts.clone();
+        let mut publisher = FakeCompletenessCheckpointPublisher::new(None);
+        publisher.events = Some(Rc::clone(&events));
+
+        let receipt = owner
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut publisher)
+            .map_err(|_| TestError("publish current completeness checkpoint"))?;
+
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        assert_eq!(receipt.durable_frontier(), Some(3));
+        assert_eq!(receipt.transaction_count(), expected.transactions().len());
+        assert_eq!(receipt.page_count(), 2);
+        assert_eq!(
+            format!("{receipt:?}"),
+            format!(
+                "DurableTransactionRestartCheckpointCompletenessBaselinePublicationReceipt {{ persistent_log_id: {:?}, durable_frontier: Some(3), transaction_count: {}, page_count: 2 }}",
+                persistent_log_id,
+                expected.transactions().len()
+            )
+        );
+        assert_eq!(publisher.publication_calls, 1);
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["wal", "completeness-checkpoint-publish"]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+        assert_eq!(
+            owner.parts().1.observations.borrow().len(),
+            store_observations + expected.pages().len()
+        );
+
+        let loaded = publisher
+            .load_restart_checkpoint_completeness_baseline()
+            .map_err(|_| TestError("load successfully published completeness checkpoint"))?
+            .ok_or(TestError("published completeness checkpoint disappeared"))?;
+        assert_eq!(loaded, owned_decoded_completeness_checkpoint(&expected));
+        assert_eq!(
+            loaded.transactions().persistent_log_id(),
+            persistent_log_id.get()
+        );
+        assert_eq!(loaded.transactions().durable_frontier(), Some(3));
+        assert_eq!(loaded.pages().len(), 2);
+
+        let validated = owner
+            .validate_restart_checkpoint_completeness_baseline_from_source(&mut publisher)
+            .map_err(|_| TestError("revalidate published completeness checkpoint"))?
+            .ok_or(TestError(
+                "published completeness validation returned absence",
+            ))?;
+        assert_eq!(validated, expected);
+        assert_eq!(publisher.load_calls, 2);
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "wal",
+                "completeness-checkpoint-publish",
+                "completeness-checkpoint-read",
+                "completeness-checkpoint-read",
+                "wal",
+            ]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 2);
+        assert_eq!(
+            owner.parts().1.observations.borrow().len(),
+            store_observations + 2 * expected.pages().len()
+        );
+        assert_eq!(
+            owner.restart_analysis().durable_frontier(),
+            Some(&startup_frontier)
+        );
+        assert_eq!(owner.parts().1.attempts, store_attempts);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_completeness_publication_round_trips_an_exact_empty_baseline() -> Result<(), TestError>
+    {
+        let persistent_log_id =
+            PersistentLogId::new(0x1502).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = restart_analyzed_checkpoint_owner(&lineage, None, Vec::new())?;
+        let seeded_baseline = {
+            let mut seeded = completeness_checkpoint_owner_with_two_pages(&lineage)?.0;
+            seeded
+                .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+                .map_err(|_| TestError("prepare seeded completeness fixture"))?
+        };
+        let mut publisher = FakeCompletenessCheckpointPublisher::new(Some(
+            owned_decoded_completeness_checkpoint(&seeded_baseline),
+        ));
+
+        let receipt = owner
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut publisher)
+            .map_err(|_| TestError("publish empty completeness checkpoint"))?;
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        assert_eq!(receipt.durable_frontier(), None);
+        assert_eq!(receipt.transaction_count(), 0);
+        assert_eq!(receipt.page_count(), 0);
+
+        let validated = owner
+            .validate_restart_checkpoint_completeness_baseline_from_source(&mut publisher)
+            .map_err(|_| TestError("validate empty completeness checkpoint"))?
+            .ok_or(TestError("empty completeness checkpoint disappeared"))?;
+        assert_eq!(validated.durable_frontier(), None);
+        assert!(validated.transactions().is_empty());
+        assert!(validated.pages().is_empty());
+        assert_eq!(
+            validated.replay_start(),
+            &DurableTransactionRestartReplayStart::AfterFrontier { frontier: None }
+        );
+        assert!(owner.parts().1.observations.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn completeness_publication_distinguishes_preparation_from_indeterminate_effects()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1503).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let (mut owner, stored_page, _dirty_page) =
+            completeness_checkpoint_owner_with_two_pages(&lineage)?;
+        let expected = owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("prepare indeterminacy completeness baseline"))?;
+        let startup_frontier = owner
+            .restart_analysis()
+            .durable_frontier()
+            .ok_or(TestError("indeterminacy startup frontier"))?
+            .clone();
+        let store_attempts = owner.parts().1.attempts.clone();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.parts_mut().0.restart_events = Some(Rc::clone(&events));
+        let callbacks = owner.parts().0.restart_callbacks;
+        let mut publisher = FakeCompletenessCheckpointPublisher::new(None);
+        publisher.events = Some(Rc::clone(&events));
+
+        owner.parts_mut().0.restart_before_callback_error =
+            Some(FakeFault("current completeness WAL unavailable"));
+        let preparation = owner
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut publisher)
+            .err()
+            .ok_or(TestError("completeness WAL failure reached publisher"))?;
+        assert_eq!(
+            Error::source(&preparation).map(ToString::to_string),
+            Some(String::from(
+                "current restart checkpoint completeness analysis failed: restart-analysis source failed: current completeness WAL unavailable"
+            ))
+        );
+        assert!(matches!(
+            preparation,
+            DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError::Preparation(
+                DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::CompletenessAnalysis(
+                    DurableTransactionRestartCompletenessError::Source(FakeFault(
+                        "current completeness WAL unavailable"
+                    ))
+                )
+            )
+        ));
+        assert_eq!(publisher.publication_calls, 0);
+        assert!(publisher.checkpoint.is_none());
+        assert!(events.borrow().is_empty());
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks);
+
+        owner.parts_mut().1.observation_fault =
+            Some((stored_page, FakeFault("completeness publication store")));
+        let store_preparation = owner
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut publisher)
+            .err()
+            .ok_or(TestError("completeness store failure reached publisher"))?;
+        assert!(matches!(
+            store_preparation,
+            DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError::Preparation(
+                DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::CompletenessAnalysis(
+                    DurableTransactionRestartCompletenessError::StoreObservation {
+                        page_number,
+                        source: FakeFault("completeness publication store"),
+                    }
+                )
+            ) if page_number == stored_page
+        ));
+        assert_eq!(publisher.publication_calls, 0);
+        assert!(publisher.checkpoint.is_none());
+        owner.parts_mut().1.observation_fault = None;
+
+        publisher.publication_fault = Some(FakeCheckpointPublicationFault::Before(FakeFault(
+            "before completeness publication",
+        )));
+        let before_error = owner
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut publisher)
+            .err()
+            .ok_or(TestError(
+                "before completeness publication failure became success",
+            ))?;
+        let DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError::Publication(
+            before_error,
+        ) = before_error
+        else {
+            return Err(TestError("before completeness publication stayed retryable"));
+        };
+        assert_eq!(
+            Error::source(&before_error).map(ToString::to_string),
+            Some(String::from("before completeness publication"))
+        );
+        assert_eq!(
+            before_error.cause(),
+            &FakeFault("before completeness publication")
+        );
+        assert_eq!(
+            before_error.publication().persistent_log_id(),
+            persistent_log_id
+        );
+        assert_eq!(before_error.publication().durable_frontier(), Some(3));
+        assert_eq!(
+            before_error.publication().transaction_count(),
+            expected.transactions().len()
+        );
+        assert_eq!(before_error.publication().page_count(), 2);
+        assert_eq!(publisher.publication_calls, 1);
+        assert!(publisher.checkpoint.is_none());
+
+        let mut after = FakeCompletenessCheckpointPublisher::new(None);
+        after.events = Some(Rc::clone(&events));
+        after.publication_fault = Some(FakeCheckpointPublicationFault::After(FakeFault(
+            "after completeness publication",
+        )));
+        let after_error = owner
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut after)
+            .err()
+            .ok_or(TestError(
+                "after completeness publication failure became success",
+            ))?;
+        let DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError::Publication(
+            after_error,
+        ) = after_error
+        else {
+            return Err(TestError("after completeness publication stayed retryable"));
+        };
+        assert_eq!(
+            after_error.cause(),
+            &FakeFault("after completeness publication")
+        );
+        assert_eq!(after_error.publication().page_count(), 2);
+        assert_eq!(after.publication_calls, 1);
+        assert_eq!(
+            after.checkpoint.as_ref(),
+            Some(&owned_decoded_completeness_checkpoint(&expected))
+        );
+
+        assert_eq!(
+            owner.restart_analysis().durable_frontier(),
+            Some(&startup_frontier)
+        );
+        assert_eq!(owner.parts().1.attempts, store_attempts);
+
+        let ephemeral_lineage = LogLineage::new();
+        let (mut ephemeral, _stored, _dirty) =
+            completeness_checkpoint_owner_with_two_pages(&ephemeral_lineage)?;
+        let mut untouched = FakeCompletenessCheckpointPublisher::new(None);
+        let baseline_preparation = ephemeral
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut untouched)
+            .err()
+            .ok_or(TestError(
+                "ephemeral completeness baseline reached publisher",
+            ))?;
+        assert!(matches!(
+            baseline_preparation,
+            DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError::Preparation(
+                DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::BaselinePreparation(
+                    DurableTransactionRestartCheckpointBaselineError::PersistentLineageRequired
+                )
+            )
+        ));
+        assert_eq!(untouched.publication_calls, 0);
+        assert!(untouched.checkpoint.is_none());
         Ok(())
     }
 

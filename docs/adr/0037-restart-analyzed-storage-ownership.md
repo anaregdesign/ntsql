@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #126
 - Extends: ADR 0033, ADR 0034, ADR 0035, ADR 0036
-- Extended by: ADR 0038, ADR 0047, ADR 0053, ADR 0054
+- Extended by: ADR 0038, ADR 0047, ADR 0053, ADR 0054, ADR 0055
 
 ## Context
 
@@ -237,6 +237,11 @@ ADR 0053 later wraps this unchanged recovery/analysis path with one retained
 completeness source. That wrapper does not release the WAL or page store at the
 page-recovered intermediate, and it releases or transfers the third source only
 with the same final `into_parts` boundary or drop.
+
+ADRs 0054 and 0055 retain all three values through replay planning and read-only
+page-repair preparation. Neither state is restart-analyzed live storage; explicit
+fallback must still complete this ADR's recovery and analysis transitions before
+any adapter can be released.
 
 ## Concrete Scenarios
 

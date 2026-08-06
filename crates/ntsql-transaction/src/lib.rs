@@ -4318,6 +4318,37 @@ impl<Source, Store, CheckpointSource, const N: usize>
     }
 }
 
+impl<Source, Store, CheckpointSource, const N: usize>
+    PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Consumes the owned replay window into ordered read-only page-repair decisions.
+    ///
+    /// This transition does not re-enter the WAL source or invoke a page-store
+    /// write. All retained-evidence checks and allocations complete before the
+    /// first page snapshot is observed.
+    pub fn prepare_page_repairs(
+        self,
+    ) -> TransactionPageStorageRestartCheckpointRepairPreparation<Source, Store, CheckpointSource, N>
+    {
+        match prepare_transaction_restart_checkpoint_page_repairs(&self) {
+            Ok(page_repairs) => TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(
+                PreparedTransactionPageStorageRestartCheckpointRepairs {
+                    planned: self,
+                    page_repairs,
+                },
+            ),
+            Err(error) => TransactionPageStorageRestartCheckpointRepairPreparation::Failed(
+                FailedTransactionPageStorageRestartCheckpointRepairPreparation {
+                    planned: self,
+                    error,
+                },
+            ),
+        }
+    }
+}
+
 impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
     for PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
 {
@@ -4334,6 +4365,960 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
                 &self.current_transaction_count(),
             )
             .finish_non_exhaustive()
+    }
+}
+
+/// Retained-evidence contradiction while preparing selected replay page repairs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointRepairPreparationEvidenceError {
+    /// The distinct replay-page inventory could not reserve its record-count bound.
+    PageInventoryCapacityExhausted {
+        /// Replay-record count used as the inventory upper bound.
+        record_count: usize,
+    },
+    /// The ordered repair-decision table could not reserve its exact page count.
+    DecisionCapacityExhausted {
+        /// Number of distinct replay pages requiring one decision each.
+        page_count: usize,
+    },
+    /// A replay page was absent from the inventory derived from the same window.
+    ReplayPageInventoryMissing {
+        /// Page omitted from the private sorted inventory.
+        page_number: PageNumber,
+        /// Exact owned replay position for the omitted page.
+        page_position: LogSequenceNumber,
+    },
+    /// A replay transaction-page owner was absent from complete-current analysis.
+    CurrentTransactionMissing {
+        /// Persisted owner missing from the retained transaction table.
+        transaction: DurableTransactionIdentityObservation,
+        /// Exact transaction-page position.
+        page_position: LogSequenceNumber,
+    },
+    /// A committed replay page had no exact later commit in the owned window.
+    CommittedReplayRecordMissing {
+        /// Persisted committed owner.
+        transaction: DurableTransactionIdentityObservation,
+        /// Exact transaction-page position.
+        page_position: LogSequenceNumber,
+        /// Commit position retained by complete-current analysis.
+        commit_position: LogSequenceNumber,
+    },
+    /// A dirty selected-checkpoint image was absent from the owned replay window.
+    DirtyCheckpointRequiredImageMissing {
+        /// Dirty selected-checkpoint page.
+        page_number: PageNumber,
+        /// Required full-image position that the replay floor should retain.
+        page_position: u64,
+    },
+    /// A store observation described another page.
+    UnexpectedSnapshotPage {
+        /// Requested replay page.
+        expected: PageNumber,
+        /// Page returned by the store.
+        actual: PageNumber,
+        /// Returned snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// A store observation belonged to another WAL lineage.
+    ForeignSnapshotLineage {
+        /// Replay page whose snapshot was rejected.
+        page_number: PageNumber,
+        /// Foreign snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// A selected-checkpoint page no longer had its exact retained source state.
+    CheckpointSourceChanged {
+        /// Selected-checkpoint page.
+        page_number: PageNumber,
+        /// Expected stored position, or absence.
+        expected_position: Option<u64>,
+        /// Newly observed stored position, or absence.
+        actual_position: Option<u64>,
+    },
+    /// A suffix-only snapshot position had no owned replay page record.
+    SuffixSnapshotRecordMissing {
+        /// Suffix-only replay page.
+        page_number: PageNumber,
+        /// Unbacked snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// An eligible backing replay record was absent from the derived target.
+    EligibleReplayTargetMissing {
+        /// Replay page whose target derivation contradicted its backing record.
+        page_number: PageNumber,
+        /// Eligible full-image position omitted from the target.
+        position: LogSequenceNumber,
+    },
+    /// A snapshot contradicted the full image at its owned replay position.
+    SnapshotPayloadContradiction {
+        /// Replay page whose bytes or version contradicted the owned record.
+        page_number: PageNumber,
+        /// Contradictory snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// A store snapshot was backed by a currently uncommitted replay page.
+    SnapshotBackedByUncommittedTransaction {
+        /// Replay page whose snapshot was rejected.
+        page_number: PageNumber,
+        /// Persisted uncommitted owner.
+        transaction: DurableTransactionIdentityObservation,
+        /// Uncommitted transaction-page position.
+        page_position: LogSequenceNumber,
+    },
+    /// A store snapshot was physically later than the derived repair target.
+    SnapshotAfterTarget {
+        /// Replay page whose source was later than its target.
+        page_number: PageNumber,
+        /// Newly observed source position.
+        snapshot_position: LogSequenceNumber,
+        /// Latest eligible target position.
+        target_position: LogSequenceNumber,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartCheckpointRepairPreparationEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PageInventoryCapacityExhausted { record_count } => write!(
+                formatter,
+                "restart checkpoint repair page inventory capacity is exhausted for {record_count} replay records"
+            ),
+            Self::DecisionCapacityExhausted { page_count } => write!(
+                formatter,
+                "restart checkpoint repair decision capacity is exhausted for {page_count} pages"
+            ),
+            Self::ReplayPageInventoryMissing {
+                page_number,
+                page_position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page {} at position {} is absent from its derived inventory",
+                page_number.get(),
+                page_position.get()
+            ),
+            Self::CurrentTransactionMissing {
+                transaction,
+                page_position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page at position {} has transaction {} absent from complete-current analysis",
+                page_position.get(),
+                transaction
+            ),
+            Self::CommittedReplayRecordMissing {
+                transaction,
+                page_position,
+                commit_position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page for transaction {} at position {} has no owned commit record at position {}",
+                transaction,
+                page_position.get(),
+                commit_position.get()
+            ),
+            Self::DirtyCheckpointRequiredImageMissing {
+                page_number,
+                page_position,
+            } => write!(
+                formatter,
+                "dirty restart checkpoint page {} requires image position {page_position} outside the owned replay window",
+                page_number.get()
+            ),
+            Self::UnexpectedSnapshotPage {
+                expected,
+                actual,
+                position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair for page {} observed page {} at position {}",
+                expected.get(),
+                actual.get(),
+                position.get()
+            ),
+            Self::ForeignSnapshotLineage {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page {} observed foreign snapshot position {}",
+                page_number.get(),
+                position.get()
+            ),
+            Self::CheckpointSourceChanged {
+                page_number,
+                expected_position,
+                actual_position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page {} changed from selected source position {:?} to {:?}",
+                page_number.get(),
+                expected_position,
+                actual_position
+            ),
+            Self::SuffixSnapshotRecordMissing {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "suffix-only restart checkpoint repair page {} has snapshot position {} absent from the owned replay window",
+                page_number.get(),
+                position.get()
+            ),
+            Self::EligibleReplayTargetMissing {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page {} has eligible replay position {} absent from its derived target",
+                page_number.get(),
+                position.get()
+            ),
+            Self::SnapshotPayloadContradiction {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page {} snapshot contradicts replay payload at position {}",
+                page_number.get(),
+                position.get()
+            ),
+            Self::SnapshotBackedByUncommittedTransaction {
+                page_number,
+                transaction,
+                page_position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page {} snapshot is backed by uncommitted transaction {} at position {}",
+                page_number.get(),
+                transaction,
+                page_position.get()
+            ),
+            Self::SnapshotAfterTarget {
+                page_number,
+                snapshot_position,
+                target_position,
+            } => write!(
+                formatter,
+                "restart checkpoint repair page {} snapshot position {} is after target position {}",
+                page_number.get(),
+                snapshot_position.get(),
+                target_position.get()
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartCheckpointRepairPreparationEvidenceError {}
+
+/// Exact failure while preparing page repairs from one owned replay plan.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointRepairPreparationError<StoreError> {
+    /// Retained replay evidence and the page store belonged to different lineages.
+    LineageMismatch {
+        /// Lineage retained by complete-current analysis.
+        replay_lineage: LogLineage,
+        /// Lineage currently declared by the retained page store.
+        store_lineage: LogLineage,
+    },
+    /// The read-only page-store observation port failed for one ordered page.
+    StoreObservation {
+        /// Page whose source snapshot could not be observed.
+        page_number: PageNumber,
+        /// Exact adapter observation failure.
+        source: StoreError,
+    },
+    /// Retained evidence or a returned snapshot was contradictory.
+    Evidence(Box<DurableTransactionRestartCheckpointRepairPreparationEvidenceError>),
+}
+
+impl<StoreError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCheckpointRepairPreparationError<StoreError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LineageMismatch { .. } => formatter.write_str(
+                "restart checkpoint replay plan and page snapshot source belong to different lineages",
+            ),
+            Self::StoreObservation {
+                page_number,
+                source,
+            } => write!(
+                formatter,
+                "restart checkpoint repair source observation failed for page {}: {source}",
+                page_number.get()
+            ),
+            Self::Evidence(source) => {
+                write!(formatter, "restart checkpoint repair preparation failed: {source}")
+            }
+        }
+    }
+}
+
+impl<StoreError> Error for DurableTransactionRestartCheckpointRepairPreparationError<StoreError>
+where
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StoreObservation { source, .. } => Some(source),
+            Self::Evidence(source) => Some(source.as_ref()),
+            Self::LineageMismatch { .. } => None,
+        }
+    }
+}
+
+/// Exact preparation error retained by an owning failed state.
+pub type TransactionPageStorageRestartCheckpointRepairPreparationError<Store, const N: usize> =
+    DurableTransactionRestartCheckpointRepairPreparationError<
+        <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+    >;
+
+/// Result of consuming one replay plan into prepared page-repair decisions.
+#[must_use = "repair preparation must be matched to retain its owning state"]
+pub enum TransactionPageStorageRestartCheckpointRepairPreparation<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Every replay page has one privately retained read-only decision.
+    Prepared(
+        PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>,
+    ),
+    /// Preparation failed without invoking a page-store write.
+    Failed(
+        FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    ),
+}
+
+/// Owning replay state with one ordered private page-repair decision table.
+///
+/// Callers cannot forge a prepared state:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     PlannedTransactionPageStorageRestartCheckpointReplay,
+///     PreparedTransactionPageStorageRestartCheckpointRepairs,
+/// };
+///
+/// fn cannot_forge_prepared<Source, Store, CheckpointSource, const N: usize>(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> PreparedTransactionPageStorageRestartCheckpointRepairs<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     N,
+/// > {
+///     PreparedTransactionPageStorageRestartCheckpointRepairs {
+///         planned,
+///         page_repairs: Vec::new(),
+///     }
+/// }
+/// ```
+///
+/// Exact source snapshots, target images, and replay records remain private:
+///
+/// ```compile_fail
+/// use ntsql_transaction::PreparedTransactionPageStorageRestartCheckpointRepairs;
+///
+/// fn cannot_extract_page_repairs<Source, Store, CheckpointSource, const N: usize>(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = prepared.page_repairs;
+/// }
+/// ```
+///
+/// The selected baseline, complete-current analysis, and adapters remain
+/// inseparable from the private plan:
+///
+/// ```compile_fail
+/// use ntsql_transaction::PreparedTransactionPageStorageRestartCheckpointRepairs;
+///
+/// fn cannot_extract_plan<Source, Store, CheckpointSource, const N: usize>(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = prepared.planned;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::PreparedTransactionPageStorageRestartCheckpointRepairs;
+///
+/// fn cannot_extract_adapters<Source, Store, CheckpointSource, const N: usize>(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = prepared.into_parts();
+/// }
+/// ```
+///
+/// Prepared metadata cannot bypass the explicit full-recovery fallback:
+///
+/// ```compile_fail
+/// use ntsql_transaction::PreparedTransactionPageStorageRestartCheckpointRepairs;
+///
+/// fn cannot_recover_directly<Source, Store, CheckpointSource, const N: usize>(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = prepared.recover();
+/// }
+/// ```
+///
+/// It grants no ordinary page-write, recovery-write, or checkpoint-publication
+/// permit:
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::PreparedTransactionPageStorageRestartCheckpointRepairs;
+///
+/// fn cannot_authorize_page_write<
+///     'attempt,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> PageWritePermit<'attempt> {
+///     prepared.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit,
+///     PreparedTransactionPageStorageRestartCheckpointRepairs,
+/// };
+///
+/// fn cannot_authorize_recovery_write<
+///     'attempt,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     prepared.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
+///     PreparedTransactionPageStorageRestartCheckpointRepairs,
+/// };
+///
+/// fn cannot_authorize_publication<
+///     'attempt,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'attempt> {
+///     prepared.into()
+/// }
+/// ```
+///
+/// It cannot restore a live transaction or authorize WAL retention/reclamation:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, PreparedTransactionPageStorageRestartCheckpointRepairs,
+/// };
+///
+/// fn cannot_restore_transaction<Source, Store, CheckpointSource, const N: usize>(
+///     prepared: PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> ActiveTransaction {
+///     prepared.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::PreparedTransactionPageStorageRestartCheckpointRepairs;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_retain_or_reclaim_log<
+///     Log,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     log: &mut Log,
+///     prepared: &PreparedTransactionPageStorageRestartCheckpointRepairs<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Log: LogDurability,
+/// {
+///     let _ = log.flush_through(prepared);
+/// }
+/// ```
+#[must_use = "prepared repairs must be retained, explicitly declined, or dropped"]
+pub struct PreparedTransactionPageStorageRestartCheckpointRepairs<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    planned:
+        PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    page_repairs: Vec<PreparedTransactionRestartCheckpointPageRepair<N>>,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>
+{
+    /// Returns the persistent lineage identity retained by the selected checkpoint.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.planned.persistent_log_id()
+    }
+
+    /// Returns the selected checkpoint frontier.
+    #[must_use]
+    pub const fn checkpoint_frontier(&self) -> Option<u64> {
+        self.planned.checkpoint_frontier()
+    }
+
+    /// Returns the complete current frontier covered by the repair preparation.
+    #[must_use]
+    pub fn current_frontier(&self) -> Option<u64> {
+        self.planned.current_frontier()
+    }
+
+    /// Returns the number of distinct replay pages with one ordered decision.
+    #[must_use]
+    pub const fn page_count(&self) -> usize {
+        self.page_repairs.len()
+    }
+
+    /// Returns the number of pages with no currently required durable image.
+    #[must_use]
+    pub fn no_required_image_count(&self) -> usize {
+        self.page_repairs
+            .iter()
+            .filter(|repair| {
+                matches!(
+                    repair.resolution,
+                    PreparedTransactionRestartCheckpointPageRepairResolution::NoRequiredImage
+                )
+            })
+            .count()
+    }
+
+    /// Returns checkpoint-current pages unaffected by an eligible replay image.
+    #[must_use]
+    pub fn unchanged_checkpoint_current_count(&self) -> usize {
+        self.page_repairs
+            .iter()
+            .filter(|repair| {
+                matches!(
+                    repair.resolution,
+                    PreparedTransactionRestartCheckpointPageRepairResolution::CheckpointCurrent(_)
+                )
+            })
+            .count()
+    }
+
+    /// Returns replay targets already present exactly in the current page store.
+    #[must_use]
+    pub fn already_current_count(&self) -> usize {
+        self.page_repairs
+            .iter()
+            .filter(|repair| {
+                matches!(
+                    repair.resolution,
+                    PreparedTransactionRestartCheckpointPageRepairResolution::AlreadyCurrent(_)
+                )
+            })
+            .count()
+    }
+
+    /// Returns exact source/target candidates requiring a later write executor.
+    #[must_use]
+    pub fn repair_candidate_count(&self) -> usize {
+        self.page_repairs
+            .iter()
+            .filter(|repair| {
+                matches!(
+                    repair.resolution,
+                    PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(_)
+                )
+            })
+            .count()
+    }
+
+    /// Discards every private decision and replay record before granting full recovery.
+    pub fn decline_page_repairs(
+        self,
+    ) -> UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N> {
+        let Self {
+            planned,
+            page_repairs: _,
+        } = self;
+        planned.decline_replay_plan()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedTransactionPageStorageRestartCheckpointRepairs")
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("checkpoint_frontier", &self.checkpoint_frontier())
+            .field("current_frontier", &self.current_frontier())
+            .field("page_count", &self.page_count())
+            .field("no_required_image_count", &self.no_required_image_count())
+            .field(
+                "unchanged_checkpoint_current_count",
+                &self.unchanged_checkpoint_current_count(),
+            )
+            .field("already_current_count", &self.already_current_count())
+            .field("repair_candidate_count", &self.repair_candidate_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owning read-only repair-preparation failure retaining the original replay plan.
+///
+/// Its private fields prevent construction with detached evidence:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource,
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation,
+///     PlannedTransactionPageStorageRestartCheckpointReplay,
+///     TransactionPageStorageRestartCheckpointRepairPreparationError,
+/// };
+///
+/// fn cannot_forge_failure<Source, Store, CheckpointSource, const N: usize>(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+///     error: TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
+/// ) -> FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     N,
+/// >
+/// where
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation { planned, error }
+/// }
+/// ```
+///
+/// The retained plan, replay evidence, baseline, analysis, and adapters cannot
+/// escape independently:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource,
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation,
+/// };
+///
+/// fn cannot_extract_plan<Source, Store, CheckpointSource, const N: usize>(
+///     failure: FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     let _ = failure.planned;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource,
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation,
+/// };
+///
+/// fn cannot_extract_adapters<Source, Store, CheckpointSource, const N: usize>(
+///     failure: FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     let _ = failure.into_parts();
+/// }
+/// ```
+///
+/// Failure metadata cannot invoke recovery without first destroying the failed
+/// plan through its explicit fallback:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource,
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation,
+/// };
+///
+/// fn cannot_recover_directly<Source, Store, CheckpointSource, const N: usize>(
+///     failure: FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     let _ = failure.recover();
+/// }
+/// ```
+///
+/// It grants no page-write capability, live transaction, or WAL retention:
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource,
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation,
+/// };
+///
+/// fn cannot_authorize_page_write<
+///     'attempt,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     failure: FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> PageWritePermit<'attempt>
+/// where
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     failure.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, DurablePageStoreSnapshotSource,
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation,
+/// };
+///
+/// fn cannot_restore_transaction<Source, Store, CheckpointSource, const N: usize>(
+///     failure: FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> ActiveTransaction
+/// where
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     failure.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource,
+///     FailedTransactionPageStorageRestartCheckpointRepairPreparation,
+/// };
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_retain_or_reclaim_log<
+///     Log,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     log: &mut Log,
+///     failure: &FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Log: LogDurability,
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     let _ = log.flush_through(failure);
+/// }
+/// ```
+#[must_use = "failed repair preparation must be inspected, bypassed, or dropped"]
+pub struct FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    planned:
+        PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    error: TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Returns the exact preparation failure without releasing retained ownership.
+    #[must_use]
+    pub const fn error(
+        &self,
+    ) -> &TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N> {
+        &self.error
+    }
+
+    /// Destroys the failed plan before returning unchanged full-recovery authority.
+    pub fn continue_with_full_recovery(
+        self,
+    ) -> (
+        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+        TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
+    ) {
+        let Self { planned, error } = self;
+        (planned.decline_replay_plan(), error)
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+    Store::ObservationError: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRestartCheckpointRepairPreparation")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+    Store::ObservationError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction-page storage restart checkpoint repair preparation failed: {}",
+            self.error
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> Error
+    for FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+    Store::ObservationError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -6152,6 +7137,49 @@ impl<const N: usize> From<&DurableTransactionRestartObservation<N>>
             },
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedTransactionRestartCheckpointPageRepairTargetKind {
+    Raw,
+    CommittedTransaction {
+        transaction: DurableTransactionIdentityObservation,
+        commit_position: LogSequenceNumber,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedTransactionRestartCheckpointPageRepairTarget<const N: usize> {
+    kind: PreparedTransactionRestartCheckpointPageRepairTargetKind,
+    page_number: PageNumber,
+    page_version: PageVersion,
+    bytes: [u8; N],
+    page_position: LogSequenceNumber,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PreparedTransactionRestartCheckpointPageSourceExpectation {
+    SuffixOnly,
+    MissingAtCheckpoint,
+    ExactCheckpointSnapshot { position: u64 },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PreparedTransactionRestartCheckpointPageRepairResolution<const N: usize> {
+    Pending,
+    NoRequiredImage,
+    CheckpointCurrent(StoredPageSnapshotObservation<N>),
+    AlreadyCurrent(StoredPageSnapshotObservation<N>),
+    Candidate(Option<StoredPageSnapshotObservation<N>>),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PreparedTransactionRestartCheckpointPageRepair<const N: usize> {
+    page_number: PageNumber,
+    source_expectation: PreparedTransactionRestartCheckpointPageSourceExpectation,
+    target: Option<PreparedTransactionRestartCheckpointPageRepairTarget<N>>,
+    unchanged_checkpoint_current: bool,
+    resolution: PreparedTransactionRestartCheckpointPageRepairResolution<N>,
 }
 
 /// Stable complete-prefix source for transaction restart analysis.
@@ -11261,6 +12289,726 @@ where
         }
         Err(source) => Err(DurableTransactionRestartCheckpointReplayPlanningError::Source(source)),
     }
+}
+
+fn reserve_restart_checkpoint_repair_page_inventory(
+    page_numbers: &mut Vec<PageNumber>,
+    record_count: usize,
+) -> Result<(), DurableTransactionRestartCheckpointRepairPreparationEvidenceError> {
+    page_numbers.try_reserve_exact(record_count).map_err(|_| {
+        DurableTransactionRestartCheckpointRepairPreparationEvidenceError::PageInventoryCapacityExhausted {
+            record_count,
+        }
+    })
+}
+
+fn reserve_restart_checkpoint_repair_decisions<const N: usize>(
+    page_repairs: &mut Vec<PreparedTransactionRestartCheckpointPageRepair<N>>,
+    page_count: usize,
+) -> Result<(), DurableTransactionRestartCheckpointRepairPreparationEvidenceError> {
+    page_repairs.try_reserve_exact(page_count).map_err(|_| {
+        DurableTransactionRestartCheckpointRepairPreparationEvidenceError::DecisionCapacityExhausted {
+            page_count,
+        }
+    })
+}
+
+fn current_restart_transaction<'analysis>(
+    analysis: &'analysis DurableTransactionRestartAnalysis,
+    transaction: DurableTransactionIdentityObservation,
+    page_position: &LogSequenceNumber,
+) -> Result<
+    &'analysis DurableTransactionRestartEntry,
+    DurableTransactionRestartCheckpointRepairPreparationEvidenceError,
+> {
+    analysis
+        .transactions()
+        .binary_search_by_key(&transaction, DurableTransactionRestartEntry::transaction)
+        .map(|index| &analysis.transactions()[index])
+        .map_err(|_| {
+            DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CurrentTransactionMissing {
+                transaction,
+                page_position: page_position.clone(),
+            }
+        })
+}
+
+fn owned_replay_observation_position<const N: usize>(
+    observation: &OwnedDurableTransactionRestartReplayObservation<N>,
+) -> &LogSequenceNumber {
+    match observation {
+        OwnedDurableTransactionRestartReplayObservation::Page { position, .. }
+        | OwnedDurableTransactionRestartReplayObservation::TransactionPage { position, .. }
+        | OwnedDurableTransactionRestartReplayObservation::Commit { position, .. } => position,
+    }
+}
+
+fn owned_replay_observation_at_position<const N: usize>(
+    replay_observations: &[OwnedDurableTransactionRestartReplayObservation<N>],
+    position: u64,
+) -> Option<(usize, &OwnedDurableTransactionRestartReplayObservation<N>)> {
+    replay_observations
+        .binary_search_by_key(&position, |observation| {
+            owned_replay_observation_position(observation).get()
+        })
+        .ok()
+        .and_then(|index| {
+            replay_observations
+                .get(index)
+                .map(|observation| (index, observation))
+        })
+}
+
+fn prepared_replay_page_target<const N: usize>(
+    observation_index: usize,
+    observation: &OwnedDurableTransactionRestartReplayObservation<N>,
+    replay_observations: &[OwnedDurableTransactionRestartReplayObservation<N>],
+    analysis: &DurableTransactionRestartAnalysis,
+) -> Result<
+    Option<PreparedTransactionRestartCheckpointPageRepairTarget<N>>,
+    DurableTransactionRestartCheckpointRepairPreparationEvidenceError,
+> {
+    match observation {
+        OwnedDurableTransactionRestartReplayObservation::Page {
+            page_number,
+            page_version,
+            bytes,
+            position,
+        } => Ok(Some(PreparedTransactionRestartCheckpointPageRepairTarget {
+            kind: PreparedTransactionRestartCheckpointPageRepairTargetKind::Raw,
+            page_number: *page_number,
+            page_version: *page_version,
+            bytes: *bytes,
+            page_position: position.clone(),
+        })),
+        OwnedDurableTransactionRestartReplayObservation::TransactionPage {
+            transaction,
+            page_number,
+            page_version,
+            bytes,
+            position,
+        } => {
+            let entry = current_restart_transaction(analysis, *transaction, position)?;
+            match entry.state() {
+                DurableTransactionRestartState::Uncommitted => Ok(None),
+                DurableTransactionRestartState::Committed { commit_position } => {
+                    let matching_later_commit = matches!(
+                        owned_replay_observation_at_position(
+                            replay_observations,
+                            commit_position.get(),
+                        ),
+                        Some((
+                            commit_index,
+                            OwnedDurableTransactionRestartReplayObservation::Commit {
+                                transaction: actual_transaction,
+                                position: actual_position,
+                            },
+                        )) if commit_index > observation_index
+                            && *actual_transaction == *transaction
+                            && actual_position == commit_position
+                    );
+                    if !matching_later_commit {
+                        return Err(
+                            DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CommittedReplayRecordMissing {
+                                transaction: *transaction,
+                                page_position: position.clone(),
+                                commit_position: commit_position.clone(),
+                            },
+                        );
+                    }
+                    Ok(Some(
+                        PreparedTransactionRestartCheckpointPageRepairTarget {
+                            kind: PreparedTransactionRestartCheckpointPageRepairTargetKind::CommittedTransaction {
+                                transaction: *transaction,
+                                commit_position: commit_position.clone(),
+                            },
+                            page_number: *page_number,
+                            page_version: *page_version,
+                            bytes: *bytes,
+                            page_position: position.clone(),
+                        },
+                    ))
+                }
+            }
+        }
+        OwnedDurableTransactionRestartReplayObservation::Commit { .. } => Ok(None),
+    }
+}
+
+fn dirty_checkpoint_required_image_is_owned<const N: usize>(
+    page_number: PageNumber,
+    required: &DurableTransactionRestartRequiredPageImage,
+    replay_observations: &[OwnedDurableTransactionRestartReplayObservation<N>],
+    analysis: &DurableTransactionRestartAnalysis,
+) -> Result<bool, DurableTransactionRestartCheckpointRepairPreparationEvidenceError> {
+    let Some((observation_index, observation)) =
+        owned_replay_observation_at_position(replay_observations, required.page_position())
+    else {
+        return Ok(false);
+    };
+    match (required, observation) {
+        (
+            DurableTransactionRestartRequiredPageImage::Raw { .. },
+            OwnedDurableTransactionRestartReplayObservation::Page {
+                page_number: actual_page,
+                ..
+            },
+        ) => Ok(*actual_page == page_number),
+        (
+            DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                transaction,
+                commit_position,
+                ..
+            },
+            OwnedDurableTransactionRestartReplayObservation::TransactionPage {
+                transaction: actual_transaction,
+                page_number: actual_page,
+                ..
+            },
+        ) if *actual_transaction == *transaction && *actual_page == page_number => Ok(matches!(
+            prepared_replay_page_target(
+                observation_index,
+                observation,
+                replay_observations,
+                analysis,
+            )?,
+            Some(PreparedTransactionRestartCheckpointPageRepairTarget {
+                kind:
+                    PreparedTransactionRestartCheckpointPageRepairTargetKind::CommittedTransaction {
+                        transaction: target_transaction,
+                        commit_position: target_commit,
+                    },
+                ..
+            }) if target_transaction == *transaction
+                && target_commit.get() == *commit_position
+        )),
+        _ => Ok(false),
+    }
+}
+
+fn selected_checkpoint_page_entry(
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    page_number: PageNumber,
+) -> Option<&DurableTransactionRestartPageEntry> {
+    baseline
+        .pages()
+        .binary_search_by_key(
+            &page_number,
+            DurableTransactionRestartPageEntry::page_number,
+        )
+        .ok()
+        .map(|index| &baseline.pages()[index])
+}
+
+fn validate_owned_dirty_checkpoint_images<const N: usize>(
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    replay_observations: &[OwnedDurableTransactionRestartReplayObservation<N>],
+    analysis: &DurableTransactionRestartAnalysis,
+) -> Result<(), DurableTransactionRestartCheckpointRepairPreparationEvidenceError> {
+    for entry in baseline.pages() {
+        let required = match entry.state() {
+            DurableTransactionRestartPageState::StoreMissing { required }
+            | DurableTransactionRestartPageState::StoreBehind { required, .. } => required,
+            DurableTransactionRestartPageState::NoRequiredImage
+            | DurableTransactionRestartPageState::StoreCurrent { .. } => continue,
+        };
+        if !dirty_checkpoint_required_image_is_owned(
+            entry.page_number(),
+            required,
+            replay_observations,
+            analysis,
+        )? {
+            return Err(
+                DurableTransactionRestartCheckpointRepairPreparationEvidenceError::DirtyCheckpointRequiredImageMissing {
+                    page_number: entry.page_number(),
+                    page_position: required.page_position(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn combine_restart_checkpoint_page_repair_evidence<const N: usize>(
+    repair: &mut PreparedTransactionRestartCheckpointPageRepair<N>,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) {
+    let page_number = repair.page_number;
+    let mut target = repair.target.take();
+    let checkpoint = selected_checkpoint_page_entry(baseline, page_number);
+
+    let (source_expectation, unchanged_checkpoint_current) = match checkpoint
+        .map(DurableTransactionRestartPageEntry::state)
+    {
+        None => (
+            PreparedTransactionRestartCheckpointPageSourceExpectation::SuffixOnly,
+            false,
+        ),
+        Some(DurableTransactionRestartPageState::NoRequiredImage) => (
+            PreparedTransactionRestartCheckpointPageSourceExpectation::MissingAtCheckpoint,
+            false,
+        ),
+        Some(DurableTransactionRestartPageState::StoreMissing { .. }) => (
+            PreparedTransactionRestartCheckpointPageSourceExpectation::MissingAtCheckpoint,
+            false,
+        ),
+        Some(DurableTransactionRestartPageState::StoreCurrent {
+            required,
+            stored_position,
+        }) => {
+            let unchanged = target
+                .as_ref()
+                .is_none_or(|candidate| candidate.page_position.get() <= required.page_position());
+            if unchanged {
+                target = None;
+            }
+            (
+                PreparedTransactionRestartCheckpointPageSourceExpectation::ExactCheckpointSnapshot {
+                    position: *stored_position,
+                },
+                unchanged,
+            )
+        }
+        Some(DurableTransactionRestartPageState::StoreBehind {
+            stored_position, ..
+        }) => (
+            PreparedTransactionRestartCheckpointPageSourceExpectation::ExactCheckpointSnapshot {
+                position: *stored_position,
+            },
+            false,
+        ),
+    };
+
+    repair.source_expectation = source_expectation;
+    repair.target = target;
+    repair.unchanged_checkpoint_current = unchanged_checkpoint_current;
+}
+
+fn owned_replay_page_at_position<'replay, const N: usize>(
+    page_number: PageNumber,
+    position: &LogSequenceNumber,
+    replay_observations: &'replay [OwnedDurableTransactionRestartReplayObservation<N>],
+) -> Option<(
+    usize,
+    &'replay OwnedDurableTransactionRestartReplayObservation<N>,
+)> {
+    owned_replay_observation_at_position(replay_observations, position.get()).and_then(
+        |(index, observation)| {
+            matches!(
+                observation,
+                OwnedDurableTransactionRestartReplayObservation::Page {
+                    page_number: actual_page,
+                    position: actual_position,
+                    ..
+                }
+                    | OwnedDurableTransactionRestartReplayObservation::TransactionPage {
+                        page_number: actual_page,
+                        position: actual_position,
+                        ..
+                    } if *actual_page == page_number && actual_position == position
+            )
+            .then_some((index, observation))
+        },
+    )
+}
+
+fn validate_replay_backed_snapshot<const N: usize>(
+    snapshot: &StoredPageSnapshotObservation<N>,
+    replay_observations: &[OwnedDurableTransactionRestartReplayObservation<N>],
+    analysis: &DurableTransactionRestartAnalysis,
+) -> Result<(), DurableTransactionRestartCheckpointRepairPreparationEvidenceError> {
+    let page_number = snapshot.page_number();
+    let Some((observation_index, observation)) = owned_replay_page_at_position(
+        page_number,
+        snapshot.required_position(),
+        replay_observations,
+    ) else {
+        return Err(
+            DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SuffixSnapshotRecordMissing {
+                page_number,
+                position: snapshot.required_position().clone(),
+            },
+        );
+    };
+
+    match observation {
+        OwnedDurableTransactionRestartReplayObservation::Page {
+            page_version,
+            bytes,
+            ..
+        } => {
+            if snapshot.page_version() != *page_version || snapshot.image().bytes() != bytes {
+                return Err(
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotPayloadContradiction {
+                        page_number,
+                        position: snapshot.required_position().clone(),
+                    },
+                );
+            }
+        }
+        OwnedDurableTransactionRestartReplayObservation::TransactionPage {
+            transaction,
+            page_version,
+            bytes,
+            position,
+            ..
+        } => {
+            if snapshot.page_version() != *page_version || snapshot.image().bytes() != bytes {
+                return Err(
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotPayloadContradiction {
+                        page_number,
+                        position: snapshot.required_position().clone(),
+                    },
+                );
+            }
+            if prepared_replay_page_target(
+                observation_index,
+                observation,
+                replay_observations,
+                analysis,
+            )?
+            .is_none()
+            {
+                return Err(
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotBackedByUncommittedTransaction {
+                        page_number,
+                        transaction: *transaction,
+                        page_position: position.clone(),
+                    },
+                );
+            }
+        }
+        OwnedDurableTransactionRestartReplayObservation::Commit { .. } => {
+            return Err(
+                DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SuffixSnapshotRecordMissing {
+                    page_number,
+                    position: snapshot.required_position().clone(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_matches_prepared_repair_target<const N: usize>(
+    snapshot: &StoredPageSnapshotObservation<N>,
+    target: &PreparedTransactionRestartCheckpointPageRepairTarget<N>,
+) -> bool {
+    snapshot.page_number() == target.page_number
+        && snapshot.required_position() == &target.page_position
+        && snapshot.page_version() == target.page_version
+        && snapshot.image().bytes() == &target.bytes
+}
+
+fn validate_prepared_snapshot_identity<const N: usize>(
+    lineage: &LogLineage,
+    page_number: PageNumber,
+    snapshot: &StoredPageSnapshotObservation<N>,
+) -> Result<(), DurableTransactionRestartCheckpointRepairPreparationEvidenceError> {
+    if snapshot.page_number() != page_number {
+        return Err(
+            DurableTransactionRestartCheckpointRepairPreparationEvidenceError::UnexpectedSnapshotPage {
+                expected: page_number,
+                actual: snapshot.page_number(),
+                position: snapshot.required_position().clone(),
+            },
+        );
+    }
+    if !lineage.same_lineage(snapshot.required_position().lineage()) {
+        return Err(
+            DurableTransactionRestartCheckpointRepairPreparationEvidenceError::ForeignSnapshotLineage {
+                page_number,
+                position: snapshot.required_position().clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn resolve_prepared_restart_checkpoint_page_repair<const N: usize>(
+    lineage: &LogLineage,
+    repair: &mut PreparedTransactionRestartCheckpointPageRepair<N>,
+    snapshot: Option<StoredPageSnapshotObservation<N>>,
+    replay_observations: &[OwnedDurableTransactionRestartReplayObservation<N>],
+    analysis: &DurableTransactionRestartAnalysis,
+) -> Result<(), DurableTransactionRestartCheckpointRepairPreparationEvidenceError> {
+    if let Some(snapshot) = snapshot.as_ref() {
+        validate_prepared_snapshot_identity(lineage, repair.page_number, snapshot)?;
+    }
+
+    match &repair.source_expectation {
+        PreparedTransactionRestartCheckpointPageSourceExpectation::MissingAtCheckpoint => {
+            if snapshot.is_some() {
+                return Err(
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CheckpointSourceChanged {
+                        page_number: repair.page_number,
+                        expected_position: None,
+                        actual_position: snapshot
+                            .as_ref()
+                            .map(|source| source.required_position().get()),
+                    },
+                );
+            }
+        }
+        PreparedTransactionRestartCheckpointPageSourceExpectation::ExactCheckpointSnapshot {
+            position,
+        } => {
+            if snapshot
+                .as_ref()
+                .map(|source| source.required_position().get())
+                != Some(*position)
+            {
+                return Err(
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CheckpointSourceChanged {
+                        page_number: repair.page_number,
+                        expected_position: Some(*position),
+                        actual_position: snapshot
+                            .as_ref()
+                            .map(|source| source.required_position().get()),
+                    },
+                );
+            }
+        }
+        PreparedTransactionRestartCheckpointPageSourceExpectation::SuffixOnly => {}
+    }
+
+    if repair.unchanged_checkpoint_current {
+        let Some(snapshot) = snapshot else {
+            return Err(
+                DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CheckpointSourceChanged {
+                    page_number: repair.page_number,
+                    expected_position: match repair.source_expectation {
+                        PreparedTransactionRestartCheckpointPageSourceExpectation::ExactCheckpointSnapshot {
+                            position,
+                        } => Some(position),
+                        PreparedTransactionRestartCheckpointPageSourceExpectation::SuffixOnly
+                        | PreparedTransactionRestartCheckpointPageSourceExpectation::MissingAtCheckpoint => None,
+                    },
+                    actual_position: None,
+                },
+            );
+        };
+        if owned_replay_page_at_position(
+            repair.page_number,
+            snapshot.required_position(),
+            replay_observations,
+        )
+        .is_some()
+        {
+            validate_replay_backed_snapshot(&snapshot, replay_observations, analysis)?;
+        }
+        repair.resolution =
+            PreparedTransactionRestartCheckpointPageRepairResolution::CheckpointCurrent(snapshot);
+        return Ok(());
+    }
+
+    let Some(target) = repair.target.as_ref() else {
+        if let Some(snapshot) = snapshot {
+            validate_replay_backed_snapshot(&snapshot, replay_observations, analysis)?;
+            return Err(
+                DurableTransactionRestartCheckpointRepairPreparationEvidenceError::EligibleReplayTargetMissing {
+                    page_number: repair.page_number,
+                    position: snapshot.required_position().clone(),
+                },
+            );
+        }
+        repair.resolution =
+            PreparedTransactionRestartCheckpointPageRepairResolution::NoRequiredImage;
+        return Ok(());
+    };
+
+    let Some(snapshot) = snapshot else {
+        repair.resolution =
+            PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(None);
+        return Ok(());
+    };
+    if snapshot.required_position() == &target.page_position {
+        if !snapshot_matches_prepared_repair_target(&snapshot, target) {
+            return Err(
+                DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotPayloadContradiction {
+                    page_number: repair.page_number,
+                    position: snapshot.required_position().clone(),
+                },
+            );
+        }
+        repair.resolution =
+            PreparedTransactionRestartCheckpointPageRepairResolution::AlreadyCurrent(snapshot);
+        return Ok(());
+    }
+    if snapshot.required_position().get() > target.page_position.get() {
+        return Err(
+            DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotAfterTarget {
+                page_number: repair.page_number,
+                snapshot_position: snapshot.required_position().clone(),
+                target_position: target.page_position.clone(),
+            },
+        );
+    }
+
+    match repair.source_expectation {
+        PreparedTransactionRestartCheckpointPageSourceExpectation::SuffixOnly => {
+            validate_replay_backed_snapshot(&snapshot, replay_observations, analysis)?;
+        }
+        PreparedTransactionRestartCheckpointPageSourceExpectation::ExactCheckpointSnapshot {
+            ..
+        } => {
+            if owned_replay_page_at_position(
+                repair.page_number,
+                snapshot.required_position(),
+                replay_observations,
+            )
+            .is_some()
+            {
+                validate_replay_backed_snapshot(&snapshot, replay_observations, analysis)?;
+            }
+        }
+        PreparedTransactionRestartCheckpointPageSourceExpectation::MissingAtCheckpoint => {}
+    }
+    repair.resolution =
+        PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(Some(snapshot));
+    Ok(())
+}
+
+fn prepare_transaction_restart_checkpoint_page_repairs<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+>(
+    planned: &PlannedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+) -> Result<
+    Vec<PreparedTransactionRestartCheckpointPageRepair<N>>,
+    TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
+>
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    let replay_lineage = planned.current_analysis.lineage().clone();
+    let store_lineage = planned.selected.storage.store.lineage().clone();
+    if !replay_lineage.same_lineage(&store_lineage) {
+        return Err(
+            DurableTransactionRestartCheckpointRepairPreparationError::LineageMismatch {
+                replay_lineage,
+                store_lineage,
+            },
+        );
+    }
+
+    let mut page_numbers = Vec::new();
+    reserve_restart_checkpoint_repair_page_inventory(
+        &mut page_numbers,
+        planned.replay_observations.len(),
+    )
+    .map_err(|source| {
+        DurableTransactionRestartCheckpointRepairPreparationError::Evidence(Box::new(source))
+    })?;
+    for observation in &planned.replay_observations {
+        match observation {
+            OwnedDurableTransactionRestartReplayObservation::Page { page_number, .. }
+            | OwnedDurableTransactionRestartReplayObservation::TransactionPage {
+                page_number,
+                ..
+            } => page_numbers.push(*page_number),
+            OwnedDurableTransactionRestartReplayObservation::Commit { .. } => {}
+        }
+    }
+    page_numbers.sort_unstable();
+    page_numbers.dedup();
+
+    let mut page_repairs = Vec::new();
+    reserve_restart_checkpoint_repair_decisions(&mut page_repairs, page_numbers.len()).map_err(
+        |source| {
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(Box::new(source))
+        },
+    )?;
+    page_repairs.extend(page_numbers.into_iter().map(|page_number| {
+        PreparedTransactionRestartCheckpointPageRepair {
+            page_number,
+            source_expectation:
+                PreparedTransactionRestartCheckpointPageSourceExpectation::SuffixOnly,
+            target: None,
+            unchanged_checkpoint_current: false,
+            resolution: PreparedTransactionRestartCheckpointPageRepairResolution::Pending,
+        }
+    }));
+    for (observation_index, observation) in planned.replay_observations.iter().enumerate() {
+        let (page_number, page_position) = match observation {
+            OwnedDurableTransactionRestartReplayObservation::Page {
+                page_number,
+                position,
+                ..
+            }
+            | OwnedDurableTransactionRestartReplayObservation::TransactionPage {
+                page_number,
+                position,
+                ..
+            } => (*page_number, position),
+            OwnedDurableTransactionRestartReplayObservation::Commit { .. } => continue,
+        };
+        let repair_index = page_repairs
+            .binary_search_by_key(&page_number, |repair| repair.page_number)
+            .map_err(|_| {
+                DurableTransactionRestartCheckpointRepairPreparationError::Evidence(Box::new(
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::ReplayPageInventoryMissing {
+                        page_number,
+                        page_position: page_position.clone(),
+                    },
+                ))
+            })?;
+        if let Some(target) = prepared_replay_page_target(
+            observation_index,
+            observation,
+            &planned.replay_observations,
+            &planned.current_analysis,
+        )
+        .map_err(|source| {
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(Box::new(source))
+        })? {
+            page_repairs[repair_index].target = Some(target);
+        }
+    }
+    validate_owned_dirty_checkpoint_images(
+        &planned.selected.baseline,
+        &planned.replay_observations,
+        &planned.current_analysis,
+    )
+    .map_err(|source| {
+        DurableTransactionRestartCheckpointRepairPreparationError::Evidence(Box::new(source))
+    })?;
+    for repair in &mut page_repairs {
+        combine_restart_checkpoint_page_repair_evidence(repair, &planned.selected.baseline);
+    }
+
+    for repair in &mut page_repairs {
+        let page_number = repair.page_number;
+        let snapshot = planned
+            .selected
+            .storage
+            .store
+            .observe_page(page_number)
+            .map_err(|source| {
+                DurableTransactionRestartCheckpointRepairPreparationError::StoreObservation {
+                    page_number,
+                    source,
+                }
+            })?;
+        resolve_prepared_restart_checkpoint_page_repair(
+            &replay_lineage,
+            repair,
+            snapshot,
+            &planned.replay_observations,
+            &planned.current_analysis,
+        )
+        .map_err(|source| {
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(Box::new(source))
+        })?;
+    }
+    Ok(page_repairs)
 }
 
 fn validate_restart_checkpoint_completeness_baseline_against_current_prefix<
@@ -22752,6 +24500,951 @@ mod tests {
             assert_eq!(checkpoint.calls, 1);
         }
         Ok(())
+    }
+
+    #[test]
+    fn replay_page_repair_preparation_classifies_checkpoint_and_suffix_pages()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1630).ok_or(TestError("repair persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let checkpoint_committed = durable_identity(163, 1)?;
+        let checkpoint_uncommitted = durable_identity(163, 2)?;
+        let later_uncommitted = durable_identity(163, 3)?;
+        let suffix_uncommitted = durable_identity(163, 4)?;
+        let suffix_committed = durable_identity(163, 5)?;
+        let checkpoint_current =
+            PageNumber::new(171).ok_or(TestError("checkpoint current page"))?;
+        let checkpoint_missing =
+            PageNumber::new(172).ok_or(TestError("checkpoint missing page"))?;
+        let checkpoint_behind = PageNumber::new(173).ok_or(TestError("checkpoint behind page"))?;
+        let checkpoint_later_commit =
+            PageNumber::new(174).ok_or(TestError("checkpoint later commit page"))?;
+        let suffix_current = PageNumber::new(175).ok_or(TestError("suffix current page"))?;
+        let suffix_no_required =
+            PageNumber::new(176).ok_or(TestError("suffix no-required page"))?;
+        let suffix_behind = PageNumber::new(177).ok_or(TestError("suffix behind page"))?;
+
+        let checkpoint_stream = vec![
+            restart_raw_page(&lineage, checkpoint_current.get(), 1)?,
+            restart_owned_page(&lineage, checkpoint_committed, checkpoint_missing.get(), 2)?,
+            restart_commit(&lineage, checkpoint_committed, 3)?,
+            restart_raw_page(&lineage, checkpoint_behind.get(), 4)?,
+            restart_raw_page(&lineage, checkpoint_behind.get(), 5)?,
+            restart_owned_page(
+                &lineage,
+                checkpoint_uncommitted,
+                checkpoint_later_commit.get(),
+                6,
+            )?,
+        ];
+        let current_snapshot = FakeRecoverySnapshot {
+            page_number: checkpoint_current,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(checkpoint_current.get())
+                .map_err(|_| TestError("checkpoint current byte"))?,
+            page_position: lineage.position(1),
+        };
+        let behind_snapshot = FakeRecoverySnapshot {
+            page_number: checkpoint_behind,
+            page_version: PageVersion::new(4),
+            byte: u8::try_from(checkpoint_behind.get())
+                .map_err(|_| TestError("checkpoint behind byte"))?,
+            page_position: lineage.position(4),
+        };
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(6)),
+            checkpoint_stream,
+            vec![current_snapshot.clone(), behind_snapshot.clone()],
+        )?;
+        assert_eq!(baseline.replay_start().position(), Some(2));
+
+        let current_stream = vec![
+            restart_raw_page(&lineage, checkpoint_current.get(), 1)?,
+            restart_owned_page(&lineage, checkpoint_committed, checkpoint_missing.get(), 2)?,
+            restart_commit(&lineage, checkpoint_committed, 3)?,
+            restart_raw_page(&lineage, checkpoint_behind.get(), 4)?,
+            restart_raw_page(&lineage, checkpoint_behind.get(), 5)?,
+            restart_owned_page(
+                &lineage,
+                checkpoint_uncommitted,
+                checkpoint_later_commit.get(),
+                6,
+            )?,
+            restart_owned_page(&lineage, later_uncommitted, checkpoint_current.get(), 7)?,
+            restart_commit(&lineage, checkpoint_uncommitted, 8)?,
+            restart_raw_page(&lineage, suffix_current.get(), 9)?,
+            restart_owned_page(&lineage, suffix_uncommitted, suffix_no_required.get(), 10)?,
+            restart_raw_page(&lineage, suffix_behind.get(), 11)?,
+            restart_owned_page(&lineage, suffix_committed, suffix_behind.get(), 12)?,
+            restart_commit(&lineage, suffix_committed, 13)?,
+        ];
+        let suffix_current_snapshot = FakeRecoverySnapshot {
+            page_number: suffix_current,
+            page_version: PageVersion::new(9),
+            byte: u8::try_from(suffix_current.get())
+                .map_err(|_| TestError("suffix current byte"))?,
+            page_position: lineage.position(9),
+        };
+        let suffix_behind_snapshot = FakeRecoverySnapshot {
+            page_number: suffix_behind,
+            page_version: PageVersion::new(11),
+            byte: u8::try_from(suffix_behind.get()).map_err(|_| TestError("suffix behind byte"))?,
+            page_position: lineage.position(11),
+        };
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        store.current = vec![
+            current_snapshot,
+            behind_snapshot,
+            suffix_current_snapshot,
+            suffix_behind_snapshot,
+        ];
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(13)), current_stream),
+            store,
+            &baseline,
+        )?;
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("repair replay planning"))?;
+        assert_eq!(planned.replay_record_count(), 12);
+        assert_eq!(planned.selected.storage.source.restart_callbacks, 2);
+        assert_eq!(
+            planned.selected.storage.store.observations.borrow().len(),
+            8
+        );
+
+        let preparation = planned.prepare_page_repairs();
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            preparation
+        else {
+            return Err(TestError("repair preparation unexpectedly failed"));
+        };
+        assert_eq!(prepared.persistent_log_id(), persistent_log_id);
+        assert_eq!(prepared.checkpoint_frontier(), Some(6));
+        assert_eq!(prepared.current_frontier(), Some(13));
+        assert_eq!(prepared.page_count(), 7);
+        assert_eq!(prepared.no_required_image_count(), 1);
+        assert_eq!(prepared.unchanged_checkpoint_current_count(), 1);
+        assert_eq!(prepared.already_current_count(), 1);
+        assert_eq!(prepared.repair_candidate_count(), 4);
+        assert_eq!(
+            prepared
+                .page_repairs
+                .iter()
+                .map(|repair| repair.page_number)
+                .collect::<Vec<_>>(),
+            [
+                checkpoint_current,
+                checkpoint_missing,
+                checkpoint_behind,
+                checkpoint_later_commit,
+                suffix_current,
+                suffix_no_required,
+                suffix_behind,
+            ]
+        );
+        assert!(matches!(
+            prepared.page_repairs[0].resolution,
+            PreparedTransactionRestartCheckpointPageRepairResolution::CheckpointCurrent(_)
+        ));
+        assert!(matches!(
+            &prepared.page_repairs[1],
+            PreparedTransactionRestartCheckpointPageRepair {
+                target: Some(PreparedTransactionRestartCheckpointPageRepairTarget {
+                    kind:
+                        PreparedTransactionRestartCheckpointPageRepairTargetKind::CommittedTransaction {
+                            transaction,
+                            commit_position,
+                        },
+                    page_position,
+                    ..
+                }),
+                resolution:
+                    PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(None),
+                ..
+            } if *transaction == checkpoint_committed
+                && page_position == &lineage.position(2)
+                && commit_position == &lineage.position(3)
+        ));
+        assert!(matches!(
+            &prepared.page_repairs[2],
+            PreparedTransactionRestartCheckpointPageRepair {
+                target: Some(PreparedTransactionRestartCheckpointPageRepairTarget {
+                    kind: PreparedTransactionRestartCheckpointPageRepairTargetKind::Raw,
+                    page_position,
+                    ..
+                }),
+                resolution:
+                    PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(
+                        Some(source)
+                    ),
+                ..
+            } if page_position == &lineage.position(5)
+                && source.required_position() == &lineage.position(4)
+        ));
+        assert!(matches!(
+            &prepared.page_repairs[3],
+            PreparedTransactionRestartCheckpointPageRepair {
+                target: Some(PreparedTransactionRestartCheckpointPageRepairTarget {
+                    kind:
+                        PreparedTransactionRestartCheckpointPageRepairTargetKind::CommittedTransaction {
+                            transaction,
+                            commit_position,
+                        },
+                    page_position,
+                    ..
+                }),
+                resolution:
+                    PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(None),
+                ..
+            } if *transaction == checkpoint_uncommitted
+                && page_position == &lineage.position(6)
+                && commit_position == &lineage.position(8)
+        ));
+        assert!(matches!(
+            prepared.page_repairs[4].resolution,
+            PreparedTransactionRestartCheckpointPageRepairResolution::AlreadyCurrent(_)
+        ));
+        assert!(matches!(
+            prepared.page_repairs[5].resolution,
+            PreparedTransactionRestartCheckpointPageRepairResolution::NoRequiredImage
+        ));
+        assert!(matches!(
+            &prepared.page_repairs[6],
+            PreparedTransactionRestartCheckpointPageRepair {
+                target: Some(PreparedTransactionRestartCheckpointPageRepairTarget {
+                    kind:
+                        PreparedTransactionRestartCheckpointPageRepairTargetKind::CommittedTransaction {
+                            transaction,
+                            commit_position,
+                        },
+                    page_position,
+                    ..
+                }),
+                resolution:
+                    PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(
+                        Some(source)
+                    ),
+                ..
+            } if *transaction == suffix_committed
+                && page_position == &lineage.position(12)
+                && commit_position == &lineage.position(13)
+                && source.required_position() == &lineage.position(11)
+        ));
+        assert_eq!(
+            prepared
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [
+                checkpoint_current,
+                checkpoint_missing,
+                checkpoint_behind,
+                checkpoint_later_commit,
+                checkpoint_current,
+                checkpoint_missing,
+                checkpoint_behind,
+                checkpoint_later_commit,
+                checkpoint_current,
+                checkpoint_missing,
+                checkpoint_behind,
+                checkpoint_later_commit,
+                suffix_current,
+                suffix_no_required,
+                suffix_behind,
+            ]
+        );
+        assert_eq!(
+            prepared.planned.selected.storage.source.restart_callbacks,
+            2
+        );
+        assert!(prepared.planned.selected.storage.store.attempts.is_empty());
+        assert_eq!(prepared.planned.selected.checkpoint_source.calls, 1);
+
+        let analyzed = prepared
+            .decline_page_repairs()
+            .recover()
+            .map_err(|_| TestError("prepared repair fallback recovery"))?
+            .analyze_restart()
+            .map_err(|_| TestError("prepared repair fallback analysis"))?;
+        let (source, store, _, analysis, checkpoint) = analyzed.into_parts();
+        assert_eq!(source.restart_callbacks, 3);
+        assert_eq!(analysis.durable_frontier(), Some(&lineage.position(13)));
+        assert!(store.attempts.is_empty());
+        assert_eq!(checkpoint.calls, 1);
+        Ok(())
+    }
+
+    fn suffix_repair_preparation_error(
+        lineage: &LogLineage,
+        observations: Vec<DurableTransactionRestartObservation<1>>,
+        snapshot_page: PageNumber,
+        snapshot: FakeRecoverySnapshot,
+    ) -> Result<DurableTransactionRestartCheckpointRepairPreparationError<FakeFault>, TestError>
+    {
+        let frontier = observations
+            .last()
+            .map(DurableTransactionRestartObservation::position)
+            .cloned();
+        let baseline = fake_completeness_baseline(lineage, None, Vec::new(), Vec::new())?;
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        store.observation_override = Some((snapshot_page, snapshot));
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(lineage, frontier, observations),
+            store,
+            &baseline,
+        )?;
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("suffix failure replay planning"))?;
+        let preparation = planned.prepare_page_repairs();
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(failed) = preparation
+        else {
+            return Err(TestError("suffix repair contradiction prepared"));
+        };
+        assert_eq!(
+            failed
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [snapshot_page]
+        );
+        assert_eq!(failed.planned.selected.storage.source.restart_callbacks, 2);
+        assert!(failed.planned.selected.storage.store.attempts.is_empty());
+        let (_uncheckpointed, error) = failed.continue_with_full_recovery();
+        Ok(error)
+    }
+
+    #[test]
+    fn replay_page_repair_preparation_handles_empty_replay_and_physical_recency()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1635).ok_or(TestError("edge persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let store_only_page = PageNumber::new(184).ok_or(TestError("store-only page"))?;
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        store.current.push(FakeRecoverySnapshot {
+            page_number: store_only_page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(store_only_page.get())
+                .map_err(|_| TestError("store-only page byte"))?,
+            page_position: lineage.position(1),
+        });
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            store,
+            &baseline,
+        )?;
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("empty repair replay planning"))?;
+        assert_eq!(planned.replay_record_count(), 0);
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(empty) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("empty repair preparation failed"));
+        };
+        assert_eq!(empty.page_count(), 0);
+        assert_eq!(empty.no_required_image_count(), 0);
+        assert_eq!(empty.unchanged_checkpoint_current_count(), 0);
+        assert_eq!(empty.already_current_count(), 0);
+        assert_eq!(empty.repair_candidate_count(), 0);
+        assert!(
+            empty
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .is_empty()
+        );
+        assert_eq!(empty.planned.selected.storage.source.restart_callbacks, 2);
+
+        let transaction = durable_identity(163, 9)?;
+        let replay_page = PageNumber::new(185).ok_or(TestError("physical recency page"))?;
+        let replay = vec![
+            DurableTransactionRestartObservation::TransactionPage(durable_page_observation(
+                &lineage,
+                transaction,
+                replay_page.get(),
+                200,
+                0xA5,
+                1,
+            )?),
+            restart_commit(&lineage, transaction, 2)?,
+            DurableTransactionRestartObservation::Page(physical_page_observation(
+                &lineage,
+                replay_page.get(),
+                1,
+                0x5A,
+                3,
+            )?),
+        ];
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(3)), replay),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("physical recency replay planning"))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("physical recency repair preparation failed"));
+        };
+        assert_eq!(prepared.page_count(), 1);
+        assert_eq!(prepared.repair_candidate_count(), 1);
+        assert!(matches!(
+            &prepared.page_repairs[0],
+            PreparedTransactionRestartCheckpointPageRepair {
+                target: Some(PreparedTransactionRestartCheckpointPageRepairTarget {
+                    kind: PreparedTransactionRestartCheckpointPageRepairTargetKind::Raw,
+                    page_version,
+                    bytes,
+                    page_position,
+                    ..
+                }),
+                resolution:
+                    PreparedTransactionRestartCheckpointPageRepairResolution::Candidate(None),
+                ..
+            } if *page_version == PageVersion::new(1)
+                && *bytes == [0x5A]
+                && page_position == &lineage.position(3)
+        ));
+        assert_eq!(
+            prepared
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [replay_page]
+        );
+        assert_eq!(
+            prepared.planned.selected.storage.source.restart_callbacks,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_page_repair_preparation_rejects_changed_store_lineage_before_observation()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1636).ok_or(TestError("lineage persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page_number = PageNumber::new(186).ok_or(TestError("lineage page"))?;
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(1)),
+                vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let mut planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("lineage replay planning"))?;
+        let foreign = LogLineage::persistent(
+            PersistentLogId::new(0x1637).ok_or(TestError("foreign store lineage id"))?,
+        );
+        planned.selected.storage.store.lineage = foreign.clone();
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(failed) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("changed store lineage prepared"));
+        };
+        assert!(matches!(
+            failed.error(),
+            DurableTransactionRestartCheckpointRepairPreparationError::LineageMismatch {
+                replay_lineage,
+                store_lineage,
+            } if replay_lineage.same_lineage(&lineage)
+                && store_lineage.same_lineage(&foreign)
+        ));
+        assert!(
+            failed
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .is_empty()
+        );
+        assert_eq!(failed.planned.selected.storage.source.restart_callbacks, 2);
+        assert!(failed.planned.selected.storage.store.attempts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn replay_page_repair_preparation_rejects_snapshot_contradictions() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1631).ok_or(TestError("contradiction persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page_number = PageNumber::new(180).ok_or(TestError("contradiction page"))?;
+        let other_page = PageNumber::new(181).ok_or(TestError("unexpected page"))?;
+
+        let unexpected = suffix_repair_preparation_error(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            page_number,
+            FakeRecoverySnapshot {
+                page_number: other_page,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(other_page.get())
+                    .map_err(|_| TestError("unexpected page byte"))?,
+                page_position: lineage.position(1),
+            },
+        )?;
+        assert!(matches!(
+            unexpected,
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::UnexpectedSnapshotPage {
+                        expected,
+                        actual,
+                        ..
+                    } if *expected == page_number && *actual == other_page
+                )
+        ));
+
+        let foreign = LogLineage::persistent(
+            PersistentLogId::new(0x1632).ok_or(TestError("foreign persistent log id"))?,
+        );
+        let foreign_error = suffix_repair_preparation_error(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            page_number,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("foreign page byte"))?,
+                page_position: foreign.position(1),
+            },
+        )?;
+        assert!(matches!(
+            foreign_error,
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::ForeignSnapshotLineage {
+                        page_number: actual,
+                        ..
+                    } if *actual == page_number
+                )
+        ));
+
+        let payload_error = suffix_repair_preparation_error(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            page_number,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(1),
+                byte: 0,
+                page_position: lineage.position(1),
+            },
+        )?;
+        assert!(matches!(
+            payload_error,
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotPayloadContradiction {
+                        page_number: actual,
+                        ..
+                    } if *actual == page_number
+                )
+        ));
+
+        let unbacked_error = suffix_repair_preparation_error(
+            &lineage,
+            vec![
+                restart_raw_page(&lineage, page_number.get(), 1)?,
+                restart_raw_page(&lineage, page_number.get(), 3)?,
+            ],
+            page_number,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(2),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("unbacked page byte"))?,
+                page_position: lineage.position(2),
+            },
+        )?;
+        assert!(matches!(
+            unbacked_error,
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SuffixSnapshotRecordMissing {
+                        page_number: actual,
+                        ..
+                    } if *actual == page_number
+                )
+        ));
+
+        let after_error = suffix_repair_preparation_error(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            page_number,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(2),
+                byte: u8::try_from(page_number.get()).map_err(|_| TestError("later page byte"))?,
+                page_position: lineage.position(2),
+            },
+        )?;
+        assert!(matches!(
+            after_error,
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotAfterTarget {
+                        page_number: actual,
+                        ..
+                    } if *actual == page_number
+                )
+        ));
+
+        let uncommitted = durable_identity(163, 6)?;
+        let uncommitted_error = suffix_repair_preparation_error(
+            &lineage,
+            vec![restart_owned_page(
+                &lineage,
+                uncommitted,
+                page_number.get(),
+                1,
+            )?],
+            page_number,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("uncommitted page byte"))?,
+                page_position: lineage.position(1),
+            },
+        )?;
+        assert!(matches!(
+            uncommitted_error,
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::SnapshotBackedByUncommittedTransaction {
+                        page_number: actual_page,
+                        transaction,
+                        ..
+                    } if *actual_page == page_number && *transaction == uncommitted
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn replay_page_repair_preparation_fails_before_store_for_retained_evidence_errors()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1633).ok_or(TestError("evidence persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let transaction = durable_identity(163, 7)?;
+        let page_number = PageNumber::new(182).ok_or(TestError("evidence page"))?;
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_owned_page(&lineage, transaction, page_number.get(), 1)?,
+                restart_commit(&lineage, transaction, 2)?,
+            ],
+            Vec::new(),
+        )?;
+
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(2)),
+                vec![
+                    restart_owned_page(&lineage, transaction, page_number.get(), 1)?,
+                    restart_commit(&lineage, transaction, 2)?,
+                ],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let mut missing_dirty = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("missing dirty replay planning"))?;
+        missing_dirty.replay_observations.clear();
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(missing_dirty) =
+            missing_dirty.prepare_page_repairs()
+        else {
+            return Err(TestError("missing dirty image prepared"));
+        };
+        assert!(matches!(
+            missing_dirty.error(),
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::DirtyCheckpointRequiredImageMissing {
+                        page_number: actual,
+                        page_position: 1,
+                    } if *actual == page_number
+                )
+        ));
+        assert_eq!(
+            missing_dirty
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [page_number, page_number]
+        );
+
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(2)),
+                vec![
+                    restart_owned_page(&lineage, transaction, page_number.get(), 1)?,
+                    restart_commit(&lineage, transaction, 2)?,
+                ],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let mut missing_transaction = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("missing transaction replay planning"))?;
+        missing_transaction.current_analysis.transactions.clear();
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(missing_transaction) =
+            missing_transaction.prepare_page_repairs()
+        else {
+            return Err(TestError("missing transaction entry prepared"));
+        };
+        assert!(matches!(
+            missing_transaction.error(),
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CurrentTransactionMissing {
+                        transaction: actual,
+                        ..
+                    } if *actual == transaction
+                )
+        ));
+        assert_eq!(
+            missing_transaction
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [page_number, page_number]
+        );
+
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(2)),
+                vec![
+                    restart_owned_page(&lineage, transaction, page_number.get(), 1)?,
+                    restart_commit(&lineage, transaction, 2)?,
+                ],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let mut missing_commit = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("missing commit replay planning"))?;
+        drop(missing_commit.replay_observations.pop());
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(missing_commit) =
+            missing_commit.prepare_page_repairs()
+        else {
+            return Err(TestError("missing commit record prepared"));
+        };
+        assert!(matches!(
+            missing_commit.error(),
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CommittedReplayRecordMissing {
+                        transaction: actual,
+                        ..
+                    } if *actual == transaction
+                )
+        ));
+        assert_eq!(
+            missing_commit
+                .planned
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [page_number, page_number]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replay_page_repair_preparation_preserves_store_errors_and_source_changes()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1634).ok_or(TestError("store failure persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page_number = PageNumber::new(183).ok_or(TestError("store failure page"))?;
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let mut fault_store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        fault_store.observation_fault = Some((page_number, FakeFault("repair observation")));
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(1)),
+                vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            ),
+            fault_store,
+            &baseline,
+        )?;
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("store failure replay planning"))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(failed) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("store observation failure prepared"));
+        };
+        assert!(matches!(
+            failed.error(),
+            DurableTransactionRestartCheckpointRepairPreparationError::StoreObservation {
+                page_number: actual,
+                source: FakeFault("repair observation"),
+            } if *actual == page_number
+        ));
+        let preparation_source =
+            Error::source(&failed).ok_or(TestError("repair preparation source missing"))?;
+        assert_eq!(
+            preparation_source.to_string(),
+            String::from(
+                "restart checkpoint repair source observation failed for page 183: repair observation"
+            )
+        );
+        assert_eq!(
+            preparation_source.source().map(ToString::to_string),
+            Some(String::from("repair observation"))
+        );
+        let (uncheckpointed, error) = failed.continue_with_full_recovery();
+        assert!(matches!(
+            error,
+            DurableTransactionRestartCheckpointRepairPreparationError::StoreObservation { .. }
+        ));
+        let recovered = uncheckpointed
+            .recover()
+            .map_err(|_| TestError("store failure fallback recovery"))?;
+        assert!(recovered.recovery_report().pages().is_empty());
+
+        let current_snapshot = FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(page_number.get())
+                .map_err(|_| TestError("source change page byte"))?,
+            page_position: lineage.position(1),
+        };
+        let current_baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            vec![current_snapshot.clone()],
+        )?;
+        let transaction = durable_identity(163, 8)?;
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        store.current.push(current_snapshot);
+        let selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(2)),
+                vec![
+                    restart_raw_page(&lineage, page_number.get(), 1)?,
+                    restart_owned_page(&lineage, transaction, page_number.get(), 2)?,
+                ],
+            ),
+            store,
+            &current_baseline,
+        )?;
+        let mut planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("source change replay planning"))?;
+        planned.selected.storage.store.current.clear();
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(changed) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("changed checkpoint source prepared"));
+        };
+        assert!(matches!(
+            changed.error(),
+            DurableTransactionRestartCheckpointRepairPreparationError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointRepairPreparationEvidenceError::CheckpointSourceChanged {
+                        page_number: actual,
+                        expected_position: Some(1),
+                        actual_position: None,
+                    } if *actual == page_number
+                )
+        ));
+        assert_eq!(changed.planned.selected.storage.source.restart_callbacks, 2);
+        assert!(changed.planned.selected.storage.store.attempts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn replay_page_repair_capacity_failures_are_typed_before_observation() {
+        let mut page_numbers = Vec::new();
+        assert_eq!(
+            reserve_restart_checkpoint_repair_page_inventory(&mut page_numbers, usize::MAX),
+            Err(
+                DurableTransactionRestartCheckpointRepairPreparationEvidenceError::PageInventoryCapacityExhausted {
+                    record_count: usize::MAX,
+                }
+            )
+        );
+        assert!(page_numbers.is_empty());
+
+        let mut page_repairs: Vec<PreparedTransactionRestartCheckpointPageRepair<1>> = Vec::new();
+        assert_eq!(
+            reserve_restart_checkpoint_repair_decisions(&mut page_repairs, usize::MAX),
+            Err(
+                DurableTransactionRestartCheckpointRepairPreparationEvidenceError::DecisionCapacityExhausted {
+                    page_count: usize::MAX,
+                }
+            )
+        );
+        assert!(page_repairs.is_empty());
     }
 
     #[test]

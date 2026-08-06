@@ -3877,6 +3877,46 @@ where
             Err(source) => Err(DurableTransactionRestartCompletenessError::Source(source)),
         }
     }
+
+    /// Prepares one inert persistent-lineage baseline from current completeness.
+    ///
+    /// Ephemeral source lineage is rejected before the stable-prefix callback.
+    /// Otherwise transaction, page, and replay metadata come from exactly one
+    /// current completeness analysis. No codec, publisher, replay, or
+    /// reclamation authority is created.
+    pub fn prepare_restart_checkpoint_completeness_baseline_from_current_prefix(
+        &mut self,
+    ) -> Result<
+        DurableTransactionRestartCheckpointCompletenessBaseline,
+        DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError<
+            Source::Error,
+            Store::ObservationError,
+        >,
+    > {
+        if self
+            .storage
+            .storage
+            .source
+            .lineage()
+            .persistent_id()
+            .is_none()
+        {
+            return Err(
+                DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::BaselinePreparation(
+                    DurableTransactionRestartCheckpointBaselineError::PersistentLineageRequired,
+                ),
+            );
+        }
+
+        let analysis = self
+            .analyze_current_restart_completeness()
+            .map_err(
+                DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::CompletenessAnalysis,
+            )?;
+        prepare_restart_checkpoint_completeness_baseline(analysis).map_err(
+            DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::BaselinePreparation,
+        )
+    }
 }
 
 /// Fail-closed restart-analysis state that retains the recovered storage pair.
@@ -5157,6 +5197,150 @@ impl DurableTransactionRestartCheckpointBaseline {
     }
 }
 
+/// Inert persistable transaction/page completeness for one durable WAL prefix.
+///
+/// The nested transaction baseline, page table, and replay start were derived
+/// from one ADR 0047 result. Private fields prevent callers from mixing
+/// independently obtained evidence:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartPageEntry, DurableTransactionRestartReplayStart,
+/// };
+///
+/// fn cannot_forge(
+///     transaction_baseline: DurableTransactionRestartCheckpointBaseline,
+///     pages: Vec<DurableTransactionRestartPageEntry>,
+///     replay_start: DurableTransactionRestartReplayStart,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaseline {
+///     DurableTransactionRestartCheckpointCompletenessBaseline {
+///         transaction_baseline,
+///         pages,
+///         replay_start,
+///     }
+/// }
+/// ```
+///
+/// Detached completeness evidence cannot bypass the final-owner preparation
+/// gate:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCompletenessAnalysis;
+///
+/// fn cannot_prepare_from_detached_analysis(
+///     mut analysis: DurableTransactionRestartCompletenessAnalysis,
+/// ) {
+///     let _ = analysis.prepare_restart_checkpoint_completeness_baseline_from_current_prefix();
+/// }
+/// ```
+///
+/// The baseline cannot become live transaction, page, storage, publication, or
+/// WAL authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, DurableTransactionRestartCheckpointCompletenessBaseline,
+/// };
+///
+/// fn cannot_restore_transaction(
+///     baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) -> ActiveTransaction {
+///     baseline.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaseline;
+///
+/// fn cannot_create_dirty_page<const N: usize>(
+///     baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) -> DirtyPage<N> {
+///     baseline.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+/// };
+///
+/// fn cannot_authorize_publication(
+///     baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) -> DurableTransactionRestartCheckpointBaselinePublicationReceipt {
+///     baseline.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Store, const N: usize>(
+///     baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     baseline.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaseline;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_replay_start_as_log_authority<Log: LogDurability>(
+///     log: &mut Log,
+///     baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) {
+///     let _ = log.flush_through(baseline.replay_start());
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct DurableTransactionRestartCheckpointCompletenessBaseline {
+    transaction_baseline: DurableTransactionRestartCheckpointBaseline,
+    pages: Vec<DurableTransactionRestartPageEntry>,
+    replay_start: DurableTransactionRestartReplayStart,
+}
+
+impl DurableTransactionRestartCheckpointCompletenessBaseline {
+    /// Returns the exact persistable transaction baseline from the same window.
+    pub const fn transaction_baseline(&self) -> &DurableTransactionRestartCheckpointBaseline {
+        &self.transaction_baseline
+    }
+
+    /// Returns the exact adapter-owned persistent log identity.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.transaction_baseline.persistent_log_id()
+    }
+
+    /// Returns the analyzed numeric frontier, or `None` for an empty prefix.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.transaction_baseline.durable_frontier()
+    }
+
+    /// Returns transaction entries in strict persisted-identity order.
+    pub fn transactions(&self) -> &[DurableTransactionRestartCheckpointBaselineEntry] {
+        self.transaction_baseline.transactions()
+    }
+
+    /// Returns page entries in strict numeric page-number order.
+    pub fn pages(&self) -> &[DurableTransactionRestartPageEntry] {
+        &self.pages
+    }
+
+    /// Returns the inert replay lower bound from the same evidence window.
+    pub const fn replay_start(&self) -> &DurableTransactionRestartReplayStart {
+        &self.replay_start
+    }
+}
+
 /// Untrusted decoded commit classification for one baseline entry.
 ///
 /// This observation remains distinct from the authoritative baseline state:
@@ -5985,6 +6169,58 @@ impl fmt::Display for DurableTransactionRestartCheckpointBaselineError {
 
 impl Error for DurableTransactionRestartCheckpointBaselineError {}
 
+/// Failure to derive or lower one current restart-completeness baseline.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError<
+    SourceError,
+    StoreError,
+> {
+    /// Current WAL/page-store completeness analysis failed.
+    CompletenessAnalysis(DurableTransactionRestartCompletenessError<SourceError, StoreError>),
+    /// Valid completeness evidence could not form a persistable transaction baseline.
+    BaselinePreparation(DurableTransactionRestartCheckpointBaselineError),
+}
+
+impl<SourceError, StoreError> fmt::Display
+    for DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError<
+        SourceError,
+        StoreError,
+    >
+where
+    SourceError: fmt::Display,
+    StoreError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CompletenessAnalysis(source) => write!(
+                formatter,
+                "current restart checkpoint completeness analysis failed: {source}"
+            ),
+            Self::BaselinePreparation(source) => write!(
+                formatter,
+                "current restart checkpoint completeness preparation failed: {source}"
+            ),
+        }
+    }
+}
+
+impl<SourceError, StoreError> Error
+    for DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError<
+        SourceError,
+        StoreError,
+    >
+where
+    SourceError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CompletenessAnalysis(source) => Some(source),
+            Self::BaselinePreparation(source) => Some(source),
+        }
+    }
+}
+
 fn reserve_restart_checkpoint_baseline_transactions(
     transactions: &mut Vec<DurableTransactionRestartCheckpointBaselineEntry>,
     transaction_count: usize,
@@ -6046,6 +6282,25 @@ fn prepare_restart_checkpoint_baseline(
         persistent_log_id,
         durable_frontier: analysis.durable_frontier().map(LogSequenceNumber::get),
         transactions,
+    })
+}
+
+fn prepare_restart_checkpoint_completeness_baseline(
+    analysis: DurableTransactionRestartCompletenessAnalysis,
+) -> Result<
+    DurableTransactionRestartCheckpointCompletenessBaseline,
+    DurableTransactionRestartCheckpointBaselineError,
+> {
+    let DurableTransactionRestartCompletenessAnalysis {
+        transaction_analysis,
+        pages,
+        replay_start,
+    } = analysis;
+    let transaction_baseline = prepare_restart_checkpoint_baseline(&transaction_analysis)?;
+    Ok(DurableTransactionRestartCheckpointCompletenessBaseline {
+        transaction_baseline,
+        pages,
+        replay_start,
     })
 }
 
@@ -12993,7 +13248,9 @@ mod tests {
     #[test]
     fn current_restart_completeness_uses_one_window_and_floors_uncommitted_and_dirty_pages()
     -> Result<(), TestError> {
-        let lineage = LogLineage::new();
+        let persistent_log_id =
+            PersistentLogId::new(0x1491).ok_or(TestError("completeness persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
         let first_committed = durable_identity(91, 1)?;
         let uncommitted = durable_identity(91, 2)?;
         let later_committed = durable_identity(91, 3)?;
@@ -13109,7 +13366,46 @@ mod tests {
         assert!(store.attempts.is_empty());
         assert_eq!(
             store.current,
+            [
+                stored_older_committed.clone(),
+                stored_current_committed.clone()
+            ]
+        );
+
+        let baseline = owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("current restart completeness baseline"))?;
+        assert_eq!(baseline.persistent_log_id(), persistent_log_id);
+        assert_eq!(baseline.durable_frontier(), Some(7));
+        assert_eq!(baseline.transactions().len(), 3);
+        assert_eq!(baseline.pages(), completeness.pages());
+        assert_eq!(baseline.replay_start(), completeness.replay_start());
+        assert_eq!(
+            baseline.transaction_baseline().transactions(),
+            baseline.transactions()
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, 3);
+        assert_eq!(
+            owner.parts().1.observations.borrow().as_slice(),
+            &[
+                raw_missing_page,
+                later_raw_page,
+                uncommitted_page,
+                committed_current_page,
+                raw_missing_page,
+                later_raw_page,
+                uncommitted_page,
+                committed_current_page,
+            ]
+        );
+        assert!(owner.parts().1.attempts.is_empty());
+        assert_eq!(
+            owner.parts().1.current,
             [stored_older_committed, stored_current_committed]
+        );
+        assert_eq!(
+            owner.restart_analysis().durable_frontier(),
+            Some(&lineage.position(7))
         );
         Ok(())
     }
@@ -13117,7 +13413,9 @@ mod tests {
     #[test]
     fn current_restart_completeness_handles_empty_and_after_frontier_without_arithmetic()
     -> Result<(), TestError> {
-        let lineage = LogLineage::new();
+        let persistent_log_id = PersistentLogId::new(0x1492)
+            .ok_or(TestError("empty completeness persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
         let mut empty = restart_analyzed_checkpoint_owner(&lineage, None, Vec::new())?;
         let empty_completeness = empty
             .analyze_current_restart_completeness()
@@ -13133,6 +13431,19 @@ mod tests {
             empty_completeness.replay_start(),
             &DurableTransactionRestartReplayStart::AfterFrontier { frontier: None }
         );
+        assert!(empty.parts().1.observations.borrow().is_empty());
+        let empty_baseline = empty
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("empty restart completeness baseline"))?;
+        assert_eq!(empty_baseline.persistent_log_id(), persistent_log_id);
+        assert_eq!(empty_baseline.durable_frontier(), None);
+        assert!(empty_baseline.transactions().is_empty());
+        assert!(empty_baseline.pages().is_empty());
+        assert_eq!(
+            empty_baseline.replay_start(),
+            &DurableTransactionRestartReplayStart::AfterFrontier { frontier: None }
+        );
+        assert_eq!(empty.parts().0.restart_callbacks, 3);
         assert!(empty.parts().1.observations.borrow().is_empty());
 
         let commit_only = durable_identity(92, 1)?;
@@ -13168,7 +13479,9 @@ mod tests {
     #[test]
     fn current_restart_completeness_preserves_lineage_source_store_and_stream_failures()
     -> Result<(), TestError> {
-        let lineage = LogLineage::new();
+        let persistent_log_id =
+            PersistentLogId::new(0x1493).ok_or(TestError("failure persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
         let page_number = PageNumber::new(12).ok_or(TestError("failure page"))?;
         let mut lineage_mismatch = restart_analyzed_checkpoint_owner(&lineage, None, Vec::new())?;
         lineage_mismatch.parts_mut().1.lineage = LogLineage::new();
@@ -13229,6 +13542,23 @@ mod tests {
         ));
         assert!(Error::source(&store_error).is_some());
 
+        store_failure.parts_mut().1.observation_fault =
+            Some((page_number, FakeFault("staged snapshot unavailable")));
+        let staged_store_error = store_failure
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .err()
+            .ok_or(TestError("staged store observation failure ignored"))?;
+        assert!(matches!(
+            staged_store_error,
+            DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::CompletenessAnalysis(
+                DurableTransactionRestartCompletenessError::StoreObservation {
+                    page_number: actual,
+                    source: FakeFault("staged snapshot unavailable"),
+                }
+            ) if actual == page_number
+        ));
+        assert!(Error::source(&staged_store_error).is_some());
+
         store_failure.parts_mut().1.observation_fault = None;
         store_failure.parts_mut().0.restart_after_callback_error =
             Some(FakeFault("source after callback"));
@@ -13241,11 +13571,44 @@ mod tests {
             DurableTransactionRestartCompletenessError::Source(FakeFault("source after callback"))
         ));
         assert!(Error::source(&source_error).is_some());
+
+        store_failure.parts_mut().0.restart_before_callback_error =
+            Some(FakeFault("staged source before callback"));
+        let staged_source_error = store_failure
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .err()
+            .ok_or(TestError("staged source failure ignored"))?;
+        assert!(matches!(
+            staged_source_error,
+            DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::CompletenessAnalysis(
+                DurableTransactionRestartCompletenessError::Source(FakeFault(
+                    "staged source before callback"
+                ))
+            )
+        ));
+        assert!(Error::source(&staged_source_error).is_some());
         assert_eq!(
             store_failure.parts().1.observations.borrow().as_slice(),
-            &[page_number, page_number]
+            &[page_number, page_number, page_number]
         );
         assert!(store_failure.parts().1.attempts.is_empty());
+
+        let ephemeral_lineage = LogLineage::new();
+        let mut ephemeral =
+            restart_analyzed_checkpoint_owner(&ephemeral_lineage, None, Vec::new())?;
+        let callbacks = ephemeral.parts().0.restart_callbacks;
+        let ephemeral_error = ephemeral
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .err()
+            .ok_or(TestError("ephemeral completeness baseline prepared"))?;
+        assert!(matches!(
+            ephemeral_error,
+            DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::BaselinePreparation(
+                DurableTransactionRestartCheckpointBaselineError::PersistentLineageRequired
+            )
+        ));
+        assert_eq!(ephemeral.parts().0.restart_callbacks, callbacks);
+        assert!(ephemeral.parts().1.observations.borrow().is_empty());
         Ok(())
     }
 

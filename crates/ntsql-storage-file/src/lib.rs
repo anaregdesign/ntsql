@@ -107,9 +107,10 @@ use ntsql_transaction::{
     DurableCommittedTransactionPageRecoveryComparison,
     DurableCommittedTransactionPageRecoveryComparisonError, DurableTransactionCommitObservation,
     DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
-    DurableTransactionPageObservationBytesError, TransactionCommitRecord, TransactionEpochSource,
-    TransactionId, TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
-    UnrecoveredTransactionPageStorage, compare_committed_transaction_page_recovery_candidate,
+    DurableTransactionPageObservationBytesError, DurableTransactionRestartObservation,
+    TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
+    TransactionPageWriteRecord, TransactionRecoverySource, UnrecoveredTransactionPageStorage,
+    compare_committed_transaction_page_recovery_candidate,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -971,6 +972,61 @@ impl<const N: usize> Error for FileCommittedPageRecoverySourceError<N> {
     }
 }
 
+/// Failure to project one complete filesystem durable prefix for restart analysis.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileTransactionRestartAnalysisSourceError<const N: usize> {
+    /// An uncertain prior WAL write requires reopen before authoritative analysis.
+    PoisonedWriter,
+    /// The unified observation stream could not reserve its durable-prefix bound.
+    ObservationCapacityExhausted {
+        /// Exact number of durable logical records that required reservation.
+        record_count: usize,
+    },
+    /// One raw page record could not become adapter-neutral restart evidence.
+    PageProjection(Box<PageRecoveryObservationBytesError<N>>),
+    /// One transaction-owned page could not become restart evidence.
+    TransactionPageProjection(Box<DurableTransactionPageObservationBytesError<N>>),
+    /// One transaction commit could not become restart evidence.
+    CommitProjection(Box<DurableTransactionCommitObservationFieldsError>),
+}
+
+impl<const N: usize> fmt::Display for FileTransactionRestartAnalysisSourceError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoisonedWriter => formatter.write_str(
+                "commit-log writer is poisoned; reopen the file before restart analysis",
+            ),
+            Self::ObservationCapacityExhausted { record_count } => write!(
+                formatter,
+                "filesystem restart observation capacity is exhausted for {record_count} durable records"
+            ),
+            Self::PageProjection(source) => {
+                write!(formatter, "raw page restart projection failed: {source}")
+            }
+            Self::TransactionPageProjection(source) => {
+                write!(
+                    formatter,
+                    "transaction page restart projection failed: {source}"
+                )
+            }
+            Self::CommitProjection(source) => {
+                write!(formatter, "commit restart projection failed: {source}")
+            }
+        }
+    }
+}
+
+impl<const N: usize> Error for FileTransactionRestartAnalysisSourceError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PageProjection(source) => Some(source.as_ref()),
+            Self::TransactionPageProjection(source) => Some(source.as_ref()),
+            Self::CommitProjection(source) => Some(source.as_ref()),
+            Self::PoisonedWriter | Self::ObservationCapacityExhausted { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct StoredTransactionIdentity {
     epoch: u64,
@@ -1251,13 +1307,7 @@ impl<const N: usize> FileLogRecord<N> {
         &self,
     ) -> Result<Option<DurablePageWalObservation<N>>, PageRecoveryObservationBytesError<N>> {
         match self.page_write() {
-            Some(record) => DurablePageWalObservation::from_bytes(
-                record.page_number(),
-                record.page_version(),
-                *record.bytes(),
-                self.position.clone(),
-            )
-            .map(Some),
+            Some(record) => self.project_page_recovery_observation(record).map(Some),
             None => Ok(None),
         }
     }
@@ -1276,18 +1326,9 @@ impl<const N: usize> FileLogRecord<N> {
         DurableTransactionPageObservationBytesError<N>,
     > {
         match self.transaction_page_write() {
-            Some(record) => {
-                let page = record.page_write();
-                DurableTransactionPageObservation::from_bytes(
-                    record.transaction_epoch(),
-                    record.transaction_sequence(),
-                    page.page_number(),
-                    page.page_version(),
-                    *page.bytes(),
-                    self.position.clone(),
-                )
-                .map(Some)
-            }
+            Some(record) => self
+                .project_transaction_page_recovery_observation(record)
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -1307,16 +1348,57 @@ impl<const N: usize> FileLogRecord<N> {
             FileLogRecordKind::TransactionCommit {
                 transaction_epoch,
                 transaction_sequence,
-            } => DurableTransactionCommitObservation::from_fields(
-                *transaction_epoch,
-                *transaction_sequence,
-                self.position.clone(),
-            )
-            .map(Some),
+            } => self
+                .project_transaction_commit_recovery_observation(
+                    *transaction_epoch,
+                    *transaction_sequence,
+                )
+                .map(Some),
             FileLogRecordKind::PageWrite(_) | FileLogRecordKind::TransactionPageWrite(_) => {
                 Ok(None)
             }
         }
+    }
+
+    fn project_page_recovery_observation(
+        &self,
+        record: &FilePageWriteRecord<N>,
+    ) -> Result<DurablePageWalObservation<N>, PageRecoveryObservationBytesError<N>> {
+        DurablePageWalObservation::from_bytes(
+            record.page_number(),
+            record.page_version(),
+            *record.bytes(),
+            self.position.clone(),
+        )
+    }
+
+    fn project_transaction_page_recovery_observation(
+        &self,
+        record: &FileTransactionPageWriteRecord<N>,
+    ) -> Result<DurableTransactionPageObservation<N>, DurableTransactionPageObservationBytesError<N>>
+    {
+        let page = record.page_write();
+        DurableTransactionPageObservation::from_bytes(
+            record.transaction_epoch(),
+            record.transaction_sequence(),
+            page.page_number(),
+            page.page_version(),
+            *page.bytes(),
+            self.position.clone(),
+        )
+    }
+
+    fn project_transaction_commit_recovery_observation(
+        &self,
+        transaction_epoch: u64,
+        transaction_sequence: u64,
+    ) -> Result<DurableTransactionCommitObservation, DurableTransactionCommitObservationFieldsError>
+    {
+        DurableTransactionCommitObservation::from_fields(
+            transaction_epoch,
+            transaction_sequence,
+            self.position.clone(),
+        )
     }
 }
 
@@ -1956,6 +2038,76 @@ impl<const N: usize> ntsql_transaction::DurableTransactionPageRecoverySource<N>
         }
 
         Ok(operation(&physical_pages, &transaction_pages, &commits))
+    }
+}
+
+impl<const N: usize> ntsql_transaction::DurableTransactionRestartAnalysisSource<N>
+    for FileCommitLog<N>
+{
+    type Error = FileTransactionRestartAnalysisSourceError<N>;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    fn with_durable_transaction_restart_observations<Output, Operation>(
+        &mut self,
+        operation: Operation,
+    ) -> Result<Output, Self::Error>
+    where
+        Operation: for<'evidence> FnOnce(
+            Option<&'evidence LogSequenceNumber>,
+            &'evidence [DurableTransactionRestartObservation<N>],
+        ) -> Output,
+    {
+        if self.poisoned {
+            return Err(FileTransactionRestartAnalysisSourceError::PoisonedWriter);
+        }
+
+        let durable_len = self.durable_len;
+        let durable_frontier = self.durable_position();
+        let mut observations = Vec::new();
+        observations.try_reserve(durable_len).map_err(|_| {
+            FileTransactionRestartAnalysisSourceError::ObservationCapacityExhausted {
+                record_count: durable_len,
+            }
+        })?;
+
+        for record in self.durable_records() {
+            let observation = match record.kind() {
+                FileLogRecordKind::TransactionCommit {
+                    transaction_epoch,
+                    transaction_sequence,
+                } => record
+                    .project_transaction_commit_recovery_observation(
+                        *transaction_epoch,
+                        *transaction_sequence,
+                    )
+                    .map(DurableTransactionRestartObservation::Commit)
+                    .map_err(|source| {
+                        FileTransactionRestartAnalysisSourceError::CommitProjection(Box::new(
+                            source,
+                        ))
+                    })?,
+                FileLogRecordKind::PageWrite(page) => record
+                    .project_page_recovery_observation(page)
+                    .map(DurableTransactionRestartObservation::Page)
+                    .map_err(|source| {
+                        FileTransactionRestartAnalysisSourceError::PageProjection(Box::new(source))
+                    })?,
+                FileLogRecordKind::TransactionPageWrite(transaction_page) => record
+                    .project_transaction_page_recovery_observation(transaction_page)
+                    .map(DurableTransactionRestartObservation::TransactionPage)
+                    .map_err(|source| {
+                        FileTransactionRestartAnalysisSourceError::TransactionPageProjection(
+                            Box::new(source),
+                        )
+                    })?,
+            };
+            observations.push(observation);
+        }
+
+        Ok(operation(durable_frontier.as_ref(), &observations))
     }
 }
 
@@ -5989,6 +6141,159 @@ mod tests {
             projection: FilePageRecoveryProjection::Commits,
         };
         assert!(Error::source(&capacity).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_source_errors_are_typed_and_callback_free() -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("restart-analysis-source-errors")?;
+        let capacity_path = directory.path().join("capacity.bin");
+        let malformed_path = directory.path().join("malformed.bin");
+
+        let mut capacity_log = FileCommitLog::<1>::create_new_transaction_page_capable(
+            &capacity_path,
+            persistent_id(503)?,
+        )?;
+        capacity_log.poisoned = true;
+        let mut poison_callback = false;
+        let poison =
+            <FileCommitLog<1> as ntsql_transaction::DurableTransactionRestartAnalysisSource<1>>::with_durable_transaction_restart_observations(
+                &mut capacity_log,
+                |_frontier, _observations| poison_callback = true,
+            );
+        assert_eq!(
+            poison,
+            Err(FileTransactionRestartAnalysisSourceError::PoisonedWriter)
+        );
+        assert!(!poison_callback);
+
+        capacity_log.poisoned = false;
+        capacity_log.durable_len = usize::MAX;
+        let mut capacity_callback = false;
+        let capacity =
+            <FileCommitLog<1> as ntsql_transaction::DurableTransactionRestartAnalysisSource<1>>::with_durable_transaction_restart_observations(
+                &mut capacity_log,
+                |_frontier, _observations| capacity_callback = true,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("impossible restart capacity was reserved"))?;
+        assert!(!capacity_callback);
+        assert!(Error::source(&capacity).is_none());
+        assert_eq!(
+            capacity,
+            FileTransactionRestartAnalysisSourceError::ObservationCapacityExhausted {
+                record_count: usize::MAX,
+            }
+        );
+
+        let mut malformed = FileCommitLog::create_new(&malformed_path, persistent_id(504)?)?;
+        let lineage = malformed.lineage.clone();
+        let page_number = page_number(44)?;
+
+        let raw_position = lineage.position(1);
+        let expected_raw = DurablePageWalObservation::<0>::from_bytes(
+            page_number,
+            PageVersion::new(1),
+            [],
+            raw_position.clone(),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width raw page projected"))?;
+        malformed.records.push(FileLogRecord {
+            position: raw_position,
+            kind: FileLogRecordKind::PageWrite(FilePageWriteRecord {
+                page_number,
+                page_version: PageVersion::new(1),
+                bytes: [],
+            }),
+        });
+        malformed.durable_len = 1;
+        let mut raw_callback = false;
+        let raw_error =
+            <FileCommitLog<0> as ntsql_transaction::DurableTransactionRestartAnalysisSource<0>>::with_durable_transaction_restart_observations(
+                &mut malformed,
+                |_frontier, _observations| raw_callback = true,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("malformed raw page entered restart analysis"))?;
+        assert!(!raw_callback);
+        assert!(Error::source(&raw_error).is_some());
+        let FileTransactionRestartAnalysisSourceError::PageProjection(source) = raw_error else {
+            return Err(io::Error::other("raw restart cause changed variant").into());
+        };
+        assert_eq!(*source, expected_raw);
+
+        let transaction_position = lineage.position(2);
+        let expected_transaction = DurableTransactionPageObservation::<0>::from_bytes(
+            1,
+            1,
+            page_number,
+            PageVersion::new(2),
+            [],
+            transaction_position.clone(),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width transaction page projected"))?;
+        malformed.records.clear();
+        malformed.records.push(FileLogRecord {
+            position: transaction_position,
+            kind: FileLogRecordKind::TransactionPageWrite(FileTransactionPageWriteRecord {
+                transaction_epoch: 1,
+                transaction_sequence: 1,
+                page: FilePageWriteRecord {
+                    page_number,
+                    page_version: PageVersion::new(2),
+                    bytes: [],
+                },
+            }),
+        });
+        let mut transaction_callback = false;
+        let transaction_error =
+            <FileCommitLog<0> as ntsql_transaction::DurableTransactionRestartAnalysisSource<0>>::with_durable_transaction_restart_observations(
+                &mut malformed,
+                |_frontier, _observations| transaction_callback = true,
+            )
+            .err()
+            .ok_or_else(|| {
+                io::Error::other("malformed transaction page entered restart analysis")
+            })?;
+        assert!(!transaction_callback);
+        assert!(Error::source(&transaction_error).is_some());
+        let FileTransactionRestartAnalysisSourceError::TransactionPageProjection(source) =
+            transaction_error
+        else {
+            return Err(io::Error::other("transaction restart cause changed variant").into());
+        };
+        assert_eq!(*source, expected_transaction);
+
+        let zero_position = lineage.position(0);
+        let expected_commit =
+            DurableTransactionCommitObservation::from_fields(1, 1, zero_position.clone())
+                .err()
+                .ok_or_else(|| io::Error::other("zero-position commit projected"))?;
+        malformed.records.clear();
+        malformed.records.push(FileLogRecord {
+            position: zero_position,
+            kind: FileLogRecordKind::TransactionCommit {
+                transaction_epoch: 1,
+                transaction_sequence: 1,
+            },
+        });
+        let mut commit_callback = false;
+        let commit_error =
+            <FileCommitLog<0> as ntsql_transaction::DurableTransactionRestartAnalysisSource<0>>::with_durable_transaction_restart_observations(
+                &mut malformed,
+                |_frontier, _observations| commit_callback = true,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("malformed commit entered restart analysis"))?;
+        assert!(!commit_callback);
+        assert!(Error::source(&commit_error).is_some());
+        let FileTransactionRestartAnalysisSourceError::CommitProjection(source) = commit_error
+        else {
+            return Err(io::Error::other("commit restart cause changed variant").into());
+        };
+        assert_eq!(*source, expected_commit);
         Ok(())
     }
 

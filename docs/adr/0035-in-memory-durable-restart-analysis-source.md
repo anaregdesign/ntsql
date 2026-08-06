@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #122
 - Extends: ADR 0030, ADR 0034
+- Extended by: ADR 0036
 
 ## Context
 
@@ -194,7 +195,6 @@ This ADR does not:
 The deterministic memory WAL now satisfies the complete-prefix source contract
 and can drive ADR 0034 analysis without manual projection or authority leakage.
 
-The next focused slice may implement the same contract in the filesystem WAL
-while holding its cooperating-writer lock continuously across frontier capture,
-projection, and callback return. Recovered-owner binding remains separate until
-both adapters implement the source.
+ADR 0036 implements the same contract in the filesystem WAL while holding its
+cooperating-writer lock continuously across frontier capture, projection, and
+callback return. Recovered-owner binding remains a separate owning transition.

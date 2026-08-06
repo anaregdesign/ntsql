@@ -2364,6 +2364,20 @@ pub trait DurableTransactionPageRecoverySource<const N: usize> {
         ) -> Output;
 }
 
+/// Authoritative owned inventory for deterministic committed-page recovery.
+///
+/// Implementations return every distinct transaction-owned page present in one
+/// durable prefix, strictly increasing by [`PageNumber`]. Raw-only and volatile
+/// records must not enter the inventory. The returned values are inert
+/// bookkeeping and grant no recovery write authority.
+pub trait DurableTransactionPageRecoveryInventory<const N: usize> {
+    /// Adapter-specific failure before a complete inventory is available.
+    type Error;
+
+    /// Returns one complete, strictly increasing durable owned-page inventory.
+    fn durable_transaction_page_numbers(&mut self) -> Result<Vec<PageNumber>, Self::Error>;
+}
+
 type CommittedPageRecoveryAttemptBrand<'attempt> = (&'attempt (), fn(&'attempt ()) -> &'attempt ());
 
 /// Single-use proof that the recovery gate authorized one exact store attempt.
@@ -2671,6 +2685,17 @@ pub enum CommittedTransactionPageRecoveryOutcome<const N: usize> {
         /// Exact committed target reported durable.
         target: CommittedTransactionPageRecoveryTarget<N>,
     },
+}
+
+impl<const N: usize> CommittedTransactionPageRecoveryOutcome<N> {
+    /// Returns the page number resolved by this single-page recovery outcome.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        match self {
+            Self::NoCommittedPage { page_number } => *page_number,
+            Self::AlreadyCurrent { target } | Self::Recovered { target } => target.page_number(),
+        }
+    }
 }
 
 /// Terminal state after the recovery store method returned an error.
@@ -3071,6 +3096,219 @@ where
             Err(CommittedTransactionPageRecoveryError::AttemptResultMissing { page_number })
         }
     }
+}
+
+/// Ordered completed prefix from one deterministic multi-page recovery run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct CommittedTransactionPagesRecoveryOutcome<const N: usize> {
+    pages: Vec<CommittedTransactionPageRecoveryOutcome<N>>,
+}
+
+impl<const N: usize> CommittedTransactionPagesRecoveryOutcome<N> {
+    /// Returns the completed outcomes in strict inventory order.
+    pub fn pages(&self) -> &[CommittedTransactionPageRecoveryOutcome<N>] {
+        &self.pages
+    }
+
+    /// Consumes the batch outcome and returns its ordered page outcomes.
+    pub fn into_pages(self) -> Vec<CommittedTransactionPageRecoveryOutcome<N>> {
+        self.pages
+    }
+}
+
+/// Failure before or during deterministic multi-page committed recovery.
+#[derive(Debug)]
+pub enum CommittedTransactionPagesRecoveryError<
+    InventoryError,
+    SourceError,
+    ObservationError,
+    WriteError,
+    const N: usize,
+> {
+    /// Source and store lineages differed before inventory or observation.
+    LineageMismatch {
+        /// Authoritative source lineage.
+        source_lineage: LogLineage,
+        /// Page-store lineage.
+        store_lineage: LogLineage,
+    },
+    /// The source could not produce one complete durable owned-page inventory.
+    Inventory(InventoryError),
+    /// The inventory was duplicated or out of deterministic ascending order.
+    InventoryNotStrictlyIncreasing {
+        /// Page immediately preceding the violation.
+        previous: PageNumber,
+        /// Duplicate or descending page at the violation.
+        actual: PageNumber,
+    },
+    /// The complete outcome vector could not reserve capacity before recovery.
+    OutcomeCapacityExhausted {
+        /// Number of inventoried pages whose outcomes required reservation.
+        page_count: usize,
+    },
+    /// One page failed after the retained completed prefix.
+    Page {
+        /// Exact outcomes completed before the failing page.
+        completed: CommittedTransactionPagesRecoveryOutcome<N>,
+        /// Page whose fresh single-page gate failed.
+        page_number: PageNumber,
+        /// Exact nested single-page gate failure.
+        source: CommittedTransactionPageRecoveryError<SourceError, ObservationError, WriteError, N>,
+    },
+}
+
+impl<InventoryError, SourceError, ObservationError, WriteError, const N: usize> fmt::Display
+    for CommittedTransactionPagesRecoveryError<
+        InventoryError,
+        SourceError,
+        ObservationError,
+        WriteError,
+        N,
+    >
+where
+    InventoryError: fmt::Display,
+    SourceError: fmt::Display,
+    ObservationError: fmt::Display,
+    WriteError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LineageMismatch { .. } => formatter
+                .write_str("recovery inventory source and page store belong to different lineages"),
+            Self::Inventory(source) => write!(formatter, "recovery inventory failed: {source}"),
+            Self::InventoryNotStrictlyIncreasing { previous, actual } => write!(
+                formatter,
+                "recovery inventory page {} is not strictly greater than page {}",
+                actual.get(),
+                previous.get()
+            ),
+            Self::OutcomeCapacityExhausted { page_count } => write!(
+                formatter,
+                "recovery outcome capacity is exhausted for {page_count} inventoried pages"
+            ),
+            Self::Page {
+                page_number,
+                source,
+                ..
+            } => write!(
+                formatter,
+                "committed recovery failed at inventoried page {}: {source}",
+                page_number.get()
+            ),
+        }
+    }
+}
+
+impl<InventoryError, SourceError, ObservationError, WriteError, const N: usize> Error
+    for CommittedTransactionPagesRecoveryError<
+        InventoryError,
+        SourceError,
+        ObservationError,
+        WriteError,
+        N,
+    >
+where
+    InventoryError: Error + 'static,
+    SourceError: Error + 'static,
+    ObservationError: Error + 'static,
+    WriteError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Inventory(source) => Some(source),
+            Self::Page { source, .. } => Some(source),
+            Self::LineageMismatch { .. }
+            | Self::InventoryNotStrictlyIncreasing { .. }
+            | Self::OutcomeCapacityExhausted { .. } => None,
+        }
+    }
+}
+
+/// Result of one deterministic complete-inventory recovery run.
+pub type CommittedTransactionPagesRecoveryResult<
+    InventoryError,
+    SourceError,
+    ObservationError,
+    WriteError,
+    const N: usize,
+> = Result<
+    CommittedTransactionPagesRecoveryOutcome<N>,
+    CommittedTransactionPagesRecoveryError<
+        InventoryError,
+        SourceError,
+        ObservationError,
+        WriteError,
+        N,
+    >,
+>;
+
+/// Recovers every transaction-owned page in one deterministic durable inventory.
+///
+/// The source and store are held mutably for the complete run. Implementations
+/// of the inventory and evidence ports must retain the same durable prefix until
+/// this function returns. Every mutation remains delegated to
+/// [`recover_committed_transaction_page`].
+pub fn recover_committed_transaction_pages<Source, Store, const N: usize>(
+    source: &mut Source,
+    store: &mut Store,
+) -> CommittedTransactionPagesRecoveryResult<
+    <Source as DurableTransactionPageRecoveryInventory<N>>::Error,
+    <Source as DurableTransactionPageRecoverySource<N>>::Error,
+    Store::ObservationError,
+    Store::WriteError,
+    N,
+>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    let source_lineage =
+        <Source as DurableTransactionPageRecoverySource<N>>::lineage(source).clone();
+    if !source_lineage.same_lineage(store.lineage()) {
+        return Err(CommittedTransactionPagesRecoveryError::LineageMismatch {
+            source_lineage,
+            store_lineage: store.lineage().clone(),
+        });
+    }
+
+    let page_numbers = source
+        .durable_transaction_page_numbers()
+        .map_err(CommittedTransactionPagesRecoveryError::Inventory)?;
+    for pair in page_numbers.windows(2) {
+        let previous = pair[0];
+        let actual = pair[1];
+        if previous >= actual {
+            return Err(
+                CommittedTransactionPagesRecoveryError::InventoryNotStrictlyIncreasing {
+                    previous,
+                    actual,
+                },
+            );
+        }
+    }
+
+    let mut pages = Vec::new();
+    pages.try_reserve(page_numbers.len()).map_err(|_| {
+        CommittedTransactionPagesRecoveryError::OutcomeCapacityExhausted {
+            page_count: page_numbers.len(),
+        }
+    })?;
+
+    for page_number in page_numbers {
+        match recover_committed_transaction_page(source, store, page_number) {
+            Ok(outcome) => pages.push(outcome),
+            Err(source) => {
+                return Err(CommittedTransactionPagesRecoveryError::Page {
+                    completed: CommittedTransactionPagesRecoveryOutcome { pages },
+                    page_number,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(CommittedTransactionPagesRecoveryOutcome { pages })
 }
 
 /// Read-only in-process lifecycle phase recorded by the coordinator.
@@ -5142,6 +5380,9 @@ mod tests {
         physical: Vec<DurablePageWalObservation<1>>,
         owned: Vec<DurableTransactionPageObservation<1>>,
         commits: Vec<DurableTransactionCommitObservation>,
+        inventory: Vec<PageNumber>,
+        inventory_error: Option<FakeFault>,
+        inventory_calls: usize,
         before_callback_error: Option<FakeFault>,
         after_callback_error: Option<FakeFault>,
         callbacks: usize,
@@ -5150,18 +5391,41 @@ mod tests {
     impl FakeDurablePageRecoverySource {
         fn new(
             lineage: LogLineage,
-            physical: Vec<DurablePageWalObservation<1>>,
-            owned: Vec<DurableTransactionPageObservation<1>>,
+            mut physical: Vec<DurablePageWalObservation<1>>,
+            mut owned: Vec<DurableTransactionPageObservation<1>>,
             commits: Vec<DurableTransactionCommitObservation>,
         ) -> Self {
+            physical.sort_by_key(DurablePageWalObservation::page_number);
+            owned.sort_by_key(|observation| observation.page().page_number());
+            let mut inventory = owned
+                .iter()
+                .map(|observation| observation.page().page_number())
+                .collect::<Vec<_>>();
+            inventory.sort_unstable();
+            inventory.dedup();
             Self {
                 lineage,
                 physical,
                 owned,
                 commits,
+                inventory,
+                inventory_error: None,
+                inventory_calls: 0,
                 before_callback_error: None,
                 after_callback_error: None,
                 callbacks: 0,
+            }
+        }
+    }
+
+    impl DurableTransactionPageRecoveryInventory<1> for FakeDurablePageRecoverySource {
+        type Error = FakeFault;
+
+        fn durable_transaction_page_numbers(&mut self) -> Result<Vec<PageNumber>, Self::Error> {
+            self.inventory_calls += 1;
+            match self.inventory_error.take() {
+                Some(source) => Err(source),
+                None => Ok(self.inventory.clone()),
             }
         }
     }
@@ -5175,7 +5439,7 @@ mod tests {
 
         fn with_durable_page_evidence<Output, Operation>(
             &mut self,
-            _page_number: PageNumber,
+            page_number: PageNumber,
             operation: Operation,
         ) -> Result<Output, Self::Error>
         where
@@ -5189,7 +5453,23 @@ mod tests {
                 return Err(source);
             }
             self.callbacks += 1;
-            let output = operation(&self.physical, &self.owned, &self.commits);
+            let physical_start = self
+                .physical
+                .partition_point(|observation| observation.page_number() < page_number);
+            let physical_end = self
+                .physical
+                .partition_point(|observation| observation.page_number() <= page_number);
+            let owned_start = self
+                .owned
+                .partition_point(|observation| observation.page().page_number() < page_number);
+            let owned_end = self
+                .owned
+                .partition_point(|observation| observation.page().page_number() <= page_number);
+            let output = operation(
+                &self.physical[physical_start..physical_end],
+                &self.owned[owned_start..owned_end],
+                &self.commits,
+            );
             match self.after_callback_error.take() {
                 Some(source) => Err(source),
                 None => Ok(output),
@@ -5291,6 +5571,106 @@ mod tests {
         }
     }
 
+    struct FakeBatchCommittedPageRecoveryStore {
+        lineage: LogLineage,
+        current: Vec<FakeRecoverySnapshot>,
+        write_fault: Option<(PageNumber, FakeRecoveryWriteFault)>,
+        observations: RefCell<Vec<PageNumber>>,
+        attempts: Vec<PageNumber>,
+    }
+
+    impl FakeBatchCommittedPageRecoveryStore {
+        fn new(lineage: LogLineage) -> Self {
+            Self {
+                lineage,
+                current: Vec::new(),
+                write_fault: None,
+                observations: RefCell::new(Vec::new()),
+                attempts: Vec::new(),
+            }
+        }
+
+        fn current_observation(
+            &self,
+            page_number: PageNumber,
+        ) -> Result<Option<StoredPageSnapshotObservation<1>>, FakeFault> {
+            self.current
+                .iter()
+                .find(|snapshot| snapshot.page_number == page_number)
+                .map(FakeRecoverySnapshot::observation)
+                .transpose()
+        }
+    }
+
+    impl CommittedTransactionPageRecoveryStore<1> for FakeBatchCommittedPageRecoveryStore {
+        type ObservationError = FakeFault;
+        type WriteError = FakeFault;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn observe_page(
+            &self,
+            page_number: PageNumber,
+        ) -> Result<Option<StoredPageSnapshotObservation<1>>, Self::ObservationError> {
+            self.observations.borrow_mut().push(page_number);
+            self.current_observation(page_number)
+        }
+
+        fn compare_and_replace(
+            &mut self,
+            candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, 1>,
+            permit: CommittedTransactionPageRecoveryWritePermit<'_>,
+        ) -> Result<(), Self::WriteError> {
+            let target = candidate.latest_committed();
+            let page_number = target.observation().page().page_number();
+            self.attempts.push(page_number);
+            if permit.page_position() != target.observation().position()
+                || permit.commit_position() != target.commit_position()
+            {
+                return Err(FakeFault("permit mismatch"));
+            }
+
+            let current = self.current_observation(page_number)?;
+            if compare_committed_transaction_page_recovery_candidate(candidate, current.as_ref())
+                != Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches)
+            {
+                return Err(FakeFault("precondition changed"));
+            }
+            if self.write_fault
+                == Some((
+                    page_number,
+                    FakeRecoveryWriteFault::Before(FakeFault("batch write")),
+                ))
+            {
+                self.write_fault = None;
+                return Err(FakeFault("batch write"));
+            }
+
+            let snapshot = FakeRecoverySnapshot::from_target(&owned_recovery_target(target));
+            match self
+                .current
+                .iter()
+                .position(|current| current.page_number == page_number)
+            {
+                Some(index) => self.current[index] = snapshot,
+                None => self.current.push(snapshot),
+            }
+            if self.write_fault
+                == Some((
+                    page_number,
+                    FakeRecoveryWriteFault::After(FakeFault("batch write")),
+                ))
+            {
+                self.write_fault = None;
+                Err(FakeFault("batch write"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn one_page_recovery_source(
         lineage: &LogLineage,
         owner: DurableTransactionIdentityObservation,
@@ -5341,6 +5721,49 @@ mod tests {
                 durable_commit_observation(lineage, source_owner, 3)?,
                 durable_commit_observation(lineage, target_owner, 7)?,
             ],
+        ))
+    }
+
+    fn batch_recovery_source(
+        lineage: &LogLineage,
+        page_numbers: &[u64],
+    ) -> Result<FakeDurablePageRecoverySource, TestError> {
+        let mut physical = Vec::new();
+        let mut owned = Vec::new();
+        let mut commits = Vec::new();
+        for (index, page_number) in page_numbers.iter().copied().enumerate() {
+            let sequence = u64::try_from(index + 1).map_err(|_| TestError("batch sequence"))?;
+            let page_position = sequence
+                .checked_mul(2)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or(TestError("batch page position"))?;
+            let commit_position = page_position
+                .checked_add(1)
+                .ok_or(TestError("batch commit position"))?;
+            let byte = u8::try_from(page_number).map_err(|_| TestError("batch page byte"))?;
+            let owner = durable_identity(40, sequence)?;
+            physical.push(physical_page_observation(
+                lineage,
+                page_number,
+                sequence,
+                byte,
+                page_position,
+            )?);
+            owned.push(durable_page_observation(
+                lineage,
+                owner,
+                page_number,
+                sequence,
+                byte,
+                page_position,
+            )?);
+            commits.push(durable_commit_observation(lineage, owner, commit_position)?);
+        }
+        Ok(FakeDurablePageRecoverySource::new(
+            lineage.clone(),
+            physical,
+            owned,
+            commits,
         ))
     }
 
@@ -7896,6 +8319,180 @@ mod tests {
             CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
         ));
         assert_eq!(after_store.attempts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_recovery_rejects_lineage_inventory_failure_and_invalid_order_before_store_access()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let first_page = PageNumber::new(81).ok_or(TestError("first batch page"))?;
+        let second_page = PageNumber::new(82).ok_or(TestError("second batch page"))?;
+
+        let mut mismatch_source = batch_recovery_source(&lineage, &[81, 82])?;
+        let mut mismatch_store = FakeBatchCommittedPageRecoveryStore::new(foreign.clone());
+        let mismatch =
+            recover_committed_transaction_pages(&mut mismatch_source, &mut mismatch_store);
+        let Err(CommittedTransactionPagesRecoveryError::LineageMismatch {
+            source_lineage,
+            store_lineage,
+        }) = mismatch
+        else {
+            return Err(TestError("expected batch lineage mismatch"));
+        };
+        assert!(source_lineage.same_lineage(&lineage));
+        assert!(store_lineage.same_lineage(&foreign));
+        assert_eq!(mismatch_source.inventory_calls, 0);
+        assert_eq!(mismatch_source.callbacks, 0);
+        assert!(mismatch_store.observations.borrow().is_empty());
+
+        let mut failed_inventory = batch_recovery_source(&lineage, &[81, 82])?;
+        failed_inventory.inventory_error = Some(FakeFault("inventory"));
+        let mut untouched_store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        assert!(matches!(
+            recover_committed_transaction_pages(&mut failed_inventory, &mut untouched_store),
+            Err(CommittedTransactionPagesRecoveryError::Inventory(
+                FakeFault("inventory")
+            ))
+        ));
+        assert_eq!(failed_inventory.inventory_calls, 1);
+        assert_eq!(failed_inventory.callbacks, 0);
+        assert!(untouched_store.observations.borrow().is_empty());
+
+        let mut descending = batch_recovery_source(&lineage, &[81, 82])?;
+        descending.inventory = vec![second_page, first_page];
+        let result = recover_committed_transaction_pages(&mut descending, &mut untouched_store);
+        assert!(matches!(
+            result,
+            Err(
+                CommittedTransactionPagesRecoveryError::InventoryNotStrictlyIncreasing {
+                    previous,
+                    actual,
+                }
+            ) if previous == second_page && actual == first_page
+        ));
+        assert_eq!(descending.callbacks, 0);
+        assert!(untouched_store.observations.borrow().is_empty());
+
+        let mut duplicate = batch_recovery_source(&lineage, &[81, 82])?;
+        duplicate.inventory = vec![first_page, first_page];
+        let result = recover_committed_transaction_pages(&mut duplicate, &mut untouched_store);
+        assert!(matches!(
+            result,
+            Err(
+                CommittedTransactionPagesRecoveryError::InventoryNotStrictlyIncreasing {
+                    previous,
+                    actual,
+                }
+            ) if previous == first_page && actual == first_page
+        ));
+        assert_eq!(duplicate.callbacks, 0);
+        assert!(untouched_store.observations.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn batch_recovery_completes_once_in_strict_inventory_order() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let expected = [81, 82, 83]
+            .into_iter()
+            .map(|number| PageNumber::new(number).ok_or(TestError("batch page")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut source = batch_recovery_source(&lineage, &[83, 81, 82])?;
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+
+        let outcome = recover_committed_transaction_pages(&mut source, &mut store)
+            .map_err(|_| TestError("batch recovery"))?;
+
+        assert_eq!(
+            outcome
+                .pages()
+                .iter()
+                .map(CommittedTransactionPageRecoveryOutcome::page_number)
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(outcome.pages().iter().all(|outcome| matches!(
+            outcome,
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        )));
+        assert_eq!(source.inventory_calls, 1);
+        assert_eq!(source.callbacks, 3);
+        assert_eq!(store.observations.into_inner(), expected);
+        assert_eq!(store.attempts, expected);
+        assert_eq!(store.current.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn batch_recovery_stops_with_exact_prefix_and_fresh_rerun_is_idempotent()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let first_page = PageNumber::new(81).ok_or(TestError("first batch page"))?;
+        let failed_page = PageNumber::new(82).ok_or(TestError("failed batch page"))?;
+        let last_page = PageNumber::new(83).ok_or(TestError("last batch page"))?;
+        let mut source = batch_recovery_source(&lineage, &[81, 82, 83])?;
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        store.write_fault = Some((
+            failed_page,
+            FakeRecoveryWriteFault::Before(FakeFault("batch write")),
+        ));
+
+        let result = recover_committed_transaction_pages(&mut source, &mut store);
+        let Err(CommittedTransactionPagesRecoveryError::Page {
+            page_number,
+            completed,
+            source: nested,
+        }) = result
+        else {
+            return Err(TestError("expected batch page failure"));
+        };
+        assert_eq!(page_number, failed_page);
+        assert_eq!(completed.pages().len(), 1);
+        assert_eq!(completed.pages()[0].page_number(), first_page);
+        let CommittedTransactionPageRecoveryError::StoreWrite { state } = nested else {
+            return Err(TestError("batch failure lost nested write state"));
+        };
+        assert_eq!(state.as_ref().target().page_number(), failed_page);
+        assert_eq!(state.as_ref().cause(), &FakeFault("batch write"));
+        assert_eq!(
+            store.observations.borrow().as_slice(),
+            &[first_page, failed_page]
+        );
+        assert_eq!(store.attempts, [first_page, failed_page]);
+        assert_eq!(store.current.len(), 1);
+        assert_eq!(store.current[0].page_number, first_page);
+
+        let rerun = recover_committed_transaction_pages(&mut source, &mut store)
+            .map_err(|_| TestError("fresh batch rerun"))?;
+        assert_eq!(
+            rerun
+                .pages()
+                .iter()
+                .map(CommittedTransactionPageRecoveryOutcome::page_number)
+                .collect::<Vec<_>>(),
+            [first_page, failed_page, last_page]
+        );
+        assert!(matches!(
+            rerun.pages()[0],
+            CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+        ));
+        assert!(matches!(
+            rerun.pages()[1],
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        ));
+        assert!(matches!(
+            rerun.pages()[2],
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        ));
+        assert_eq!(source.inventory_calls, 2);
+        assert_eq!(source.callbacks, 5);
+        assert_eq!(
+            store.attempts,
+            [first_page, failed_page, failed_page, last_page]
+        );
+        assert_eq!(store.current.len(), 3);
         Ok(())
     }
 }

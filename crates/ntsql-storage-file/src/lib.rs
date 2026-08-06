@@ -848,6 +848,39 @@ impl fmt::Display for FileTransactionRecoveryError {
 
 impl Error for FileTransactionRecoveryError {}
 
+/// Failure to inventory durable transaction-owned pages in a filesystem WAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileCommittedPageRecoveryInventoryError {
+    /// The opened WAL format cannot contain transaction-owned page evidence.
+    TransactionPageSupportUnavailable {
+        /// Exact opened WAL format version.
+        version: u16,
+    },
+    /// An uncertain prior WAL write requires reopen before authoritative recovery.
+    PoisonedWriter,
+    /// The owned-page inventory could not reserve its durable-prefix upper bound.
+    PageCapacityExhausted,
+}
+
+impl fmt::Display for FileCommittedPageRecoveryInventoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TransactionPageSupportUnavailable { version } => write!(
+                formatter,
+                "file WAL format version {version} does not support committed-page recovery inventory"
+            ),
+            Self::PoisonedWriter => formatter.write_str(
+                "commit-log writer is poisoned; reopen the file before committed-page recovery inventory",
+            ),
+            Self::PageCapacityExhausted => {
+                formatter.write_str("filesystem recovery page inventory capacity is exhausted")
+            }
+        }
+    }
+}
+
+impl Error for FileCommittedPageRecoveryInventoryError {}
+
 /// Projection whose filesystem recovery evidence could not reserve memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FilePageRecoveryProjection {
@@ -1800,6 +1833,38 @@ impl<const N: usize> TransactionRecoverySource for FileCommitLog<N> {
             None => DurableCommitLookup::Absent,
         };
         Ok((self.lineage.clone(), lookup))
+    }
+}
+
+impl<const N: usize> ntsql_transaction::DurableTransactionPageRecoveryInventory<N>
+    for FileCommitLog<N>
+{
+    type Error = FileCommittedPageRecoveryInventoryError;
+
+    fn durable_transaction_page_numbers(&mut self) -> Result<Vec<PageNumber>, Self::Error> {
+        if self.poisoned {
+            return Err(FileCommittedPageRecoveryInventoryError::PoisonedWriter);
+        }
+        if !self.format.supports_transaction_pages() {
+            return Err(
+                FileCommittedPageRecoveryInventoryError::TransactionPageSupportUnavailable {
+                    version: self.format.version(),
+                },
+            );
+        }
+
+        let mut page_numbers = Vec::new();
+        page_numbers
+            .try_reserve(self.durable_len)
+            .map_err(|_| FileCommittedPageRecoveryInventoryError::PageCapacityExhausted)?;
+        for record in self.durable_records() {
+            if let Some(page) = record.transaction_page_write() {
+                page_numbers.push(page.page_write().page_number());
+            }
+        }
+        page_numbers.sort_unstable();
+        page_numbers.dedup();
+        Ok(page_numbers)
     }
 }
 
@@ -5726,6 +5791,12 @@ mod tests {
         coordinator.commit(active, &mut log)?;
 
         log.poisoned = true;
+        assert_eq!(
+            <FileCommitLog<2> as ntsql_transaction::DurableTransactionPageRecoveryInventory<
+                2,
+            >>::durable_transaction_page_numbers(&mut log),
+            Err(FileCommittedPageRecoveryInventoryError::PoisonedWriter)
+        );
         let mut callback_called = false;
         let source =
             <FileCommitLog<2> as ntsql_transaction::DurableTransactionPageRecoverySource<

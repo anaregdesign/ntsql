@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #110
 - Extends: ADR 0015, ADR 0018, ADR 0026, ADR 0028
+- Extended by: ADR 0030
 
 ## Context
 
@@ -248,7 +249,7 @@ evidence, authorizes one atomic exact-source replacement, preserves terminal
 write ambiguity, and makes repeated recovery idempotent through fresh
 reconciliation.
 
-The next slice may implement both ports in the deterministic memory adapter.
-Filesystem implementation must later preserve the same source-stability and
-atomic store-recheck contracts across WAL v3/page-store reopen before checkpoint
-or multi-page orchestration begins.
+ADR 0030 implements both ports in the deterministic memory adapter. Filesystem
+implementation must preserve the same source-stability and atomic store-recheck
+contracts across WAL v3/page-store reopen before checkpoint or multi-page
+orchestration begins.

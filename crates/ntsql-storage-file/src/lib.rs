@@ -132,6 +132,29 @@
 //! only owned untrusted checkpoint fields. Publication writes and synchronizes
 //! one fresh unselected `candidate`, closes it, renames it over `current`, and
 //! synchronizes the retained directory before reporting success.
+//!
+//! ## Filesystem restart checkpoint completeness baseline source
+//!
+//! [`FileRestartCheckpointCompletenessBaselineSource`] owns a second,
+//! completely separate caller-selected slot directory for ADR 0051's
+//! completeness ports. It never opens, empties, or overwrites the
+//! transaction-only slot above, and the transaction-only adapter never reads
+//! its entries.
+//!
+//! The two namespaces are distinguished by independent 64-byte control magic:
+//! the transaction-only slot's `control` starts with `NTSQCKS1`, while the
+//! completeness slot's `control` starts with `NTSQCMS1`. Both share the exact
+//! same reviewed control geometry — version `1`, header length `64`, zero
+//! flags, a nonzero persistent log ID, reserved zero bytes, and the final
+//! checksum — so opening one slot type as the other fails at the control
+//! header magic even when the optional `current` entry is absent.
+//!
+//! Inside the completeness slot the selected `current` entry holds only
+//! `NTSQCMP1` bytes and the fixed unselected `candidate` entry holds only
+//! in-progress publication bytes. Creation, lock-before-parse open, exact
+//! optional reading, and the candidate/rename/directory-synchronization
+//! publication sequence match the transaction-only slot's reviewed discipline,
+//! but each format decodes strictly through its own codec.
 
 use std::{
     error::Error,
@@ -161,6 +184,7 @@ use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, Persist
 
 mod restart_checkpoint_codec;
 mod restart_checkpoint_completeness_codec;
+mod restart_checkpoint_completeness_file;
 mod restart_checkpoint_file;
 
 pub use restart_checkpoint_codec::{
@@ -176,6 +200,16 @@ pub use restart_checkpoint_completeness_codec::{
     RestartCheckpointCompletenessBaselineRequiredImageField,
     decode_restart_checkpoint_completeness_baseline,
     encode_restart_checkpoint_completeness_baseline,
+};
+pub use restart_checkpoint_completeness_file::{
+    FileRestartCheckpointCompletenessBaselinePublicationError,
+    FileRestartCheckpointCompletenessBaselinePublicationFaultAlreadyArmed,
+    FileRestartCheckpointCompletenessBaselinePublicationFaultPoint,
+    FileRestartCheckpointCompletenessBaselineSource,
+    FileRestartCheckpointCompletenessBaselineSourceError,
+    FileTransactionPageStorageCompletenessCheckpointOpenError,
+    UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint,
+    open_transaction_page_storage_with_completeness_checkpoint,
 };
 pub use restart_checkpoint_file::{
     FileRestartCheckpointBaselinePublicationError,

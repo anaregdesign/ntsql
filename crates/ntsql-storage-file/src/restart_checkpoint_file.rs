@@ -22,12 +22,12 @@ use super::{
     read_u64, read_u128, write_u16, write_u32, write_u64, write_u128,
 };
 
-const CONTROL_FILE_NAME: &str = "control";
-const CURRENT_FILE_NAME: &str = "current";
-const CANDIDATE_FILE_NAME: &str = "candidate";
+pub(crate) const CONTROL_FILE_NAME: &str = "control";
+pub(crate) const CURRENT_FILE_NAME: &str = "current";
+pub(crate) const CANDIDATE_FILE_NAME: &str = "candidate";
 const CONTROL_MAGIC: [u8; 8] = *b"NTSQCKS1";
 const CONTROL_FORMAT_VERSION: u16 = 1;
-const CONTROL_HEADER_LENGTH: usize = 64;
+pub(crate) const CONTROL_HEADER_LENGTH: usize = 64;
 const CONTROL_HEADER_LENGTH_U16: u16 = 64;
 const CONTROL_RESERVED_START: usize = 32;
 const CONTROL_CHECKSUM_OFFSET: usize = 56;
@@ -441,6 +441,23 @@ impl Error for FileRestartCheckpointBaselineSourceError {
     }
 }
 
+impl From<SlotCurrentReadError> for FileRestartCheckpointBaselineSourceError {
+    fn from(source: SlotCurrentReadError) -> Self {
+        match source {
+            SlotCurrentReadError::Io(source) => Self::Io(source),
+            SlotCurrentReadError::CurrentLengthOutOfRange { actual } => {
+                Self::CurrentLengthOutOfRange { actual }
+            }
+            SlotCurrentReadError::CurrentCapacityExhausted { length } => {
+                Self::CurrentCapacityExhausted { length }
+            }
+            SlotCurrentReadError::CurrentLengthChanged { before, after } => {
+                Self::CurrentLengthChanged { before, after }
+            }
+        }
+    }
+}
+
 /// Exact deterministic failure point in filesystem checkpoint publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileRestartCheckpointBaselinePublicationFaultPoint {
@@ -458,6 +475,20 @@ pub enum FileRestartCheckpointBaselinePublicationFaultPoint {
     AfterCurrentReplace,
     /// Fail after directory synchronization instead of reporting success.
     AfterDirectorySync,
+}
+
+impl FileRestartCheckpointBaselinePublicationFaultPoint {
+    const fn from_step(step: SlotPublicationStep) -> Self {
+        match step {
+            SlotPublicationStep::BeforeCandidateCleanup => Self::BeforeCandidateCleanup,
+            SlotPublicationStep::AfterCandidateCleanup => Self::AfterCandidateCleanup,
+            SlotPublicationStep::AfterCandidateCreate => Self::AfterCandidateCreate,
+            SlotPublicationStep::AfterCandidateWrite => Self::AfterCandidateWrite,
+            SlotPublicationStep::AfterCandidateSync => Self::AfterCandidateSync,
+            SlotPublicationStep::AfterCurrentReplace => Self::AfterCurrentReplace,
+            SlotPublicationStep::AfterDirectorySync => Self::AfterDirectorySync,
+        }
+    }
 }
 
 impl fmt::Display for FileRestartCheckpointBaselinePublicationFaultPoint {
@@ -640,59 +671,8 @@ impl FileRestartCheckpointBaselineSource {
         P: AsRef<Path>,
     {
         let slot_directory = slot_directory.as_ref().to_path_buf();
-        let control_path = slot_directory.join(CONTROL_FILE_NAME);
-
-        fs::create_dir(&slot_directory).map_err(|source| {
-            FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::CreateSlotDirectory,
-                source,
-            ))
-        })?;
-        let mut control_file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&control_path)
-            .map_err(|source| {
-                FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::CreateControlFile,
-                    source,
-                ))
-            })?;
-        control_file.try_lock().map_err(|source| {
-            FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::AcquireExclusiveControlLock,
-                source.into(),
-            ))
-        })?;
-
-        let header = build_control_header(persistent_log_id);
-        control_file.write_all(&header).map_err(|source| {
-            FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::WriteControlHeader,
-                source,
-            ))
-        })?;
-        control_file.sync_all().map_err(|source| {
-            FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::SyncControlFile,
-                source,
-            ))
-        })?;
-
-        let directory = File::open(&slot_directory).map_err(|source| {
-            FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::OpenSlotDirectory,
-                source,
-            ))
-        })?;
-        directory.sync_all().map_err(|source| {
-            FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::SyncSlotDirectory,
-                source,
-            ))
-        })?;
-        sync_parent_directory(&slot_directory)?;
+        let (control_file, directory) =
+            create_locked_control_slot(&slot_directory, CONTROL_MAGIC, persistent_log_id)?;
 
         Ok(Self {
             slot_directory,
@@ -709,59 +689,8 @@ impl FileRestartCheckpointBaselineSource {
         P: AsRef<Path>,
     {
         let slot_directory = slot_directory.as_ref().to_path_buf();
-        let control_path = slot_directory.join(CONTROL_FILE_NAME);
-        let mut control_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(control_path)
-            .map_err(|source| {
-                FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::OpenControlFile,
-                    source,
-                ))
-            })?;
-        control_file.try_lock().map_err(|source| {
-            FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::AcquireExclusiveControlLock,
-                source.into(),
-            ))
-        })?;
-
-        let control_length = control_file
-            .metadata()
-            .map_err(|source| {
-                FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::ReadControlMetadata,
-                    source,
-                ))
-            })?
-            .len();
-        if control_length != CONTROL_HEADER_LENGTH as u64 {
-            return Err(FileRestartCheckpointSlotOpenError::Format(
-                FileRestartCheckpointSlotFormatError::new(
-                    0,
-                    FileRestartCheckpointSlotFormatErrorReason::FileLength {
-                        actual: control_length,
-                    },
-                ),
-            ));
-        }
-
-        let mut header = [0_u8; CONTROL_HEADER_LENGTH];
-        control_file.read_exact(&mut header).map_err(|source| {
-            FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::ReadControlHeader,
-                source,
-            ))
-        })?;
-        let persistent_log_id =
-            parse_control_header(&header).map_err(FileRestartCheckpointSlotOpenError::Format)?;
-        let directory = File::open(&slot_directory).map_err(|source| {
-            FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::OpenSlotDirectory,
-                source,
-            ))
-        })?;
+        let (control_file, directory, persistent_log_id) =
+            open_locked_control_slot(&slot_directory, CONTROL_MAGIC)?;
 
         Ok(Self {
             slot_directory,
@@ -806,18 +735,6 @@ impl FileRestartCheckpointBaselineSource {
     ) -> Option<FileRestartCheckpointBaselinePublicationFaultPoint> {
         self.armed_publication_fault
     }
-
-    fn consume_publication_fault(
-        &mut self,
-        point: FileRestartCheckpointBaselinePublicationFaultPoint,
-    ) -> bool {
-        if self.armed_publication_fault == Some(point) {
-            self.armed_publication_fault = None;
-            true
-        } else {
-            false
-        }
-    }
 }
 
 impl DurableTransactionRestartCheckpointBaselineSource for FileRestartCheckpointBaselineSource {
@@ -827,96 +744,9 @@ impl DurableTransactionRestartCheckpointBaselineSource for FileRestartCheckpoint
         &mut self,
     ) -> Result<Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>, Self::Error>
     {
-        let current_path = self.slot_directory.join(CURRENT_FILE_NAME);
-        let mut current_file = match File::open(&current_path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                match fs::symlink_metadata(&current_path) {
-                    Ok(_) => {
-                        return Err(FileRestartCheckpointBaselineSourceError::Io(
-                            FileRestartCheckpointSlotIoError::new(
-                                FileRestartCheckpointSlotIoStage::OpenCurrentFile,
-                                source,
-                            ),
-                        ));
-                    }
-                    Err(absence_source) if absence_source.kind() == io::ErrorKind::NotFound => {
-                        match fs::metadata(&self.slot_directory) {
-                            Ok(metadata) if metadata.is_dir() => return Ok(None),
-                            Ok(_) => {
-                                return Err(FileRestartCheckpointBaselineSourceError::Io(
-                                    FileRestartCheckpointSlotIoError::new(
-                                        FileRestartCheckpointSlotIoStage::OpenCurrentFile,
-                                        source,
-                                    ),
-                                ));
-                            }
-                            Err(parent_source) => {
-                                return Err(FileRestartCheckpointBaselineSourceError::Io(
-                                    FileRestartCheckpointSlotIoError::new(
-                                        FileRestartCheckpointSlotIoStage::VerifyCurrentAbsence,
-                                        parent_source,
-                                    ),
-                                ));
-                            }
-                        }
-                    }
-                    Err(absence_source) => {
-                        return Err(FileRestartCheckpointBaselineSourceError::Io(
-                            FileRestartCheckpointSlotIoError::new(
-                                FileRestartCheckpointSlotIoStage::VerifyCurrentAbsence,
-                                absence_source,
-                            ),
-                        ));
-                    }
-                }
-            }
-            Err(source) => {
-                return Err(FileRestartCheckpointBaselineSourceError::Io(
-                    FileRestartCheckpointSlotIoError::new(
-                        FileRestartCheckpointSlotIoStage::OpenCurrentFile,
-                        source,
-                    ),
-                ));
-            }
+        let Some(bytes) = read_current_slot_bytes(&self.slot_directory)? else {
+            return Ok(None);
         };
-        let before = current_file
-            .metadata()
-            .map_err(|source| {
-                FileRestartCheckpointBaselineSourceError::Io(FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::ReadCurrentMetadataBeforeRead,
-                    source,
-                ))
-            })?
-            .len();
-        let length = usize::try_from(before).map_err(|_| {
-            FileRestartCheckpointBaselineSourceError::CurrentLengthOutOfRange { actual: before }
-        })?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(length).map_err(|_| {
-            FileRestartCheckpointBaselineSourceError::CurrentCapacityExhausted { length }
-        })?;
-        bytes.resize(length, 0);
-        current_file.read_exact(&mut bytes).map_err(|source| {
-            FileRestartCheckpointBaselineSourceError::Io(FileRestartCheckpointSlotIoError::new(
-                FileRestartCheckpointSlotIoStage::ReadCurrentBytes,
-                source,
-            ))
-        })?;
-        let after = current_file
-            .metadata()
-            .map_err(|source| {
-                FileRestartCheckpointBaselineSourceError::Io(FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::ReadCurrentMetadataAfterRead,
-                    source,
-                ))
-            })?
-            .len();
-        if before != after {
-            return Err(
-                FileRestartCheckpointBaselineSourceError::CurrentLengthChanged { before, after },
-            );
-        }
         decode_restart_checkpoint_baseline(&bytes)
             .map(Some)
             .map_err(FileRestartCheckpointBaselineSourceError::Decode)
@@ -963,136 +793,32 @@ impl DurableTransactionRestartCheckpointBaselinePublisher for FileRestartCheckpo
 
         let encoded = encode_restart_checkpoint_baseline(baseline)
             .map_err(FileRestartCheckpointBaselinePublicationError::Encode)?;
-        if self.consume_publication_fault(
-            FileRestartCheckpointBaselinePublicationFaultPoint::BeforeCandidateCleanup,
-        ) {
-            return Err(
-                FileRestartCheckpointBaselinePublicationError::InjectedFault(
-                    FileRestartCheckpointBaselinePublicationFaultPoint::BeforeCandidateCleanup,
-                ),
-            );
-        }
 
-        let candidate_path = self.slot_directory.join(CANDIDATE_FILE_NAME);
-        match fs::remove_file(&candidate_path) {
-            Ok(()) => {}
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(FileRestartCheckpointBaselinePublicationError::Io(
-                    FileRestartCheckpointSlotIoError::new(
-                        FileRestartCheckpointSlotIoStage::RemoveCandidateFile,
-                        source,
-                    ),
-                ));
+        let Self {
+            slot_directory,
+            directory,
+            armed_publication_fault,
+            ..
+        } = self;
+        publish_slot_current_bytes(slot_directory, directory, &encoded, |step| {
+            let point = FileRestartCheckpointBaselinePublicationFaultPoint::from_step(step);
+            if *armed_publication_fault == Some(point) {
+                *armed_publication_fault = None;
+                true
+            } else {
+                false
             }
-        }
-        if self.consume_publication_fault(
-            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCleanup,
-        ) {
-            return Err(
+        })
+        .map_err(|source| match source {
+            SlotPublicationError::InjectedFault(step) => {
                 FileRestartCheckpointBaselinePublicationError::InjectedFault(
-                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCleanup,
-                ),
-            );
-        }
-
-        let mut candidate_file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&candidate_path)
-            .map_err(|source| {
-                FileRestartCheckpointBaselinePublicationError::Io(
-                    FileRestartCheckpointSlotIoError::new(
-                        FileRestartCheckpointSlotIoStage::CreateCandidateFile,
-                        source,
-                    ),
+                    FileRestartCheckpointBaselinePublicationFaultPoint::from_step(step),
                 )
-            })?;
-        if self.consume_publication_fault(
-            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCreate,
-        ) {
-            return Err(
-                FileRestartCheckpointBaselinePublicationError::InjectedFault(
-                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateCreate,
-                ),
-            );
-        }
-
-        candidate_file.write_all(&encoded).map_err(|source| {
-            FileRestartCheckpointBaselinePublicationError::Io(
-                FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::WriteCandidateFile,
-                    source,
-                ),
-            )
-        })?;
-        if self.consume_publication_fault(
-            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateWrite,
-        ) {
-            return Err(
-                FileRestartCheckpointBaselinePublicationError::InjectedFault(
-                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateWrite,
-                ),
-            );
-        }
-
-        candidate_file.sync_all().map_err(|source| {
-            FileRestartCheckpointBaselinePublicationError::Io(
-                FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::SyncCandidateFile,
-                    source,
-                ),
-            )
-        })?;
-        drop(candidate_file);
-        if self.consume_publication_fault(
-            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateSync,
-        ) {
-            return Err(
-                FileRestartCheckpointBaselinePublicationError::InjectedFault(
-                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCandidateSync,
-                ),
-            );
-        }
-
-        let current_path = self.slot_directory.join(CURRENT_FILE_NAME);
-        fs::rename(&candidate_path, &current_path).map_err(|source| {
-            FileRestartCheckpointBaselinePublicationError::Io(
-                FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::ReplaceCurrentFile,
-                    source,
-                ),
-            )
-        })?;
-        if self.consume_publication_fault(
-            FileRestartCheckpointBaselinePublicationFaultPoint::AfterCurrentReplace,
-        ) {
-            return Err(
-                FileRestartCheckpointBaselinePublicationError::InjectedFault(
-                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterCurrentReplace,
-                ),
-            );
-        }
-
-        self.directory.sync_all().map_err(|source| {
-            FileRestartCheckpointBaselinePublicationError::Io(
-                FileRestartCheckpointSlotIoError::new(
-                    FileRestartCheckpointSlotIoStage::SyncPublishedSlotDirectory,
-                    source,
-                ),
-            )
-        })?;
-        if self.consume_publication_fault(
-            FileRestartCheckpointBaselinePublicationFaultPoint::AfterDirectorySync,
-        ) {
-            Err(
-                FileRestartCheckpointBaselinePublicationError::InjectedFault(
-                    FileRestartCheckpointBaselinePublicationFaultPoint::AfterDirectorySync,
-                ),
-            )
-        } else {
-            Ok(())
-        }
+            }
+            SlotPublicationError::Io(source) => {
+                FileRestartCheckpointBaselinePublicationError::Io(source)
+            }
+        })
     }
 }
 
@@ -1251,9 +977,41 @@ where
     })
 }
 
-fn build_control_header(persistent_log_id: PersistentLogId) -> [u8; CONTROL_HEADER_LENGTH] {
+/// Exact untyped failure while reading one optional selected slot value.
+///
+/// Each concrete adapter maps these variants onto its own public source error
+/// so the two slot namespaces never share a public error type.
+pub(crate) enum SlotCurrentReadError {
+    Io(FileRestartCheckpointSlotIoError),
+    CurrentLengthOutOfRange { actual: u64 },
+    CurrentCapacityExhausted { length: usize },
+    CurrentLengthChanged { before: u64, after: u64 },
+}
+
+/// Exact physical boundary inside one atomic slot publication attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotPublicationStep {
+    BeforeCandidateCleanup,
+    AfterCandidateCleanup,
+    AfterCandidateCreate,
+    AfterCandidateWrite,
+    AfterCandidateSync,
+    AfterCurrentReplace,
+    AfterDirectorySync,
+}
+
+/// Untyped publication failure before an adapter-specific error is built.
+pub(crate) enum SlotPublicationError {
+    InjectedFault(SlotPublicationStep),
+    Io(FileRestartCheckpointSlotIoError),
+}
+
+pub(crate) fn build_slot_control_header(
+    magic: [u8; 8],
+    persistent_log_id: PersistentLogId,
+) -> [u8; CONTROL_HEADER_LENGTH] {
     let mut header = [0_u8; CONTROL_HEADER_LENGTH];
-    header[..8].copy_from_slice(&CONTROL_MAGIC);
+    header[..8].copy_from_slice(&magic);
     write_u16(&mut header, 8, CONTROL_FORMAT_VERSION);
     write_u16(&mut header, 10, CONTROL_HEADER_LENGTH_U16);
     write_u32(&mut header, 12, 0);
@@ -1263,10 +1021,11 @@ fn build_control_header(persistent_log_id: PersistentLogId) -> [u8; CONTROL_HEAD
     header
 }
 
-fn parse_control_header(
+pub(crate) fn parse_slot_control_header(
+    magic: [u8; 8],
     header: &[u8; CONTROL_HEADER_LENGTH],
 ) -> Result<PersistentLogId, FileRestartCheckpointSlotFormatError> {
-    if header[..8] != CONTROL_MAGIC {
+    if header[..8] != magic {
         let mut actual = [0_u8; 8];
         actual.copy_from_slice(&header[..8]);
         return Err(FileRestartCheckpointSlotFormatError::new(
@@ -1327,6 +1086,357 @@ fn parse_control_header(
         ));
     }
     Ok(persistent_log_id)
+}
+
+/// Creates, locks, writes, and synchronizes one new lineaged control slot.
+///
+/// The exclusive control lock is acquired before the header is written or
+/// synchronized, so a cooperating adapter cannot observe an in-progress
+/// creation through a successfully opened slot. No rollback or best-effort
+/// cleanup is attempted after a partial failure.
+pub(crate) fn create_locked_control_slot(
+    slot_directory: &Path,
+    magic: [u8; 8],
+    persistent_log_id: PersistentLogId,
+) -> Result<(File, File), FileRestartCheckpointSlotCreateError> {
+    let control_path = slot_directory.join(CONTROL_FILE_NAME);
+
+    fs::create_dir(slot_directory).map_err(|source| {
+        FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::CreateSlotDirectory,
+            source,
+        ))
+    })?;
+    let mut control_file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&control_path)
+        .map_err(|source| {
+            FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
+                FileRestartCheckpointSlotIoStage::CreateControlFile,
+                source,
+            ))
+        })?;
+    control_file.try_lock().map_err(|source| {
+        FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::AcquireExclusiveControlLock,
+            source.into(),
+        ))
+    })?;
+
+    let header = build_slot_control_header(magic, persistent_log_id);
+    control_file.write_all(&header).map_err(|source| {
+        FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::WriteControlHeader,
+            source,
+        ))
+    })?;
+    control_file.sync_all().map_err(|source| {
+        FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::SyncControlFile,
+            source,
+        ))
+    })?;
+
+    let directory = File::open(slot_directory).map_err(|source| {
+        FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::OpenSlotDirectory,
+            source,
+        ))
+    })?;
+    directory.sync_all().map_err(|source| {
+        FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::SyncSlotDirectory,
+            source,
+        ))
+    })?;
+    sync_parent_directory(slot_directory)?;
+    Ok((control_file, directory))
+}
+
+/// Opens and exclusively locks one control file before parsing its bytes.
+///
+/// The returned control file and slot-directory handle are the adapter's
+/// lifetime lock and later directory-synchronization ownership.
+pub(crate) fn open_locked_control_slot(
+    slot_directory: &Path,
+    magic: [u8; 8],
+) -> Result<(File, File, PersistentLogId), FileRestartCheckpointSlotOpenError> {
+    let control_path = slot_directory.join(CONTROL_FILE_NAME);
+    let mut control_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(control_path)
+        .map_err(|source| {
+            FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
+                FileRestartCheckpointSlotIoStage::OpenControlFile,
+                source,
+            ))
+        })?;
+    control_file.try_lock().map_err(|source| {
+        FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::AcquireExclusiveControlLock,
+            source.into(),
+        ))
+    })?;
+
+    let control_length = control_file
+        .metadata()
+        .map_err(|source| {
+            FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
+                FileRestartCheckpointSlotIoStage::ReadControlMetadata,
+                source,
+            ))
+        })?
+        .len();
+    if control_length != CONTROL_HEADER_LENGTH as u64 {
+        return Err(FileRestartCheckpointSlotOpenError::Format(
+            FileRestartCheckpointSlotFormatError::new(
+                0,
+                FileRestartCheckpointSlotFormatErrorReason::FileLength {
+                    actual: control_length,
+                },
+            ),
+        ));
+    }
+
+    let mut header = [0_u8; CONTROL_HEADER_LENGTH];
+    control_file.read_exact(&mut header).map_err(|source| {
+        FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::ReadControlHeader,
+            source,
+        ))
+    })?;
+    let persistent_log_id = parse_slot_control_header(magic, &header)
+        .map_err(FileRestartCheckpointSlotOpenError::Format)?;
+    let directory = File::open(slot_directory).map_err(|source| {
+        FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::OpenSlotDirectory,
+            source,
+        ))
+    })?;
+    Ok((control_file, directory, persistent_log_id))
+}
+
+/// Reads the complete optional selected `current` value of one slot.
+///
+/// `Ok(None)` means exactly one existing slot directory with no `current`
+/// entry. A dangling link, directory, removed slot, access failure, short
+/// read, metadata failure, host-length overflow, capacity exhaustion, or
+/// length race is reported instead of absence.
+pub(crate) fn read_current_slot_bytes(
+    slot_directory: &Path,
+) -> Result<Option<Vec<u8>>, SlotCurrentReadError> {
+    let current_path = slot_directory.join(CURRENT_FILE_NAME);
+    let mut current_file = match File::open(&current_path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&current_path) {
+                Ok(_) => {
+                    return Err(SlotCurrentReadError::Io(
+                        FileRestartCheckpointSlotIoError::new(
+                            FileRestartCheckpointSlotIoStage::OpenCurrentFile,
+                            source,
+                        ),
+                    ));
+                }
+                Err(absence_source) if absence_source.kind() == io::ErrorKind::NotFound => {
+                    match fs::metadata(slot_directory) {
+                        Ok(metadata) if metadata.is_dir() => return Ok(None),
+                        Ok(_) => {
+                            return Err(SlotCurrentReadError::Io(
+                                FileRestartCheckpointSlotIoError::new(
+                                    FileRestartCheckpointSlotIoStage::OpenCurrentFile,
+                                    source,
+                                ),
+                            ));
+                        }
+                        Err(parent_source) => {
+                            return Err(SlotCurrentReadError::Io(
+                                FileRestartCheckpointSlotIoError::new(
+                                    FileRestartCheckpointSlotIoStage::VerifyCurrentAbsence,
+                                    parent_source,
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Err(absence_source) => {
+                    return Err(SlotCurrentReadError::Io(
+                        FileRestartCheckpointSlotIoError::new(
+                            FileRestartCheckpointSlotIoStage::VerifyCurrentAbsence,
+                            absence_source,
+                        ),
+                    ));
+                }
+            }
+        }
+        Err(source) => {
+            return Err(SlotCurrentReadError::Io(
+                FileRestartCheckpointSlotIoError::new(
+                    FileRestartCheckpointSlotIoStage::OpenCurrentFile,
+                    source,
+                ),
+            ));
+        }
+    };
+    let before = current_file
+        .metadata()
+        .map_err(|source| {
+            SlotCurrentReadError::Io(FileRestartCheckpointSlotIoError::new(
+                FileRestartCheckpointSlotIoStage::ReadCurrentMetadataBeforeRead,
+                source,
+            ))
+        })?
+        .len();
+    let length = usize::try_from(before)
+        .map_err(|_| SlotCurrentReadError::CurrentLengthOutOfRange { actual: before })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(length)
+        .map_err(|_| SlotCurrentReadError::CurrentCapacityExhausted { length })?;
+    bytes.resize(length, 0);
+    current_file.read_exact(&mut bytes).map_err(|source| {
+        SlotCurrentReadError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::ReadCurrentBytes,
+            source,
+        ))
+    })?;
+    let after = current_file
+        .metadata()
+        .map_err(|source| {
+            SlotCurrentReadError::Io(FileRestartCheckpointSlotIoError::new(
+                FileRestartCheckpointSlotIoStage::ReadCurrentMetadataAfterRead,
+                source,
+            ))
+        })?
+        .len();
+    if before != after {
+        return Err(SlotCurrentReadError::CurrentLengthChanged { before, after });
+    }
+    Ok(Some(bytes))
+}
+
+/// Performs one complete atomic replacement of a slot's selected `current`.
+///
+/// The caller supplies already encoded bytes; this operation performs no
+/// encoding, permit check, or slot-identity check. `fault` reports whether a
+/// deterministic test fault is armed at each exact physical boundary and
+/// consumes it when it fires.
+pub(crate) fn publish_slot_current_bytes<Fault>(
+    slot_directory: &Path,
+    directory: &File,
+    encoded: &[u8],
+    mut fault: Fault,
+) -> Result<(), SlotPublicationError>
+where
+    Fault: FnMut(SlotPublicationStep) -> bool,
+{
+    if fault(SlotPublicationStep::BeforeCandidateCleanup) {
+        return Err(SlotPublicationError::InjectedFault(
+            SlotPublicationStep::BeforeCandidateCleanup,
+        ));
+    }
+
+    let candidate_path = slot_directory.join(CANDIDATE_FILE_NAME);
+    match fs::remove_file(&candidate_path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(SlotPublicationError::Io(
+                FileRestartCheckpointSlotIoError::new(
+                    FileRestartCheckpointSlotIoStage::RemoveCandidateFile,
+                    source,
+                ),
+            ));
+        }
+    }
+    if fault(SlotPublicationStep::AfterCandidateCleanup) {
+        return Err(SlotPublicationError::InjectedFault(
+            SlotPublicationStep::AfterCandidateCleanup,
+        ));
+    }
+
+    let mut candidate_file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&candidate_path)
+        .map_err(|source| {
+            SlotPublicationError::Io(FileRestartCheckpointSlotIoError::new(
+                FileRestartCheckpointSlotIoStage::CreateCandidateFile,
+                source,
+            ))
+        })?;
+    if fault(SlotPublicationStep::AfterCandidateCreate) {
+        return Err(SlotPublicationError::InjectedFault(
+            SlotPublicationStep::AfterCandidateCreate,
+        ));
+    }
+
+    candidate_file.write_all(encoded).map_err(|source| {
+        SlotPublicationError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::WriteCandidateFile,
+            source,
+        ))
+    })?;
+    if fault(SlotPublicationStep::AfterCandidateWrite) {
+        return Err(SlotPublicationError::InjectedFault(
+            SlotPublicationStep::AfterCandidateWrite,
+        ));
+    }
+
+    candidate_file.sync_all().map_err(|source| {
+        SlotPublicationError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::SyncCandidateFile,
+            source,
+        ))
+    })?;
+    drop(candidate_file);
+    if fault(SlotPublicationStep::AfterCandidateSync) {
+        return Err(SlotPublicationError::InjectedFault(
+            SlotPublicationStep::AfterCandidateSync,
+        ));
+    }
+
+    let current_path = slot_directory.join(CURRENT_FILE_NAME);
+    fs::rename(&candidate_path, &current_path).map_err(|source| {
+        SlotPublicationError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::ReplaceCurrentFile,
+            source,
+        ))
+    })?;
+    if fault(SlotPublicationStep::AfterCurrentReplace) {
+        return Err(SlotPublicationError::InjectedFault(
+            SlotPublicationStep::AfterCurrentReplace,
+        ));
+    }
+
+    directory.sync_all().map_err(|source| {
+        SlotPublicationError::Io(FileRestartCheckpointSlotIoError::new(
+            FileRestartCheckpointSlotIoStage::SyncPublishedSlotDirectory,
+            source,
+        ))
+    })?;
+    if fault(SlotPublicationStep::AfterDirectorySync) {
+        Err(SlotPublicationError::InjectedFault(
+            SlotPublicationStep::AfterDirectorySync,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn build_control_header(persistent_log_id: PersistentLogId) -> [u8; CONTROL_HEADER_LENGTH] {
+    build_slot_control_header(CONTROL_MAGIC, persistent_log_id)
+}
+
+#[cfg(test)]
+fn parse_control_header(
+    header: &[u8; CONTROL_HEADER_LENGTH],
+) -> Result<PersistentLogId, FileRestartCheckpointSlotFormatError> {
+    parse_slot_control_header(CONTROL_MAGIC, header)
 }
 
 fn sync_parent_directory(

@@ -3499,9 +3499,45 @@ where
     }
 }
 
-/// Owning startup state released only after complete committed-page recovery.
+/// Owning startup state whose committed-page recovery has completed.
 ///
-/// Its private transition state and report prevent direct construction:
+/// Its adapters remain private until restart analysis also succeeds:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_inspect_before_analysis<Source, Store, const N: usize>(
+///     storage: &RecoveredTransactionPageStorage<Source, Store, N>,
+/// ) {
+///     let _ = storage.parts();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_before_analysis<Source, Store, const N: usize>(
+///     mut storage: RecoveredTransactionPageStorage<Source, Store, N>,
+/// ) {
+///     let _ = storage.parts_mut();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_extract_before_analysis<Source, Store, const N: usize>(
+///     storage: RecoveredTransactionPageStorage<Source, Store, N>,
+/// ) {
+///     let _ = storage.into_parts();
+/// }
+/// ```
 ///
 /// ```compile_fail
 /// use ntsql_transaction::{
@@ -3509,7 +3545,7 @@ where
 ///     UnrecoveredTransactionPageStorage,
 /// };
 ///
-/// fn cannot_forge_recovered<Source, Store, const N: usize>(
+/// fn cannot_forge_page_recovered<Source, Store, const N: usize>(
 ///     source: Source,
 ///     store: Store,
 ///     report: CommittedTransactionPagesRecoveryOutcome<N>,
@@ -3520,7 +3556,7 @@ where
 ///     }
 /// }
 /// ```
-#[must_use = "recovered storage owns the live source and page store"]
+#[must_use = "page-recovered storage must be restart-analyzed or dropped"]
 pub struct RecoveredTransactionPageStorage<Source, Store, const N: usize> {
     storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
     report: CommittedTransactionPagesRecoveryOutcome<N>,
@@ -3528,23 +3564,229 @@ pub struct RecoveredTransactionPageStorage<Source, Store, const N: usize> {
 
 impl<Source, Store, const N: usize> RecoveredTransactionPageStorage<Source, Store, N> {
     /// Returns the exact complete ordered startup recovery report.
-    pub const fn report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
+    pub const fn recovery_report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
         &self.report
     }
+}
 
-    /// Borrows the recovered source and store for read-only inspection.
+impl<Source, Store, const N: usize> RecoveredTransactionPageStorage<Source, Store, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    /// Consumes page-recovered storage and validates its complete restart prefix.
+    pub fn analyze_restart(
+        mut self,
+    ) -> Result<
+        RestartAnalyzedTransactionPageStorage<Source, Store, N>,
+        FailedTransactionPageStorageRestartAnalysis<Source, Store, N>,
+    > {
+        match analyze_durable_transaction_restart(&mut self.storage.source) {
+            Ok(analysis) => Ok(RestartAnalyzedTransactionPageStorage {
+                storage: self,
+                analysis,
+            }),
+            Err(error) => Err(FailedTransactionPageStorageRestartAnalysis {
+                storage: self,
+                error,
+            }),
+        }
+    }
+}
+
+/// Startup storage released only after page recovery and restart analysis.
+///
+/// Private fields prevent callers from substituting inert analysis metadata:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysis, RecoveredTransactionPageStorage,
+///     RestartAnalyzedTransactionPageStorage,
+/// };
+///
+/// fn cannot_forge_analyzed<Source, Store, const N: usize>(
+///     storage: RecoveredTransactionPageStorage<Source, Store, N>,
+///     analysis: DurableTransactionRestartAnalysis,
+/// ) -> RestartAnalyzedTransactionPageStorage<Source, Store, N> {
+///     RestartAnalyzedTransactionPageStorage { storage, analysis }
+/// }
+/// ```
+#[must_use = "restart-analyzed storage owns the live source and page store"]
+pub struct RestartAnalyzedTransactionPageStorage<Source, Store, const N: usize> {
+    storage: RecoveredTransactionPageStorage<Source, Store, N>,
+    analysis: DurableTransactionRestartAnalysis,
+}
+
+impl<Source, Store, const N: usize> RestartAnalyzedTransactionPageStorage<Source, Store, N> {
+    /// Returns the exact complete ordered committed-page recovery report.
+    pub const fn recovery_report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
+        &self.storage.report
+    }
+
+    /// Returns the exact point-in-time durable restart analysis.
+    pub const fn restart_analysis(&self) -> &DurableTransactionRestartAnalysis {
+        &self.analysis
+    }
+
+    /// Borrows the startup-validated source and store for read-only inspection.
     pub const fn parts(&self) -> (&Source, &Store) {
-        (&self.storage.source, &self.storage.store)
+        (&self.storage.storage.source, &self.storage.storage.store)
     }
 
-    /// Borrows the recovered source and store for subsequent live operations.
+    /// Borrows the startup-validated source and store for live operations.
     pub const fn parts_mut(&mut self) -> (&mut Source, &mut Store) {
-        (&mut self.storage.source, &mut self.storage.store)
+        (
+            &mut self.storage.storage.source,
+            &mut self.storage.storage.store,
+        )
     }
 
-    /// Consumes the recovered state and returns both adapters and startup report.
-    pub fn into_parts(self) -> (Source, Store, CommittedTransactionPagesRecoveryOutcome<N>) {
-        (self.storage.source, self.storage.store, self.report)
+    /// Consumes the validated state and returns adapters plus immutable evidence.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Source,
+        Store,
+        CommittedTransactionPagesRecoveryOutcome<N>,
+        DurableTransactionRestartAnalysis,
+    ) {
+        (
+            self.storage.storage.source,
+            self.storage.storage.store,
+            self.storage.report,
+            self.analysis,
+        )
+    }
+}
+
+/// Fail-closed restart-analysis state that retains the recovered storage pair.
+///
+/// The unchanged owned prefix provides no meaningful in-place retry, and neither
+/// adapter can escape this state:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartAnalysis,
+/// };
+///
+/// fn cannot_inspect_failed<Source, Store, const N: usize>(
+///     failure: &FailedTransactionPageStorageRestartAnalysis<Source, Store, N>,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+/// {
+///     let _ = failure.parts();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartAnalysis,
+/// };
+///
+/// fn cannot_mutate_failed<Source, Store, const N: usize>(
+///     mut failure: FailedTransactionPageStorageRestartAnalysis<Source, Store, N>,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+/// {
+///     let _ = failure.parts_mut();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartAnalysis,
+/// };
+///
+/// fn cannot_extract_failed<Source, Store, const N: usize>(
+///     failure: FailedTransactionPageStorageRestartAnalysis<Source, Store, N>,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+/// {
+///     let _ = failure.into_parts();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartAnalysis,
+/// };
+///
+/// fn cannot_retry_unchanged_prefix<Source, Store, const N: usize>(
+///     failure: FailedTransactionPageStorageRestartAnalysis<Source, Store, N>,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+/// {
+///     let _ = failure.retry();
+/// }
+/// ```
+#[must_use = "failed restart analysis retains storage until dropped"]
+pub struct FailedTransactionPageStorageRestartAnalysis<Source, Store, const N: usize>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    storage: RecoveredTransactionPageStorage<Source, Store, N>,
+    error: DurableTransactionRestartAnalysisError<Source::Error>,
+}
+
+impl<Source, Store, const N: usize> FailedTransactionPageStorageRestartAnalysis<Source, Store, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    /// Returns the successful committed-page recovery report.
+    pub const fn recovery_report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
+        &self.storage.report
+    }
+
+    /// Returns the exact source or evidence failure that blocked live access.
+    pub const fn error(&self) -> &DurableTransactionRestartAnalysisError<Source::Error> {
+        &self.error
+    }
+}
+
+impl<Source, Store, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRestartAnalysis<Source, Store, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Source::Error: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRestartAnalysis")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRestartAnalysis<Source, Store, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Source::Error: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction-page storage restart analysis failed: {}",
+            self.error
+        )
+    }
+}
+
+impl<Source, Store, const N: usize> Error
+    for FailedTransactionPageStorageRestartAnalysis<Source, Store, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Source::Error: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -6370,6 +6612,11 @@ mod tests {
         before_callback_error: Option<FakeFault>,
         after_callback_error: Option<FakeFault>,
         callbacks: usize,
+        restart_frontier: Option<LogSequenceNumber>,
+        restart_observations: Vec<DurableTransactionRestartObservation<1>>,
+        restart_before_callback_error: Option<FakeFault>,
+        restart_after_callback_error: Option<FakeFault>,
+        restart_callbacks: usize,
     }
 
     impl FakeDurablePageRecoverySource {
@@ -6398,6 +6645,11 @@ mod tests {
                 before_callback_error: None,
                 after_callback_error: None,
                 callbacks: 0,
+                restart_frontier: None,
+                restart_observations: Vec::new(),
+                restart_before_callback_error: None,
+                restart_after_callback_error: None,
+                restart_callbacks: 0,
             }
         }
     }
@@ -6410,6 +6662,35 @@ mod tests {
             match self.inventory_error.take() {
                 Some(source) => Err(source),
                 None => Ok(self.inventory.clone()),
+            }
+        }
+    }
+
+    impl DurableTransactionRestartAnalysisSource<1> for FakeDurablePageRecoverySource {
+        type Error = FakeFault;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn with_durable_transaction_restart_observations<Output, Operation>(
+            &mut self,
+            operation: Operation,
+        ) -> Result<Output, Self::Error>
+        where
+            Operation: for<'evidence> FnOnce(
+                Option<&'evidence LogSequenceNumber>,
+                &'evidence [DurableTransactionRestartObservation<1>],
+            ) -> Output,
+        {
+            if let Some(source) = self.restart_before_callback_error.take() {
+                return Err(source);
+            }
+            self.restart_callbacks += 1;
+            let output = operation(self.restart_frontier.as_ref(), &self.restart_observations);
+            match self.restart_after_callback_error.take() {
+                Some(source) => Err(source),
+                None => Ok(output),
             }
         }
     }
@@ -6715,6 +6996,8 @@ mod tests {
         let mut physical = Vec::new();
         let mut owned = Vec::new();
         let mut commits = Vec::new();
+        let mut restart_observations = Vec::new();
+        let mut restart_frontier = None;
         for (index, page_number) in page_numbers.iter().copied().enumerate() {
             let sequence = u64::try_from(index + 1).map_err(|_| TestError("batch sequence"))?;
             let page_position = sequence
@@ -6742,13 +7025,20 @@ mod tests {
                 page_position,
             )?);
             commits.push(durable_commit_observation(lineage, owner, commit_position)?);
+            restart_observations.push(restart_owned_page(
+                lineage,
+                owner,
+                page_number,
+                page_position,
+            )?);
+            restart_observations.push(restart_commit(lineage, owner, commit_position)?);
+            restart_frontier = Some(lineage.position(commit_position));
         }
-        Ok(FakeDurablePageRecoverySource::new(
-            lineage.clone(),
-            physical,
-            owned,
-            commits,
-        ))
+        let mut source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), physical, owned, commits);
+        source.restart_frontier = restart_frontier;
+        source.restart_observations = restart_observations;
+        Ok(source)
     }
 
     #[test]
@@ -9481,14 +9771,14 @@ mod tests {
     }
 
     #[test]
-    fn owning_recovery_state_retains_failure_and_releases_parts_only_after_fresh_retry()
+    fn owning_recovery_state_releases_parts_only_after_retry_and_restart_analysis()
     -> Result<(), TestError> {
         let lineage = LogLineage::new();
         let first_page = PageNumber::new(81).ok_or(TestError("first owning page"))?;
         let failed_page = PageNumber::new(82).ok_or(TestError("failed owning page"))?;
         let last_page = PageNumber::new(83).ok_or(TestError("last owning page"))?;
         let source = batch_recovery_source(&lineage, &[81, 82, 83])?;
-        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
         store.write_fault = Some((
             failed_page,
             FakeRecoveryWriteFault::Before(FakeFault("batch write")),
@@ -9512,12 +9802,15 @@ mod tests {
         assert_eq!(state.as_ref().cause(), &FakeFault("batch write"));
         assert!(Error::source(&failure).is_some());
 
-        let mut recovered = failure
+        let page_recovered = failure
             .retry()
             .map_err(|_| TestError("fresh owning retry failed"))?;
+        let mut recovered = page_recovered
+            .analyze_restart()
+            .map_err(|_| TestError("owning restart analysis failed"))?;
         assert_eq!(
             recovered
-                .report()
+                .recovery_report()
                 .pages()
                 .iter()
                 .map(CommittedTransactionPageRecoveryOutcome::page_number)
@@ -9525,21 +9818,123 @@ mod tests {
             [first_page, failed_page, last_page]
         );
         assert!(matches!(
-            recovered.report().pages()[0],
+            recovered.recovery_report().pages()[0],
             CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
         ));
+        assert!(
+            recovered
+                .restart_analysis()
+                .lineage()
+                .same_lineage(&lineage)
+        );
+        assert_eq!(
+            recovered.restart_analysis().durable_frontier(),
+            Some(&lineage.position(6))
+        );
+        let transactions = recovered.restart_analysis().transactions();
+        assert_eq!(transactions.len(), 3);
+        for (index, entry) in transactions.iter().enumerate() {
+            let sequence =
+                u64::try_from(index + 1).map_err(|_| TestError("owning transaction sequence"))?;
+            let page_position = sequence
+                .checked_mul(2)
+                .and_then(|position| position.checked_sub(1))
+                .ok_or(TestError("owning page position"))?;
+            let commit_position = page_position
+                .checked_add(1)
+                .ok_or(TestError("owning commit position"))?;
+            assert_eq!(entry.transaction(), durable_identity(40, sequence)?);
+            assert_eq!(
+                entry.first_owned_page_position(),
+                Some(&lineage.position(page_position))
+            );
+            assert_eq!(
+                entry.last_owned_page_position(),
+                Some(&lineage.position(page_position))
+            );
+            assert_eq!(entry.owned_page_record_count(), 1);
+            assert_eq!(
+                entry.state().commit_position(),
+                Some(&lineage.position(commit_position))
+            );
+        }
         let (source, store) = recovered.parts_mut();
         assert_eq!(source.inventory_calls, 2);
         assert_eq!(source.callbacks, 5);
+        assert_eq!(source.restart_callbacks, 1);
+        assert_eq!(
+            store.observations.borrow().as_slice(),
+            &[first_page, failed_page, first_page, failed_page, last_page]
+        );
         assert_eq!(
             store.attempts,
             [first_page, failed_page, failed_page, last_page]
         );
 
-        let (source, store, report) = recovered.into_parts();
+        let (source, store, report, analysis) = recovered.into_parts();
         assert_eq!(source.inventory_calls, 2);
+        assert_eq!(source.restart_callbacks, 1);
         assert_eq!(store.current.len(), 3);
         assert_eq!(report.pages().len(), 3);
+        assert_eq!(analysis.transactions().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn restart_analysis_ownership_fails_closed_with_exact_evidence_and_source_errors()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let transaction = durable_identity(90, 1)?;
+        let mut contradictory =
+            FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
+        contradictory.restart_frontier = Some(lineage.position(2));
+        contradictory.restart_observations = vec![
+            restart_commit(&lineage, transaction, 1)?,
+            restart_commit(&lineage, transaction, 2)?,
+        ];
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+
+        let page_recovered = UnrecoveredTransactionPageStorage::new(contradictory, store)
+            .recover()
+            .map_err(|_| TestError("empty page recovery failed"))?;
+        let failure = page_recovered
+            .analyze_restart()
+            .err()
+            .ok_or(TestError("duplicate commit reached live storage"))?;
+        assert!(failure.recovery_report().pages().is_empty());
+        assert!(matches!(
+            failure.error(),
+            DurableTransactionRestartAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartAnalysisEvidenceError::DuplicateCommit {
+                        transaction: actual,
+                        first_commit_position,
+                        duplicate_commit_position,
+                    } if *actual == transaction
+                        && first_commit_position == &lineage.position(1)
+                        && duplicate_commit_position == &lineage.position(2)
+                )
+        ));
+        assert!(Error::source(&failure).is_some());
+
+        let mut unavailable =
+            FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
+        unavailable.restart_before_callback_error = Some(FakeFault("restart source"));
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        let page_recovered = UnrecoveredTransactionPageStorage::new(unavailable, store)
+            .recover()
+            .map_err(|_| TestError("source-failure page recovery failed"))?;
+        let failure = page_recovered
+            .analyze_restart()
+            .err()
+            .ok_or(TestError("restart source failure reached live storage"))?;
+        assert!(failure.recovery_report().pages().is_empty());
+        assert!(matches!(
+            failure.error(),
+            DurableTransactionRestartAnalysisError::Source(FakeFault("restart source"))
+        ));
+        assert!(Error::source(&failure).is_some());
         Ok(())
     }
 

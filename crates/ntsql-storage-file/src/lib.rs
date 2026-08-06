@@ -97,6 +97,30 @@
 //! preceding blob. Decoding returns owned untrusted fields and performs no file
 //! I/O, publication, startup selection, or checkpoint validation.
 //!
+//! ## Restart checkpoint completeness baseline codec v1
+//!
+//! [`restart_checkpoint_completeness_codec`] is a second, completely
+//! independent pure-memory codec for ADR 0048's
+//! `DurableTransactionRestartCheckpointCompletenessBaseline`. It uses its own
+//! `NTSQCMP1` header and `NTSQCME1` footer namespace; it does not extend,
+//! wrap, or reinterpret the ADR 0044 `NTSQCKP1` bytes above, and encoding or
+//! decoding one format never touches the other's bytes or module.
+//!
+//! A fixed 128-byte header is followed by fixed 64-byte transaction entries
+//! (retaining ADR 0044's exact field layout as an independent copy), then
+//! fixed 64-byte page entries, then one 16-byte footer. The header carries the
+//! exact geometry, raw persistent ID, baseline frontier payload and presence,
+//! transaction/page counts, total length, and the replay kind plus
+//! independent optional frontier/position/cause fields and cause payloads.
+//! Each page entry independently retains its page number, optional
+//! required-image payload/kind, optional stored position, and state
+//! discriminator; unused absent or raw-kind fields are structurally canonical
+//! zero, as are unused replay payloads. Decoding validates every discriminant,
+//! presence bit, canonical-zero field, and reserved byte, plus the complete
+//! blob checksum, before returning only an owned untrusted completeness
+//! observation. It never sorts, deduplicates, infers, compares, or authorizes
+//! semantic relationships.
+//!
 //! ## Filesystem restart checkpoint baseline source
 //!
 //! One caller-selected checkpoint slot directory contains an immutable
@@ -136,12 +160,22 @@ use ntsql_transaction::{
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
 mod restart_checkpoint_codec;
+mod restart_checkpoint_completeness_codec;
 mod restart_checkpoint_file;
 
 pub use restart_checkpoint_codec::{
     RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,
     RestartCheckpointBaselineEntryOptionalField, decode_restart_checkpoint_baseline,
     encode_restart_checkpoint_baseline,
+};
+pub use restart_checkpoint_completeness_codec::{
+    RestartCheckpointCompletenessBaselineDecodeError,
+    RestartCheckpointCompletenessBaselineEncodeError,
+    RestartCheckpointCompletenessBaselineEntryOptionalField,
+    RestartCheckpointCompletenessBaselineReplayCauseField,
+    RestartCheckpointCompletenessBaselineRequiredImageField,
+    decode_restart_checkpoint_completeness_baseline,
+    encode_restart_checkpoint_completeness_baseline,
 };
 pub use restart_checkpoint_file::{
     FileRestartCheckpointBaselinePublicationError,

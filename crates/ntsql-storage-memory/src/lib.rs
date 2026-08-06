@@ -13,7 +13,8 @@ use ntsql_transaction::{
     DurableCommittedTransactionPageRecoveryComparisonError, DurableTransactionCommitObservation,
     DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
     DurableTransactionPageObservationBytesError, DurableTransactionPageRecoveryInventory,
-    DurableTransactionPageRecoverySource, TransactionCommitRecord, TransactionEpochSource,
+    DurableTransactionPageRecoverySource, DurableTransactionRestartAnalysisSource,
+    DurableTransactionRestartObservation, TransactionCommitRecord, TransactionEpochSource,
     TransactionId, TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
     compare_committed_transaction_page_recovery_candidate,
 };
@@ -259,13 +260,7 @@ impl<const N: usize> InMemoryLogRecord<N> {
         &self,
     ) -> Result<Option<DurablePageWalObservation<N>>, PageRecoveryObservationBytesError<N>> {
         match self.page_write() {
-            Some(record) => DurablePageWalObservation::from_bytes(
-                record.page_number(),
-                record.page_version(),
-                *record.bytes(),
-                self.position.clone(),
-            )
-            .map(Some),
+            Some(record) => self.project_page_recovery_observation(record).map(Some),
             None => Ok(None),
         }
     }
@@ -284,19 +279,9 @@ impl<const N: usize> InMemoryLogRecord<N> {
         DurableTransactionPageObservationBytesError<N>,
     > {
         match self.transaction_page_write() {
-            Some(record) => {
-                let transaction_id = record.transaction_id();
-                let page = record.page_write();
-                DurableTransactionPageObservation::from_bytes(
-                    transaction_id.epoch().get(),
-                    transaction_id.sequence(),
-                    page.page_number(),
-                    page.page_version(),
-                    *page.bytes(),
-                    self.position.clone(),
-                )
-                .map(Some)
-            }
+            Some(record) => self
+                .project_transaction_page_recovery_observation(record)
+                .map(Some),
             None => Ok(None),
         }
     }
@@ -313,14 +298,52 @@ impl<const N: usize> InMemoryLogRecord<N> {
         DurableTransactionCommitObservationFieldsError,
     > {
         match self.transaction_id() {
-            Some(transaction_id) => DurableTransactionCommitObservation::from_fields(
-                transaction_id.epoch().get(),
-                transaction_id.sequence(),
-                self.position.clone(),
-            )
-            .map(Some),
+            Some(transaction_id) => self
+                .project_transaction_commit_recovery_observation(transaction_id)
+                .map(Some),
             None => Ok(None),
         }
+    }
+
+    fn project_page_recovery_observation(
+        &self,
+        record: &InMemoryPageWriteRecord<N>,
+    ) -> Result<DurablePageWalObservation<N>, PageRecoveryObservationBytesError<N>> {
+        DurablePageWalObservation::from_bytes(
+            record.page_number(),
+            record.page_version(),
+            *record.bytes(),
+            self.position.clone(),
+        )
+    }
+
+    fn project_transaction_page_recovery_observation(
+        &self,
+        record: &InMemoryTransactionPageWriteRecord<N>,
+    ) -> Result<DurableTransactionPageObservation<N>, DurableTransactionPageObservationBytesError<N>>
+    {
+        let transaction_id = record.transaction_id();
+        let page = record.page_write();
+        DurableTransactionPageObservation::from_bytes(
+            transaction_id.epoch().get(),
+            transaction_id.sequence(),
+            page.page_number(),
+            page.page_version(),
+            *page.bytes(),
+            self.position.clone(),
+        )
+    }
+
+    fn project_transaction_commit_recovery_observation(
+        &self,
+        transaction_id: TransactionId,
+    ) -> Result<DurableTransactionCommitObservation, DurableTransactionCommitObservationFieldsError>
+    {
+        DurableTransactionCommitObservation::from_fields(
+            transaction_id.epoch().get(),
+            transaction_id.sequence(),
+            self.position.clone(),
+        )
     }
 }
 
@@ -856,6 +879,56 @@ impl<const N: usize> Error for InMemoryCommittedPageRecoverySourceError<N> {
     }
 }
 
+/// Failure to project one complete in-memory durable prefix for restart analysis.
+#[derive(Debug, Eq, PartialEq)]
+pub enum InMemoryTransactionRestartAnalysisSourceError<const N: usize> {
+    /// The unified observation stream could not reserve its durable-prefix bound.
+    ObservationCapacityExhausted {
+        /// Exact number of durable logical records that required reservation.
+        record_count: usize,
+    },
+    /// One raw page record could not become adapter-neutral restart evidence.
+    PageProjection(Box<PageRecoveryObservationBytesError<N>>),
+    /// One transaction-owned page could not become restart evidence.
+    TransactionPageProjection(Box<DurableTransactionPageObservationBytesError<N>>),
+    /// One transaction commit could not become restart evidence.
+    CommitProjection(Box<DurableTransactionCommitObservationFieldsError>),
+}
+
+impl<const N: usize> fmt::Display for InMemoryTransactionRestartAnalysisSourceError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ObservationCapacityExhausted { record_count } => write!(
+                formatter,
+                "in-memory restart observation capacity is exhausted for {record_count} durable records"
+            ),
+            Self::PageProjection(source) => {
+                write!(formatter, "raw page restart projection failed: {source}")
+            }
+            Self::TransactionPageProjection(source) => {
+                write!(
+                    formatter,
+                    "transaction page restart projection failed: {source}"
+                )
+            }
+            Self::CommitProjection(source) => {
+                write!(formatter, "commit restart projection failed: {source}")
+            }
+        }
+    }
+}
+
+impl<const N: usize> Error for InMemoryTransactionRestartAnalysisSourceError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PageProjection(source) => Some(source.as_ref()),
+            Self::TransactionPageProjection(source) => Some(source.as_ref()),
+            Self::CommitProjection(source) => Some(source.as_ref()),
+            Self::ObservationCapacityExhausted { .. } => None,
+        }
+    }
+}
+
 /// Inspectable in-memory implementation of the transaction and page WAL ports.
 ///
 /// This adapter models only repository-authored physical effects. Its durable
@@ -1175,6 +1248,66 @@ impl<const N: usize> DurableTransactionPageRecoverySource<N> for InMemoryCommitL
         }
 
         Ok(operation(&physical_pages, &transaction_pages, &commits))
+    }
+}
+
+impl<const N: usize> DurableTransactionRestartAnalysisSource<N> for InMemoryCommitLog<N> {
+    type Error = InMemoryTransactionRestartAnalysisSourceError<N>;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    fn with_durable_transaction_restart_observations<Output, Operation>(
+        &mut self,
+        operation: Operation,
+    ) -> Result<Output, Self::Error>
+    where
+        Operation: for<'evidence> FnOnce(
+            Option<&'evidence LogSequenceNumber>,
+            &'evidence [DurableTransactionRestartObservation<N>],
+        ) -> Output,
+    {
+        let durable_len = self.durable_len;
+        let durable_frontier = self.durable_position();
+        let mut observations = Vec::new();
+        observations.try_reserve(durable_len).map_err(|_| {
+            InMemoryTransactionRestartAnalysisSourceError::ObservationCapacityExhausted {
+                record_count: durable_len,
+            }
+        })?;
+
+        for record in self.durable_records() {
+            let observation = match record.kind() {
+                InMemoryLogRecordKind::TransactionCommit { transaction_id } => record
+                    .project_transaction_commit_recovery_observation(*transaction_id)
+                    .map(DurableTransactionRestartObservation::Commit)
+                    .map_err(|source| {
+                        InMemoryTransactionRestartAnalysisSourceError::CommitProjection(Box::new(
+                            source,
+                        ))
+                    })?,
+                InMemoryLogRecordKind::PageWrite(page) => record
+                    .project_page_recovery_observation(page)
+                    .map(DurableTransactionRestartObservation::Page)
+                    .map_err(|source| {
+                        InMemoryTransactionRestartAnalysisSourceError::PageProjection(Box::new(
+                            source,
+                        ))
+                    })?,
+                InMemoryLogRecordKind::TransactionPageWrite(transaction_page) => record
+                    .project_transaction_page_recovery_observation(transaction_page)
+                    .map(DurableTransactionRestartObservation::TransactionPage)
+                    .map_err(|source| {
+                        InMemoryTransactionRestartAnalysisSourceError::TransactionPageProjection(
+                            Box::new(source),
+                        )
+                    })?,
+            };
+            observations.push(observation);
+        }
+
+        Ok(operation(durable_frontier.as_ref(), &observations))
     }
 }
 
@@ -1695,6 +1828,149 @@ mod tests {
             projection: InMemoryPageRecoveryProjection::Commits,
         };
         assert!(Error::source(&capacity).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn restart_source_errors_retain_projection_causes() -> Result<(), Box<dyn Error>> {
+        let page_number =
+            PageNumber::new(93).ok_or_else(|| io::Error::other("page number is zero"))?;
+
+        let raw_lineage = LogLineage::new();
+        let raw_position = raw_lineage.position(1);
+        let expected_raw = DurablePageWalObservation::<0>::from_bytes(
+            page_number,
+            PageVersion::new(1),
+            [],
+            raw_position.clone(),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width raw page projected"))?;
+        let mut raw_log = InMemoryCommitLog::<0>::with_lineage(raw_lineage);
+        raw_log.records.push(InMemoryLogRecord {
+            position: raw_position,
+            kind: InMemoryLogRecordKind::PageWrite(InMemoryPageWriteRecord {
+                page_number,
+                page_version: PageVersion::new(1),
+                bytes: [],
+            }),
+        });
+        raw_log.durable_len = 1;
+        let mut raw_callback = false;
+        let raw_error =
+            DurableTransactionRestartAnalysisSource::with_durable_transaction_restart_observations(
+                &mut raw_log,
+                |_frontier, _observations| raw_callback = true,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("malformed raw page entered restart analysis"))?;
+        assert!(!raw_callback);
+        assert!(Error::source(&raw_error).is_some());
+        let InMemoryTransactionRestartAnalysisSourceError::PageProjection(source) = raw_error
+        else {
+            return Err(io::Error::other("raw restart cause changed variant").into());
+        };
+        assert_eq!(*source, expected_raw);
+
+        let mut identity_log = InMemoryCommitLog::<1>::new();
+        let mut coordinator = TransactionCoordinator::open(&mut identity_log)?;
+        let owner = coordinator.begin()?.transaction_id();
+
+        let transaction_lineage = LogLineage::new();
+        let transaction_position = transaction_lineage.position(2);
+        let expected_transaction = DurableTransactionPageObservation::<0>::from_bytes(
+            owner.epoch().get(),
+            owner.sequence(),
+            page_number,
+            PageVersion::new(2),
+            [],
+            transaction_position.clone(),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width transaction page projected"))?;
+        let mut transaction_log = InMemoryCommitLog::<0>::with_lineage(transaction_lineage);
+        transaction_log.records.push(InMemoryLogRecord {
+            position: transaction_position,
+            kind: InMemoryLogRecordKind::TransactionPageWrite(InMemoryTransactionPageWriteRecord {
+                transaction_id: owner,
+                page: InMemoryPageWriteRecord {
+                    page_number,
+                    page_version: PageVersion::new(2),
+                    bytes: [],
+                },
+            }),
+        });
+        transaction_log.durable_len = 1;
+        let mut transaction_callback = false;
+        let transaction_error =
+            DurableTransactionRestartAnalysisSource::with_durable_transaction_restart_observations(
+                &mut transaction_log,
+                |_frontier, _observations| transaction_callback = true,
+            )
+            .err()
+            .ok_or_else(|| {
+                io::Error::other("malformed transaction page entered restart analysis")
+            })?;
+        assert!(!transaction_callback);
+        assert!(Error::source(&transaction_error).is_some());
+        let InMemoryTransactionRestartAnalysisSourceError::TransactionPageProjection(source) =
+            transaction_error
+        else {
+            return Err(io::Error::other("transaction restart cause changed variant").into());
+        };
+        assert_eq!(*source, expected_transaction);
+
+        let commit_lineage = LogLineage::new();
+        let zero_position = commit_lineage.position(0);
+        let expected_commit = DurableTransactionCommitObservation::from_fields(
+            owner.epoch().get(),
+            owner.sequence(),
+            zero_position.clone(),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-position commit projected"))?;
+        let mut commit_log = InMemoryCommitLog::<1>::with_lineage(commit_lineage);
+        commit_log.records.push(InMemoryLogRecord {
+            position: zero_position,
+            kind: InMemoryLogRecordKind::TransactionCommit {
+                transaction_id: owner,
+            },
+        });
+        commit_log.durable_len = 1;
+        let mut commit_callback = false;
+        let commit_error =
+            DurableTransactionRestartAnalysisSource::with_durable_transaction_restart_observations(
+                &mut commit_log,
+                |_frontier, _observations| commit_callback = true,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("malformed commit entered restart analysis"))?;
+        assert!(!commit_callback);
+        assert!(Error::source(&commit_error).is_some());
+        let InMemoryTransactionRestartAnalysisSourceError::CommitProjection(source) = commit_error
+        else {
+            return Err(io::Error::other("commit restart cause changed variant").into());
+        };
+        assert_eq!(*source, expected_commit);
+
+        let mut capacity_log = InMemoryCommitLog::<1>::new();
+        capacity_log.durable_len = usize::MAX;
+        let mut capacity_callback = false;
+        let capacity =
+            DurableTransactionRestartAnalysisSource::with_durable_transaction_restart_observations(
+                &mut capacity_log,
+                |_frontier, _observations| capacity_callback = true,
+            )
+            .err()
+            .ok_or_else(|| io::Error::other("impossible restart capacity was reserved"))?;
+        assert!(!capacity_callback);
+        assert!(Error::source(&capacity).is_none());
+        assert_eq!(
+            capacity,
+            InMemoryTransactionRestartAnalysisSourceError::ObservationCapacityExhausted {
+                record_count: usize::MAX,
+            }
+        );
         Ok(())
     }
 

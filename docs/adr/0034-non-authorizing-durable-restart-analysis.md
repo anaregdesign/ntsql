@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #120
 - Extends: ADR 0023, ADR 0025, ADR 0033
+- Extended by: ADR 0035
 
 ## Context
 
@@ -255,7 +256,8 @@ The transaction domain can now validate one complete unified durable logical
 prefix and reconstruct deterministic committed/uncommitted transaction metadata
 without granting replay or persistence authority.
 
-The next slice may implement one-pass stable-prefix projection in the memory and
-filesystem WAL adapters. A later owning transition may bind this analysis to
-recovered storage. Persisted checkpoints, dirty-page analysis, replay start,
-undo, and log reclamation remain separately reviewed work.
+ADR 0035 implements one-pass stable-prefix projection in the memory WAL adapter.
+The next slice may implement the same contract in the filesystem WAL adapter. A
+later owning transition may bind this analysis to recovered storage. Persisted
+checkpoints, dirty-page analysis, replay start, undo, and log reclamation remain
+separately reviewed work.

@@ -3380,6 +3380,24 @@ mod tests {
         );
         assert_eq!(recovered.parts().1.pages().len(), page_count);
 
+        let completeness_baseline =
+            recovered.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        assert_eq!(completeness_baseline.persistent_log_id(), persistent_log_id);
+        assert_eq!(
+            completeness_baseline.durable_frontier(),
+            Some(live_frontier.get())
+        );
+        assert_eq!(completeness_baseline.pages(), completeness.pages());
+        assert_eq!(
+            completeness_baseline.replay_start(),
+            completeness.replay_start()
+        );
+        assert_eq!(
+            completeness_baseline.transactions(),
+            completeness_baseline.transaction_baseline().transactions()
+        );
+        assert_eq!(recovered.parts().1.pages().len(), page_count);
+
         let duplicate_commit = recovered
             .parts()
             .0

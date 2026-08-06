@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     error::Error,
     fmt,
+    marker::PhantomData,
     num::NonZeroU64,
     sync::Arc,
 };
@@ -2276,6 +2277,802 @@ pub fn compare_committed_transaction_page_recovery_candidate<const N: usize>(
     }
 }
 
+/// Trusted source of one stable authoritative durable page-recovery prefix.
+///
+/// Implementations must build all three slices from one durable prefix, keep
+/// that prefix from advancing for the callback's full duration, and return the
+/// callback output directly once invoked. The physical and owner-aware slices
+/// must be complete for `page_number`; the commit slice must be complete for the
+/// prefix. The domain trusts these adapter obligations.
+///
+/// `Output` cannot borrow callback evidence:
+///
+/// ```compile_fail
+/// use ntsql_page::{DurablePageWalObservation, PageNumber};
+/// use ntsql_transaction::DurableTransactionPageRecoverySource;
+///
+/// fn cannot_escape<'source, Source, const N: usize>(
+///     source: &'source mut Source,
+///     page_number: PageNumber,
+/// ) -> Result<&'source [DurablePageWalObservation<N>], Source::Error>
+/// where
+///     Source: DurableTransactionPageRecoverySource<N>,
+/// {
+///     source.with_durable_page_evidence(
+///         page_number,
+///         |physical, _owned, _commits| physical,
+///     )
+/// }
+/// ```
+///
+/// A safe implementation cannot manufacture an arbitrary successful `Output`
+/// without invoking the callback:
+///
+/// ```compile_fail
+/// use ntsql_page::{DurablePageWalObservation, PageNumber};
+/// use ntsql_transaction::{
+///     DurableTransactionCommitObservation, DurableTransactionPageObservation,
+///     DurableTransactionPageRecoverySource,
+/// };
+/// use ntsql_wal::LogLineage;
+///
+/// struct InvalidSource {
+///     lineage: LogLineage,
+/// }
+///
+/// impl<const N: usize> DurableTransactionPageRecoverySource<N> for InvalidSource {
+///     type Error = ();
+///
+///     fn lineage(&self) -> &LogLineage {
+///         &self.lineage
+///     }
+///
+///     fn with_durable_page_evidence<Output, Operation>(
+///         &mut self,
+///         _page_number: PageNumber,
+///         _operation: Operation,
+///     ) -> Result<Output, Self::Error>
+///     where
+///         Operation: for<'evidence> FnOnce(
+///             &'evidence [DurablePageWalObservation<N>],
+///             &'evidence [DurableTransactionPageObservation<N>],
+///             &'evidence [DurableTransactionCommitObservation],
+///         ) -> Output,
+///     {
+///         Ok(Default::default())
+///     }
+/// }
+/// ```
+pub trait DurableTransactionPageRecoverySource<const N: usize> {
+    /// Source-specific failure before authoritative evidence is available.
+    type Error;
+
+    /// Returns the exact WAL lineage whose stable prefix will be projected.
+    fn lineage(&self) -> &LogLineage;
+
+    /// Runs one operation while the projected durable prefix remains stable.
+    fn with_durable_page_evidence<Output, Operation>(
+        &mut self,
+        page_number: PageNumber,
+        operation: Operation,
+    ) -> Result<Output, Self::Error>
+    where
+        Operation: for<'evidence> FnOnce(
+            &'evidence [DurablePageWalObservation<N>],
+            &'evidence [DurableTransactionPageObservation<N>],
+            &'evidence [DurableTransactionCommitObservation],
+        ) -> Output;
+}
+
+type CommittedPageRecoveryAttemptBrand<'attempt> = (&'attempt (), fn(&'attempt ()) -> &'attempt ());
+
+/// Single-use proof that the recovery gate authorized one exact store attempt.
+///
+/// Fields and construction are private. The invariant attempt brand cannot
+/// escape the gate, be widened, or be cloned.
+///
+/// ```compile_fail
+/// use ntsql_transaction::CommittedTransactionPageRecoveryWritePermit;
+/// use ntsql_wal::LogLineage;
+///
+/// fn cannot_forge() {
+///     let lineage = LogLineage::new();
+///     let _permit = CommittedTransactionPageRecoveryWritePermit {
+///         page_position: lineage.position(1),
+///         commit_position: lineage.position(2),
+///     };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::CommittedTransactionPageRecoveryWritePermit;
+///
+/// fn cannot_clone(permit: CommittedTransactionPageRecoveryWritePermit<'_>) {
+///     let _copy = permit.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::CommittedTransactionPageRecoveryWritePermit;
+///
+/// fn cannot_widen<'attempt>(
+///     permit: CommittedTransactionPageRecoveryWritePermit<'attempt>,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'static> {
+///     permit
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub struct CommittedTransactionPageRecoveryWritePermit<'attempt> {
+    page_position: LogSequenceNumber,
+    commit_position: LogSequenceNumber,
+    attempt_brand: PhantomData<CommittedPageRecoveryAttemptBrand<'attempt>>,
+}
+
+impl CommittedTransactionPageRecoveryWritePermit<'_> {
+    /// Returns the exact committed page position authorized for this attempt.
+    #[must_use]
+    pub const fn page_position(&self) -> &LogSequenceNumber {
+        &self.page_position
+    }
+
+    /// Returns the exact matching commit position authorized for this attempt.
+    #[must_use]
+    pub const fn commit_position(&self) -> &LogSequenceNumber {
+        &self.commit_position
+    }
+}
+
+fn with_committed_page_recovery_write_permit<Output, Operation>(
+    page_position: LogSequenceNumber,
+    commit_position: LogSequenceNumber,
+    operation: Operation,
+) -> Output
+where
+    Operation:
+        for<'attempt> FnOnce(CommittedTransactionPageRecoveryWritePermit<'attempt>) -> Output,
+{
+    operation(CommittedTransactionPageRecoveryWritePermit {
+        page_position,
+        commit_position,
+        attempt_brand: PhantomData,
+    })
+}
+
+/// Recovery-only page-store port with atomic source recheck and replacement.
+///
+/// `compare_and_replace` must validate the permit against the candidate, recheck
+/// the exact source precondition against authoritative current store state, and
+/// durably write the exact target under one continuous exclusive hold. An error
+/// after this method is invoked does not prove whether the target became durable.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore,
+///     DurableCommittedTransactionPageRecoveryCandidate,
+/// };
+///
+/// fn cannot_call_without_permit<Store, const N: usize>(
+///     store: &mut Store,
+///     candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+/// )
+/// where
+///     Store: CommittedTransactionPageRecoveryStore<N>,
+/// {
+///     let _ = store.compare_and_replace(candidate);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore,
+///     DurableCommittedTransactionPageRecoveryCandidate,
+/// };
+///
+/// fn cannot_substitute_live_permit<Store, const N: usize>(
+///     store: &mut Store,
+///     candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+///     permit: PageWritePermit<'_>,
+/// )
+/// where
+///     Store: CommittedTransactionPageRecoveryStore<N>,
+/// {
+///     let _ = store.compare_and_replace(candidate, permit);
+/// }
+/// ```
+pub trait CommittedTransactionPageRecoveryStore<const N: usize> {
+    /// Adapter-specific current-snapshot observation failure.
+    type ObservationError;
+    /// Adapter-specific compare-and-replace failure.
+    type WriteError;
+
+    /// Returns the exact lineage this store protects.
+    fn lineage(&self) -> &LogLineage;
+
+    /// Observes the authoritative current snapshot under store ownership.
+    fn observe_page(
+        &self,
+        page_number: PageNumber,
+    ) -> Result<Option<StoredPageSnapshotObservation<N>>, Self::ObservationError>;
+
+    /// Atomically rechecks the source and durably replaces it with the target.
+    fn compare_and_replace(
+        &mut self,
+        candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+        permit: CommittedTransactionPageRecoveryWritePermit<'_>,
+    ) -> Result<(), Self::WriteError>;
+}
+
+/// Owned exact source-store identity retained after a recovery write attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommittedTransactionPageRecoverySourceState<const N: usize> {
+    /// The exact page was absent from one store lineage.
+    StoreMissing {
+        /// Missing page number.
+        page_number: PageNumber,
+        /// Exact candidate target position whose lineage scopes the absence.
+        target_page_position: LogSequenceNumber,
+    },
+    /// The store contained one exact earlier committed snapshot.
+    ExactSnapshot {
+        /// Stored page number.
+        page_number: PageNumber,
+        /// Stored page version.
+        page_version: PageVersion,
+        /// Exact stored page bytes.
+        bytes: [u8; N],
+        /// Page WAL position backing the snapshot.
+        page_position: LogSequenceNumber,
+        /// Matching durable commit position.
+        commit_position: LogSequenceNumber,
+    },
+}
+
+impl<const N: usize> CommittedTransactionPageRecoverySourceState<N> {
+    /// Returns the page number whose source state was validated.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        match self {
+            Self::StoreMissing { page_number, .. } | Self::ExactSnapshot { page_number, .. } => {
+                *page_number
+            }
+        }
+    }
+}
+
+/// Owned exact committed target retained after recovery planning or an attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommittedTransactionPageRecoveryTarget<const N: usize> {
+    transaction: DurableTransactionIdentityObservation,
+    page_number: PageNumber,
+    page_version: PageVersion,
+    bytes: [u8; N],
+    page_position: LogSequenceNumber,
+    commit_position: LogSequenceNumber,
+}
+
+impl<const N: usize> CommittedTransactionPageRecoveryTarget<N> {
+    /// Returns the persisted owner of the committed target.
+    #[must_use]
+    pub const fn transaction(&self) -> DurableTransactionIdentityObservation {
+        self.transaction
+    }
+
+    /// Returns the target page number.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.page_number
+    }
+
+    /// Returns the target page version.
+    #[must_use]
+    pub const fn page_version(&self) -> PageVersion {
+        self.page_version
+    }
+
+    /// Returns the exact target page bytes.
+    #[must_use]
+    pub const fn bytes(&self) -> &[u8; N] {
+        &self.bytes
+    }
+
+    /// Returns the exact target page WAL position.
+    #[must_use]
+    pub const fn page_position(&self) -> &LogSequenceNumber {
+        &self.page_position
+    }
+
+    /// Returns the exact matching durable commit position.
+    #[must_use]
+    pub const fn commit_position(&self) -> &LogSequenceNumber {
+        &self.commit_position
+    }
+}
+
+fn owned_recovery_source_state<const N: usize>(
+    candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+) -> CommittedTransactionPageRecoverySourceState<N> {
+    match candidate.precondition() {
+        DurableCommittedTransactionPageRecoveryPrecondition::StoreMissing => {
+            let target = candidate.latest_committed().observation();
+            CommittedTransactionPageRecoverySourceState::StoreMissing {
+                page_number: target.page().page_number(),
+                target_page_position: target.position().clone(),
+            }
+        }
+        DurableCommittedTransactionPageRecoveryPrecondition::ExactSnapshot {
+            snapshot,
+            commit_position,
+        } => CommittedTransactionPageRecoverySourceState::ExactSnapshot {
+            page_number: snapshot.page_number(),
+            page_version: snapshot.page_version(),
+            bytes: *snapshot.image().bytes(),
+            page_position: snapshot.required_position().clone(),
+            commit_position: commit_position.clone(),
+        },
+    }
+}
+
+fn owned_recovery_target<const N: usize>(
+    latest: &LatestCommittedTransactionPage<'_, N>,
+) -> CommittedTransactionPageRecoveryTarget<N> {
+    let observation = latest.observation();
+    CommittedTransactionPageRecoveryTarget {
+        transaction: observation.owner(),
+        page_number: observation.page().page_number(),
+        page_version: observation.page().page_version(),
+        bytes: *observation.page().image().bytes(),
+        page_position: observation.position().clone(),
+        commit_position: latest.commit_position().clone(),
+    }
+}
+
+/// Completed recovery-gate outcome that grants no further write authority.
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::CommittedTransactionPageRecoveryOutcome;
+///
+/// fn cannot_create_dirty<const N: usize>(
+///     outcome: CommittedTransactionPageRecoveryOutcome<N>,
+/// ) -> DirtyPage<N> {
+///     outcome.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryOutcome,
+///     CommittedTransactionPageRecoveryWritePermit,
+/// };
+///
+/// fn cannot_reuse_outcome<'attempt, const N: usize>(
+///     outcome: CommittedTransactionPageRecoveryOutcome<N>,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     outcome.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum CommittedTransactionPageRecoveryOutcome<const N: usize> {
+    /// The stable prefix contains no committed page and no write was attempted.
+    NoCommittedPage {
+        /// Requested page number.
+        page_number: PageNumber,
+    },
+    /// The store already contains the exact latest committed target.
+    AlreadyCurrent {
+        /// Exact committed target already present.
+        target: CommittedTransactionPageRecoveryTarget<N>,
+    },
+    /// The store reported the exact committed target durably replaced.
+    Recovered {
+        /// Exact committed target reported durable.
+        target: CommittedTransactionPageRecoveryTarget<N>,
+    },
+}
+
+/// Terminal state after the recovery store method returned an error.
+///
+/// This value has no retry entrypoint and cannot recreate a permit:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit,
+///     IndeterminateCommittedTransactionPageRecovery,
+/// };
+///
+/// fn cannot_retry<'attempt, Error, const N: usize>(
+///     recovery: IndeterminateCommittedTransactionPageRecovery<Error, N>,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     recovery.into()
+/// }
+/// ```
+#[derive(Debug)]
+pub struct IndeterminateCommittedTransactionPageRecovery<WriteError, const N: usize> {
+    source_state: CommittedTransactionPageRecoverySourceState<N>,
+    target: CommittedTransactionPageRecoveryTarget<N>,
+    source: WriteError,
+}
+
+impl<WriteError, const N: usize> IndeterminateCommittedTransactionPageRecovery<WriteError, N> {
+    /// Returns the exact source state used for the attempted replacement.
+    #[must_use]
+    pub const fn source_state(&self) -> &CommittedTransactionPageRecoverySourceState<N> {
+        &self.source_state
+    }
+
+    /// Returns the exact committed target used for the attempted replacement.
+    #[must_use]
+    pub const fn target(&self) -> &CommittedTransactionPageRecoveryTarget<N> {
+        &self.target
+    }
+
+    /// Returns the exact adapter failure.
+    #[must_use]
+    pub const fn cause(&self) -> &WriteError {
+        &self.source
+    }
+
+    /// Returns the exact source state, target, and adapter failure.
+    #[must_use]
+    pub fn into_parts(
+        self,
+    ) -> (
+        CommittedTransactionPageRecoverySourceState<N>,
+        CommittedTransactionPageRecoveryTarget<N>,
+        WriteError,
+    ) {
+        (self.source_state, self.target, self.source)
+    }
+}
+
+impl<WriteError: fmt::Display, const N: usize> fmt::Display
+    for IndeterminateCommittedTransactionPageRecovery<WriteError, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "committed recovery write for page {} at position {} failed: {}",
+            self.target.page_number().get(),
+            self.target.page_position().get(),
+            self.source
+        )
+    }
+}
+
+impl<WriteError, const N: usize> Error
+    for IndeterminateCommittedTransactionPageRecovery<WriteError, N>
+where
+    WriteError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Recovery-gate failure before or after the store indeterminacy boundary.
+#[derive(Debug)]
+pub enum CommittedTransactionPageRecoveryError<
+    SourceError,
+    ObservationError,
+    WriteError,
+    const N: usize,
+> {
+    /// Source and store do not protect one log lineage; neither effectful port
+    /// operation was called.
+    LineageMismatch {
+        /// Authoritative source lineage.
+        source_lineage: LogLineage,
+        /// Page-store lineage.
+        store_lineage: LogLineage,
+    },
+    /// The authoritative source failed before any store write was attempted.
+    Source(SourceError),
+    /// The store snapshot could not be observed before any write attempt.
+    StoreObservation(ObservationError),
+    /// Fresh complete-prefix recovery planning failed before any write attempt.
+    Planning {
+        /// Exact ADR 0028 planning failure.
+        source: Box<DurableCommittedTransactionPageRecoveryPlanningError>,
+    },
+    /// Candidate self-comparison failed before any write attempt.
+    CandidateComparison {
+        /// Exact ADR 0028 comparison failure.
+        source: Box<DurableCommittedTransactionPageRecoveryComparisonError>,
+    },
+    /// Candidate self-comparison produced a non-source success unexpectedly.
+    UnexpectedCandidateComparison {
+        /// Unexpected comparison result.
+        actual: DurableCommittedTransactionPageRecoveryComparison,
+    },
+    /// The store method was invoked and its physical result is indeterminate.
+    StoreWrite {
+        /// Terminal exact source, target, and adapter failure.
+        state: Box<IndeterminateCommittedTransactionPageRecovery<WriteError, N>>,
+    },
+    /// The source returned the callback's write marker but the gate retained no
+    /// corresponding attempt result.
+    AttemptResultMissing {
+        /// Requested page number.
+        page_number: PageNumber,
+    },
+}
+
+impl<SourceError, ObservationError, WriteError, const N: usize> fmt::Display
+    for CommittedTransactionPageRecoveryError<SourceError, ObservationError, WriteError, N>
+where
+    SourceError: fmt::Display,
+    ObservationError: fmt::Display,
+    WriteError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LineageMismatch { .. } => {
+                formatter.write_str("recovery source and page store belong to different lineages")
+            }
+            Self::Source(source) => write!(formatter, "recovery source failed: {source}"),
+            Self::StoreObservation(source) => {
+                write!(formatter, "page-store observation failed: {source}")
+            }
+            Self::Planning { source } => write!(formatter, "recovery planning failed: {source}"),
+            Self::CandidateComparison { source } => {
+                write!(formatter, "recovery candidate comparison failed: {source}")
+            }
+            Self::UnexpectedCandidateComparison { actual } => write!(
+                formatter,
+                "recovery candidate self-comparison unexpectedly returned {actual:?}"
+            ),
+            Self::StoreWrite { state } => state.fmt(formatter),
+            Self::AttemptResultMissing { page_number } => write!(
+                formatter,
+                "page {} recovery source returned a write marker without an attempt result",
+                page_number.get()
+            ),
+        }
+    }
+}
+
+impl<SourceError, ObservationError, WriteError, const N: usize> Error
+    for CommittedTransactionPageRecoveryError<SourceError, ObservationError, WriteError, N>
+where
+    SourceError: Error + 'static,
+    ObservationError: Error + 'static,
+    WriteError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::StoreObservation(source) => Some(source),
+            Self::Planning { source } => Some(source.as_ref()),
+            Self::CandidateComparison { source } => Some(source.as_ref()),
+            Self::StoreWrite { state } => Some(state.as_ref()),
+            Self::LineageMismatch { .. }
+            | Self::UnexpectedCandidateComparison { .. }
+            | Self::AttemptResultMissing { .. } => None,
+        }
+    }
+}
+
+/// Result of one complete committed transaction-page recovery-gate invocation.
+pub type CommittedTransactionPageRecoveryResult<
+    SourceError,
+    ObservationError,
+    WriteError,
+    const N: usize,
+> = Result<
+    CommittedTransactionPageRecoveryOutcome<N>,
+    CommittedTransactionPageRecoveryError<SourceError, ObservationError, WriteError, N>,
+>;
+
+enum RecoveryBeforeWriteError<ObservationError> {
+    StoreObservation(ObservationError),
+    Planning(Box<DurableCommittedTransactionPageRecoveryPlanningError>),
+    CandidateComparison(Box<DurableCommittedTransactionPageRecoveryComparisonError>),
+    UnexpectedCandidateComparison(DurableCommittedTransactionPageRecoveryComparison),
+}
+
+enum RecoveryCallbackOutcome<ObservationError, const N: usize> {
+    Completed(
+        Result<
+            CommittedTransactionPageRecoveryOutcome<N>,
+            RecoveryBeforeWriteError<ObservationError>,
+        >,
+    ),
+    WriteAttempted,
+}
+
+enum RecoveryWriteAttempt<WriteError, const N: usize> {
+    Succeeded(CommittedTransactionPageRecoveryTarget<N>),
+    Failed(IndeterminateCommittedTransactionPageRecovery<WriteError, N>),
+}
+
+fn map_recovery_before_write_error<SourceError, ObservationError, WriteError, const N: usize>(
+    error: RecoveryBeforeWriteError<ObservationError>,
+) -> CommittedTransactionPageRecoveryError<SourceError, ObservationError, WriteError, N> {
+    match error {
+        RecoveryBeforeWriteError::StoreObservation(source) => {
+            CommittedTransactionPageRecoveryError::StoreObservation(source)
+        }
+        RecoveryBeforeWriteError::Planning(source) => {
+            CommittedTransactionPageRecoveryError::Planning { source }
+        }
+        RecoveryBeforeWriteError::CandidateComparison(source) => {
+            CommittedTransactionPageRecoveryError::CandidateComparison { source }
+        }
+        RecoveryBeforeWriteError::UnexpectedCandidateComparison(actual) => {
+            CommittedTransactionPageRecoveryError::UnexpectedCandidateComparison { actual }
+        }
+    }
+}
+
+/// Reconciles one stable durable prefix and atomically attempts exact recovery.
+///
+/// The source prefix remains exclusively stable for the callback duration. The
+/// store observes current state, ADR 0026/0028 planning is rerun, and only an
+/// exact candidate source match creates the private one-attempt permit. The
+/// adapter must perform its own atomic source recheck under the store lock.
+///
+/// A write attempt is recorded outside the callback output. If a defective
+/// source discards that output and returns an error after the store was invoked,
+/// the attempted success or terminal store failure still takes priority.
+///
+/// Source and store must be distinct objects or disjoint split borrows:
+///
+/// ```compile_fail
+/// use ntsql_page::PageNumber;
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore, DurableTransactionPageRecoverySource,
+///     recover_committed_transaction_page,
+/// };
+///
+/// fn cannot_alias_source_and_store<Both, const N: usize>(
+///     both: &mut Both,
+///     page_number: PageNumber,
+/// )
+/// where
+///     Both: DurableTransactionPageRecoverySource<N>
+///         + CommittedTransactionPageRecoveryStore<N>,
+/// {
+///     let _ = recover_committed_transaction_page(both, both, page_number);
+/// }
+/// ```
+pub fn recover_committed_transaction_page<Source, Store, const N: usize>(
+    source: &mut Source,
+    store: &mut Store,
+    page_number: PageNumber,
+) -> CommittedTransactionPageRecoveryResult<
+    Source::Error,
+    Store::ObservationError,
+    Store::WriteError,
+    N,
+>
+where
+    Source: DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    let source_lineage = source.lineage().clone();
+    if !source_lineage.same_lineage(store.lineage()) {
+        return Err(CommittedTransactionPageRecoveryError::LineageMismatch {
+            source_lineage,
+            store_lineage: store.lineage().clone(),
+        });
+    }
+
+    let mut write_attempt = None;
+    let callback_result = source.with_durable_page_evidence(
+        page_number,
+        |physical_pages, owned_pages, commit_observations| {
+            let snapshot = match store.observe_page(page_number) {
+                Ok(snapshot) => snapshot,
+                Err(source) => {
+                    return RecoveryCallbackOutcome::Completed(Err(
+                        RecoveryBeforeWriteError::StoreObservation(source),
+                    ));
+                }
+            };
+            let decision = match derive_committed_transaction_page_recovery_candidate(
+                &source_lineage,
+                page_number,
+                snapshot.as_ref(),
+                physical_pages,
+                owned_pages,
+                commit_observations,
+            ) {
+                Ok(decision) => decision,
+                Err(source) => {
+                    return RecoveryCallbackOutcome::Completed(Err(
+                        RecoveryBeforeWriteError::Planning(Box::new(source)),
+                    ));
+                }
+            };
+
+            match decision {
+                DurableCommittedTransactionPageRecoveryDecision::NoCommittedPage {
+                    page_number,
+                } => RecoveryCallbackOutcome::Completed(Ok(
+                    CommittedTransactionPageRecoveryOutcome::NoCommittedPage { page_number },
+                )),
+                DurableCommittedTransactionPageRecoveryDecision::ExactCurrent {
+                    latest_committed,
+                } => RecoveryCallbackOutcome::Completed(Ok(
+                    CommittedTransactionPageRecoveryOutcome::AlreadyCurrent {
+                        target: owned_recovery_target(&latest_committed),
+                    },
+                )),
+                DurableCommittedTransactionPageRecoveryDecision::Candidate(candidate) => {
+                    match compare_committed_transaction_page_recovery_candidate(
+                        &candidate,
+                        snapshot.as_ref(),
+                    ) {
+                        Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches) => {}
+                        Ok(actual) => {
+                            return RecoveryCallbackOutcome::Completed(Err(
+                                RecoveryBeforeWriteError::UnexpectedCandidateComparison(actual),
+                            ));
+                        }
+                        Err(source) => {
+                            return RecoveryCallbackOutcome::Completed(Err(
+                                RecoveryBeforeWriteError::CandidateComparison(Box::new(source)),
+                            ));
+                        }
+                    }
+
+                    let source_state = owned_recovery_source_state(&candidate);
+                    let target = owned_recovery_target(candidate.latest_committed());
+                    let page_position = target.page_position().clone();
+                    let commit_position = target.commit_position().clone();
+                    let result = with_committed_page_recovery_write_permit(
+                        page_position,
+                        commit_position,
+                        |permit| store.compare_and_replace(&candidate, permit),
+                    );
+                    write_attempt = Some(match result {
+                        Ok(()) => RecoveryWriteAttempt::Succeeded(target),
+                        Err(source) => RecoveryWriteAttempt::Failed(
+                            IndeterminateCommittedTransactionPageRecovery {
+                                source_state,
+                                target,
+                                source,
+                            },
+                        ),
+                    });
+                    RecoveryCallbackOutcome::WriteAttempted
+                }
+            }
+        },
+    );
+
+    if let Some(write_attempt) = write_attempt {
+        return match write_attempt {
+            RecoveryWriteAttempt::Succeeded(target) => {
+                Ok(CommittedTransactionPageRecoveryOutcome::Recovered { target })
+            }
+            RecoveryWriteAttempt::Failed(state) => {
+                Err(CommittedTransactionPageRecoveryError::StoreWrite {
+                    state: Box::new(state),
+                })
+            }
+        };
+    }
+
+    match callback_result {
+        Err(source) => Err(CommittedTransactionPageRecoveryError::Source(source)),
+        Ok(RecoveryCallbackOutcome::Completed(result)) => result.map_err(
+            map_recovery_before_write_error::<
+                Source::Error,
+                Store::ObservationError,
+                Store::WriteError,
+                N,
+            >,
+        ),
+        Ok(RecoveryCallbackOutcome::WriteAttempted) => {
+            Err(CommittedTransactionPageRecoveryError::AttemptResultMissing { page_number })
+        }
+    }
+}
+
 /// Read-only in-process lifecycle phase recorded by the coordinator.
 ///
 /// This phase is not persistent recovery evidence and deliberately carries no
@@ -4058,7 +4855,10 @@ mod tests {
         Ok(())
     }
 
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
 
     use ntsql_page::{PageAddress, PageImage, PageNumber, PageVersion};
 
@@ -4306,6 +5106,242 @@ mod tests {
     ) -> Result<DurableTransactionCommitObservation, TestError> {
         DurableTransactionCommitObservation::new(transaction, lineage.position(position))
             .map_err(|_| TestError("durable commit observation"))
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FakeRecoverySnapshot {
+        page_number: PageNumber,
+        page_version: PageVersion,
+        byte: u8,
+        page_position: LogSequenceNumber,
+    }
+
+    impl FakeRecoverySnapshot {
+        fn observation(&self) -> Result<StoredPageSnapshotObservation<1>, FakeFault> {
+            StoredPageSnapshotObservation::from_bytes(
+                self.page_number,
+                self.page_version,
+                [self.byte],
+                self.page_position.clone(),
+            )
+            .map_err(|_| FakeFault("snapshot projection"))
+        }
+
+        fn from_target(target: &CommittedTransactionPageRecoveryTarget<1>) -> Self {
+            Self {
+                page_number: target.page_number(),
+                page_version: target.page_version(),
+                byte: target.bytes()[0],
+                page_position: target.page_position().clone(),
+            }
+        }
+    }
+
+    struct FakeDurablePageRecoverySource {
+        lineage: LogLineage,
+        physical: Vec<DurablePageWalObservation<1>>,
+        owned: Vec<DurableTransactionPageObservation<1>>,
+        commits: Vec<DurableTransactionCommitObservation>,
+        before_callback_error: Option<FakeFault>,
+        after_callback_error: Option<FakeFault>,
+        callbacks: usize,
+    }
+
+    impl FakeDurablePageRecoverySource {
+        fn new(
+            lineage: LogLineage,
+            physical: Vec<DurablePageWalObservation<1>>,
+            owned: Vec<DurableTransactionPageObservation<1>>,
+            commits: Vec<DurableTransactionCommitObservation>,
+        ) -> Self {
+            Self {
+                lineage,
+                physical,
+                owned,
+                commits,
+                before_callback_error: None,
+                after_callback_error: None,
+                callbacks: 0,
+            }
+        }
+    }
+
+    impl DurableTransactionPageRecoverySource<1> for FakeDurablePageRecoverySource {
+        type Error = FakeFault;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn with_durable_page_evidence<Output, Operation>(
+            &mut self,
+            _page_number: PageNumber,
+            operation: Operation,
+        ) -> Result<Output, Self::Error>
+        where
+            Operation: for<'evidence> FnOnce(
+                &'evidence [DurablePageWalObservation<1>],
+                &'evidence [DurableTransactionPageObservation<1>],
+                &'evidence [DurableTransactionCommitObservation],
+            ) -> Output,
+        {
+            if let Some(source) = self.before_callback_error.take() {
+                return Err(source);
+            }
+            self.callbacks += 1;
+            let output = operation(&self.physical, &self.owned, &self.commits);
+            match self.after_callback_error.take() {
+                Some(source) => Err(source),
+                None => Ok(output),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FakeRecoveryWriteFault {
+        Before(FakeFault),
+        After(FakeFault),
+    }
+
+    struct FakeCommittedPageRecoveryStore {
+        lineage: LogLineage,
+        current: Option<FakeRecoverySnapshot>,
+        observation_fault: Option<FakeFault>,
+        write_fault: Option<FakeRecoveryWriteFault>,
+        replace_before_compare: Option<FakeRecoverySnapshot>,
+        observations: Cell<usize>,
+        attempts: usize,
+    }
+
+    impl FakeCommittedPageRecoveryStore {
+        fn new(lineage: LogLineage, current: Option<FakeRecoverySnapshot>) -> Self {
+            Self {
+                lineage,
+                current,
+                observation_fault: None,
+                write_fault: None,
+                replace_before_compare: None,
+                observations: Cell::new(0),
+                attempts: 0,
+            }
+        }
+
+        fn current_observation(
+            &self,
+        ) -> Result<Option<StoredPageSnapshotObservation<1>>, FakeFault> {
+            self.current
+                .as_ref()
+                .map(FakeRecoverySnapshot::observation)
+                .transpose()
+        }
+    }
+
+    impl CommittedTransactionPageRecoveryStore<1> for FakeCommittedPageRecoveryStore {
+        type ObservationError = FakeFault;
+        type WriteError = FakeFault;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.lineage
+        }
+
+        fn observe_page(
+            &self,
+            _page_number: PageNumber,
+        ) -> Result<Option<StoredPageSnapshotObservation<1>>, Self::ObservationError> {
+            self.observations.set(self.observations.get() + 1);
+            match self.observation_fault {
+                Some(source) => Err(source),
+                None => self.current_observation(),
+            }
+        }
+
+        fn compare_and_replace(
+            &mut self,
+            candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, 1>,
+            permit: CommittedTransactionPageRecoveryWritePermit<'_>,
+        ) -> Result<(), Self::WriteError> {
+            self.attempts += 1;
+            let target = candidate.latest_committed();
+            if permit.page_position() != target.observation().position()
+                || permit.commit_position() != target.commit_position()
+            {
+                return Err(FakeFault("permit mismatch"));
+            }
+
+            if let Some(replacement) = self.replace_before_compare.take() {
+                self.current = Some(replacement);
+            }
+            let current = self.current_observation()?;
+            if compare_committed_transaction_page_recovery_candidate(candidate, current.as_ref())
+                != Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches)
+            {
+                return Err(FakeFault("precondition changed"));
+            }
+            if let Some(FakeRecoveryWriteFault::Before(source)) = self.write_fault {
+                self.write_fault = None;
+                return Err(source);
+            }
+
+            let target = owned_recovery_target(target);
+            self.current = Some(FakeRecoverySnapshot::from_target(&target));
+            match self.write_fault.take() {
+                Some(FakeRecoveryWriteFault::After(source)) => Err(source),
+                Some(FakeRecoveryWriteFault::Before(_)) | None => Ok(()),
+            }
+        }
+    }
+
+    fn one_page_recovery_source(
+        lineage: &LogLineage,
+        owner: DurableTransactionIdentityObservation,
+        page_number: u64,
+        page_version: u64,
+        byte: u8,
+        page_position: u64,
+        commit_position: u64,
+    ) -> Result<FakeDurablePageRecoverySource, TestError> {
+        Ok(FakeDurablePageRecoverySource::new(
+            lineage.clone(),
+            vec![physical_page_observation(
+                lineage,
+                page_number,
+                page_version,
+                byte,
+                page_position,
+            )?],
+            vec![durable_page_observation(
+                lineage,
+                owner,
+                page_number,
+                page_version,
+                byte,
+                page_position,
+            )?],
+            vec![durable_commit_observation(lineage, owner, commit_position)?],
+        ))
+    }
+
+    fn two_page_recovery_source(
+        lineage: &LogLineage,
+        source_owner: DurableTransactionIdentityObservation,
+        target_owner: DurableTransactionIdentityObservation,
+        page_number: u64,
+    ) -> Result<FakeDurablePageRecoverySource, TestError> {
+        Ok(FakeDurablePageRecoverySource::new(
+            lineage.clone(),
+            vec![
+                physical_page_observation(lineage, page_number, 10, 0xA0, 2)?,
+                physical_page_observation(lineage, page_number, 1, 0xB0, 5)?,
+            ],
+            vec![
+                durable_page_observation(lineage, source_owner, page_number, 10, 0xA0, 2)?,
+                durable_page_observation(lineage, target_owner, page_number, 1, 0xB0, 5)?,
+            ],
+            vec![
+                durable_commit_observation(lineage, source_owner, 3)?,
+                durable_commit_observation(lineage, target_owner, 7)?,
+            ],
+        ))
     }
 
     #[test]
@@ -6483,6 +7519,383 @@ mod tests {
             compare_committed_transaction_page_recovery_candidate(&candidate, Some(&first_target)),
             Ok(DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_gate_rejects_lineage_and_prewrite_port_failures() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let page_number = PageNumber::new(69).ok_or(TestError("page number"))?;
+
+        let mut mismatch_source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), vec![], vec![], vec![]);
+        let mut mismatch_store = FakeCommittedPageRecoveryStore::new(foreign.clone(), None);
+        let mismatch = recover_committed_transaction_page(
+            &mut mismatch_source,
+            &mut mismatch_store,
+            page_number,
+        );
+        let Err(CommittedTransactionPageRecoveryError::LineageMismatch {
+            source_lineage,
+            store_lineage,
+        }) = mismatch
+        else {
+            return Err(TestError("expected lineage mismatch"));
+        };
+        assert!(source_lineage.same_lineage(&lineage));
+        assert!(store_lineage.same_lineage(&foreign));
+        assert_eq!(mismatch_source.callbacks, 0);
+        assert_eq!(mismatch_store.observations.get(), 0);
+        assert_eq!(mismatch_store.attempts, 0);
+
+        let mut source_failure =
+            FakeDurablePageRecoverySource::new(lineage.clone(), vec![], vec![], vec![]);
+        source_failure.before_callback_error = Some(FakeFault("source before callback"));
+        let mut untouched_store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+        assert!(matches!(
+            recover_committed_transaction_page(
+                &mut source_failure,
+                &mut untouched_store,
+                page_number
+            ),
+            Err(CommittedTransactionPageRecoveryError::Source(FakeFault(
+                "source before callback"
+            )))
+        ));
+        assert_eq!(source_failure.callbacks, 0);
+        assert_eq!(untouched_store.observations.get(), 0);
+        assert_eq!(untouched_store.attempts, 0);
+
+        let mut observation_source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), vec![], vec![], vec![]);
+        let mut observation_store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+        observation_store.observation_fault = Some(FakeFault("observation"));
+        assert!(matches!(
+            recover_committed_transaction_page(
+                &mut observation_source,
+                &mut observation_store,
+                page_number
+            ),
+            Err(CommittedTransactionPageRecoveryError::StoreObservation(
+                FakeFault("observation")
+            ))
+        ));
+        assert_eq!(observation_source.callbacks, 1);
+        assert_eq!(observation_store.observations.get(), 1);
+        assert_eq!(observation_store.attempts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_gate_returns_explicit_no_write_outcomes() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(70).ok_or(TestError("page number"))?;
+        let mut empty_source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), vec![], vec![], vec![]);
+        let mut empty_store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+
+        assert_eq!(
+            recover_committed_transaction_page(&mut empty_source, &mut empty_store, page_number)
+                .map_err(|_| TestError("empty recovery")),
+            Ok(CommittedTransactionPageRecoveryOutcome::NoCommittedPage { page_number })
+        );
+        assert_eq!(empty_store.observations.get(), 1);
+        assert_eq!(empty_store.attempts, 0);
+
+        let owner = durable_identity(31, 1)?;
+        let mut exact_source = one_page_recovery_source(&lineage, owner, 70, 4, 0x70, 2, 4)?;
+        let exact_snapshot = FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(4),
+            byte: 0x70,
+            page_position: lineage.position(2),
+        };
+        let mut exact_store =
+            FakeCommittedPageRecoveryStore::new(lineage.clone(), Some(exact_snapshot));
+        let exact =
+            recover_committed_transaction_page(&mut exact_source, &mut exact_store, page_number)
+                .map_err(|_| TestError("exact recovery"))?;
+        let CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { target } = exact else {
+            return Err(TestError("expected already-current outcome"));
+        };
+        assert_eq!(target.transaction(), owner);
+        assert_eq!(target.page_number(), page_number);
+        assert_eq!(target.page_version(), PageVersion::new(4));
+        assert_eq!(target.bytes(), &[0x70]);
+        assert_eq!(target.page_position(), &lineage.position(2));
+        assert_eq!(target.commit_position(), &lineage.position(4));
+        assert_eq!(exact_store.observations.get(), 1);
+        assert_eq!(exact_store.attempts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_gate_writes_missing_and_behind_lower_version_targets() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(71).ok_or(TestError("page number"))?;
+        let source_owner = durable_identity(32, 1)?;
+        let target_owner = durable_identity(32, 2)?;
+
+        let mut missing_source =
+            two_page_recovery_source(&lineage, source_owner, target_owner, 71)?;
+        let mut missing_store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+        let missing = recover_committed_transaction_page(
+            &mut missing_source,
+            &mut missing_store,
+            page_number,
+        )
+        .map_err(|_| TestError("missing recovery"))?;
+        let CommittedTransactionPageRecoveryOutcome::Recovered { target } = missing else {
+            return Err(TestError("expected missing recovery"));
+        };
+        assert_eq!(target.transaction(), target_owner);
+        assert_eq!(target.page_version(), PageVersion::new(1));
+        assert_eq!(target.bytes(), &[0xB0]);
+        assert_eq!(target.page_position(), &lineage.position(5));
+        assert_eq!(target.commit_position(), &lineage.position(7));
+        assert_eq!(missing_store.attempts, 1);
+        assert_eq!(
+            missing_store.current,
+            Some(FakeRecoverySnapshot::from_target(&target))
+        );
+
+        let mut behind_source = two_page_recovery_source(&lineage, source_owner, target_owner, 71)?;
+        let behind_snapshot = FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(10),
+            byte: 0xA0,
+            page_position: lineage.position(2),
+        };
+        let mut behind_store =
+            FakeCommittedPageRecoveryStore::new(lineage.clone(), Some(behind_snapshot));
+        let behind =
+            recover_committed_transaction_page(&mut behind_source, &mut behind_store, page_number)
+                .map_err(|_| TestError("behind recovery"))?;
+        let CommittedTransactionPageRecoveryOutcome::Recovered { target } = behind else {
+            return Err(TestError("expected behind recovery"));
+        };
+        assert_eq!(target.transaction(), target_owner);
+        assert_eq!(target.page_version(), PageVersion::new(1));
+        assert_eq!(target.page_position(), &lineage.position(5));
+        assert_eq!(behind_store.attempts, 1);
+        assert_eq!(
+            behind_store.current,
+            Some(FakeRecoverySnapshot::from_target(&target))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_gate_preserves_planning_failure_before_store_attempt() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let foreign = LogLineage::new();
+        let page_number = PageNumber::new(72).ok_or(TestError("page number"))?;
+        let owner = durable_identity(33, 1)?;
+        let mut source = FakeDurablePageRecoverySource::new(
+            lineage.clone(),
+            vec![],
+            vec![],
+            vec![durable_commit_observation(&foreign, owner, 1)?],
+        );
+        let mut store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+
+        let result = recover_committed_transaction_page(&mut source, &mut store, page_number);
+        let Err(CommittedTransactionPageRecoveryError::Planning { source }) = result else {
+            return Err(TestError("expected planning failure"));
+        };
+        assert_eq!(
+            source.as_ref(),
+            &DurableCommittedTransactionPageRecoveryPlanningError::Reconciliation {
+                source: Box::new(
+                    DurableCommittedTransactionPageReconciliationError::Selection {
+                        source: Box::new(DurableTransactionPageSelectionError::CommitPrefix {
+                            source: Box::new(
+                                DurableTransactionPageClassificationError::ForeignCommitLineage {
+                                    position: foreign.position(1),
+                                },
+                            ),
+                        },),
+                    },
+                ),
+            }
+        );
+        assert_eq!(store.observations.get(), 1);
+        assert_eq!(store.attempts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_gate_preserves_defensive_comparison_failures() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(72).ok_or(TestError("page number"))?;
+        let comparison = DurableCommittedTransactionPageRecoveryComparisonError::StoreChanged {
+            page_number,
+            expected_source_position: None,
+            actual_position: Some(lineage.position(2)),
+        };
+        let mapped = map_recovery_before_write_error::<FakeFault, FakeFault, FakeFault, 1>(
+            RecoveryBeforeWriteError::CandidateComparison(Box::new(comparison)),
+        );
+        let CommittedTransactionPageRecoveryError::CandidateComparison { source } = mapped else {
+            return Err(TestError("expected candidate-comparison failure"));
+        };
+        assert_eq!(
+            source.as_ref(),
+            &DurableCommittedTransactionPageRecoveryComparisonError::StoreChanged {
+                page_number,
+                expected_source_position: None,
+                actual_position: Some(lineage.position(2)),
+            }
+        );
+
+        let mapped = map_recovery_before_write_error::<FakeFault, FakeFault, FakeFault, 1>(
+            RecoveryBeforeWriteError::UnexpectedCandidateComparison(
+                DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent,
+            ),
+        );
+        assert!(matches!(
+            mapped,
+            CommittedTransactionPageRecoveryError::UnexpectedCandidateComparison {
+                actual: DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent,
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_gate_store_recheck_prevents_changed_source_overwrite() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(73).ok_or(TestError("page number"))?;
+        let source_owner = durable_identity(34, 1)?;
+        let target_owner = durable_identity(34, 2)?;
+        let mut source = two_page_recovery_source(&lineage, source_owner, target_owner, 73)?;
+        let original = FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(10),
+            byte: 0xA0,
+            page_position: lineage.position(2),
+        };
+        let changed = FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(99),
+            byte: 0xCC,
+            page_position: lineage.position(6),
+        };
+        let mut store =
+            FakeCommittedPageRecoveryStore::new(lineage.clone(), Some(original.clone()));
+        store.replace_before_compare = Some(changed.clone());
+
+        let result = recover_committed_transaction_page(&mut source, &mut store, page_number);
+        let Err(CommittedTransactionPageRecoveryError::StoreWrite { state }) = result else {
+            return Err(TestError("expected terminal changed-store state"));
+        };
+        assert_eq!(state.as_ref().cause(), &FakeFault("precondition changed"));
+        let CommittedTransactionPageRecoverySourceState::ExactSnapshot {
+            page_version,
+            bytes,
+            page_position,
+            commit_position,
+            ..
+        } = state.source_state()
+        else {
+            return Err(TestError("expected exact source state"));
+        };
+        assert_eq!(*page_version, PageVersion::new(10));
+        assert_eq!(bytes, &[0xA0]);
+        assert_eq!(page_position, &lineage.position(2));
+        assert_eq!(commit_position, &lineage.position(3));
+        assert_eq!(state.target().transaction(), target_owner);
+        assert_eq!(state.target().bytes(), &[0xB0]);
+        assert_eq!(state.target().page_position(), &lineage.position(5));
+        assert_eq!(store.current, Some(changed));
+        assert_eq!(store.attempts, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_gate_attempt_outcome_overrides_post_callback_source_error() -> Result<(), TestError>
+    {
+        let lineage = LogLineage::new();
+        let owner = durable_identity(35, 1)?;
+
+        let success_page = PageNumber::new(74).ok_or(TestError("success page"))?;
+        let mut success_source = one_page_recovery_source(&lineage, owner, 74, 4, 0x74, 2, 4)?;
+        success_source.after_callback_error = Some(FakeFault("source after success"));
+        let mut success_store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+        let success = recover_committed_transaction_page(
+            &mut success_source,
+            &mut success_store,
+            success_page,
+        )
+        .map_err(|_| TestError("post-callback success lost"))?;
+        assert!(matches!(
+            success,
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        ));
+        assert!(success_store.current.is_some());
+
+        let before_page = PageNumber::new(75).ok_or(TestError("before page"))?;
+        let mut before_source = one_page_recovery_source(&lineage, owner, 75, 5, 0x75, 2, 4)?;
+        before_source.after_callback_error = Some(FakeFault("source after before-fault"));
+        let mut before_store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+        before_store.write_fault = Some(FakeRecoveryWriteFault::Before(FakeFault("before write")));
+        let before =
+            recover_committed_transaction_page(&mut before_source, &mut before_store, before_page);
+        let Err(CommittedTransactionPageRecoveryError::StoreWrite { state }) = before else {
+            return Err(TestError("before fault became source error"));
+        };
+        assert_eq!(state.as_ref().cause(), &FakeFault("before write"));
+        assert!(before_store.current.is_none());
+        assert!(matches!(
+            state.source_state(),
+            CommittedTransactionPageRecoverySourceState::StoreMissing { .. }
+        ));
+
+        let retry =
+            recover_committed_transaction_page(&mut before_source, &mut before_store, before_page)
+                .map_err(|_| TestError("fresh before-fault retry"))?;
+        assert!(matches!(
+            retry,
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        ));
+        assert_eq!(before_store.attempts, 2);
+
+        let after_page = PageNumber::new(76).ok_or(TestError("after page"))?;
+        let mut after_source = one_page_recovery_source(&lineage, owner, 76, 6, 0x76, 2, 4)?;
+        after_source.after_callback_error = Some(FakeFault("source after after-fault"));
+        let mut after_store = FakeCommittedPageRecoveryStore::new(lineage.clone(), None);
+        after_store.write_fault = Some(FakeRecoveryWriteFault::After(FakeFault("after write")));
+        let after =
+            recover_committed_transaction_page(&mut after_source, &mut after_store, after_page);
+        let Err(CommittedTransactionPageRecoveryError::StoreWrite { state }) = after else {
+            return Err(TestError("after fault became source error"));
+        };
+        assert_eq!(state.as_ref().cause(), &FakeFault("after write"));
+        assert!(matches!(
+            state.source_state(),
+            CommittedTransactionPageRecoverySourceState::StoreMissing {
+                page_number,
+                target_page_position,
+            } if *page_number == after_page && target_page_position == &lineage.position(2)
+        ));
+        assert_eq!(state.target().transaction(), owner);
+        assert_eq!(state.target().page_number(), after_page);
+        assert_eq!(state.target().page_version(), PageVersion::new(6));
+        assert_eq!(state.target().bytes(), &[0x76]);
+        assert_eq!(state.target().page_position(), &lineage.position(2));
+        assert_eq!(state.target().commit_position(), &lineage.position(4));
+        assert!(after_store.current.is_some());
+        assert_eq!(after_store.attempts, 1);
+
+        let resolved =
+            recover_committed_transaction_page(&mut after_source, &mut after_store, after_page)
+                .map_err(|_| TestError("after-fault resolution"))?;
+        assert!(matches!(
+            resolved,
+            CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+        ));
+        assert_eq!(after_store.attempts, 1);
         Ok(())
     }
 }

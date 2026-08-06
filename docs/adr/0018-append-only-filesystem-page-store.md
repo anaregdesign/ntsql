@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #86
 - Extends: ADR 0001, ADR 0012, ADR 0014, ADR 0015, ADR 0016, ADR 0017
-- Extended by: ADR 0019
+- Extended by: ADR 0019, ADR 0029
 
 ## Context
 
@@ -163,10 +163,12 @@ claim; an unsupported or failed operation remains a typed I/O error.
 
 ## Recovery and Evidence Boundary
 
-The page store retains the required WAL position with each snapshot so a later
-recovery component can compare durable page state with WAL records. This ADR
-does not perform that comparison, resolve an indeterminate write, select a redo
-start point, or authorize retry.
+The page store retains the required WAL position with each snapshot so a
+recovery component can compare durable page state with WAL records. ADR 0029
+defines the domain recovery-only gate and its atomic adapter contract, but does
+not implement that contract in this filesystem adapter. This ADR does not
+perform recovery comparison, resolve an indeterminate write, select a redo start
+point, or authorize retry.
 
 The format is repository-authored. Its page numbers, versions, widths, store
 sequences, WAL positions, chunks, checksums, barriers, and errors define no SQL

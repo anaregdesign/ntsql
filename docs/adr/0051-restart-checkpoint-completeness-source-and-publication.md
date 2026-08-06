@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #155
 - Extends: ADR 0043, ADR 0048, ADR 0049, ADR 0050
-- Extended by: ADR 0052
+- Extended by: ADR 0052, ADR 0053
 
 ## Context
 
@@ -402,8 +402,8 @@ replacement, structural read-back, fallible exact reservation, and independent
 before/after-effect faults, while published values stay untrusted on load and
 acquire authority only through ADR 0050 validation.
 
-A persistent completeness source and publisher remain blocked on separately
-reviewed physical replacement, synchronization, repair, and global lock order.
-Startup consumption of a validated completeness baseline, replay execution,
-dirty-page repair, and WAL retention/reclamation remain later boundaries; this
-decision grants none of them.
+ADR 0052 later supplies the persistent completeness source, publisher,
+replacement, synchronization, and global lock order. ADR 0053 consumes this
+unchanged source port before page recovery and retains the same concrete source
+through fallback and later publication. Replay execution, dirty-page repair, and
+WAL retention/reclamation remain later boundaries.

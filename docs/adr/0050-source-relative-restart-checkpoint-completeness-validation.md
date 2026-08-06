@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #153
 - Extends: ADR 0039, ADR 0047, ADR 0048, ADR 0049
-- Extended by: ADR 0051
+- Extended by: ADR 0051, ADR 0053
 - Follows: #151
 
 ## Context
@@ -298,3 +298,7 @@ The next separately reviewed work can define a completeness checkpoint
 source/publisher pair and any startup consumption of a validated completeness
 baseline. Replay execution, dirty-page repair, and WAL retention/reclamation
 remain later boundaries; this decision grants none of them.
+
+ADR 0053 later reuses this exact validator before committed-page recovery. It
+does not change selected-prefix logic, current-snapshot comparison, or strict
+`SnapshotBeyondFrontier` rejection.

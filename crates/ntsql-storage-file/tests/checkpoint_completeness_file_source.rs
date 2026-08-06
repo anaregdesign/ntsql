@@ -15,10 +15,11 @@ use ntsql_storage_file::{
     FileRestartCheckpointSlotOpenError, FileTransactionPageStorageCompletenessCheckpointOpenError,
     PageStoreIoStage, PageStoreOpenError, RestartCheckpointCompletenessBaselineDecodeError,
     encode_restart_checkpoint_baseline, encode_restart_checkpoint_completeness_baseline,
-    open_transaction_page_storage, open_transaction_page_storage_with_completeness_checkpoint,
+    open_transaction_page_storage_with_completeness_checkpoint,
 };
 use ntsql_transaction::{
     DurableTransactionRestartCheckpointCompletenessBaselineSource, TransactionCoordinator,
+    TransactionPageStorageRestartCheckpointCompletenessSelection,
     UnrecoveredTransactionPageStorage, flush_committed_page,
 };
 use ntsql_wal::{LogDurability, PersistentLogId};
@@ -557,24 +558,37 @@ fn completeness_composition_opens_wal_page_store_slot_in_fixed_order_and_release
         &store_path,
         &slot_path,
     )?;
-    assert!(open_transaction_page_storage::<1, _, _>(&log_path, &store_path).is_err());
-    assert_page_store_locked(
-        FilePageStore::<1>::open(&store_path)
-            .err()
-            .ok_or_else(|| io::Error::other("composition released its page-store lock"))?,
-    )?;
-    assert_completeness_slot_locked(
-        FileRestartCheckpointCompletenessBaselineSource::open(&slot_path)
-            .err()
-            .ok_or_else(|| io::Error::other("composition released its completeness lock"))?,
-    )?;
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
 
-    let (unrecovered, mut checkpoint) = opened.into_parts();
-    let mut analyzed = unrecovered.recover()?.analyze_restart()?;
-    assert_eq!(
-        analyzed.validate_restart_checkpoint_completeness_baseline_from_source(&mut checkpoint)?,
-        None
-    );
+    let selection = opened.select_restart_checkpoint_completeness();
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(absent) = selection
+    else {
+        return Err(io::Error::other("new completeness slot was not absent").into());
+    };
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
+
+    let uncheckpointed = absent.continue_with_full_recovery();
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
+    let recovered = uncheckpointed.recover()?;
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
+    let mut analyzed = recovered.analyze_restart()?;
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
+    let receipt =
+        analyzed.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+    assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+    assert_eq!(receipt.durable_frontier(), None);
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
+
+    let (log, store, _, _, checkpoint) = analyzed.into_parts();
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
+    drop((log, store, checkpoint));
+    drop(FileCommitLog::<1>::open_transaction_page_capable(
+        &log_path,
+    )?);
+    drop(FilePageStore::<1>::open(&store_path)?);
+    drop(FileRestartCheckpointCompletenessBaselineSource::open(
+        &slot_path,
+    )?);
     Ok(())
 }
 
@@ -683,6 +697,28 @@ fn assert_page_store_locked(error: PageStoreOpenError) -> Result<(), io::Error> 
         ));
     }
     Ok(())
+}
+
+fn assert_composition_locks_held(
+    log_path: &Path,
+    store_path: &Path,
+    slot_path: &Path,
+) -> Result<(), io::Error> {
+    if FileCommitLog::<1>::open_transaction_page_capable(log_path).is_ok() {
+        return Err(io::Error::other(
+            "composition released its transaction-page WAL lock",
+        ));
+    }
+    assert_page_store_locked(
+        FilePageStore::<1>::open(store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("composition released its page-store lock"))?,
+    )?;
+    assert_completeness_slot_locked(
+        FileRestartCheckpointCompletenessBaselineSource::open(slot_path)
+            .err()
+            .ok_or_else(|| io::Error::other("composition released its completeness lock"))?,
+    )
 }
 
 fn write_synced_new(path: &Path, bytes: &[u8]) -> io::Result<()> {

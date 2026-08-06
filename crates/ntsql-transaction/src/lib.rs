@@ -5673,6 +5673,728 @@ impl OwnedDurableTransactionRestartCheckpointBaselineObservation {
     }
 }
 
+/// Untrusted decoded page-state discriminant independent of optional payloads.
+///
+/// Decoded bytes may claim any discriminant regardless of whether an
+/// accompanying required-image or stored-position field is present. Exact
+/// agreement between this discriminant and those independent optional fields
+/// remains a later source-relative validator's responsibility:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation,
+///     DurableTransactionRestartPageState,
+/// };
+///
+/// fn cannot_authorize_state(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation,
+/// ) -> DurableTransactionRestartPageState {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation {
+    /// Decoded bytes claim only uncommitted transaction images exist for this page.
+    NoRequiredImage,
+    /// Decoded bytes claim a required image exists with no current snapshot.
+    StoreMissing,
+    /// Decoded bytes claim the current snapshot matches the required image.
+    StoreCurrent,
+    /// Decoded bytes claim the current snapshot precedes the required image.
+    StoreBehind,
+}
+
+/// Untrusted decoded required-image fields for one completeness page entry.
+///
+/// Every numeric field is raw and may be zero. Construction does not require a
+/// nonzero page position or a nonzero coordinator epoch, sequence, or commit
+/// position, so exact validation—not this observation—rejects invalid values:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation,
+///     DurableTransactionRestartRequiredPageImage,
+/// };
+///
+/// fn cannot_authorize_required_image(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation,
+/// ) -> DurableTransactionRestartRequiredPageImage {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation {
+    /// Decoded bytes claim the latest required image came from a raw page record.
+    Raw {
+        /// Raw decoded numeric position of the required image.
+        page_position: u64,
+    },
+    /// Decoded bytes claim the latest required image belongs to a committed transaction.
+    CommittedTransaction {
+        /// Raw decoded coordinator epoch of the claimed owner.
+        epoch: u64,
+        /// Raw decoded coordinator-local sequence of the claimed owner.
+        sequence: u64,
+        /// Raw decoded numeric position of the required image.
+        page_position: u64,
+        /// Raw decoded numeric position of the claimed commit.
+        commit_position: u64,
+    },
+}
+
+impl DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation {
+    /// Returns the raw decoded numeric position of the required image.
+    #[must_use]
+    pub const fn page_position(self) -> u64 {
+        match self {
+            Self::Raw { page_position } | Self::CommittedTransaction { page_position, .. } => {
+                page_position
+            }
+        }
+    }
+
+    /// Returns the raw decoded coordinator epoch, or `None` for a raw image.
+    #[must_use]
+    pub const fn epoch(self) -> Option<u64> {
+        match self {
+            Self::Raw { .. } => None,
+            Self::CommittedTransaction { epoch, .. } => Some(epoch),
+        }
+    }
+
+    /// Returns the raw decoded coordinator-local sequence, or `None` for a raw image.
+    #[must_use]
+    pub const fn sequence(self) -> Option<u64> {
+        match self {
+            Self::Raw { .. } => None,
+            Self::CommittedTransaction { sequence, .. } => Some(sequence),
+        }
+    }
+
+    /// Returns the raw decoded commit position, or `None` for a raw image.
+    #[must_use]
+    pub const fn commit_position(self) -> Option<u64> {
+        match self {
+            Self::Raw { .. } => None,
+            Self::CommittedTransaction {
+                commit_position, ..
+            } => Some(commit_position),
+        }
+    }
+}
+
+/// Untrusted decoded page entry for one completeness checkpoint blob.
+///
+/// The page number, state discriminant, optional required image, and optional
+/// stored position are independent fields. Decoded bytes may combine them in
+/// ways the authoritative [`DurableTransactionRestartPageState`] cannot
+/// represent, and construction does not reject that:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePageObservation,
+///     DurableTransactionRestartPageEntry,
+/// };
+///
+/// fn cannot_authorize_page_entry(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselinePageObservation,
+/// ) -> DurableTransactionRestartPageEntry {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePageObservation;
+///
+/// fn cannot_create_dirty<const N: usize>(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselinePageObservation,
+/// ) -> DirtyPage<N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselinePageObservation;
+///
+/// fn cannot_authorize_page_write<'attempt>(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselinePageObservation,
+/// ) -> PageWritePermit<'attempt> {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableTransactionRestartCheckpointCompletenessBaselinePageObservation {
+    page_number: u64,
+    state: DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation,
+    required_image:
+        Option<DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation>,
+    stored_position: Option<u64>,
+}
+
+impl DurableTransactionRestartCheckpointCompletenessBaselinePageObservation {
+    /// Retains one complete set of decoded page fields without validation.
+    #[must_use]
+    pub const fn new(
+        page_number: u64,
+        state: DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation,
+        required_image: Option<
+            DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation,
+        >,
+        stored_position: Option<u64>,
+    ) -> Self {
+        Self {
+            page_number,
+            state,
+            required_image,
+            stored_position,
+        }
+    }
+
+    /// Returns the raw decoded numeric page number.
+    #[must_use]
+    pub const fn page_number(self) -> u64 {
+        self.page_number
+    }
+
+    /// Returns the raw decoded page-state discriminant.
+    #[must_use]
+    pub const fn state(
+        self,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation {
+        self.state
+    }
+
+    /// Returns the raw decoded required image, independent of `state`.
+    #[must_use]
+    pub const fn required_image(
+        self,
+    ) -> Option<DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation>
+    {
+        self.required_image
+    }
+
+    /// Returns the raw decoded stored position, independent of `state`.
+    #[must_use]
+    pub const fn stored_position(self) -> Option<u64> {
+        self.stored_position
+    }
+}
+
+/// Untrusted decoded replay-lower-bound cause with raw values.
+///
+/// Every identifying field is raw and may be zero:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation,
+///     DurableTransactionRestartReplayStartCause,
+/// };
+///
+/// fn cannot_authorize_cause(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation,
+/// ) -> DurableTransactionRestartReplayStartCause {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation {
+    /// Decoded bytes claim a required image has no current stored snapshot.
+    StoreMissingPage {
+        /// Raw decoded numeric page number establishing the floor.
+        page_number: u64,
+    },
+    /// Decoded bytes claim a stored snapshot precedes its required image.
+    StoreBehindPage {
+        /// Raw decoded numeric page number establishing the floor.
+        page_number: u64,
+    },
+    /// Decoded bytes claim an uncommitted transaction establishes the floor.
+    UncommittedTransaction {
+        /// Raw decoded coordinator epoch of the claimed owner.
+        epoch: u64,
+        /// Raw decoded coordinator-local sequence of the claimed owner.
+        sequence: u64,
+    },
+}
+
+/// Untrusted decoded replay kind, independent of optional frontier/position/cause.
+///
+/// Decoded bytes may claim either kind regardless of which optional fields
+/// accompany it, so a structurally canonical but semantically contradictory
+/// combination can still be decoded and later rejected by validation:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation,
+///     DurableTransactionRestartReplayStart,
+/// };
+///
+/// fn cannot_authorize_kind(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation,
+/// ) -> DurableTransactionRestartReplayStart {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation {
+    /// Decoded bytes claim no earlier record is required.
+    AfterFrontier,
+    /// Decoded bytes claim an earlier inclusive record is required.
+    AtPosition,
+}
+
+/// Untrusted decoded replay-lower-bound fields for one completeness checkpoint blob.
+///
+/// `kind`, `frontier`, `position`, and `cause` are independent fields. Decoded
+/// bytes may claim `AtPosition` with an absent position and cause, or
+/// `AfterFrontier` with a present position and cause; the authoritative
+/// [`DurableTransactionRestartReplayStart`] cannot represent either
+/// combination, and this observation preserves it unchanged for validation:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+///     DurableTransactionRestartReplayStart,
+/// };
+///
+/// fn cannot_authorize_replay(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+/// ) -> DurableTransactionRestartReplayStart {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_as_log_authority<Log: LogDurability>(
+///     log: &mut Log,
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+/// ) {
+///     let _ = log.flush_through(observation);
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation {
+    kind: DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation,
+    frontier: Option<u64>,
+    position: Option<u64>,
+    cause: Option<DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation>,
+}
+
+impl DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation {
+    /// Retains one complete set of decoded replay fields without validation.
+    #[must_use]
+    pub const fn new(
+        kind: DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation,
+        frontier: Option<u64>,
+        position: Option<u64>,
+        cause: Option<
+            DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation,
+        >,
+    ) -> Self {
+        Self {
+            kind,
+            frontier,
+            position,
+            cause,
+        }
+    }
+
+    /// Returns the raw decoded replay kind.
+    #[must_use]
+    pub const fn kind(
+        self,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation {
+        self.kind
+    }
+
+    /// Returns the raw decoded optional frontier, independent of `kind`.
+    #[must_use]
+    pub const fn frontier(self) -> Option<u64> {
+        self.frontier
+    }
+
+    /// Returns the raw decoded optional inclusive position, independent of `kind`.
+    #[must_use]
+    pub const fn position(self) -> Option<u64> {
+        self.position
+    }
+
+    /// Returns the raw decoded optional cause, independent of `kind`.
+    #[must_use]
+    pub const fn cause(
+        self,
+    ) -> Option<DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation> {
+        self.cause
+    }
+}
+
+/// Borrowed untrusted completeness fields decoded from checkpoint storage.
+///
+/// This observation nests the exact ADR 0039
+/// [`DurableTransactionRestartCheckpointBaselineObservation`] for its
+/// transaction fields and adds independent raw page and replay observations.
+/// It cannot become the authoritative completeness baseline or any live
+/// transaction, page, recovery, storage, publication, or WAL authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     DurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_baseline(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaseline {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, DurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_activate(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) -> ActiveTransaction {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselineObservation;
+///
+/// fn cannot_create_dirty_page<const N: usize>(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) -> DirtyPage<N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselineObservation;
+///
+/// fn cannot_authorize_page_write<'attempt>(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'attempt>,
+/// ) -> PageWritePermit<'attempt> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit,
+///     DurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_recovery<'attempt>(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'attempt>,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselineObservation,
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Store, const N: usize>(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselineObservation,
+///     RestartAnalyzedTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_restart_analyzed_storage<Source, Store, const N: usize>(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) -> RestartAnalyzedTransactionPageStorage<Source, Store, N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+///     DurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_publication(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) -> DurableTransactionRestartCheckpointBaselinePublicationReceipt {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselineObservation;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_as_log_authority<Log: LogDurability>(
+///     log: &mut Log,
+///     observation: &DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) {
+///     let _ = log.flush_through(observation);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointCompletenessBaselineObservation;
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_reconstruct_position(
+///     observation: DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+/// ) -> LogSequenceNumber {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableTransactionRestartCheckpointCompletenessBaselineObservation<'evidence> {
+    transactions: DurableTransactionRestartCheckpointBaselineObservation<'evidence>,
+    pages: &'evidence [DurableTransactionRestartCheckpointCompletenessBaselinePageObservation],
+    replay: DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+}
+
+impl<'evidence> DurableTransactionRestartCheckpointCompletenessBaselineObservation<'evidence> {
+    /// Retains decoded completeness fields without validation or allocation.
+    #[must_use]
+    pub const fn new(
+        transactions: DurableTransactionRestartCheckpointBaselineObservation<'evidence>,
+        pages: &'evidence [DurableTransactionRestartCheckpointCompletenessBaselinePageObservation],
+        replay: DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+    ) -> Self {
+        Self {
+            transactions,
+            pages,
+            replay,
+        }
+    }
+
+    /// Returns the nested ADR 0039 transaction-baseline observation.
+    #[must_use]
+    pub const fn transactions(
+        &self,
+    ) -> DurableTransactionRestartCheckpointBaselineObservation<'evidence> {
+        self.transactions
+    }
+
+    /// Returns decoded page entries in their persisted order.
+    #[must_use]
+    pub const fn pages(
+        &self,
+    ) -> &'evidence [DurableTransactionRestartCheckpointCompletenessBaselinePageObservation] {
+        self.pages
+    }
+
+    /// Returns the raw decoded replay-lower-bound fields.
+    #[must_use]
+    pub const fn replay(
+        &self,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation {
+        self.replay
+    }
+}
+
+/// Owned untrusted completeness fields returned after one source read completes.
+///
+/// This value owns decoded transaction, page, and replay fields only and
+/// cannot become the authoritative completeness baseline or any live
+/// transaction, page, recovery, storage, publication, or WAL authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_baseline(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaseline {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_activate(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> ActiveTransaction {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation;
+///
+/// fn cannot_create_dirty_page<const N: usize>(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> DirtyPage<N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation;
+///
+/// fn cannot_authorize_page_write<'attempt>(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> PageWritePermit<'attempt> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit,
+///     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_recovery<'attempt>(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Store, const N: usize>(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+///     RestartAnalyzedTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_restart_analyzed_storage<Source, Store, const N: usize>(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> RestartAnalyzedTransactionPageStorage<Source, Store, N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+///     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_publication(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> DurableTransactionRestartCheckpointBaselinePublicationReceipt {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_as_log_authority<Log: LogDurability>(
+///     log: &mut Log,
+///     observation: &OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) {
+///     let _ = log.flush_through(observation);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation;
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_reconstruct_position(
+///     observation: OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+/// ) -> LogSequenceNumber {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation {
+    transactions: OwnedDurableTransactionRestartCheckpointBaselineObservation,
+    pages: Vec<DurableTransactionRestartCheckpointCompletenessBaselinePageObservation>,
+    replay: DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+}
+
+impl OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation {
+    /// Retains one owned set of decoded completeness fields without validation.
+    #[must_use]
+    pub const fn new(
+        transactions: OwnedDurableTransactionRestartCheckpointBaselineObservation,
+        pages: Vec<DurableTransactionRestartCheckpointCompletenessBaselinePageObservation>,
+        replay: DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+    ) -> Self {
+        Self {
+            transactions,
+            pages,
+            replay,
+        }
+    }
+
+    /// Returns the nested owned ADR 0039 transaction-baseline observation.
+    #[must_use]
+    pub const fn transactions(
+        &self,
+    ) -> &OwnedDurableTransactionRestartCheckpointBaselineObservation {
+        &self.transactions
+    }
+
+    /// Returns owned decoded page entries in their persisted order.
+    #[must_use]
+    pub fn pages(
+        &self,
+    ) -> &[DurableTransactionRestartCheckpointCompletenessBaselinePageObservation] {
+        &self.pages
+    }
+
+    /// Returns the raw decoded replay-lower-bound fields.
+    #[must_use]
+    pub const fn replay(
+        &self,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation {
+        self.replay
+    }
+
+    /// Borrows this owned snapshot through the borrowed completeness shape.
+    #[must_use]
+    pub fn as_observation(
+        &self,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_> {
+        DurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+            self.transactions.as_observation(),
+            &self.pages,
+            self.replay,
+        )
+    }
+}
+
 /// Source of one optional owned decoded restart checkpoint baseline slot.
 ///
 /// Retrieval must complete before the returned value is validated against a

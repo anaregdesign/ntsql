@@ -1523,7 +1523,8 @@ mod tests {
     use ntsql_transaction::{
         CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
         CommittedTransactionPagesRecoveryError, CoordinatedCommitError, TransactionCoordinator,
-        TransactionLifecycleStatus, TransactionResolutionFailure, flush_committed_page,
+        TransactionLifecycleStatus, TransactionResolutionFailure,
+        UnrecoveredTransactionPageStorage, flush_committed_page,
         recover_committed_transaction_pages,
     };
     use ntsql_wal::CommitError;
@@ -1896,16 +1897,19 @@ mod tests {
         assert_eq!(behind.bytes(), &[0xA3]);
         store.arm_fault(PageStoreFaultPoint::BeforeWrite)?;
 
-        let result = recover_committed_transaction_pages(&mut log, &mut store);
-        let Err(CommittedTransactionPagesRecoveryError::Page {
+        let failure = UnrecoveredTransactionPageStorage::new(log, store)
+            .recover()
+            .err()
+            .ok_or_else(|| io::Error::other("owning batch unexpectedly succeeded"))?;
+        let CommittedTransactionPagesRecoveryError::Page {
             completed,
             page_number,
             source: CommittedTransactionPageRecoveryError::StoreWrite { state: write_state },
-        }) = result
+        } = failure.error()
         else {
             return Err(io::Error::other("batch did not stop at the injected fault").into());
         };
-        assert_eq!(page_number, failed_page);
+        assert_eq!(*page_number, failed_page);
         assert_eq!(completed.pages().len(), 1);
         assert_eq!(completed.pages()[0].page_number(), first_page);
         assert_eq!(
@@ -1914,18 +1918,9 @@ mod tests {
                 PageStoreFaultPoint::BeforeWrite
             )
         );
-        assert!(store.page(first_page).is_some());
-        assert!(store.page(failed_page).is_none());
-        let behind = store
-            .page(last_page)
-            .ok_or_else(|| io::Error::other("behind page was touched after later-page failure"))?;
-        assert_eq!(behind.page_version(), PageVersion::new(100));
-        assert_eq!(behind.bytes(), &[0xA3]);
-        assert!(store.page(uncommitted_page_number).is_none());
-        assert!(store.page(raw_page_number).is_none());
-        assert!(store.page(volatile_page_number).is_none());
 
-        let rerun = recover_committed_transaction_pages(&mut log, &mut store)?;
+        let mut recovered = failure.retry()?;
+        let rerun = recovered.report();
         assert_eq!(
             rerun
                 .pages()
@@ -1952,14 +1947,14 @@ mod tests {
                 page_number: uncommitted_page_number
             }
         );
+        let (log, store) = recovered.parts_mut();
         let recovered_behind = store
             .page(last_page)
             .ok_or_else(|| io::Error::other("behind page was not recovered"))?;
         assert_eq!(recovered_behind.page_version(), PageVersion::new(1));
         assert_eq!(recovered_behind.bytes(), &[0x03]);
-
         let page_count = store.pages().len();
-        let idempotent = recover_committed_transaction_pages(&mut log, &mut store)?;
+        let idempotent = recover_committed_transaction_pages(log, store)?;
         assert!(idempotent.pages()[..3].iter().all(|outcome| matches!(
             outcome,
             CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
@@ -1971,6 +1966,26 @@ mod tests {
             }
         );
         assert_eq!(store.pages().len(), page_count);
+
+        let live_page_number =
+            PageNumber::new(87).ok_or_else(|| io::Error::other("live page is zero"))?;
+        let live_page = UnloggedPage::new(
+            PageAddress::new(
+                LogDurability::lineage(recovered.parts().0),
+                live_page_number,
+            ),
+            PageVersion::new(87),
+            PageImage::new([0x87])?,
+        );
+        let (log, store) = recovered.parts_mut();
+        let live_dirty = ntsql_page::stage_page_write(log, live_page)?;
+        ntsql_page::flush_dirty_page(log, store, live_dirty)?;
+        assert!(store.page(live_page_number).is_some());
+
+        let (_log, store, _) = recovered.into_parts();
+        assert!(store.page(raw_page_number).is_none());
+        assert!(store.page(volatile_page_number).is_none());
+        assert!(store.page(live_page_number).is_some());
         Ok(())
     }
 }

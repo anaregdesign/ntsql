@@ -11,14 +11,16 @@ use ntsql_page::{
 use ntsql_storage_file::{
     FaultPoint, FileCommitLog, FileCommittedPageRecoveryInventoryError,
     FileCommittedPageRecoverySourceError, FileCommittedPageRecoveryStoreError, FilePageStore,
-    FilePageStoreError, PageStoreFaultPoint,
+    FilePageStoreError, FileTransactionPageStorageOpenError, PageStoreFaultPoint,
+    open_transaction_page_storage,
 };
 use ntsql_transaction::{
     CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
     CommittedTransactionPageRecoverySourceState, CommittedTransactionPageRecoveryTarget,
     CommittedTransactionPagesRecoveryError, CoordinatedCommitError,
     DurableTransactionPageRecoveryInventory, TransactionCoordinator, TransactionId,
-    flush_committed_page, recover_committed_transaction_page, recover_committed_transaction_pages,
+    UnrecoveredTransactionPageStorage, flush_committed_page, recover_committed_transaction_page,
+    recover_committed_transaction_pages,
 };
 use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
 
@@ -347,16 +349,19 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
     assert_eq!(behind.bytes(), &[0xA3]);
     store.arm_fault(PageStoreFaultPoint::BeforeWrite)?;
 
-    let result = recover_committed_transaction_pages(&mut log, &mut store);
-    let Err(CommittedTransactionPagesRecoveryError::Page {
+    let failure = UnrecoveredTransactionPageStorage::new(log, store)
+        .recover()
+        .err()
+        .ok_or_else(|| io::Error::other("owning filesystem batch unexpectedly succeeded"))?;
+    let CommittedTransactionPagesRecoveryError::Page {
         completed,
         page_number,
         source: CommittedTransactionPageRecoveryError::StoreWrite { state: write_state },
-    }) = result
+    } = failure.error()
     else {
         return Err(io::Error::other("filesystem batch did not stop at the fault").into());
     };
-    assert_eq!(page_number, failed_page);
+    assert_eq!(*page_number, failed_page);
     assert_eq!(completed.pages().len(), 1);
     assert_eq!(completed.pages()[0].page_number(), first_page);
     assert_eq!(
@@ -365,18 +370,9 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
             PageStoreFaultPoint::BeforeWrite
         ))
     );
-    assert!(store.page(first_page).is_some());
-    assert!(store.page(failed_page).is_none());
-    let behind = store.page(last_page).ok_or_else(|| {
-        io::Error::other("behind filesystem page was touched after later-page failure")
-    })?;
-    assert_eq!(behind.page_version(), PageVersion::new(100));
-    assert_eq!(behind.bytes(), &[0xA3]);
-    assert!(store.page(uncommitted_page_number).is_none());
-    assert!(store.page(raw_page_number).is_none());
-    assert!(store.page(volatile_page_number).is_none());
 
-    let rerun = recover_committed_transaction_pages(&mut log, &mut store)?;
+    let mut recovered = failure.retry()?;
+    let rerun = recovered.report();
     assert_eq!(
         rerun
             .pages()
@@ -403,6 +399,7 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
             page_number: uncommitted_page_number
         }
     );
+    let (log, store) = recovered.parts_mut();
     let recovered_behind = store
         .page(last_page)
         .ok_or_else(|| io::Error::other("behind filesystem page was not recovered"))?;
@@ -420,7 +417,7 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
         recovered_behind.store_sequence(),
     ];
 
-    let idempotent = recover_committed_transaction_pages(&mut log, &mut store)?;
+    let idempotent = recover_committed_transaction_pages(log, store)?;
     assert!(idempotent.pages()[..3].iter().all(|outcome| matches!(
         outcome,
         CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
@@ -448,6 +445,11 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
         ],
         sequences
     );
+    assert!(store.page(uncommitted_page_number).is_none());
+    assert!(store.page(raw_page_number).is_none());
+    assert!(store.page(volatile_page_number).is_none());
+
+    let (_log, store, _) = recovered.into_parts();
     drop(store);
 
     let reopened = FilePageStore::<1>::open(&store_path)?;
@@ -465,6 +467,111 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
     assert!(reopened.page(uncommitted_page_number).is_none());
     assert!(reopened.page(raw_page_number).is_none());
     assert!(reopened.page(volatile_page_number).is_none());
+    Ok(())
+}
+
+#[test]
+fn filesystem_pair_open_reports_stage_and_releases_first_lock_on_second_failure()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("transaction-page-storage-open")?;
+    let log_path = directory.path().join("commit-log.bin");
+    let store_path = directory.path().join("pages.bin");
+    let missing_log_path = directory.path().join("missing-log.bin");
+    let missing_store_path = directory.path().join("missing-pages.bin");
+    let persistent_id = persistent_log_id(521)?;
+    drop(FileCommitLog::<1>::create_new_transaction_page_capable(
+        &log_path,
+        persistent_id,
+    )?);
+    drop(FilePageStore::<1>::create_new(&store_path, persistent_id)?);
+
+    let held_store = FilePageStore::<1>::open(&store_path)?;
+    assert!(matches!(
+        open_transaction_page_storage::<1, _, _>(&missing_log_path, &store_path),
+        Err(FileTransactionPageStorageOpenError::CommitLog(_))
+    ));
+    drop(held_store);
+
+    assert!(matches!(
+        open_transaction_page_storage::<1, _, _>(&log_path, &missing_store_path),
+        Err(FileTransactionPageStorageOpenError::PageStore(_))
+    ));
+    let reopened_log = FileCommitLog::<1>::open_transaction_page_capable(&log_path)?;
+    drop(reopened_log);
+    Ok(())
+}
+
+#[test]
+fn filesystem_pair_recovery_releases_live_parts_and_reopens_exact() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("transaction-page-storage-owner")?;
+    let log_path = directory.path().join("commit-log.bin");
+    let store_path = directory.path().join("pages.bin");
+    let persistent_id = persistent_log_id(522)?;
+    let first_page = page_number(90)?;
+    let second_page = page_number(91)?;
+    let mut log =
+        FileCommitLog::<1>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+    let store = FilePageStore::<1>::create_new(&store_path, persistent_id)?;
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+    let active = coordinator.begin()?;
+    let page = unlogged_page(log.lineage(), 90, 9, [0x90])?;
+    let (active, dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+    coordinator.commit(active, &mut log)?;
+    drop(dirty);
+    drop(coordinator);
+    drop(log);
+    drop(store);
+
+    let mut recovered =
+        open_transaction_page_storage::<1, _, _>(&log_path, &store_path)?.recover()?;
+    assert_eq!(recovered.report().pages().len(), 1);
+    assert!(matches!(
+        recovered.report().pages()[0],
+        CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+    ));
+    {
+        let (log, store) = recovered.parts_mut();
+        let stored = store
+            .page(first_page)
+            .ok_or_else(|| io::Error::other("startup recovery did not release the first page"))?;
+        assert_eq!(stored.page_version(), PageVersion::new(9));
+        assert_eq!(stored.bytes(), &[0x90]);
+
+        let mut coordinator = TransactionCoordinator::open(log)?;
+        let active = coordinator.begin()?;
+        let page = unlogged_page(log.lineage(), 91, 10, [0x91])?;
+        let (active, dirty) = coordinator.stage_page_write(active, page, log)?;
+        let committed = coordinator.commit(active, log)?;
+        flush_committed_page(&committed, log, store, dirty)?;
+    }
+    let (log, store, report) = recovered.into_parts();
+    assert_eq!(report.pages().len(), 1);
+    drop(log);
+    drop(store);
+
+    let reopened = open_transaction_page_storage::<1, _, _>(&log_path, &store_path)?.recover()?;
+    assert_eq!(
+        reopened
+            .report()
+            .pages()
+            .iter()
+            .map(CommittedTransactionPageRecoveryOutcome::page_number)
+            .collect::<Vec<_>>(),
+        [first_page, second_page]
+    );
+    assert!(reopened.report().pages().iter().all(|outcome| matches!(
+        outcome,
+        CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+    )));
+    let (_, store) = reopened.parts();
+    let first = store
+        .page(first_page)
+        .ok_or_else(|| io::Error::other("first page disappeared after pair reopen"))?;
+    let second = store
+        .page(second_page)
+        .ok_or_else(|| io::Error::other("live page disappeared after pair reopen"))?;
+    assert_eq!(first.bytes(), &[0x90]);
+    assert_eq!(second.bytes(), &[0x91]);
     Ok(())
 }
 

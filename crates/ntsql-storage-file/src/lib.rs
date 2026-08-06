@@ -109,7 +109,7 @@ use ntsql_transaction::{
     DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
     DurableTransactionPageObservationBytesError, TransactionCommitRecord, TransactionEpochSource,
     TransactionId, TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
-    compare_committed_transaction_page_recovery_candidate,
+    UnrecoveredTransactionPageStorage, compare_committed_transaction_page_recovery_candidate,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -3523,6 +3523,35 @@ impl Error for PageStoreOpenError {
     }
 }
 
+/// Stage-specific failure while opening an owned WAL/page-store recovery pair.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileTransactionPageStorageOpenError {
+    /// The transaction-page-capable WAL could not be opened first.
+    CommitLog(FileOpenError),
+    /// The page store could not be opened after the WAL lock was acquired.
+    PageStore(PageStoreOpenError),
+}
+
+impl fmt::Display for FileTransactionPageStorageOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CommitLog(source) => {
+                write!(formatter, "transaction-page WAL open failed: {source}")
+            }
+            Self::PageStore(source) => write!(formatter, "page-store open failed: {source}"),
+        }
+    }
+}
+
+impl Error for FileTransactionPageStorageOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CommitLog(source) => Some(source),
+            Self::PageStore(source) => Some(source),
+        }
+    }
+}
+
 /// Failure while writing to the page store.
 #[derive(Debug)]
 pub enum FilePageStoreError {
@@ -4151,6 +4180,29 @@ impl<const N: usize> FilePageStore<N> {
             Ok(())
         }
     }
+}
+
+/// Unrecovered owner returned by [`open_transaction_page_storage`].
+pub type UnrecoveredFileTransactionPageStorage<const N: usize> =
+    UnrecoveredTransactionPageStorage<FileCommitLog<N>, FilePageStore<N>, N>;
+
+/// Opens and locks one WAL/page-store pair without exposing either before recovery.
+///
+/// The WAL is opened first and the page store second. A second-stage failure
+/// drops the already-opened WAL before returning.
+pub fn open_transaction_page_storage<const N: usize, LogPath, StorePath>(
+    log_path: LogPath,
+    store_path: StorePath,
+) -> Result<UnrecoveredFileTransactionPageStorage<N>, FileTransactionPageStorageOpenError>
+where
+    LogPath: AsRef<Path>,
+    StorePath: AsRef<Path>,
+{
+    let log = FileCommitLog::<N>::open_transaction_page_capable(log_path)
+        .map_err(FileTransactionPageStorageOpenError::CommitLog)?;
+    let store = FilePageStore::<N>::open(store_path)
+        .map_err(FileTransactionPageStorageOpenError::PageStore)?;
+    Ok(UnrecoveredTransactionPageStorage::new(log, store))
 }
 
 impl<const N: usize> ntsql_page::PageStore<N> for FilePageStore<N> {

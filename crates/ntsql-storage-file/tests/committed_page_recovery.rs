@@ -6,23 +6,26 @@ use std::{
 };
 
 use ntsql_page::{
-    PageAddress, PageImage, PageNumber, PageVersion, flush_dirty_page, stage_page_write,
+    DurablePageWalObservation, PageAddress, PageImage, PageNumber, PageVersion, flush_dirty_page,
+    stage_page_write,
 };
 use ntsql_storage_file::{
     FaultPoint, FileCommitLog, FileCommittedPageRecoveryInventoryError,
-    FileCommittedPageRecoverySourceError, FileCommittedPageRecoveryStoreError, FilePageStore,
-    FilePageStoreError, FileTransactionPageStorageOpenError, PageStoreFaultPoint,
-    open_transaction_page_storage,
+    FileCommittedPageRecoverySourceError, FileCommittedPageRecoveryStoreError, FileIoStage,
+    FileOpenError, FilePageStore, FilePageStoreError, FileTransactionPageStorageOpenError,
+    PageStoreFaultPoint, PageStoreIoStage, PageStoreOpenError, open_transaction_page_storage,
 };
 use ntsql_transaction::{
     CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
     CommittedTransactionPageRecoverySourceState, CommittedTransactionPageRecoveryTarget,
     CommittedTransactionPagesRecoveryError, CoordinatedCommitError,
-    DurableTransactionPageRecoveryInventory, TransactionCoordinator, TransactionId,
-    UnrecoveredTransactionPageStorage, flush_committed_page, recover_committed_transaction_page,
-    recover_committed_transaction_pages,
+    DurableTransactionCommitObservation, DurableTransactionPageObservation,
+    DurableTransactionPageRecoveryInventory, DurableTransactionRestartAnalysisError,
+    DurableTransactionRestartObservation, DurableTransactionRestartState, TransactionCoordinator,
+    TransactionId, UnrecoveredTransactionPageStorage, flush_committed_page,
+    recover_committed_transaction_page, recover_committed_transaction_pages,
 };
-use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
+use ntsql_wal::{LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
@@ -37,6 +40,68 @@ struct RecoveryScenario {
     behind_store_path: PathBuf,
     missing_store_path: PathBuf,
     _directory: TestDirectory,
+}
+
+struct FailingRestartFileSource(FileCommitLog<1>);
+
+impl DurableTransactionPageRecoveryInventory<1> for FailingRestartFileSource {
+    type Error = FileCommittedPageRecoveryInventoryError;
+
+    fn durable_transaction_page_numbers(&mut self) -> Result<Vec<PageNumber>, Self::Error> {
+        self.0.durable_transaction_page_numbers()
+    }
+}
+
+impl ntsql_transaction::DurableTransactionPageRecoverySource<1> for FailingRestartFileSource {
+    type Error = FileCommittedPageRecoverySourceError<1>;
+
+    fn lineage(&self) -> &LogLineage {
+        <FileCommitLog<1> as ntsql_transaction::DurableTransactionPageRecoverySource<1>>::lineage(
+            &self.0,
+        )
+    }
+
+    fn with_durable_page_evidence<Output, Operation>(
+        &mut self,
+        page_number: PageNumber,
+        operation: Operation,
+    ) -> Result<Output, Self::Error>
+    where
+        Operation: for<'evidence> FnOnce(
+            &'evidence [DurablePageWalObservation<1>],
+            &'evidence [DurableTransactionPageObservation<1>],
+            &'evidence [DurableTransactionCommitObservation],
+        ) -> Output,
+    {
+        ntsql_transaction::DurableTransactionPageRecoverySource::with_durable_page_evidence(
+            &mut self.0,
+            page_number,
+            operation,
+        )
+    }
+}
+
+impl ntsql_transaction::DurableTransactionRestartAnalysisSource<1> for FailingRestartFileSource {
+    type Error = io::Error;
+
+    fn lineage(&self) -> &LogLineage {
+        <FileCommitLog<1> as ntsql_transaction::DurableTransactionRestartAnalysisSource<1>>::lineage(
+            &self.0,
+        )
+    }
+
+    fn with_durable_transaction_restart_observations<Output, Operation>(
+        &mut self,
+        _operation: Operation,
+    ) -> Result<Output, Self::Error>
+    where
+        Operation: for<'evidence> FnOnce(
+            Option<&'evidence LogSequenceNumber>,
+            &'evidence [DurableTransactionRestartObservation<1>],
+        ) -> Output,
+    {
+        Err(io::Error::other("injected restart-analysis failure"))
+    }
 }
 
 #[test]
@@ -270,6 +335,7 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
 
     let last_page = page_number(83)?;
     let behind_active = coordinator.begin()?;
+    let behind_owner = behind_active.transaction_id();
     let behind_page = unlogged_page(log.lineage(), 83, 100, [0xA3])?;
     let (behind_active, behind_dirty) =
         coordinator.stage_page_write(behind_active, behind_page, &mut log)?;
@@ -278,6 +344,7 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
 
     let first_page = page_number(81)?;
     let exact_active = coordinator.begin()?;
+    let exact_owner = exact_active.transaction_id();
     let exact_page = unlogged_page(log.lineage(), 81, 81, [0x81])?;
     let (exact_active, exact_dirty) =
         coordinator.stage_page_write(exact_active, exact_page, &mut log)?;
@@ -286,6 +353,7 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
 
     let failed_page = page_number(82)?;
     let missing_active = coordinator.begin()?;
+    let missing_owner = missing_active.transaction_id();
     let missing_page = unlogged_page(log.lineage(), 82, 82, [0x82])?;
     let (missing_active, missing_dirty) =
         coordinator.stage_page_write(missing_active, missing_page, &mut log)?;
@@ -293,6 +361,7 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
     drop(missing_dirty);
 
     let latest_active = coordinator.begin()?;
+    let latest_owner = latest_active.transaction_id();
     let latest_page = unlogged_page(log.lineage(), 83, 1, [0x03])?;
     let (latest_active, latest_dirty) =
         coordinator.stage_page_write(latest_active, latest_page, &mut log)?;
@@ -301,6 +370,7 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
 
     let uncommitted_page_number = page_number(84)?;
     let uncommitted_active = coordinator.begin()?;
+    let uncommitted_owner = uncommitted_active.transaction_id();
     let uncommitted_page = unlogged_page(log.lineage(), 84, 84, [0x84])?;
     let (uncommitted_active, uncommitted_dirty) =
         coordinator.stage_page_write(uncommitted_active, uncommitted_page, &mut log)?;
@@ -329,6 +399,10 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
 
     assert_eq!(log.records().len(), 12);
     assert_eq!(log.durable_records().len(), 10);
+    let expected_restart_lineage = log.lineage().clone();
+    let expected_restart_frontier = log
+        .durable_position()
+        .ok_or_else(|| io::Error::other("filesystem restart frontier is missing"))?;
     assert_eq!(
         log.records()[10]
             .transaction_page_write()
@@ -371,8 +445,19 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
         ))
     );
 
-    let mut recovered = failure.retry()?;
-    let rerun = recovered.report();
+    let page_recovered = failure.retry()?;
+    assert_transaction_page_storage_wal_locked(
+        open_transaction_page_storage::<1, _, _>(&log_path, &store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("page-recovered owner released the WAL lock"))?,
+    )?;
+    let mut recovered = page_recovered.analyze_restart()?;
+    assert_transaction_page_storage_wal_locked(
+        open_transaction_page_storage::<1, _, _>(&log_path, &store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("analyzed owner released the WAL lock"))?,
+    )?;
+    let rerun = recovered.recovery_report();
     assert_eq!(
         rerun
             .pages()
@@ -398,6 +483,44 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
         CommittedTransactionPageRecoveryOutcome::NoCommittedPage {
             page_number: uncommitted_page_number
         }
+    );
+    let analysis = recovered.restart_analysis();
+    assert!(analysis.lineage().same_lineage(&expected_restart_lineage));
+    assert_eq!(
+        analysis.durable_frontier(),
+        Some(&expected_restart_frontier)
+    );
+    let expected_transactions = [
+        (behind_owner, 1, Some(2)),
+        (exact_owner, 3, Some(4)),
+        (missing_owner, 5, Some(6)),
+        (latest_owner, 7, Some(8)),
+        (uncommitted_owner, 9, None),
+    ];
+    assert_eq!(analysis.transactions().len(), expected_transactions.len());
+    for (entry, (owner, page_position, commit_position)) in
+        analysis.transactions().iter().zip(expected_transactions)
+    {
+        assert!(entry.transaction().matches_transaction_id(owner));
+        assert_eq!(
+            entry
+                .first_owned_page_position()
+                .map(LogSequenceNumber::get),
+            Some(page_position)
+        );
+        assert_eq!(
+            entry.last_owned_page_position().map(LogSequenceNumber::get),
+            Some(page_position)
+        );
+        assert_eq!(entry.owned_page_record_count(), 1);
+        assert_eq!(
+            entry.state().commit_position().map(LogSequenceNumber::get),
+            commit_position
+        );
+    }
+    assert_eq!(
+        analysis.transactions()[4].state(),
+        &DurableTransactionRestartState::Uncommitted
     );
     let (log, store) = recovered.parts_mut();
     let recovered_behind = store
@@ -449,7 +572,12 @@ fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
     assert!(store.page(raw_page_number).is_none());
     assert!(store.page(volatile_page_number).is_none());
 
-    let (_log, store, _) = recovered.into_parts();
+    let (_log, store, report, analysis) = recovered.into_parts();
+    assert_eq!(report.pages().len(), 4);
+    assert_eq!(
+        analysis.durable_frontier(),
+        Some(&expected_restart_frontier)
+    );
     drop(store);
 
     let reopened = FilePageStore::<1>::open(&store_path)?;
@@ -514,6 +642,7 @@ fn filesystem_pair_recovery_releases_live_parts_and_reopens_exact() -> Result<()
     let store = FilePageStore::<1>::create_new(&store_path, persistent_id)?;
     let mut coordinator = TransactionCoordinator::open(&mut log)?;
     let active = coordinator.begin()?;
+    let first_owner = active.transaction_id();
     let page = unlogged_page(log.lineage(), 90, 9, [0x90])?;
     let (active, dirty) = coordinator.stage_page_write(active, page, &mut log)?;
     coordinator.commit(active, &mut log)?;
@@ -522,13 +651,69 @@ fn filesystem_pair_recovery_releases_live_parts_and_reopens_exact() -> Result<()
     drop(log);
     drop(store);
 
-    let mut recovered =
+    let page_recovered =
         open_transaction_page_storage::<1, _, _>(&log_path, &store_path)?.recover()?;
-    assert_eq!(recovered.report().pages().len(), 1);
+    assert_transaction_page_storage_wal_locked(
+        open_transaction_page_storage::<1, _, _>(&log_path, &store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("page-recovered pair released its WAL lock"))?,
+    )?;
+    assert_page_store_locked(
+        FilePageStore::<1>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("page-recovered pair released its page-store lock"))?,
+    )?;
+    let mut recovered = page_recovered.analyze_restart()?;
+    assert_transaction_page_storage_wal_locked(
+        open_transaction_page_storage::<1, _, _>(&log_path, &store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("analyzed pair released its WAL lock"))?,
+    )?;
+    assert_page_store_locked(
+        FilePageStore::<1>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("analyzed pair released its page-store lock"))?,
+    )?;
+    assert_eq!(recovered.recovery_report().pages().len(), 1);
     assert!(matches!(
-        recovered.report().pages()[0],
+        recovered.recovery_report().pages()[0],
         CommittedTransactionPageRecoveryOutcome::Recovered { .. }
     ));
+    assert_eq!(
+        recovered
+            .restart_analysis()
+            .durable_frontier()
+            .map(|position| position.get()),
+        Some(2)
+    );
+    assert_eq!(recovered.restart_analysis().transactions().len(), 1);
+    let first_entry = &recovered.restart_analysis().transactions()[0];
+    assert!(
+        first_entry
+            .transaction()
+            .matches_transaction_id(first_owner)
+    );
+    assert_eq!(
+        first_entry
+            .first_owned_page_position()
+            .map(LogSequenceNumber::get),
+        Some(1)
+    );
+    assert_eq!(
+        first_entry
+            .last_owned_page_position()
+            .map(LogSequenceNumber::get),
+        Some(1)
+    );
+    assert_eq!(first_entry.owned_page_record_count(), 1);
+    assert_eq!(
+        first_entry
+            .state()
+            .commit_position()
+            .map(LogSequenceNumber::get),
+        Some(2)
+    );
+    let second_owner;
     {
         let (log, store) = recovered.parts_mut();
         let stored = store
@@ -539,30 +724,74 @@ fn filesystem_pair_recovery_releases_live_parts_and_reopens_exact() -> Result<()
 
         let mut coordinator = TransactionCoordinator::open(log)?;
         let active = coordinator.begin()?;
+        second_owner = active.transaction_id();
         let page = unlogged_page(log.lineage(), 91, 10, [0x91])?;
         let (active, dirty) = coordinator.stage_page_write(active, page, log)?;
         let committed = coordinator.commit(active, log)?;
         flush_committed_page(&committed, log, store, dirty)?;
     }
-    let (log, store, report) = recovered.into_parts();
+    let (log, store, report, analysis) = recovered.into_parts();
     assert_eq!(report.pages().len(), 1);
+    assert_eq!(
+        analysis.durable_frontier().map(|position| position.get()),
+        Some(2)
+    );
     drop(log);
     drop(store);
 
-    let reopened = open_transaction_page_storage::<1, _, _>(&log_path, &store_path)?.recover()?;
+    let reopened = open_transaction_page_storage::<1, _, _>(&log_path, &store_path)?
+        .recover()?
+        .analyze_restart()?;
     assert_eq!(
         reopened
-            .report()
+            .recovery_report()
             .pages()
             .iter()
             .map(CommittedTransactionPageRecoveryOutcome::page_number)
             .collect::<Vec<_>>(),
         [first_page, second_page]
     );
-    assert!(reopened.report().pages().iter().all(|outcome| matches!(
-        outcome,
-        CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
-    )));
+    assert!(
+        reopened
+            .recovery_report()
+            .pages()
+            .iter()
+            .all(|outcome| matches!(
+                outcome,
+                CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+            ))
+    );
+    assert_eq!(
+        reopened
+            .restart_analysis()
+            .durable_frontier()
+            .map(|position| position.get()),
+        Some(4)
+    );
+    assert_eq!(reopened.restart_analysis().transactions().len(), 2);
+    for (entry, (owner, page_position, commit_position)) in reopened
+        .restart_analysis()
+        .transactions()
+        .iter()
+        .zip([(first_owner, 1, 2), (second_owner, 3, 4)])
+    {
+        assert!(entry.transaction().matches_transaction_id(owner));
+        assert_eq!(
+            entry
+                .first_owned_page_position()
+                .map(LogSequenceNumber::get),
+            Some(page_position)
+        );
+        assert_eq!(
+            entry.last_owned_page_position().map(LogSequenceNumber::get),
+            Some(page_position)
+        );
+        assert_eq!(entry.owned_page_record_count(), 1);
+        assert_eq!(
+            entry.state().commit_position().map(LogSequenceNumber::get),
+            Some(commit_position)
+        );
+    }
     let (_, store) = reopened.parts();
     let first = store
         .page(first_page)
@@ -572,6 +801,46 @@ fn filesystem_pair_recovery_releases_live_parts_and_reopens_exact() -> Result<()
         .ok_or_else(|| io::Error::other("live page disappeared after pair reopen"))?;
     assert_eq!(first.bytes(), &[0x90]);
     assert_eq!(second.bytes(), &[0x91]);
+    Ok(())
+}
+
+#[test]
+fn filesystem_failed_restart_analysis_retains_both_adapter_locks() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("failed-restart-owner-locks")?;
+    let log_path = directory.path().join("commit-log.bin");
+    let store_path = directory.path().join("pages.bin");
+    let persistent_id = persistent_log_id(523)?;
+    let log = FileCommitLog::<1>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+    let store = FilePageStore::<1>::create_new(&store_path, persistent_id)?;
+
+    let page_recovered =
+        UnrecoveredTransactionPageStorage::new(FailingRestartFileSource(log), store).recover()?;
+    let failure = page_recovered
+        .analyze_restart()
+        .err()
+        .ok_or_else(|| io::Error::other("injected restart failure reached live storage"))?;
+    assert!(failure.recovery_report().pages().is_empty());
+    let DurableTransactionRestartAnalysisError::Source(source) = failure.error() else {
+        return Err(io::Error::other("injected restart failure lost its source error").into());
+    };
+    assert_eq!(source.kind(), io::ErrorKind::Other);
+
+    assert_commit_log_locked(
+        FileCommitLog::<1>::open_transaction_page_capable(&log_path)
+            .err()
+            .ok_or_else(|| io::Error::other("failed analysis released the WAL lock"))?,
+    )?;
+    assert_page_store_locked(
+        FilePageStore::<1>::open(&store_path)
+            .err()
+            .ok_or_else(|| io::Error::other("failed analysis released the page-store lock"))?,
+    )?;
+
+    drop(failure);
+    let reopened_log = FileCommitLog::<1>::open_transaction_page_capable(&log_path)?;
+    let reopened_store = FilePageStore::<1>::open(&store_path)?;
+    drop(reopened_log);
+    drop(reopened_store);
     Ok(())
 }
 
@@ -624,6 +893,45 @@ fn transaction_page_recovery_rejects_older_file_wal_formats_before_callback()
     );
     assert!(!v1_called);
     assert!(!v2_called);
+    Ok(())
+}
+
+fn assert_transaction_page_storage_wal_locked(
+    error: FileTransactionPageStorageOpenError,
+) -> Result<(), io::Error> {
+    let FileTransactionPageStorageOpenError::CommitLog(source) = error else {
+        return Err(io::Error::other(
+            "owned transaction-page WAL lock contention was not commit-log I/O",
+        ));
+    };
+    assert_commit_log_locked(source)
+}
+
+fn assert_commit_log_locked(error: FileOpenError) -> Result<(), io::Error> {
+    let FileOpenError::Io(source) = error else {
+        return Err(io::Error::other("WAL lock contention was not I/O"));
+    };
+    if source.stage() != FileIoStage::AcquireExclusiveLock
+        || source.io_source().kind() != io::ErrorKind::WouldBlock
+    {
+        return Err(io::Error::other(
+            "owned transaction-page WAL lock contention had the wrong cause",
+        ));
+    }
+    Ok(())
+}
+
+fn assert_page_store_locked(error: PageStoreOpenError) -> Result<(), io::Error> {
+    let PageStoreOpenError::Io(source) = error else {
+        return Err(io::Error::other("page-store lock contention was not I/O"));
+    };
+    if source.stage() != PageStoreIoStage::AcquireExclusiveLock
+        || source.io_source().kind() != io::ErrorKind::WouldBlock
+    {
+        return Err(io::Error::other(
+            "owned transaction-page page-store lock contention had the wrong cause",
+        ));
+    }
     Ok(())
 }
 

@@ -1655,9 +1655,9 @@ mod tests {
     use ntsql_page::{PageAddress, PageImage};
     use ntsql_transaction::{
         CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
-        CommittedTransactionPagesRecoveryError, CoordinatedCommitError, TransactionCoordinator,
-        TransactionLifecycleStatus, TransactionResolutionFailure,
-        UnrecoveredTransactionPageStorage, flush_committed_page,
+        CommittedTransactionPagesRecoveryError, CoordinatedCommitError,
+        DurableTransactionRestartState, TransactionCoordinator, TransactionLifecycleStatus,
+        TransactionResolutionFailure, UnrecoveredTransactionPageStorage, flush_committed_page,
         recover_committed_transaction_pages,
     };
     use ntsql_wal::CommitError;
@@ -2057,6 +2057,7 @@ mod tests {
         let behind_page_number =
             PageNumber::new(83).ok_or_else(|| io::Error::other("behind page is zero"))?;
         let behind_active = coordinator.begin()?;
+        let behind_owner = behind_active.transaction_id();
         let behind_page = UnloggedPage::new(
             PageAddress::new(LogDurability::lineage(&log), behind_page_number),
             PageVersion::new(100),
@@ -2070,6 +2071,7 @@ mod tests {
         let first_page =
             PageNumber::new(81).ok_or_else(|| io::Error::other("first page is zero"))?;
         let exact_active = coordinator.begin()?;
+        let exact_owner = exact_active.transaction_id();
         let exact_page = UnloggedPage::new(
             PageAddress::new(LogDurability::lineage(&log), first_page),
             PageVersion::new(81),
@@ -2083,6 +2085,7 @@ mod tests {
         let failed_page =
             PageNumber::new(82).ok_or_else(|| io::Error::other("failed page is zero"))?;
         let missing_active = coordinator.begin()?;
+        let missing_owner = missing_active.transaction_id();
         let missing_page = UnloggedPage::new(
             PageAddress::new(LogDurability::lineage(&log), failed_page),
             PageVersion::new(82),
@@ -2094,6 +2097,7 @@ mod tests {
         drop(missing_dirty);
 
         let latest_active = coordinator.begin()?;
+        let latest_owner = latest_active.transaction_id();
         let latest_page = UnloggedPage::new(
             PageAddress::new(LogDurability::lineage(&log), behind_page_number),
             PageVersion::new(1),
@@ -2105,6 +2109,7 @@ mod tests {
         drop(latest_dirty);
 
         let uncommitted_active = coordinator.begin()?;
+        let uncommitted_owner = uncommitted_active.transaction_id();
         let uncommitted_page_number =
             PageNumber::new(84).ok_or_else(|| io::Error::other("uncommitted page is zero"))?;
         let uncommitted_page = UnloggedPage::new(
@@ -2149,6 +2154,10 @@ mod tests {
 
         assert_eq!(log.records().len(), 12);
         assert_eq!(log.durable_records().len(), 10);
+        let expected_restart_lineage = LogDurability::lineage(&log).clone();
+        let expected_restart_frontier = log
+            .durable_position()
+            .ok_or_else(|| io::Error::other("durable restart frontier is missing"))?;
         assert_eq!(
             log.records()[10]
                 .transaction_page_write()
@@ -2195,8 +2204,9 @@ mod tests {
             )
         );
 
-        let mut recovered = failure.retry()?;
-        let rerun = recovered.report();
+        let page_recovered = failure.retry()?;
+        let mut recovered = page_recovered.analyze_restart()?;
+        let rerun = recovered.recovery_report();
         assert_eq!(
             rerun
                 .pages()
@@ -2222,6 +2232,44 @@ mod tests {
             CommittedTransactionPageRecoveryOutcome::NoCommittedPage {
                 page_number: uncommitted_page_number
             }
+        );
+        let analysis = recovered.restart_analysis();
+        assert!(analysis.lineage().same_lineage(&expected_restart_lineage));
+        assert_eq!(
+            analysis.durable_frontier(),
+            Some(&expected_restart_frontier)
+        );
+        let expected_transactions = [
+            (behind_owner, 1, Some(2)),
+            (exact_owner, 3, Some(4)),
+            (missing_owner, 5, Some(6)),
+            (latest_owner, 7, Some(8)),
+            (uncommitted_owner, 9, None),
+        ];
+        assert_eq!(analysis.transactions().len(), expected_transactions.len());
+        for (entry, (owner, page_position, commit_position)) in
+            analysis.transactions().iter().zip(expected_transactions)
+        {
+            assert!(entry.transaction().matches_transaction_id(owner));
+            assert_eq!(
+                entry
+                    .first_owned_page_position()
+                    .map(LogSequenceNumber::get),
+                Some(page_position)
+            );
+            assert_eq!(
+                entry.last_owned_page_position().map(LogSequenceNumber::get),
+                Some(page_position)
+            );
+            assert_eq!(entry.owned_page_record_count(), 1);
+            assert_eq!(
+                entry.state().commit_position().map(LogSequenceNumber::get),
+                commit_position
+            );
+        }
+        assert_eq!(
+            analysis.transactions()[4].state(),
+            &DurableTransactionRestartState::Uncommitted
         );
         let (log, store) = recovered.parts_mut();
         let recovered_behind = store
@@ -2257,8 +2305,21 @@ mod tests {
         let live_dirty = ntsql_page::stage_page_write(log, live_page)?;
         ntsql_page::flush_dirty_page(log, store, live_dirty)?;
         assert!(store.page(live_page_number).is_some());
+        let live_frontier = log
+            .durable_position()
+            .ok_or_else(|| io::Error::other("live durable frontier is missing"))?;
+        assert!(live_frontier.get() > expected_restart_frontier.get());
+        assert_eq!(
+            recovered.restart_analysis().durable_frontier(),
+            Some(&expected_restart_frontier)
+        );
 
-        let (_log, store, _) = recovered.into_parts();
+        let (_log, store, report, analysis) = recovered.into_parts();
+        assert_eq!(report.pages().len(), 4);
+        assert_eq!(
+            analysis.durable_frontier(),
+            Some(&expected_restart_frontier)
+        );
         assert!(store.page(raw_page_number).is_none());
         assert!(store.page(volatile_page_number).is_none());
         assert!(store.page(live_page_number).is_some());

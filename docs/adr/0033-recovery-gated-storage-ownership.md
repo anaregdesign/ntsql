@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #118
 - Extends: ADR 0029, ADR 0031, ADR 0032
-- Extended by: ADR 0034
+- Extended by: ADR 0034, ADR 0037
 
 ## Context
 
@@ -275,7 +275,8 @@ until deterministic committed-page recovery completes. Partial failure retains
 both locked adapters and exact diagnostics, and the only continuation is a fresh
 whole-batch retry.
 
-The recovered owner is now a suitable composition boundary for separately
-reviewed checkpoint metadata and restart analysis. Database lifecycle, global
-startup exclusion, log truncation, dirty-page and transaction tables, and undo
-remain future work.
+ADR 0037 narrows adapter release so this page-recovered owner must also complete
+durable restart analysis before live use. The resulting analyzed owner is a
+suitable composition boundary for separately reviewed checkpoint metadata.
+Database lifecycle, global startup exclusion, log truncation, dirty-page
+analysis, replay, and undo remain future work.

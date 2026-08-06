@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #124
 - Extends: ADR 0014, ADR 0031, ADR 0034, ADR 0035
+- Extended by: ADR 0037
 
 ## Context
 
@@ -270,6 +271,6 @@ Both deterministic memory and persistent filesystem WAL adapters now satisfy
 the ADR 0034 complete-prefix source contract without manual projection or
 authority leakage.
 
-The next focused slice may bind restart analysis to the ADR 0033 recovered
-storage owner. Persistent checkpoints, dirty-page analysis, replay start,
-undo/compensation, and log reclamation remain separately reviewed work.
+ADR 0037 binds restart analysis to the ADR 0033 recovered storage owner.
+Persistent checkpoints, dirty-page analysis, replay start, undo/compensation,
+and log reclamation remain separately reviewed work.

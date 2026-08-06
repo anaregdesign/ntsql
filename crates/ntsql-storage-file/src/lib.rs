@@ -102,10 +102,14 @@ use ntsql_page::{
     StoredPageSnapshotObservation, UnloggedPage,
 };
 use ntsql_transaction::{
-    DurableCommitLookup, DurableTransactionCommitObservation,
+    CommittedTransactionPageRecoveryWritePermit, DurableCommitLookup,
+    DurableCommittedTransactionPageRecoveryCandidate,
+    DurableCommittedTransactionPageRecoveryComparison,
+    DurableCommittedTransactionPageRecoveryComparisonError, DurableTransactionCommitObservation,
     DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
     DurableTransactionPageObservationBytesError, TransactionCommitRecord, TransactionEpochSource,
     TransactionId, TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
+    compare_committed_transaction_page_recovery_candidate,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -843,6 +847,96 @@ impl fmt::Display for FileTransactionRecoveryError {
 }
 
 impl Error for FileTransactionRecoveryError {}
+
+/// Projection whose filesystem recovery evidence could not reserve memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilePageRecoveryProjection {
+    /// Commit-agnostic physical page observations.
+    PhysicalPages,
+    /// Transaction-owner-aware page observations.
+    TransactionPages,
+    /// Complete durable commit observations.
+    Commits,
+}
+
+impl fmt::Display for FilePageRecoveryProjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PhysicalPages => formatter.write_str("physical page"),
+            Self::TransactionPages => formatter.write_str("transaction page"),
+            Self::Commits => formatter.write_str("commit"),
+        }
+    }
+}
+
+/// Failure to project one stable filesystem durable prefix for page recovery.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileCommittedPageRecoverySourceError<const N: usize> {
+    /// The opened WAL format cannot contain transaction-owned page evidence.
+    TransactionPageSupportUnavailable {
+        /// Exact opened WAL format version.
+        version: u16,
+    },
+    /// An uncertain prior WAL write requires reopen before authoritative recovery.
+    PoisonedWriter,
+    /// One projection could not reserve enough memory before scanning.
+    EvidenceCapacityExhausted {
+        /// Projection whose allocation failed.
+        projection: FilePageRecoveryProjection,
+    },
+    /// A matching physical page record could not become domain evidence.
+    PhysicalPageProjection(Box<PageRecoveryObservationBytesError<N>>),
+    /// A matching transaction-owned page record could not become domain evidence.
+    TransactionPageProjection(Box<DurableTransactionPageObservationBytesError<N>>),
+    /// A durable commit record could not become domain evidence.
+    CommitProjection(Box<DurableTransactionCommitObservationFieldsError>),
+}
+
+impl<const N: usize> fmt::Display for FileCommittedPageRecoverySourceError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TransactionPageSupportUnavailable { version } => write!(
+                formatter,
+                "file WAL format version {version} does not support committed-page recovery"
+            ),
+            Self::PoisonedWriter => formatter.write_str(
+                "commit-log writer is poisoned; reopen the file before committed-page recovery",
+            ),
+            Self::EvidenceCapacityExhausted { projection } => write!(
+                formatter,
+                "filesystem {projection} recovery evidence capacity is exhausted"
+            ),
+            Self::PhysicalPageProjection(source) => {
+                write!(
+                    formatter,
+                    "physical page recovery projection failed: {source}"
+                )
+            }
+            Self::TransactionPageProjection(source) => {
+                write!(
+                    formatter,
+                    "transaction page recovery projection failed: {source}"
+                )
+            }
+            Self::CommitProjection(source) => {
+                write!(formatter, "commit recovery projection failed: {source}")
+            }
+        }
+    }
+}
+
+impl<const N: usize> Error for FileCommittedPageRecoverySourceError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PhysicalPageProjection(source) => Some(source.as_ref()),
+            Self::TransactionPageProjection(source) => Some(source.as_ref()),
+            Self::CommitProjection(source) => Some(source.as_ref()),
+            Self::TransactionPageSupportUnavailable { .. }
+            | Self::PoisonedWriter
+            | Self::EvidenceCapacityExhausted { .. } => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct StoredTransactionIdentity {
@@ -1706,6 +1800,97 @@ impl<const N: usize> TransactionRecoverySource for FileCommitLog<N> {
             None => DurableCommitLookup::Absent,
         };
         Ok((self.lineage.clone(), lookup))
+    }
+}
+
+impl<const N: usize> ntsql_transaction::DurableTransactionPageRecoverySource<N>
+    for FileCommitLog<N>
+{
+    type Error = FileCommittedPageRecoverySourceError<N>;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    fn with_durable_page_evidence<Output, Operation>(
+        &mut self,
+        page_number: PageNumber,
+        operation: Operation,
+    ) -> Result<Output, Self::Error>
+    where
+        Operation: for<'evidence> FnOnce(
+            &'evidence [DurablePageWalObservation<N>],
+            &'evidence [DurableTransactionPageObservation<N>],
+            &'evidence [DurableTransactionCommitObservation],
+        ) -> Output,
+    {
+        if self.poisoned {
+            return Err(FileCommittedPageRecoverySourceError::PoisonedWriter);
+        }
+        if !self.format.supports_transaction_pages() {
+            return Err(
+                FileCommittedPageRecoverySourceError::TransactionPageSupportUnavailable {
+                    version: self.format.version(),
+                },
+            );
+        }
+
+        let durable_len = self.durable_len;
+        let mut physical_pages = Vec::new();
+        physical_pages.try_reserve(durable_len).map_err(|_| {
+            FileCommittedPageRecoverySourceError::EvidenceCapacityExhausted {
+                projection: FilePageRecoveryProjection::PhysicalPages,
+            }
+        })?;
+        let mut transaction_pages = Vec::new();
+        transaction_pages.try_reserve(durable_len).map_err(|_| {
+            FileCommittedPageRecoverySourceError::EvidenceCapacityExhausted {
+                projection: FilePageRecoveryProjection::TransactionPages,
+            }
+        })?;
+        let mut commits = Vec::new();
+        commits.try_reserve(durable_len).map_err(|_| {
+            FileCommittedPageRecoverySourceError::EvidenceCapacityExhausted {
+                projection: FilePageRecoveryProjection::Commits,
+            }
+        })?;
+
+        for record in self.durable_records() {
+            if record
+                .page_write()
+                .is_some_and(|page| page.page_number() == page_number)
+                && let Some(observation) = record.page_recovery_observation().map_err(|source| {
+                    FileCommittedPageRecoverySourceError::PhysicalPageProjection(Box::new(source))
+                })?
+            {
+                physical_pages.push(observation);
+            }
+            if record
+                .transaction_page_write()
+                .is_some_and(|page| page.page_write().page_number() == page_number)
+                && let Some(observation) =
+                    record
+                        .transaction_page_recovery_observation()
+                        .map_err(|source| {
+                            FileCommittedPageRecoverySourceError::TransactionPageProjection(
+                                Box::new(source),
+                            )
+                        })?
+            {
+                transaction_pages.push(observation);
+            }
+            if let Some(observation) =
+                record
+                    .transaction_commit_recovery_observation()
+                    .map_err(|source| {
+                        FileCommittedPageRecoverySourceError::CommitProjection(Box::new(source))
+                    })?
+            {
+                commits.push(observation);
+            }
+        }
+
+        Ok(operation(&physical_pages, &transaction_pages, &commits))
     }
 }
 
@@ -3378,6 +3563,147 @@ impl Error for FilePageStoreError {
     }
 }
 
+/// Failure to observe an authoritative filesystem page-store snapshot.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileCommittedPageRecoveryObservationError<const N: usize> {
+    /// An uncertain prior page-store write requires reopen before observation.
+    PoisonedWriter,
+    /// The current stored bytes could not become adapter-neutral evidence.
+    Projection(Box<PageRecoveryObservationBytesError<N>>),
+}
+
+impl<const N: usize> fmt::Display for FileCommittedPageRecoveryObservationError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoisonedWriter => formatter.write_str(
+                "page-store writer is poisoned; reopen the file before committed-page recovery",
+            ),
+            Self::Projection(source) => {
+                write!(formatter, "filesystem page observation failed: {source}")
+            }
+        }
+    }
+}
+
+impl<const N: usize> Error for FileCommittedPageRecoveryObservationError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Projection(source) => Some(source.as_ref()),
+            Self::PoisonedWriter => None,
+        }
+    }
+}
+
+/// Failure during the filesystem page-store's atomic recovery replacement.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileCommittedPageRecoveryStoreError<const N: usize> {
+    /// The candidate target page position belongs to another lineage.
+    ForeignTargetPagePosition(LogSequenceNumber),
+    /// The candidate target commit position belongs to another lineage.
+    ForeignTargetCommitPosition(LogSequenceNumber),
+    /// The recovery permit page position belongs to another lineage.
+    ForeignPermitPagePosition(LogSequenceNumber),
+    /// The recovery permit commit position belongs to another lineage.
+    ForeignPermitCommitPosition(LogSequenceNumber),
+    /// The permit page position differs from the candidate target.
+    PermitPagePositionMismatch {
+        /// Candidate target page position.
+        expected: LogSequenceNumber,
+        /// Supplied permit page position.
+        actual: LogSequenceNumber,
+    },
+    /// The permit commit position differs from the candidate target.
+    PermitCommitPositionMismatch {
+        /// Candidate target commit position.
+        expected: LogSequenceNumber,
+        /// Supplied permit commit position.
+        actual: LogSequenceNumber,
+    },
+    /// Current store state could not be projected during the locked recheck.
+    CurrentObservation(Box<PageRecoveryObservationBytesError<N>>),
+    /// Current store state contradicted the candidate.
+    SourceComparison(Box<DurableCommittedTransactionPageRecoveryComparisonError>),
+    /// Current store state was valid but no longer matched the candidate source.
+    SourceNotMatched {
+        /// Non-source comparison observed under the store's lifetime lock.
+        actual: DurableCommittedTransactionPageRecoveryComparison,
+    },
+    /// Shared physical page-store writing failed at an exact typed boundary.
+    PageStore(FilePageStoreError),
+}
+
+impl<const N: usize> fmt::Display for FileCommittedPageRecoveryStoreError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ForeignTargetPagePosition(position) => write!(
+                formatter,
+                "recovery target page position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::ForeignTargetCommitPosition(position) => write!(
+                formatter,
+                "recovery target commit position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::ForeignPermitPagePosition(position) => write!(
+                formatter,
+                "recovery permit page position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::ForeignPermitCommitPosition(position) => write!(
+                formatter,
+                "recovery permit commit position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::PermitPagePositionMismatch { expected, actual } => write!(
+                formatter,
+                "recovery permit page position {} does not match target position {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::PermitCommitPositionMismatch { expected, actual } => write!(
+                formatter,
+                "recovery permit commit position {} does not match target position {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::CurrentObservation(source) => {
+                write!(
+                    formatter,
+                    "recovery current-page observation failed: {source}"
+                )
+            }
+            Self::SourceComparison(source) => {
+                write!(formatter, "recovery source comparison failed: {source}")
+            }
+            Self::SourceNotMatched { actual } => write!(
+                formatter,
+                "recovery source no longer matches the candidate: {actual:?}"
+            ),
+            Self::PageStore(source) => {
+                write!(formatter, "recovery page-store write failed: {source}")
+            }
+        }
+    }
+}
+
+impl<const N: usize> Error for FileCommittedPageRecoveryStoreError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CurrentObservation(source) => Some(source.as_ref()),
+            Self::SourceComparison(source) => Some(source.as_ref()),
+            Self::PageStore(source) => Some(source),
+            Self::ForeignTargetPagePosition(_)
+            | Self::ForeignTargetCommitPosition(_)
+            | Self::ForeignPermitPagePosition(_)
+            | Self::ForeignPermitCommitPosition(_)
+            | Self::PermitPagePositionMismatch { .. }
+            | Self::PermitCommitPositionMismatch { .. }
+            | Self::SourceNotMatched { .. } => None,
+        }
+    }
+}
+
 /// Safely inspectable latest snapshot of one stored page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileStoredPage<const N: usize> {
@@ -3656,67 +3982,23 @@ impl<const N: usize> FilePageStore<N> {
             false
         }
     }
-}
 
-impl<const N: usize> ntsql_page::PageStore<N> for FilePageStore<N> {
-    type Error = FilePageStoreError;
-
-    fn lineage(&self) -> &LogLineage {
-        &self.lineage
+    fn page_index(&self, page_number: PageNumber) -> Option<usize> {
+        self.pages
+            .iter()
+            .position(|stored| stored.page_number == page_number)
     }
 
-    fn write_page(
+    fn write_snapshot_group(
         &mut self,
-        page: &ntsql_page::DirtyPage<N>,
-        permit: ntsql_page::PageWritePermit<'_>,
-    ) -> Result<(), Self::Error> {
+        layout: PageLayout,
+        stored: FileStoredPage<N>,
+        existing_index: Option<usize>,
+        sequence: u64,
+    ) -> Result<(), FilePageStoreError> {
         if self.poisoned {
             return Err(FilePageStoreError::PoisonedWriter);
         }
-        let layout = PageLayout::for_const::<N>().map_err(FilePageStoreError::PageWidth)?;
-        if !self.lineage.same_lineage(page.address().lineage()) {
-            return Err(FilePageStoreError::ForeignPageLineage(
-                page.address().number(),
-            ));
-        }
-        if !self
-            .lineage
-            .same_lineage(permit.durable_position().lineage())
-        {
-            return Err(FilePageStoreError::ForeignPermitLineage(
-                permit.durable_position().clone(),
-            ));
-        }
-        if permit.durable_position() != page.required_position() {
-            return Err(FilePageStoreError::PermitPositionMismatch {
-                expected: page.required_position().clone(),
-                actual: permit.durable_position().clone(),
-            });
-        }
-        if page.required_position().get() == 0 {
-            return Err(FilePageStoreError::RequiredPositionZero(
-                page.address().number(),
-            ));
-        }
-
-        let sequence = self
-            .next_sequence
-            .ok_or(FilePageStoreError::StoreSequenceSpaceExhausted)?;
-        let existing_index = self
-            .pages
-            .iter()
-            .position(|stored| stored.page_number == page.address().number());
-        if existing_index.is_none() && self.pages.try_reserve(1).is_err() {
-            return Err(FilePageStoreError::SnapshotCapacityExhausted);
-        }
-
-        let stored = FileStoredPage {
-            page_number: page.address().number(),
-            page_version: page.version(),
-            bytes: *page.image().bytes(),
-            required_position: page.required_position().clone(),
-            store_sequence: sequence,
-        };
         if self.consume_fault(PageStoreFaultPoint::BeforeWrite) {
             return Err(FilePageStoreError::InjectedFault(
                 PageStoreFaultPoint::BeforeWrite,
@@ -3803,6 +4085,205 @@ impl<const N: usize> ntsql_page::PageStore<N> for FilePageStore<N> {
         } else {
             Ok(())
         }
+    }
+}
+
+impl<const N: usize> ntsql_page::PageStore<N> for FilePageStore<N> {
+    type Error = FilePageStoreError;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    fn write_page(
+        &mut self,
+        page: &ntsql_page::DirtyPage<N>,
+        permit: ntsql_page::PageWritePermit<'_>,
+    ) -> Result<(), Self::Error> {
+        if self.poisoned {
+            return Err(FilePageStoreError::PoisonedWriter);
+        }
+        let layout = PageLayout::for_const::<N>().map_err(FilePageStoreError::PageWidth)?;
+        if !self.lineage.same_lineage(page.address().lineage()) {
+            return Err(FilePageStoreError::ForeignPageLineage(
+                page.address().number(),
+            ));
+        }
+        if !self
+            .lineage
+            .same_lineage(permit.durable_position().lineage())
+        {
+            return Err(FilePageStoreError::ForeignPermitLineage(
+                permit.durable_position().clone(),
+            ));
+        }
+        if permit.durable_position() != page.required_position() {
+            return Err(FilePageStoreError::PermitPositionMismatch {
+                expected: page.required_position().clone(),
+                actual: permit.durable_position().clone(),
+            });
+        }
+        if page.required_position().get() == 0 {
+            return Err(FilePageStoreError::RequiredPositionZero(
+                page.address().number(),
+            ));
+        }
+
+        let sequence = self
+            .next_sequence
+            .ok_or(FilePageStoreError::StoreSequenceSpaceExhausted)?;
+        let existing_index = self.page_index(page.address().number());
+        if existing_index.is_none() && self.pages.try_reserve(1).is_err() {
+            return Err(FilePageStoreError::SnapshotCapacityExhausted);
+        }
+
+        let stored = FileStoredPage {
+            page_number: page.address().number(),
+            page_version: page.version(),
+            bytes: *page.image().bytes(),
+            required_position: page.required_position().clone(),
+            store_sequence: sequence,
+        };
+        self.write_snapshot_group(layout, stored, existing_index, sequence)
+    }
+}
+
+fn require_file_recovery_source_match<const N: usize>(
+    candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+    current: Option<&StoredPageSnapshotObservation<N>>,
+) -> Result<(), FileCommittedPageRecoveryStoreError<N>> {
+    match compare_committed_transaction_page_recovery_candidate(candidate, current) {
+        Ok(DurableCommittedTransactionPageRecoveryComparison::SourceMatches) => Ok(()),
+        Ok(actual) => Err(FileCommittedPageRecoveryStoreError::SourceNotMatched { actual }),
+        Err(source) => Err(FileCommittedPageRecoveryStoreError::SourceComparison(
+            Box::new(source),
+        )),
+    }
+}
+
+impl<const N: usize> ntsql_transaction::CommittedTransactionPageRecoveryStore<N>
+    for FilePageStore<N>
+{
+    type ObservationError = FileCommittedPageRecoveryObservationError<N>;
+    type WriteError = FileCommittedPageRecoveryStoreError<N>;
+
+    fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    fn observe_page(
+        &self,
+        page_number: PageNumber,
+    ) -> Result<Option<StoredPageSnapshotObservation<N>>, Self::ObservationError> {
+        if self.poisoned {
+            return Err(FileCommittedPageRecoveryObservationError::PoisonedWriter);
+        }
+        self.page(page_number)
+            .map(FileStoredPage::page_recovery_observation)
+            .transpose()
+            .map_err(|source| {
+                FileCommittedPageRecoveryObservationError::Projection(Box::new(source))
+            })
+    }
+
+    fn compare_and_replace(
+        &mut self,
+        candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+        permit: CommittedTransactionPageRecoveryWritePermit<'_>,
+    ) -> Result<(), Self::WriteError> {
+        if self.poisoned {
+            return Err(FileCommittedPageRecoveryStoreError::PageStore(
+                FilePageStoreError::PoisonedWriter,
+            ));
+        }
+
+        let latest = candidate.latest_committed();
+        let target = latest.observation();
+        if !self.lineage.same_lineage(target.position().lineage()) {
+            return Err(
+                FileCommittedPageRecoveryStoreError::ForeignTargetPagePosition(
+                    target.position().clone(),
+                ),
+            );
+        }
+        if !self
+            .lineage
+            .same_lineage(latest.commit_position().lineage())
+        {
+            return Err(
+                FileCommittedPageRecoveryStoreError::ForeignTargetCommitPosition(
+                    latest.commit_position().clone(),
+                ),
+            );
+        }
+        if !self.lineage.same_lineage(permit.page_position().lineage()) {
+            return Err(
+                FileCommittedPageRecoveryStoreError::ForeignPermitPagePosition(
+                    permit.page_position().clone(),
+                ),
+            );
+        }
+        if !self
+            .lineage
+            .same_lineage(permit.commit_position().lineage())
+        {
+            return Err(
+                FileCommittedPageRecoveryStoreError::ForeignPermitCommitPosition(
+                    permit.commit_position().clone(),
+                ),
+            );
+        }
+        if permit.page_position() != target.position() {
+            return Err(
+                FileCommittedPageRecoveryStoreError::PermitPagePositionMismatch {
+                    expected: target.position().clone(),
+                    actual: permit.page_position().clone(),
+                },
+            );
+        }
+        if permit.commit_position() != latest.commit_position() {
+            return Err(
+                FileCommittedPageRecoveryStoreError::PermitCommitPositionMismatch {
+                    expected: latest.commit_position().clone(),
+                    actual: permit.commit_position().clone(),
+                },
+            );
+        }
+
+        let page_number = target.page().page_number();
+        let current = self
+            .page(page_number)
+            .map(FileStoredPage::page_recovery_observation)
+            .transpose()
+            .map_err(|source| {
+                FileCommittedPageRecoveryStoreError::CurrentObservation(Box::new(source))
+            })?;
+        require_file_recovery_source_match(candidate, current.as_ref())?;
+
+        let layout = PageLayout::for_const::<N>()
+            .map_err(FilePageStoreError::PageWidth)
+            .map_err(FileCommittedPageRecoveryStoreError::PageStore)?;
+        let sequence = self
+            .next_sequence
+            .ok_or(FilePageStoreError::StoreSequenceSpaceExhausted)
+            .map_err(FileCommittedPageRecoveryStoreError::PageStore)?;
+        let page_index = self.page_index(page_number);
+        if page_index.is_none() {
+            self.pages
+                .try_reserve(1)
+                .map_err(|_| FilePageStoreError::SnapshotCapacityExhausted)
+                .map_err(FileCommittedPageRecoveryStoreError::PageStore)?;
+        }
+
+        let stored = FileStoredPage {
+            page_number,
+            page_version: target.page().page_version(),
+            bytes: *target.page().image().bytes(),
+            required_position: target.position().clone(),
+            store_sequence: sequence,
+        };
+        self.write_snapshot_group(layout, stored, page_index, sequence)
+            .map_err(FileCommittedPageRecoveryStoreError::PageStore)
     }
 }
 
@@ -4364,19 +4845,109 @@ mod tests {
         StagePageWriteError, reconcile_durable_page, stage_page_write,
     };
     use ntsql_transaction::{
+        CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
         CoordinatedCommitError, DurableCommittedTransactionPageReconciliation,
         DurableCommittedTransactionPageReconciliationError,
         DurableTransactionPageCommitClassification, IndeterminateTransaction,
         TransactionCommitResolution, TransactionCommittedFlushError, TransactionCoordinator,
         TransactionLifecycleStatus, TransactionPageStageError, TransactionResolutionFailure,
         classify_durable_transaction_page, flush_committed_page,
-        reconcile_committed_transaction_page,
+        reconcile_committed_transaction_page, recover_committed_transaction_page,
     };
     use ntsql_wal::{CommitError, LogDurability, LogLineage, PersistentLogId};
 
     use super::*;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct PoisonBeforeRecoveryCompare(FilePageStore<2>);
+
+    impl ntsql_transaction::CommittedTransactionPageRecoveryStore<2> for PoisonBeforeRecoveryCompare {
+        type ObservationError = FileCommittedPageRecoveryObservationError<2>;
+        type WriteError = FileCommittedPageRecoveryStoreError<2>;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.0.lineage
+        }
+
+        fn observe_page(
+            &self,
+            page_number: PageNumber,
+        ) -> Result<Option<StoredPageSnapshotObservation<2>>, Self::ObservationError> {
+            <FilePageStore<2> as ntsql_transaction::CommittedTransactionPageRecoveryStore<
+                2,
+            >>::observe_page(&self.0, page_number)
+        }
+
+        fn compare_and_replace(
+            &mut self,
+            candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, 2>,
+            permit: CommittedTransactionPageRecoveryWritePermit<'_>,
+        ) -> Result<(), Self::WriteError> {
+            self.0.poisoned = true;
+            <FilePageStore<2> as ntsql_transaction::CommittedTransactionPageRecoveryStore<
+                2,
+            >>::compare_and_replace(&mut self.0, candidate, permit)
+        }
+    }
+
+    struct TargetAppearsBeforeRecoveryCompare(FilePageStore<2>);
+
+    impl ntsql_transaction::CommittedTransactionPageRecoveryStore<2>
+        for TargetAppearsBeforeRecoveryCompare
+    {
+        type ObservationError = FileCommittedPageRecoveryObservationError<2>;
+        type WriteError = FileCommittedPageRecoveryStoreError<2>;
+
+        fn lineage(&self) -> &LogLineage {
+            &self.0.lineage
+        }
+
+        fn observe_page(
+            &self,
+            page_number: PageNumber,
+        ) -> Result<Option<StoredPageSnapshotObservation<2>>, Self::ObservationError> {
+            <FilePageStore<2> as ntsql_transaction::CommittedTransactionPageRecoveryStore<
+                2,
+            >>::observe_page(&self.0, page_number)
+        }
+
+        fn compare_and_replace(
+            &mut self,
+            candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, 2>,
+            permit: CommittedTransactionPageRecoveryWritePermit<'_>,
+        ) -> Result<(), Self::WriteError> {
+            let target = candidate.latest_committed().observation();
+            let sequence = self
+                .0
+                .next_sequence
+                .ok_or(FilePageStoreError::StoreSequenceSpaceExhausted)
+                .map_err(FileCommittedPageRecoveryStoreError::PageStore)?;
+            self.0
+                .pages
+                .try_reserve(1)
+                .map_err(|_| FilePageStoreError::SnapshotCapacityExhausted)
+                .map_err(FileCommittedPageRecoveryStoreError::PageStore)?;
+            let stored = FileStoredPage {
+                page_number: target.page().page_number(),
+                page_version: target.page().page_version(),
+                bytes: *target.page().image().bytes(),
+                required_position: target.position().clone(),
+                store_sequence: sequence,
+            };
+            let layout = PageLayout::for_const::<2>()
+                .map_err(FilePageStoreError::PageWidth)
+                .map_err(FileCommittedPageRecoveryStoreError::PageStore)?;
+            self.0
+                .write_snapshot_group(layout, stored, None, sequence)
+                .map_err(FileCommittedPageRecoveryStoreError::PageStore)?;
+            self.0.armed_fault = Some(PageStoreFaultPoint::BeforeWrite);
+
+            <FilePageStore<2> as ntsql_transaction::CommittedTransactionPageRecoveryStore<
+                2,
+            >>::compare_and_replace(&mut self.0, candidate, permit)
+        }
+    }
 
     #[test]
     fn create_new_writes_v1_header_and_rejects_existing_path() -> Result<(), Box<dyn Error>> {
@@ -5133,6 +5704,222 @@ mod tests {
         assert_eq!(
             coordinator.status(transaction_id),
             Some(TransactionLifecycleStatus::Indeterminate)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_page_recovery_rejects_poisoned_source_observation_and_write()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("committed-recovery-poison")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let observed_store_path = directory.path().join("observed-pages.bin");
+        let compared_store_path = directory.path().join("compared-pages.bin");
+        let persistent_id = persistent_id(501)?;
+        let page_number = page_number(41)?;
+        let mut log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let active = coordinator.begin()?;
+        let page = unlogged_page(log.lineage(), 41, 1, [1, 2])?;
+        let (active, _dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+        coordinator.commit(active, &mut log)?;
+
+        log.poisoned = true;
+        let mut callback_called = false;
+        let source =
+            <FileCommitLog<2> as ntsql_transaction::DurableTransactionPageRecoverySource<
+                2,
+            >>::with_durable_page_evidence(&mut log, page_number, |_, _, _| {
+                callback_called = true;
+            });
+        assert_eq!(
+            source,
+            Err(FileCommittedPageRecoverySourceError::PoisonedWriter)
+        );
+        assert!(!callback_called);
+        log.poisoned = false;
+
+        let mut observed_store =
+            FilePageStore::<2>::create_new(&observed_store_path, persistent_id)?;
+        observed_store.arm_fault(PageStoreFaultPoint::BeforeWrite)?;
+        observed_store.poisoned = true;
+        let observation =
+            recover_committed_transaction_page(&mut log, &mut observed_store, page_number);
+        assert!(matches!(
+            observation,
+            Err(CommittedTransactionPageRecoveryError::StoreObservation(
+                FileCommittedPageRecoveryObservationError::PoisonedWriter
+            ))
+        ));
+        assert_eq!(
+            observed_store.armed_fault(),
+            Some(PageStoreFaultPoint::BeforeWrite)
+        );
+        assert!(observed_store.pages().is_empty());
+
+        let mut compared_store = PoisonBeforeRecoveryCompare(FilePageStore::<2>::create_new(
+            &compared_store_path,
+            persistent_id,
+        )?);
+        compared_store
+            .0
+            .arm_fault(PageStoreFaultPoint::BeforeWrite)?;
+        let comparison =
+            recover_committed_transaction_page(&mut log, &mut compared_store, page_number);
+        let Err(CommittedTransactionPageRecoveryError::StoreWrite { state }) = comparison else {
+            return Err(io::Error::other("poisoned compare was not terminal").into());
+        };
+        assert_eq!(
+            state.as_ref().cause(),
+            &FileCommittedPageRecoveryStoreError::PageStore(FilePageStoreError::PoisonedWriter)
+        );
+        assert_eq!(
+            compared_store.0.armed_fault(),
+            Some(PageStoreFaultPoint::BeforeWrite)
+        );
+        assert!(compared_store.0.pages().is_empty());
+        assert!(compared_store.0.is_poisoned());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_page_recovery_errors_retain_projection_causes() -> Result<(), Box<dyn Error>> {
+        let lineage = LogLineage::new();
+        let page_number = page_number(43)?;
+
+        let physical = DurablePageWalObservation::<0>::from_bytes(
+            page_number,
+            PageVersion::new(1),
+            [],
+            lineage.position(1),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width physical page projected"))?;
+        let expected_physical = DurablePageWalObservation::<0>::from_bytes(
+            page_number,
+            PageVersion::new(1),
+            [],
+            lineage.position(1),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width physical page projected twice"))?;
+        let error =
+            FileCommittedPageRecoverySourceError::PhysicalPageProjection(Box::new(physical));
+        assert!(Error::source(&error).is_some());
+        let FileCommittedPageRecoverySourceError::PhysicalPageProjection(source) = error else {
+            return Err(io::Error::other("physical projection cause changed variant").into());
+        };
+        assert_eq!(*source, expected_physical);
+
+        let owned = DurableTransactionPageObservation::<0>::from_bytes(
+            1,
+            1,
+            page_number,
+            PageVersion::new(2),
+            [],
+            lineage.position(2),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width owned page projected"))?;
+        let expected_owned = DurableTransactionPageObservation::<0>::from_bytes(
+            1,
+            1,
+            page_number,
+            PageVersion::new(2),
+            [],
+            lineage.position(2),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width owned page projected twice"))?;
+        let error =
+            FileCommittedPageRecoverySourceError::TransactionPageProjection(Box::new(owned));
+        assert!(Error::source(&error).is_some());
+        let FileCommittedPageRecoverySourceError::TransactionPageProjection(source) = error else {
+            return Err(io::Error::other("owned projection cause changed variant").into());
+        };
+        assert_eq!(*source, expected_owned);
+
+        let commit = DurableTransactionCommitObservation::from_fields(0, 1, lineage.position(3))
+            .err()
+            .ok_or_else(|| io::Error::other("zero-epoch commit projected"))?;
+        let expected_commit = commit.clone();
+        let error = FileCommittedPageRecoverySourceError::<1>::CommitProjection(Box::new(commit));
+        assert!(Error::source(&error).is_some());
+        let FileCommittedPageRecoverySourceError::CommitProjection(source) = error else {
+            return Err(io::Error::other("commit projection cause changed variant").into());
+        };
+        assert_eq!(*source, expected_commit);
+
+        let observation_source = DurablePageWalObservation::<0>::from_bytes(
+            page_number,
+            PageVersion::new(1),
+            [],
+            lineage.position(1),
+        )
+        .err()
+        .ok_or_else(|| io::Error::other("zero-width snapshot projected"))?;
+        let observation =
+            FileCommittedPageRecoveryObservationError::Projection(Box::new(observation_source));
+        assert!(Error::source(&observation).is_some());
+        let capacity = FileCommittedPageRecoverySourceError::<1>::EvidenceCapacityExhausted {
+            projection: FilePageRecoveryProjection::Commits,
+        };
+        assert!(Error::source(&capacity).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_page_recovery_recheck_rejects_target_that_appeared() -> Result<(), Box<dyn Error>>
+    {
+        let directory = TestDirectory::new("committed-recovery-recheck")?;
+        let log_path = directory.path().join("commit-log.bin");
+        let store_path = directory.path().join("pages.bin");
+        let persistent_id = persistent_id(502)?;
+        let page_number = page_number(42)?;
+        let mut log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let active = coordinator.begin()?;
+        let page = unlogged_page(log.lineage(), 42, 3, [3, 4])?;
+        let (active, _dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+        coordinator.commit(active, &mut log)?;
+        let mut store = TargetAppearsBeforeRecoveryCompare(FilePageStore::<2>::create_new(
+            &store_path,
+            persistent_id,
+        )?);
+
+        let result = recover_committed_transaction_page(&mut log, &mut store, page_number);
+        let Err(CommittedTransactionPageRecoveryError::StoreWrite { state }) = result else {
+            return Err(io::Error::other("changed recovery source was not terminal").into());
+        };
+        assert_eq!(
+            state.as_ref().cause(),
+            &FileCommittedPageRecoveryStoreError::SourceNotMatched {
+                actual: DurableCommittedTransactionPageRecoveryComparison::TargetAlreadyPresent,
+            }
+        );
+        let stored = store
+            .0
+            .page(page_number)
+            .ok_or_else(|| io::Error::other("intervening durable target is missing"))?;
+        assert_eq!(stored.page_version(), PageVersion::new(3));
+        assert_eq!(stored.bytes(), &[3, 4]);
+        assert_eq!(stored.required_position().get(), 1);
+        assert_eq!(stored.store_sequence(), 1);
+        assert_eq!(
+            store.0.armed_fault(),
+            Some(PageStoreFaultPoint::BeforeWrite)
+        );
+
+        let rerun = recover_committed_transaction_page(&mut log, &mut store, page_number)?;
+        assert!(matches!(
+            rerun,
+            CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+        ));
+        assert_eq!(
+            store.0.armed_fault(),
+            Some(PageStoreFaultPoint::BeforeWrite)
         );
         Ok(())
     }

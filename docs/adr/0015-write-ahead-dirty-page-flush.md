@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #80
 - Extends: ADR 0001, ADR 0005, ADR 0011, ADR 0012
-- Extended by: ADR 0016, ADR 0018, ADR 0019, ADR 0020
+- Extended by: ADR 0016, ADR 0018, ADR 0019, ADR 0020, ADR 0029
 
 ## Context
 
@@ -67,8 +67,8 @@ idempotent WAL flush. The original WAL error is preserved.
 
 Any page-store error occurs after WAL success and returns the original store
 cause with `IndeterminatePageWrite`. It offers inspection but no direct retry or
-conversion to dirty or clean state. A later recovery design must resolve the
-physical effect before another write is authorized.
+conversion to dirty or clean state. ADR 0029 preserves this terminal boundary and requires a fresh recovery-gate
+invocation to resolve current physical state before another write is authorized.
 
 The domain proves staging and call order for safe composition; it does not prove
 an arbitrary adapter honest. `LogDurability` may report success only after the

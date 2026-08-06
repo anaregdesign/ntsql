@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #108
 - Extends: ADR 0026, ADR 0027
+- Extended by: ADR 0029
 
 ## Context
 
@@ -272,7 +273,7 @@ candidate and distinguish an unchanged source from an exact target already
 present. This establishes compare-only idempotence without granting physical
 recovery authority.
 
-The next slice may define a separately reviewed recovery-only mutation gate. It
-must re-run complete-prefix reconciliation immediately before mutation, bind the
-same source and target identities to exclusive store coordination, and preserve
+ADR 0029 defines the separately reviewed recovery-only mutation gate. It reruns
+complete-prefix reconciliation immediately before mutation, binds the same
+source and target identities to exclusive store coordination, and preserves
 terminal ambiguity for any invoked write.

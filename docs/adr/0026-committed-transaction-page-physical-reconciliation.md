@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #104
 - Extends: ADR 0019, ADR 0023, ADR 0024, ADR 0025
-- Extended by: ADR 0027, ADR 0028
+- Extended by: ADR 0027, ADR 0028, ADR 0029
 
 ## Context
 
@@ -284,7 +284,7 @@ state relative to the latest committed transaction-owned page while rejecting
 raw or uncommitted snapshot backing and preserving all non-authorizing
 boundaries.
 
-The next slice may exercise this function from memory restart/persistent reopen
-and filesystem v3 reopen using both projections from the same
-`durable_records()` prefix and real stored snapshots. Recovery mutation remains
-blocked on idempotence and a separately reviewed recovery-only write gate.
+ADRs 0027 and 0028 exercise and bind this reconciliation across restart/reopen.
+ADR 0029 adds the separately reviewed recovery-only write gate while preserving
+this operation's non-authorizing boundary. Concrete adapter mutation remains a
+later slice.

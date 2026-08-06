@@ -3749,6 +3749,56 @@ where
             )
         })
     }
+
+    /// Prepares the current WAL baseline, then publishes it to a separate slot.
+    ///
+    /// Current-WAL analysis and baseline preparation complete before the
+    /// publisher is invoked. A preparation failure proves no publication call
+    /// occurred. Any publisher error is instead outcome-indeterminate.
+    pub fn publish_restart_checkpoint_baseline_from_current_prefix<CheckpointPublisher>(
+        &mut self,
+        checkpoint_publisher: &mut CheckpointPublisher,
+    ) -> Result<
+        DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+        DurableTransactionRestartCheckpointBaselineCurrentPublicationError<
+            Source::Error,
+            CheckpointPublisher::Error,
+        >,
+    >
+    where
+        CheckpointPublisher: DurableTransactionRestartCheckpointBaselinePublisher,
+    {
+        let baseline = self
+            .prepare_restart_checkpoint_baseline_from_current_prefix()
+            .map_err(
+                DurableTransactionRestartCheckpointBaselineCurrentPublicationError::Preparation,
+            )?;
+        let persistent_log_id = baseline.persistent_log_id();
+        let durable_frontier = baseline.durable_frontier();
+        let transaction_count = baseline.transactions().len();
+
+        with_restart_checkpoint_baseline_publication_permit(
+            persistent_log_id,
+            durable_frontier,
+            transaction_count,
+            move |permit| match checkpoint_publisher
+                .publish_restart_checkpoint_baseline(&baseline, permit)
+            {
+                Ok(()) => Ok(
+                    DurableTransactionRestartCheckpointBaselinePublicationReceipt::from_baseline(
+                        baseline,
+                    ),
+                ),
+                Err(source) => Err(
+                    DurableTransactionRestartCheckpointBaselineCurrentPublicationError::Publication(
+                        DurableTransactionRestartCheckpointBaselinePublicationError::new(
+                            baseline, source,
+                        ),
+                    ),
+                ),
+            },
+        )
+    }
 }
 
 /// Fail-closed restart-analysis state that retains the recovered storage pair.
@@ -4740,6 +4790,426 @@ pub trait DurableTransactionRestartCheckpointBaselineSource {
     ) -> Result<Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>, Self::Error>;
 }
 
+type RestartCheckpointBaselinePublicationAttemptBrand<'attempt> =
+    (&'attempt (), fn(&'attempt ()) -> &'attempt ());
+
+/// Single-use proof that the restart-analyzed owner authorized publication.
+///
+/// The permit identifies the owner-prepared baseline but grants no validity,
+/// durability, replay, or retention authority by itself. Private fields and an
+/// invariant generative brand prevent construction, cloning, widening, or
+/// retention outside one owner operation:
+///
+/// ```compile_fail
+/// use std::marker::PhantomData;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselinePublicationPermit;
+/// use ntsql_wal::PersistentLogId;
+///
+/// let Some(id) = PersistentLogId::new(1) else {
+///     return;
+/// };
+/// let _forged = DurableTransactionRestartCheckpointBaselinePublicationPermit {
+///     persistent_log_id: id,
+///     durable_frontier: None,
+///     transaction_count: 0,
+///     attempt_brand: PhantomData,
+/// };
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselinePublicationPermit;
+///
+/// fn cannot_clone(
+///     permit: DurableTransactionRestartCheckpointBaselinePublicationPermit<'_>,
+/// ) {
+///     let _copy = permit.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselinePublicationPermit;
+///
+/// fn cannot_widen<'attempt>(
+///     permit: DurableTransactionRestartCheckpointBaselinePublicationPermit<'attempt>,
+/// ) -> DurableTransactionRestartCheckpointBaselinePublicationPermit<'static> {
+///     permit
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     DurableTransactionRestartCheckpointBaselinePublicationPermit,
+///     DurableTransactionRestartCheckpointBaselinePublisher,
+/// };
+///
+/// struct RetainingPublisher {
+///     retained:
+///         Option<DurableTransactionRestartCheckpointBaselinePublicationPermit<'static>>,
+/// }
+///
+/// impl DurableTransactionRestartCheckpointBaselinePublisher for RetainingPublisher {
+///     type Error = ();
+///
+///     fn publish_restart_checkpoint_baseline(
+///         &mut self,
+///         _baseline: &DurableTransactionRestartCheckpointBaseline,
+///         permit: DurableTransactionRestartCheckpointBaselinePublicationPermit<'_>,
+///     ) -> Result<(), Self::Error> {
+///         self.retained = Some(permit);
+///         Ok(())
+///     }
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub struct DurableTransactionRestartCheckpointBaselinePublicationPermit<'attempt> {
+    persistent_log_id: PersistentLogId,
+    durable_frontier: Option<u64>,
+    transaction_count: usize,
+    attempt_brand: PhantomData<RestartCheckpointBaselinePublicationAttemptBrand<'attempt>>,
+}
+
+impl DurableTransactionRestartCheckpointBaselinePublicationPermit<'_> {
+    /// Returns the persistent log identity of the authorized baseline.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the exact optional frontier of the authorized baseline.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.durable_frontier
+    }
+
+    /// Returns the number of transaction entries in the authorized baseline.
+    #[must_use]
+    pub const fn transaction_count(&self) -> usize {
+        self.transaction_count
+    }
+}
+
+fn with_restart_checkpoint_baseline_publication_permit<Output, Operation>(
+    persistent_log_id: PersistentLogId,
+    durable_frontier: Option<u64>,
+    transaction_count: usize,
+    operation: Operation,
+) -> Output
+where
+    Operation: for<'attempt> FnOnce(
+        DurableTransactionRestartCheckpointBaselinePublicationPermit<'attempt>,
+    ) -> Output,
+{
+    operation(
+        DurableTransactionRestartCheckpointBaselinePublicationPermit {
+            persistent_log_id,
+            durable_frontier,
+            transaction_count,
+            attempt_brand: PhantomData,
+        },
+    )
+}
+
+/// Publisher for one temporary durable current checkpoint slot.
+///
+/// This port is a sibling of
+/// [`DurableTransactionRestartCheckpointBaselineSource`], not its subtrait.
+/// `Ok(())` must mean an all-or-nothing durable replacement selected exactly the
+/// supplied baseline. That guarantee lasts only until another publication
+/// attempt is invoked; any later error makes selected state unknown.
+///
+/// Every error after this method is called is outcome-indeterminate. It does not
+/// prove whether the old value, new value, no value, or an unreadable value is
+/// current. The physical atomic-replacement mechanism is adapter-specific.
+///
+/// Safe callers cannot invoke the port without the private owner permit:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     DurableTransactionRestartCheckpointBaselinePublisher,
+/// };
+///
+/// fn cannot_publish_directly<Publisher>(
+///     publisher: &mut Publisher,
+///     baseline: &DurableTransactionRestartCheckpointBaseline,
+/// )
+/// where
+///     Publisher: DurableTransactionRestartCheckpointBaselinePublisher,
+/// {
+///     publisher.publish_restart_checkpoint_baseline(baseline);
+/// }
+/// ```
+///
+/// The publication port is not WAL durability authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselinePublisher;
+/// use ntsql_wal::LogDurability;
+///
+/// fn require_log<Log: LogDurability>(_log: &mut Log) {}
+///
+/// fn cannot_use_as_log<Publisher>(
+///     publisher: &mut Publisher,
+/// )
+/// where
+///     Publisher: DurableTransactionRestartCheckpointBaselinePublisher,
+/// {
+///     require_log(publisher);
+/// }
+/// ```
+///
+/// It is not page-store write authority:
+///
+/// ```compile_fail
+/// use ntsql_page::PageStore;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselinePublisher;
+///
+/// fn require_page_store<Store: PageStore<1>>(_store: &mut Store) {}
+///
+/// fn cannot_use_as_page_store<Publisher>(
+///     publisher: &mut Publisher,
+/// )
+/// where
+///     Publisher: DurableTransactionRestartCheckpointBaselinePublisher,
+/// {
+///     require_page_store(publisher);
+/// }
+/// ```
+///
+/// It is not committed-page recovery write authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore,
+///     DurableTransactionRestartCheckpointBaselinePublisher,
+/// };
+///
+/// fn require_recovery_store<Store: CommittedTransactionPageRecoveryStore<1>>(
+///     _store: &mut Store,
+/// ) {}
+///
+/// fn cannot_use_as_recovery_store<Publisher>(
+///     publisher: &mut Publisher,
+/// )
+/// where
+///     Publisher: DurableTransactionRestartCheckpointBaselinePublisher,
+/// {
+///     require_recovery_store(publisher);
+/// }
+/// ```
+///
+/// It cannot become transaction lifecycle state:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, DurableTransactionRestartCheckpointBaselinePublisher,
+/// };
+///
+/// fn cannot_activate<Publisher>(
+///     publisher: Publisher,
+/// ) -> ActiveTransaction
+/// where
+///     Publisher: DurableTransactionRestartCheckpointBaselinePublisher,
+/// {
+///     publisher.into()
+/// }
+/// ```
+///
+/// It cannot become the restart-analyzed storage owner:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselinePublisher,
+///     RestartAnalyzedTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Publisher, Source, PageStore, const N: usize>(
+///     publisher: Publisher,
+/// ) -> RestartAnalyzedTransactionPageStorage<Source, PageStore, N>
+/// where
+///     Publisher: DurableTransactionRestartCheckpointBaselinePublisher,
+/// {
+///     publisher.into()
+/// }
+/// ```
+pub trait DurableTransactionRestartCheckpointBaselinePublisher {
+    /// Adapter-specific outcome-indeterminate publication failure.
+    type Error;
+
+    /// Atomically replaces the temporary current slot with the exact baseline.
+    ///
+    /// The implementation must reject identifying permit fields that do not
+    /// match the supplied baseline before any physical effect. A successful
+    /// adapter that also implements the sibling read source must later lower the
+    /// exact baseline fields into a fresh untrusted observation. Loading that
+    /// observation never bypasses source-relative validation.
+    fn publish_restart_checkpoint_baseline(
+        &mut self,
+        baseline: &DurableTransactionRestartCheckpointBaseline,
+        permit: DurableTransactionRestartCheckpointBaselinePublicationPermit<'_>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Proof that the injected publisher reported one exact current-slot success.
+///
+/// This value privately retains the attempted baseline but deliberately exposes
+/// only identifying metadata, not the baseline or its transaction entries:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+/// };
+///
+/// fn cannot_extract_baseline(
+///     receipt: &DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+/// ) -> &DurableTransactionRestartCheckpointBaseline {
+///     receipt.baseline()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselinePublicationReceipt;
+///
+/// fn cannot_clone(
+///     receipt: DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+/// ) {
+///     let _copy = receipt.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+/// };
+///
+/// fn cannot_forge(baseline: DurableTransactionRestartCheckpointBaseline) {
+///     let _receipt =
+///         DurableTransactionRestartCheckpointBaselinePublicationReceipt { baseline };
+/// }
+/// ```
+#[must_use]
+pub struct DurableTransactionRestartCheckpointBaselinePublicationReceipt {
+    baseline: DurableTransactionRestartCheckpointBaseline,
+}
+
+impl DurableTransactionRestartCheckpointBaselinePublicationReceipt {
+    fn from_baseline(baseline: DurableTransactionRestartCheckpointBaseline) -> Self {
+        Self { baseline }
+    }
+
+    /// Returns the persistent log identity reported as published.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.baseline.persistent_log_id()
+    }
+
+    /// Returns the optional frontier reported as published.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.baseline.durable_frontier()
+    }
+
+    /// Returns the number of transaction entries reported as published.
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.baseline.transactions().len()
+    }
+}
+
+impl fmt::Debug for DurableTransactionRestartCheckpointBaselinePublicationReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableTransactionRestartCheckpointBaselinePublicationReceipt")
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("durable_frontier", &self.durable_frontier())
+            .field("transaction_count", &self.transaction_count())
+            .finish()
+    }
+}
+
+/// Terminal attempt state after the checkpoint publisher returned an error.
+///
+/// It retains exact attempted metadata for diagnosis and future reviewed
+/// resolution, but exposes no baseline extraction or direct retry path:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     IndeterminateDurableTransactionRestartCheckpointBaselinePublication,
+/// };
+///
+/// fn cannot_retry(
+///     publication: IndeterminateDurableTransactionRestartCheckpointBaselinePublication,
+/// ) -> DurableTransactionRestartCheckpointBaseline {
+///     publication.into_baseline()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     IndeterminateDurableTransactionRestartCheckpointBaselinePublication,
+/// };
+///
+/// fn cannot_forge(baseline: DurableTransactionRestartCheckpointBaseline) {
+///     let _publication =
+///         IndeterminateDurableTransactionRestartCheckpointBaselinePublication { baseline };
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::IndeterminateDurableTransactionRestartCheckpointBaselinePublication;
+///
+/// fn cannot_clone(
+///     publication: IndeterminateDurableTransactionRestartCheckpointBaselinePublication,
+/// ) {
+///     let _copy = publication.clone();
+/// }
+/// ```
+#[must_use]
+pub struct IndeterminateDurableTransactionRestartCheckpointBaselinePublication {
+    baseline: DurableTransactionRestartCheckpointBaseline,
+}
+
+impl IndeterminateDurableTransactionRestartCheckpointBaselinePublication {
+    fn from_baseline(baseline: DurableTransactionRestartCheckpointBaseline) -> Self {
+        Self { baseline }
+    }
+
+    /// Returns the persistent log identity of the attempted publication.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.baseline.persistent_log_id()
+    }
+
+    /// Returns the optional frontier of the attempted publication.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.baseline.durable_frontier()
+    }
+
+    /// Returns the attempted transaction-entry count.
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.baseline.transactions().len()
+    }
+}
+
+impl fmt::Debug for IndeterminateDurableTransactionRestartCheckpointBaselinePublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndeterminateDurableTransactionRestartCheckpointBaselinePublication")
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("durable_frontier", &self.durable_frontier())
+            .field("transaction_count", &self.transaction_count())
+            .finish()
+    }
+}
+
 /// Failure to prepare a persistable transaction restart checkpoint baseline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableTransactionRestartCheckpointBaselineError {
@@ -5144,6 +5614,109 @@ where
         match self {
             Self::CheckpointSource(source) => Some(source),
             Self::BaselineValidation(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+/// Publisher failure paired with terminal outcome-indeterminate attempt state.
+#[derive(Debug)]
+pub struct DurableTransactionRestartCheckpointBaselinePublicationError<PublisherError> {
+    publication: IndeterminateDurableTransactionRestartCheckpointBaselinePublication,
+    source: PublisherError,
+}
+
+impl<PublisherError> DurableTransactionRestartCheckpointBaselinePublicationError<PublisherError> {
+    fn new(baseline: DurableTransactionRestartCheckpointBaseline, source: PublisherError) -> Self {
+        Self {
+            publication:
+                IndeterminateDurableTransactionRestartCheckpointBaselinePublication::from_baseline(
+                    baseline,
+                ),
+            source,
+        }
+    }
+
+    /// Returns the terminal attempted publication metadata.
+    pub const fn publication(
+        &self,
+    ) -> &IndeterminateDurableTransactionRestartCheckpointBaselinePublication {
+        &self.publication
+    }
+
+    /// Returns the exact publisher failure.
+    #[must_use]
+    pub const fn cause(&self) -> &PublisherError {
+        &self.source
+    }
+}
+
+impl<PublisherError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCheckpointBaselinePublicationError<PublisherError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "restart checkpoint publication for log {} at frontier {:?} with {} transactions is indeterminate: {}",
+            self.publication.persistent_log_id().get(),
+            self.publication.durable_frontier(),
+            self.publication.transaction_count(),
+            self.source
+        )
+    }
+}
+
+impl<PublisherError> Error
+    for DurableTransactionRestartCheckpointBaselinePublicationError<PublisherError>
+where
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Failure before or after the checkpoint publisher indeterminacy boundary.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointBaselineCurrentPublicationError<
+    WalSourceError,
+    PublisherError,
+> {
+    /// Current analysis or baseline preparation failed before publisher access.
+    Preparation(DurableTransactionRestartCheckpointBaselineCurrentPreparationError<WalSourceError>),
+    /// The publisher was invoked and returned an outcome-indeterminate error.
+    Publication(DurableTransactionRestartCheckpointBaselinePublicationError<PublisherError>),
+}
+
+impl<WalSourceError, PublisherError> fmt::Display
+    for DurableTransactionRestartCheckpointBaselineCurrentPublicationError<
+        WalSourceError,
+        PublisherError,
+    >
+where
+    WalSourceError: fmt::Display,
+    PublisherError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preparation(source) => source.fmt(formatter),
+            Self::Publication(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<WalSourceError, PublisherError> Error
+    for DurableTransactionRestartCheckpointBaselineCurrentPublicationError<
+        WalSourceError,
+        PublisherError,
+    >
+where
+    WalSourceError: Error + 'static,
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Preparation(source) => Some(source),
+            Self::Publication(source) => Some(source),
         }
     }
 }
@@ -11535,6 +12108,83 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FakeCheckpointPublicationFault {
+        Before(FakeFault),
+        After(FakeFault),
+    }
+
+    struct FakeCheckpointBaselinePublisher {
+        checkpoint: Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>,
+        publication_fault: Option<FakeCheckpointPublicationFault>,
+        publication_calls: usize,
+        load_calls: usize,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    impl FakeCheckpointBaselinePublisher {
+        fn new(
+            checkpoint: Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>,
+        ) -> Self {
+            Self {
+                checkpoint,
+                publication_fault: None,
+                publication_calls: 0,
+                load_calls: 0,
+                events: None,
+            }
+        }
+    }
+
+    impl DurableTransactionRestartCheckpointBaselinePublisher for FakeCheckpointBaselinePublisher {
+        type Error = FakeFault;
+
+        fn publish_restart_checkpoint_baseline(
+            &mut self,
+            baseline: &DurableTransactionRestartCheckpointBaseline,
+            permit: DurableTransactionRestartCheckpointBaselinePublicationPermit<'_>,
+        ) -> Result<(), Self::Error> {
+            self.publication_calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("checkpoint-publish");
+            }
+            if permit.persistent_log_id() != baseline.persistent_log_id()
+                || permit.durable_frontier() != baseline.durable_frontier()
+                || permit.transaction_count() != baseline.transactions().len()
+            {
+                return Err(FakeFault("publication permit mismatch"));
+            }
+
+            let checkpoint = owned_decoded_checkpoint(baseline);
+            match self.publication_fault.take() {
+                Some(FakeCheckpointPublicationFault::Before(source)) => Err(source),
+                Some(FakeCheckpointPublicationFault::After(source)) => {
+                    self.checkpoint = Some(checkpoint);
+                    Err(source)
+                }
+                None => {
+                    self.checkpoint = Some(checkpoint);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    impl DurableTransactionRestartCheckpointBaselineSource for FakeCheckpointBaselinePublisher {
+        type Error = FakeFault;
+
+        fn load_restart_checkpoint_baseline(
+            &mut self,
+        ) -> Result<Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>, Self::Error>
+        {
+            self.load_calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("checkpoint-read");
+            }
+            Ok(self.checkpoint.clone())
+        }
+    }
+
     fn checkpoint_validation_evidence_error(
         result: Result<
             DurableTransactionRestartCheckpointBaseline,
@@ -12409,6 +13059,234 @@ mod tests {
             store_observations
         );
         assert_eq!(owner.parts().1.attempts, store_attempts);
+        Ok(())
+    }
+
+    #[test]
+    fn current_checkpoint_publication_is_sequential_and_revalidates_loaded_slot()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1360).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        let startup = owner
+            .prepare_restart_checkpoint_baseline()
+            .map_err(|_| TestError("prepare publication startup baseline"))?;
+        let startup_frontier = owner
+            .restart_analysis()
+            .durable_frontier()
+            .ok_or(TestError("publication startup frontier"))?
+            .clone();
+        let store_observations = owner.parts().1.observations.borrow().clone();
+        let store_attempts = owner.parts().1.attempts.clone();
+        owner
+            .parts_mut()
+            .0
+            .restart_observations
+            .push(restart_raw_page(&lineage, 90, 4)?);
+        owner.parts_mut().0.restart_frontier = Some(lineage.position(4));
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.parts_mut().0.restart_events = Some(Rc::clone(&events));
+        let callbacks = owner.parts().0.restart_callbacks;
+        let mut publisher = FakeCheckpointBaselinePublisher::new(None);
+        publisher.events = Some(Rc::clone(&events));
+
+        let receipt = owner
+            .publish_restart_checkpoint_baseline_from_current_prefix(&mut publisher)
+            .map_err(|_| TestError("publish current checkpoint"))?;
+
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        assert_eq!(receipt.durable_frontier(), Some(4));
+        assert_eq!(receipt.transaction_count(), startup.transactions().len());
+        assert_eq!(publisher.publication_calls, 1);
+        assert_eq!(events.borrow().as_slice(), ["wal", "checkpoint-publish"]);
+        let loaded = publisher
+            .load_restart_checkpoint_baseline()
+            .map_err(|_| TestError("load successfully published checkpoint"))?
+            .ok_or(TestError("published checkpoint disappeared"))?;
+        assert_eq!(loaded.persistent_log_id(), persistent_log_id.get());
+        assert_eq!(loaded.durable_frontier(), Some(4));
+        assert_eq!(
+            loaded.transactions(),
+            decoded_checkpoint_entries(&startup).as_slice()
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["wal", "checkpoint-publish", "checkpoint-read"]
+        );
+
+        let validated = owner
+            .validate_restart_checkpoint_baseline_from_source(&mut publisher)
+            .map_err(|_| TestError("revalidate successfully published checkpoint"))?
+            .ok_or(TestError(
+                "published checkpoint validation returned absence",
+            ))?;
+        assert_eq!(validated.persistent_log_id(), persistent_log_id);
+        assert_eq!(validated.durable_frontier(), Some(4));
+        assert_eq!(validated.transactions(), startup.transactions());
+        assert_eq!(publisher.load_calls, 2);
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "wal",
+                "checkpoint-publish",
+                "checkpoint-read",
+                "checkpoint-read",
+                "wal",
+            ]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 2);
+        assert_eq!(
+            owner.restart_analysis().durable_frontier(),
+            Some(&startup_frontier)
+        );
+        assert_eq!(
+            owner.parts().1.observations.borrow().as_slice(),
+            store_observations
+        );
+        assert_eq!(owner.parts().1.attempts, store_attempts);
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_publication_distinguishes_preparation_from_indeterminate_effects()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1361).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        let startup_frontier = owner
+            .restart_analysis()
+            .durable_frontier()
+            .ok_or(TestError("publication startup frontier"))?
+            .clone();
+        let transaction_count = owner.restart_analysis().transactions().len();
+        let store_observations = owner.parts().1.observations.borrow().clone();
+        let store_attempts = owner.parts().1.attempts.clone();
+        let callbacks = owner.parts().0.restart_callbacks;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.parts_mut().0.restart_events = Some(Rc::clone(&events));
+        let mut before = FakeCheckpointBaselinePublisher::new(None);
+        before.events = Some(Rc::clone(&events));
+
+        owner.parts_mut().0.restart_before_callback_error =
+            Some(FakeFault("current WAL unavailable"));
+        let preparation = owner
+            .publish_restart_checkpoint_baseline_from_current_prefix(&mut before)
+            .err()
+            .ok_or(TestError("WAL source failure reached publisher"))?;
+        assert_eq!(
+            Error::source(&preparation).map(ToString::to_string),
+            Some(String::from(
+                "current restart checkpoint analysis failed: restart-analysis source failed: current WAL unavailable"
+            ))
+        );
+        assert!(matches!(
+            preparation,
+            DurableTransactionRestartCheckpointBaselineCurrentPublicationError::Preparation(
+                DurableTransactionRestartCheckpointBaselineCurrentPreparationError::Analysis(
+                    DurableTransactionRestartAnalysisError::Source(FakeFault(
+                        "current WAL unavailable"
+                    ))
+                )
+            )
+        ));
+        assert_eq!(before.publication_calls, 0);
+        assert!(before.checkpoint.is_none());
+        assert!(events.borrow().is_empty());
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks);
+
+        before.publication_fault = Some(FakeCheckpointPublicationFault::Before(FakeFault(
+            "before publication",
+        )));
+        let before_error = owner
+            .publish_restart_checkpoint_baseline_from_current_prefix(&mut before)
+            .err()
+            .ok_or(TestError("before publication failure became success"))?;
+        let DurableTransactionRestartCheckpointBaselineCurrentPublicationError::Publication(
+            before_error,
+        ) = before_error
+        else {
+            return Err(TestError("before publication remained retryable"));
+        };
+        assert_eq!(
+            Error::source(&before_error).map(ToString::to_string),
+            Some(String::from("before publication"))
+        );
+        assert_eq!(before_error.cause(), &FakeFault("before publication"));
+        assert_eq!(
+            before_error.publication().persistent_log_id(),
+            persistent_log_id
+        );
+        assert_eq!(before_error.publication().durable_frontier(), Some(2));
+        assert_eq!(
+            before_error.publication().transaction_count(),
+            transaction_count
+        );
+        assert_eq!(before.publication_calls, 1);
+        assert!(before.checkpoint.is_none());
+        assert_eq!(events.borrow().as_slice(), ["wal", "checkpoint-publish"]);
+
+        let mut after = FakeCheckpointBaselinePublisher::new(None);
+        after.events = Some(Rc::clone(&events));
+        after.publication_fault = Some(FakeCheckpointPublicationFault::After(FakeFault(
+            "after publication",
+        )));
+        let after_error = owner
+            .publish_restart_checkpoint_baseline_from_current_prefix(&mut after)
+            .err()
+            .ok_or(TestError("after publication failure became success"))?;
+        let DurableTransactionRestartCheckpointBaselineCurrentPublicationError::Publication(
+            after_error,
+        ) = after_error
+        else {
+            return Err(TestError("after publication remained retryable"));
+        };
+        assert_eq!(after_error.cause(), &FakeFault("after publication"));
+        assert_eq!(
+            after_error.publication().persistent_log_id(),
+            persistent_log_id
+        );
+        assert_eq!(after_error.publication().durable_frontier(), Some(2));
+        assert_eq!(
+            after_error.publication().transaction_count(),
+            transaction_count
+        );
+        assert_eq!(after.publication_calls, 1);
+        assert!(after.checkpoint.is_some());
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["wal", "checkpoint-publish", "wal", "checkpoint-publish",]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 2);
+        assert_eq!(
+            owner.restart_analysis().durable_frontier(),
+            Some(&startup_frontier)
+        );
+        assert_eq!(
+            owner.parts().1.observations.borrow().as_slice(),
+            store_observations
+        );
+        assert_eq!(owner.parts().1.attempts, store_attempts);
+
+        let ephemeral_lineage = LogLineage::new();
+        let mut ephemeral = batch_restart_analyzed_checkpoint_owner(&ephemeral_lineage, &[82])?;
+        let mut untouched = FakeCheckpointBaselinePublisher::new(None);
+        let baseline_preparation = ephemeral
+            .publish_restart_checkpoint_baseline_from_current_prefix(&mut untouched)
+            .err()
+            .ok_or(TestError("ephemeral baseline reached publisher"))?;
+        assert!(matches!(
+            baseline_preparation,
+            DurableTransactionRestartCheckpointBaselineCurrentPublicationError::Preparation(
+                DurableTransactionRestartCheckpointBaselineCurrentPreparationError::BaselinePreparation(
+                    DurableTransactionRestartCheckpointBaselineError::PersistentLineageRequired
+                )
+            )
+        ));
+        assert_eq!(untouched.publication_calls, 0);
+        assert!(untouched.checkpoint.is_none());
         Ok(())
     }
 

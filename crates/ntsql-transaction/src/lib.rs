@@ -3676,6 +3676,26 @@ impl<Source, Store, const N: usize> RestartAnalyzedTransactionPageStorage<Source
 where
     Source: DurableTransactionRestartAnalysisSource<N>,
 {
+    /// Re-analyzes the current durable WAL prefix and prepares its inert baseline.
+    ///
+    /// Unlike [`Self::prepare_restart_checkpoint_baseline`], this operation does
+    /// not use the immutable startup analysis. It leaves that evidence and the
+    /// page store untouched.
+    pub fn prepare_restart_checkpoint_baseline_from_current_prefix(
+        &mut self,
+    ) -> Result<
+        DurableTransactionRestartCheckpointBaseline,
+        DurableTransactionRestartCheckpointBaselineCurrentPreparationError<Source::Error>,
+    > {
+        let analysis = analyze_durable_transaction_restart(&mut self.storage.storage.source)
+            .map_err(
+                DurableTransactionRestartCheckpointBaselineCurrentPreparationError::Analysis,
+            )?;
+        prepare_restart_checkpoint_baseline(&analysis).map_err(
+            DurableTransactionRestartCheckpointBaselineCurrentPreparationError::BaselinePreparation,
+        )
+    }
+
     /// Validates decoded baseline fields against their claimed current-WAL prefix.
     ///
     /// This operation re-reads the current durable source. It does not compare
@@ -3692,6 +3712,42 @@ where
             &mut self.storage.storage.source,
             observation,
         )
+    }
+
+    /// Loads one owned decoded slot, then validates it against the current WAL.
+    ///
+    /// Checkpoint retrieval completes before WAL validation begins. No
+    /// checkpoint-source borrow is held while the WAL source callback runs.
+    pub fn validate_restart_checkpoint_baseline_from_source<CheckpointSource>(
+        &mut self,
+        checkpoint_source: &mut CheckpointSource,
+    ) -> Result<
+        Option<DurableTransactionRestartCheckpointBaseline>,
+        DurableTransactionRestartCheckpointBaselineSourceValidationError<
+            CheckpointSource::Error,
+            Source::Error,
+        >,
+    >
+    where
+        CheckpointSource: DurableTransactionRestartCheckpointBaselineSource,
+    {
+        let checkpoint = checkpoint_source
+            .load_restart_checkpoint_baseline()
+            .map_err(
+                DurableTransactionRestartCheckpointBaselineSourceValidationError::CheckpointSource,
+            )?;
+        let Some(checkpoint) = checkpoint else {
+            return Ok(None);
+        };
+        self.validate_restart_checkpoint_baseline_against_current_prefix(
+            &checkpoint.as_observation(),
+        )
+        .map(Some)
+        .map_err(|source| {
+            DurableTransactionRestartCheckpointBaselineSourceValidationError::BaselineValidation(
+                Box::new(source),
+            )
+        })
     }
 }
 
@@ -4561,6 +4617,129 @@ impl<'evidence> DurableTransactionRestartCheckpointBaselineObservation<'evidence
     }
 }
 
+/// Owned untrusted checkpoint fields returned after one source read completes.
+///
+/// This value owns decoded fields only and cannot become an authoritative
+/// baseline, log position, or recovered storage owner:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     OwnedDurableTransactionRestartCheckpointBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_baseline(
+///     observation: OwnedDurableTransactionRestartCheckpointBaselineObservation,
+/// ) -> DurableTransactionRestartCheckpointBaseline {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     OwnedDurableTransactionRestartCheckpointBaselineObservation,
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Store, const N: usize>(
+///     observation: OwnedDurableTransactionRestartCheckpointBaselineObservation,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::OwnedDurableTransactionRestartCheckpointBaselineObservation;
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_reconstruct_position(
+///     observation: OwnedDurableTransactionRestartCheckpointBaselineObservation,
+/// ) -> LogSequenceNumber {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedDurableTransactionRestartCheckpointBaselineObservation {
+    persistent_log_id: u128,
+    durable_frontier: Option<u64>,
+    transactions: Vec<DurableTransactionRestartCheckpointBaselineEntryObservation>,
+}
+
+impl OwnedDurableTransactionRestartCheckpointBaselineObservation {
+    /// Retains one owned set of decoded fields without validation.
+    #[must_use]
+    pub const fn new(
+        persistent_log_id: u128,
+        durable_frontier: Option<u64>,
+        transactions: Vec<DurableTransactionRestartCheckpointBaselineEntryObservation>,
+    ) -> Self {
+        Self {
+            persistent_log_id,
+            durable_frontier,
+            transactions,
+        }
+    }
+
+    /// Returns the raw decoded persistent log identity.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> u128 {
+        self.persistent_log_id
+    }
+
+    /// Returns the raw decoded optional durable frontier.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.durable_frontier
+    }
+
+    /// Returns owned decoded entries in their persisted order.
+    pub fn transactions(&self) -> &[DurableTransactionRestartCheckpointBaselineEntryObservation] {
+        &self.transactions
+    }
+
+    /// Borrows this owned snapshot through the ADR 0039 validation shape.
+    #[must_use]
+    pub fn as_observation(&self) -> DurableTransactionRestartCheckpointBaselineObservation<'_> {
+        DurableTransactionRestartCheckpointBaselineObservation::new(
+            self.persistent_log_id,
+            self.durable_frontier,
+            &self.transactions,
+        )
+    }
+}
+
+/// Source of one optional owned decoded restart checkpoint baseline slot.
+///
+/// Retrieval must complete before the returned value is validated against a
+/// WAL source. The slot remains untrusted data and grants no storage authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselineSource;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_source_as_log<
+///     Source: DurableTransactionRestartCheckpointBaselineSource,
+///     Log: LogDurability,
+/// >(
+///     source: &mut Source,
+///     log: &mut Log,
+/// ) {
+///     let _ = log.flush_through(source);
+/// }
+/// ```
+pub trait DurableTransactionRestartCheckpointBaselineSource {
+    /// Source-specific failure to obtain an absent or complete owned slot.
+    type Error;
+
+    /// Loads the single current slot, or `None` when no checkpoint is present.
+    ///
+    /// An error returns no candidate. Multi-generation selection, persistence,
+    /// and source locking remain adapter responsibilities outside this port.
+    fn load_restart_checkpoint_baseline(
+        &mut self,
+    ) -> Result<Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>, Self::Error>;
+}
+
 /// Failure to prepare a persistable transaction restart checkpoint baseline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableTransactionRestartCheckpointBaselineError {
@@ -4867,6 +5046,104 @@ where
         match self {
             Self::Source(source) => Some(source),
             Self::Evidence(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+/// Failure to analyze and prepare the current durable restart prefix.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointBaselineCurrentPreparationError<SourceError> {
+    /// Obtaining or analyzing the current durable prefix failed.
+    Analysis(DurableTransactionRestartAnalysisError<SourceError>),
+    /// The current analysis could not form a persistable baseline.
+    BaselinePreparation(DurableTransactionRestartCheckpointBaselineError),
+}
+
+impl<SourceError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCheckpointBaselineCurrentPreparationError<SourceError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Analysis(source) => {
+                write!(
+                    formatter,
+                    "current restart checkpoint analysis failed: {source}"
+                )
+            }
+            Self::BaselinePreparation(source) => {
+                write!(
+                    formatter,
+                    "current restart checkpoint preparation failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl<SourceError> Error
+    for DurableTransactionRestartCheckpointBaselineCurrentPreparationError<SourceError>
+where
+    SourceError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Analysis(source) => Some(source),
+            Self::BaselinePreparation(source) => Some(source),
+        }
+    }
+}
+
+/// Failure to load an owned checkpoint slot or validate it against the WAL.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointBaselineSourceValidationError<
+    CheckpointSourceError,
+    WalSourceError,
+> {
+    /// Loading the optional owned checkpoint slot failed.
+    CheckpointSource(CheckpointSourceError),
+    /// A present decoded slot failed current-prefix validation.
+    BaselineValidation(
+        Box<DurableTransactionRestartCheckpointBaselineValidationError<WalSourceError>>,
+    ),
+}
+
+impl<CheckpointSourceError, WalSourceError> fmt::Display
+    for DurableTransactionRestartCheckpointBaselineSourceValidationError<
+        CheckpointSourceError,
+        WalSourceError,
+    >
+where
+    CheckpointSourceError: fmt::Display,
+    WalSourceError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CheckpointSource(source) => {
+                write!(formatter, "restart checkpoint source failed: {source}")
+            }
+            Self::BaselineValidation(source) => {
+                write!(
+                    formatter,
+                    "loaded restart checkpoint validation failed: {source}"
+                )
+            }
+        }
+    }
+}
+
+impl<CheckpointSourceError, WalSourceError> Error
+    for DurableTransactionRestartCheckpointBaselineSourceValidationError<
+        CheckpointSourceError,
+        WalSourceError,
+    >
+where
+    CheckpointSourceError: Error + 'static,
+    WalSourceError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CheckpointSource(source) => Some(source),
+            Self::BaselineValidation(source) => Some(source.as_ref()),
         }
     }
 }
@@ -7684,6 +7961,7 @@ mod tests {
         restart_before_callback_error: Option<FakeFault>,
         restart_after_callback_error: Option<FakeFault>,
         restart_callbacks: usize,
+        restart_events: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
 
     impl FakeDurablePageRecoverySource {
@@ -7717,6 +7995,7 @@ mod tests {
                 restart_before_callback_error: None,
                 restart_after_callback_error: None,
                 restart_callbacks: 0,
+                restart_events: None,
             }
         }
     }
@@ -7752,6 +8031,9 @@ mod tests {
         {
             if let Some(source) = self.restart_before_callback_error.take() {
                 return Err(source);
+            }
+            if let Some(events) = &self.restart_events {
+                events.borrow_mut().push("wal");
             }
             self.restart_callbacks += 1;
             let output = operation(self.restart_frontier.as_ref(), &self.restart_observations);
@@ -11205,6 +11487,54 @@ mod tests {
         )
     }
 
+    fn owned_decoded_checkpoint(
+        baseline: &DurableTransactionRestartCheckpointBaseline,
+    ) -> OwnedDurableTransactionRestartCheckpointBaselineObservation {
+        OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+            baseline.persistent_log_id().get(),
+            baseline.durable_frontier(),
+            decoded_checkpoint_entries(baseline),
+        )
+    }
+
+    struct FakeCheckpointBaselineSource {
+        checkpoint: Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>,
+        fault: Option<FakeFault>,
+        calls: usize,
+        events: Option<Rc<RefCell<Vec<&'static str>>>>,
+    }
+
+    impl FakeCheckpointBaselineSource {
+        fn new(
+            checkpoint: Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>,
+        ) -> Self {
+            Self {
+                checkpoint,
+                fault: None,
+                calls: 0,
+                events: None,
+            }
+        }
+    }
+
+    impl DurableTransactionRestartCheckpointBaselineSource for FakeCheckpointBaselineSource {
+        type Error = FakeFault;
+
+        fn load_restart_checkpoint_baseline(
+            &mut self,
+        ) -> Result<Option<OwnedDurableTransactionRestartCheckpointBaselineObservation>, Self::Error>
+        {
+            self.calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("checkpoint");
+            }
+            match self.fault.take() {
+                Some(source) => Err(source),
+                None => Ok(self.checkpoint.clone()),
+            }
+        }
+    }
+
     fn checkpoint_validation_evidence_error(
         result: Result<
             DurableTransactionRestartCheckpointBaseline,
@@ -11834,6 +12164,251 @@ mod tests {
             .map_err(|_| TestError("validation did not recover after source faults"))?;
         assert_eq!(validated, baseline);
         assert_eq!(owner.parts().0.restart_callbacks, callbacks + 2);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_decoded_checkpoint_retains_raw_fields_without_authorizing_them() {
+        let transaction = DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+            0,
+            0,
+            Some(0),
+            None,
+            u64::MAX,
+            DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                commit_position: 0,
+            },
+        );
+        let owned = OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+            0,
+            Some(0),
+            vec![transaction],
+        );
+
+        assert_eq!(owned.persistent_log_id(), 0);
+        assert_eq!(owned.durable_frontier(), Some(0));
+        assert_eq!(owned.transactions(), [transaction]);
+        let borrowed = owned.as_observation();
+        assert_eq!(borrowed.persistent_log_id(), 0);
+        assert_eq!(borrowed.durable_frontier(), Some(0));
+        assert_eq!(borrowed.transactions(), [transaction]);
+    }
+
+    #[test]
+    fn current_checkpoint_preparation_reanalyzes_without_changing_startup_or_store()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1320).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        let startup = owner
+            .prepare_restart_checkpoint_baseline()
+            .map_err(|_| TestError("prepare startup checkpoint"))?;
+        let startup_frontier = owner
+            .restart_analysis()
+            .durable_frontier()
+            .ok_or(TestError("startup frontier"))?
+            .clone();
+        let store_observations = owner.parts().1.observations.borrow().clone();
+        let store_attempts = owner.parts().1.attempts.clone();
+        {
+            let (source, _) = owner.parts_mut();
+            source
+                .restart_observations
+                .push(restart_raw_page(&lineage, 90, 4)?);
+            source.restart_frontier = Some(lineage.position(4));
+        }
+
+        let current = owner
+            .prepare_restart_checkpoint_baseline_from_current_prefix()
+            .map_err(|_| TestError("prepare current checkpoint"))?;
+
+        assert_eq!(startup.durable_frontier(), Some(2));
+        assert_eq!(current.durable_frontier(), Some(4));
+        assert_eq!(current.transactions(), startup.transactions());
+        assert_eq!(
+            owner.restart_analysis().durable_frontier(),
+            Some(&startup_frontier)
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, 2);
+        assert_eq!(
+            owner.parts().1.observations.borrow().as_slice(),
+            store_observations
+        );
+        assert_eq!(owner.parts().1.attempts, store_attempts);
+
+        let duplicate_owner = startup.transactions()[0].transaction();
+        {
+            let (source, _) = owner.parts_mut();
+            source
+                .restart_observations
+                .push(restart_commit(&lineage, duplicate_owner, 6)?);
+            source.restart_frontier = Some(lineage.position(6));
+        }
+        let malformed = owner
+            .prepare_restart_checkpoint_baseline_from_current_prefix()
+            .err()
+            .ok_or(TestError("malformed current checkpoint preparation"))?;
+        assert!(Error::source(&malformed).is_some());
+        assert!(matches!(
+            malformed,
+            DurableTransactionRestartCheckpointBaselineCurrentPreparationError::Analysis(
+                DurableTransactionRestartAnalysisError::Evidence(source)
+            ) if matches!(
+                source.as_ref(),
+                DurableTransactionRestartAnalysisEvidenceError::DuplicateCommit {
+                    transaction,
+                    first_commit_position,
+                    duplicate_commit_position,
+                } if *transaction == duplicate_owner
+                    && first_commit_position == &lineage.position(2)
+                    && duplicate_commit_position == &lineage.position(6)
+            )
+        ));
+        {
+            let (source, _) = owner.parts_mut();
+            source
+                .restart_observations
+                .pop()
+                .ok_or(TestError("malformed suffix disappeared"))?;
+            source.restart_frontier = Some(lineage.position(4));
+        }
+        assert_eq!(
+            owner
+                .prepare_restart_checkpoint_baseline_from_current_prefix()
+                .map_err(|_| TestError("current preparation did not recover"))?
+                .durable_frontier(),
+            Some(4)
+        );
+
+        let ephemeral = LogLineage::new();
+        let mut ephemeral_owner = batch_restart_analyzed_checkpoint_owner(&ephemeral, &[82])?;
+        assert!(matches!(
+            ephemeral_owner
+                .prepare_restart_checkpoint_baseline_from_current_prefix()
+                .err(),
+            Some(
+                DurableTransactionRestartCheckpointBaselineCurrentPreparationError::BaselinePreparation(
+                    DurableTransactionRestartCheckpointBaselineError::PersistentLineageRequired
+                )
+            )
+        ));
+        assert_eq!(ephemeral_owner.parts().0.restart_callbacks, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn owned_checkpoint_source_composition_is_sequential_optional_and_non_consuming()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1321).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81, 82])?;
+        let baseline = owner
+            .prepare_restart_checkpoint_baseline()
+            .map_err(|_| TestError("prepare source checkpoint"))?;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.parts_mut().0.restart_events = Some(Rc::clone(&events));
+        let callbacks = owner.parts().0.restart_callbacks;
+        let store_observations = owner.parts().1.observations.borrow().clone();
+        let store_attempts = owner.parts().1.attempts.clone();
+        let mut exact =
+            FakeCheckpointBaselineSource::new(Some(owned_decoded_checkpoint(&baseline)));
+        exact.events = Some(Rc::clone(&events));
+
+        let validated = owner
+            .validate_restart_checkpoint_baseline_from_source(&mut exact)
+            .map_err(|_| TestError("validate owned checkpoint source"))?
+            .ok_or(TestError("owned checkpoint source disappeared"))?;
+
+        assert_eq!(validated, baseline);
+        assert_eq!(exact.calls, 1);
+        assert_eq!(events.borrow().as_slice(), ["checkpoint", "wal"]);
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+
+        let mut absent = FakeCheckpointBaselineSource::new(None);
+        absent.events = Some(Rc::clone(&events));
+        assert_eq!(
+            owner
+                .validate_restart_checkpoint_baseline_from_source(&mut absent)
+                .map_err(|_| TestError("absent checkpoint source failed"))?,
+            None
+        );
+        assert_eq!(absent.calls, 1);
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["checkpoint", "wal", "checkpoint"]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+
+        let invalid =
+            OwnedDurableTransactionRestartCheckpointBaselineObservation::new(0, None, Vec::new());
+        let mut invalid_source = FakeCheckpointBaselineSource::new(Some(invalid));
+        invalid_source.events = Some(Rc::clone(&events));
+        let invalid_error = owner
+            .validate_restart_checkpoint_baseline_from_source(&mut invalid_source)
+            .err()
+            .ok_or(TestError("invalid owned checkpoint source"))?;
+        assert!(matches!(
+            invalid_error,
+            DurableTransactionRestartCheckpointBaselineSourceValidationError::BaselineValidation(
+                source
+            ) if matches!(
+                source.as_ref(),
+                DurableTransactionRestartCheckpointBaselineValidationError::Evidence(evidence)
+                    if matches!(
+                        evidence.as_ref(),
+                        DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ZeroPersistentLogId {
+                            persistent_log_id: 0
+                        }
+                    )
+            )
+        ));
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+
+        let mut unavailable =
+            FakeCheckpointBaselineSource::new(Some(owned_decoded_checkpoint(&baseline)));
+        unavailable.fault = Some(FakeFault("checkpoint unavailable"));
+        unavailable.events = Some(Rc::clone(&events));
+        let unavailable_error = owner
+            .validate_restart_checkpoint_baseline_from_source(&mut unavailable)
+            .err()
+            .ok_or(TestError("checkpoint source failure"))?;
+        assert_eq!(
+            Error::source(&unavailable_error).map(ToString::to_string),
+            Some(String::from("checkpoint unavailable"))
+        );
+        assert!(matches!(
+            unavailable_error,
+            DurableTransactionRestartCheckpointBaselineSourceValidationError::CheckpointSource(
+                FakeFault("checkpoint unavailable")
+            )
+        ));
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+
+        let validated_again = owner
+            .validate_restart_checkpoint_baseline_from_source(&mut exact)
+            .map_err(|_| TestError("owner unusable after checkpoint source failures"))?
+            .ok_or(TestError("exact checkpoint disappeared"))?;
+        assert_eq!(validated_again, baseline);
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "checkpoint",
+                "wal",
+                "checkpoint",
+                "checkpoint",
+                "checkpoint",
+                "checkpoint",
+                "wal",
+            ]
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 2);
+        assert_eq!(
+            owner.parts().1.observations.borrow().as_slice(),
+            store_observations
+        );
+        assert_eq!(owner.parts().1.attempts, store_attempts);
         Ok(())
     }
 

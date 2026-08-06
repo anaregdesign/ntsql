@@ -2140,6 +2140,7 @@ mod tests {
         drop(raw_dirty);
 
         let volatile_active = coordinator.begin()?;
+        let volatile_owner = volatile_active.transaction_id();
         let volatile_page_number =
             PageNumber::new(86).ok_or_else(|| io::Error::other("volatile page is zero"))?;
         let volatile_page = UnloggedPage::new(
@@ -2377,6 +2378,28 @@ mod tests {
         let validated_checkpoint = recovered
             .validate_restart_checkpoint_baseline_against_current_prefix(&decoded_checkpoint)?;
         assert_eq!(validated_checkpoint, checkpoint_baseline);
+        assert_eq!(recovered.parts().1.pages().len(), page_count);
+        let current_checkpoint =
+            recovered.prepare_restart_checkpoint_baseline_from_current_prefix()?;
+        assert_eq!(
+            current_checkpoint.durable_frontier(),
+            Some(live_frontier.get())
+        );
+        assert_eq!(
+            &current_checkpoint.transactions()[..5],
+            checkpoint_baseline.transactions()
+        );
+        assert_eq!(current_checkpoint.transactions().len(), 6);
+        let newly_durable = &current_checkpoint.transactions()[5];
+        assert!(
+            newly_durable
+                .transaction()
+                .matches_transaction_id(volatile_owner)
+        );
+        assert_eq!(newly_durable.first_owned_page_position(), Some(11));
+        assert_eq!(newly_durable.last_owned_page_position(), Some(11));
+        assert_eq!(newly_durable.owned_page_record_count(), 1);
+        assert_eq!(newly_durable.state().commit_position(), Some(12));
         assert_eq!(recovered.parts().1.pages().len(), page_count);
 
         let (_log, store, report, analysis) = recovered.into_parts();

@@ -5,6 +5,7 @@
 - Issue: #134
 - Extends: ADR 0040
 - Extended by: ADR 0042
+- Publication implementation: ADR 0043
 
 ## Context
 

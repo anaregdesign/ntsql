@@ -96,6 +96,16 @@
 //! versus present-zero fields, while the final checksum protects the complete
 //! preceding blob. Decoding returns owned untrusted fields and performs no file
 //! I/O, publication, startup selection, or checkpoint validation.
+//!
+//! ## Filesystem restart checkpoint baseline source
+//!
+//! One caller-selected checkpoint slot directory contains an immutable
+//! lineaged `control` file and an optional `current` ADR 0044 blob. The adapter
+//! holds a nonblocking exclusive lock on `control`, not `current`, so later
+//! replacement of the selected blob cannot move the lock to an obsolete inode.
+//! Creating a slot synchronizes the control file, slot directory, and parent
+//! directory. Loading structurally decodes one complete current blob but returns
+//! only owned untrusted checkpoint fields.
 
 use std::{
     error::Error,
@@ -124,11 +134,21 @@ use ntsql_transaction::{
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
 mod restart_checkpoint_codec;
+mod restart_checkpoint_file;
 
 pub use restart_checkpoint_codec::{
     RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,
     RestartCheckpointBaselineEntryOptionalField, decode_restart_checkpoint_baseline,
     encode_restart_checkpoint_baseline,
+};
+pub use restart_checkpoint_file::{
+    FileRestartCheckpointBaselineSource, FileRestartCheckpointBaselineSourceError,
+    FileRestartCheckpointSlotCreateError, FileRestartCheckpointSlotFormatError,
+    FileRestartCheckpointSlotFormatErrorReason, FileRestartCheckpointSlotIoError,
+    FileRestartCheckpointSlotIoStage, FileRestartCheckpointSlotOpenError,
+    FileTransactionPageStorageCheckpointOpenError,
+    UnrecoveredFileTransactionPageStorageWithCheckpoint,
+    open_transaction_page_storage_with_checkpoint,
 };
 
 const HEADER_MAGIC: [u8; 8] = *b"NTSQLOG1";

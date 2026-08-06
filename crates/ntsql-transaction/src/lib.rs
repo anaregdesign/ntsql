@@ -3672,6 +3672,29 @@ impl<Source, Store, const N: usize> RestartAnalyzedTransactionPageStorage<Source
     }
 }
 
+impl<Source, Store, const N: usize> RestartAnalyzedTransactionPageStorage<Source, Store, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    /// Validates decoded baseline fields against their claimed current-WAL prefix.
+    ///
+    /// This operation re-reads the current durable source. It does not compare
+    /// against the immutable startup analysis, inspect the page store, or grant
+    /// checkpoint, replay, or log-reclamation authority.
+    pub fn validate_restart_checkpoint_baseline_against_current_prefix(
+        &mut self,
+        observation: &DurableTransactionRestartCheckpointBaselineObservation<'_>,
+    ) -> Result<
+        DurableTransactionRestartCheckpointBaseline,
+        DurableTransactionRestartCheckpointBaselineValidationError<Source::Error>,
+    > {
+        validate_restart_checkpoint_baseline_against_current_prefix(
+            &mut self.storage.storage.source,
+            observation,
+        )
+    }
+}
+
 /// Fail-closed restart-analysis state that retains the recovered storage pair.
 ///
 /// The unchanged owned prefix provides no meaningful in-place retry, and neither
@@ -4297,6 +4320,247 @@ impl DurableTransactionRestartCheckpointBaseline {
     }
 }
 
+/// Untrusted decoded commit classification for one baseline entry.
+///
+/// This observation remains distinct from the authoritative baseline state:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselineState,
+///     DurableTransactionRestartCheckpointBaselineStateObservation,
+/// };
+///
+/// fn cannot_authorize_state(
+///     observation: DurableTransactionRestartCheckpointBaselineStateObservation,
+/// ) -> DurableTransactionRestartCheckpointBaselineState {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointBaselineStateObservation {
+    /// Decoded bytes claim no commit in the summarized prefix.
+    Uncommitted,
+    /// Decoded bytes claim exactly one commit at this raw numeric position.
+    Committed {
+        /// Unvalidated decoded commit position.
+        commit_position: u64,
+    },
+}
+
+impl DurableTransactionRestartCheckpointBaselineStateObservation {
+    /// Returns the decoded commit position, or `None` for uncommitted bytes.
+    #[must_use]
+    pub const fn commit_position(self) -> Option<u64> {
+        match self {
+            Self::Uncommitted => None,
+            Self::Committed { commit_position } => Some(commit_position),
+        }
+    }
+}
+
+/// Untrusted decoded fields for one restart checkpoint baseline entry.
+///
+/// Construction deliberately retains zero and contradictory fields so exact
+/// validation can report them without granting transaction or page authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselineEntry,
+///     DurableTransactionRestartCheckpointBaselineEntryObservation,
+/// };
+///
+/// fn cannot_authorize_entry(
+///     observation: DurableTransactionRestartCheckpointBaselineEntryObservation,
+/// ) -> DurableTransactionRestartCheckpointBaselineEntry {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselineEntryObservation;
+///
+/// fn cannot_authorize_page_write<'attempt>(
+///     observation: DurableTransactionRestartCheckpointBaselineEntryObservation,
+/// ) -> PageWritePermit<'attempt> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselineEntryObservation, TransactionId,
+/// };
+///
+/// fn cannot_reconstruct_transaction(
+///     observation: DurableTransactionRestartCheckpointBaselineEntryObservation,
+/// ) -> TransactionId {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit,
+///     DurableTransactionRestartCheckpointBaselineEntryObservation,
+/// };
+///
+/// fn cannot_authorize_recovery<'attempt>(
+///     observation: DurableTransactionRestartCheckpointBaselineEntryObservation,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableTransactionRestartCheckpointBaselineEntryObservation {
+    epoch: u64,
+    sequence: u64,
+    first_owned_page_position: Option<u64>,
+    last_owned_page_position: Option<u64>,
+    owned_page_record_count: u64,
+    state: DurableTransactionRestartCheckpointBaselineStateObservation,
+}
+
+impl DurableTransactionRestartCheckpointBaselineEntryObservation {
+    /// Retains one complete set of decoded fields without validation.
+    #[must_use]
+    pub const fn new(
+        epoch: u64,
+        sequence: u64,
+        first_owned_page_position: Option<u64>,
+        last_owned_page_position: Option<u64>,
+        owned_page_record_count: u64,
+        state: DurableTransactionRestartCheckpointBaselineStateObservation,
+    ) -> Self {
+        Self {
+            epoch,
+            sequence,
+            first_owned_page_position,
+            last_owned_page_position,
+            owned_page_record_count,
+            state,
+        }
+    }
+
+    /// Returns the raw decoded coordinator epoch.
+    #[must_use]
+    pub const fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns the raw decoded coordinator-local sequence.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        self.sequence
+    }
+
+    /// Returns the raw decoded first owned-page position.
+    #[must_use]
+    pub const fn first_owned_page_position(self) -> Option<u64> {
+        self.first_owned_page_position
+    }
+
+    /// Returns the raw decoded last owned-page position.
+    #[must_use]
+    pub const fn last_owned_page_position(self) -> Option<u64> {
+        self.last_owned_page_position
+    }
+
+    /// Returns the raw decoded portable record count.
+    #[must_use]
+    pub const fn owned_page_record_count(self) -> u64 {
+        self.owned_page_record_count
+    }
+
+    /// Returns the raw decoded commit classification.
+    #[must_use]
+    pub const fn state(self) -> DurableTransactionRestartCheckpointBaselineStateObservation {
+        self.state
+    }
+}
+
+/// Borrowed untrusted fields decoded from checkpoint storage.
+///
+/// This observation cannot become an authoritative baseline or storage owner:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     DurableTransactionRestartCheckpointBaselineObservation,
+/// };
+///
+/// fn cannot_authorize_baseline(
+///     observation: DurableTransactionRestartCheckpointBaselineObservation<'_>,
+/// ) -> DurableTransactionRestartCheckpointBaseline {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselineObservation,
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Store, const N: usize>(
+///     observation: DurableTransactionRestartCheckpointBaselineObservation<'_>,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     observation.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselineObservation;
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_reconstruct_position(
+///     observation: DurableTransactionRestartCheckpointBaselineObservation<'_>,
+/// ) -> LogSequenceNumber {
+///     observation.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DurableTransactionRestartCheckpointBaselineObservation<'evidence> {
+    persistent_log_id: u128,
+    durable_frontier: Option<u64>,
+    transactions: &'evidence [DurableTransactionRestartCheckpointBaselineEntryObservation],
+}
+
+impl<'evidence> DurableTransactionRestartCheckpointBaselineObservation<'evidence> {
+    /// Retains decoded baseline fields without validation or allocation.
+    #[must_use]
+    pub const fn new(
+        persistent_log_id: u128,
+        durable_frontier: Option<u64>,
+        transactions: &'evidence [DurableTransactionRestartCheckpointBaselineEntryObservation],
+    ) -> Self {
+        Self {
+            persistent_log_id,
+            durable_frontier,
+            transactions,
+        }
+    }
+
+    /// Returns the raw decoded persistent log identity.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> u128 {
+        self.persistent_log_id
+    }
+
+    /// Returns the raw decoded optional durable frontier.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.durable_frontier
+    }
+
+    /// Returns decoded entries in their persisted order.
+    pub const fn transactions(
+        &self,
+    ) -> &'evidence [DurableTransactionRestartCheckpointBaselineEntryObservation] {
+        self.transactions
+    }
+}
+
 /// Failure to prepare a persistable transaction restart checkpoint baseline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableTransactionRestartCheckpointBaselineError {
@@ -4403,6 +4667,465 @@ fn prepare_restart_checkpoint_baseline(
         durable_frontier: analysis.durable_frontier().map(LogSequenceNumber::get),
         transactions,
     })
+}
+
+/// Invalid decoded baseline evidence or current-prefix relationship.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointBaselineValidationEvidenceError {
+    /// The current WAL lineage cannot be reconstructed after process restart.
+    CurrentPersistentLineageRequired,
+    /// Decoded bytes supplied the reserved zero persistent log identity.
+    ZeroPersistentLogId {
+        /// Rejected raw decoded identity.
+        persistent_log_id: u128,
+    },
+    /// Decoded bytes name another persistent WAL lineage.
+    ForeignPersistentLogId {
+        /// Exact persistent identity of the current source.
+        expected: PersistentLogId,
+        /// Rejected decoded persistent identity.
+        actual: PersistentLogId,
+    },
+    /// A decoded nonempty frontier used the reserved zero numeric position.
+    ZeroCheckpointFrontier {
+        /// Rejected decoded frontier.
+        checkpoint_frontier: u64,
+    },
+    /// Current source frontier or complete-stream evidence was invalid.
+    CurrentPrefix(Box<DurableTransactionRestartAnalysisEvidenceError>),
+    /// The checkpoint claims a position beyond the current durable frontier.
+    CheckpointBeyondDurableFrontier {
+        /// Rejected decoded checkpoint frontier.
+        checkpoint_frontier: u64,
+        /// Current numeric durable frontier, or `None` for an empty source.
+        durable_frontier: Option<u64>,
+    },
+    /// The checkpoint position lies in a valid numeric gap between WAL records.
+    CheckpointFrontierNotRecordBoundary {
+        /// Rejected decoded checkpoint frontier.
+        checkpoint_frontier: u64,
+        /// Current numeric durable frontier.
+        durable_frontier: u64,
+    },
+    /// The selected claimed prefix itself failed restart analysis.
+    SelectedPrefix(Box<DurableTransactionRestartAnalysisEvidenceError>),
+    /// The authoritative selected-prefix baseline could not be prepared.
+    ExpectedBaselinePreparation(DurableTransactionRestartCheckpointBaselineError),
+    /// The decoded and authoritative frontier shapes or values differ.
+    DurableFrontierMismatch {
+        /// Frontier recomputed from authoritative WAL evidence.
+        expected: Option<u64>,
+        /// Raw decoded checkpoint frontier.
+        actual: Option<u64>,
+    },
+    /// The decoded transaction table has a different length.
+    TransactionCountMismatch {
+        /// Number of entries recomputed from authoritative WAL evidence.
+        expected: usize,
+        /// Number of decoded entries.
+        actual: usize,
+    },
+    /// One decoded entry differs from the authoritative entry at the same index.
+    TransactionEntryMismatch {
+        /// Zero-based identity-sorted entry index.
+        index: usize,
+        /// Entry recomputed from authoritative WAL evidence.
+        expected: Box<DurableTransactionRestartCheckpointBaselineEntry>,
+        /// Exact untrusted decoded entry.
+        actual: DurableTransactionRestartCheckpointBaselineEntryObservation,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartCheckpointBaselineValidationEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentPersistentLineageRequired => formatter.write_str(
+                "current restart checkpoint validation source requires a persistent log lineage",
+            ),
+            Self::ZeroPersistentLogId { .. } => {
+                formatter.write_str("decoded restart checkpoint persistent log identity is zero")
+            }
+            Self::ForeignPersistentLogId { expected, actual } => write!(
+                formatter,
+                "decoded restart checkpoint log identity {} does not match current identity {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::ZeroCheckpointFrontier { .. } => {
+                formatter.write_str("decoded nonempty restart checkpoint frontier is zero")
+            }
+            Self::CurrentPrefix(source) => {
+                write!(
+                    formatter,
+                    "current durable restart prefix is invalid: {source}"
+                )
+            }
+            Self::CheckpointBeyondDurableFrontier {
+                checkpoint_frontier,
+                durable_frontier: Some(durable_frontier),
+            } => write!(
+                formatter,
+                "decoded restart checkpoint frontier {checkpoint_frontier} exceeds current durable frontier {durable_frontier}"
+            ),
+            Self::CheckpointBeyondDurableFrontier {
+                checkpoint_frontier,
+                durable_frontier: None,
+            } => write!(
+                formatter,
+                "decoded restart checkpoint frontier {checkpoint_frontier} exceeds the empty current durable prefix"
+            ),
+            Self::CheckpointFrontierNotRecordBoundary {
+                checkpoint_frontier,
+                durable_frontier,
+            } => write!(
+                formatter,
+                "decoded restart checkpoint frontier {checkpoint_frontier} is not a logical record boundary through durable frontier {durable_frontier}"
+            ),
+            Self::SelectedPrefix(source) => {
+                write!(
+                    formatter,
+                    "selected restart checkpoint prefix is invalid: {source}"
+                )
+            }
+            Self::ExpectedBaselinePreparation(source) => write!(
+                formatter,
+                "authoritative restart checkpoint baseline preparation failed: {source}"
+            ),
+            Self::DurableFrontierMismatch { expected, actual } => write!(
+                formatter,
+                "decoded restart checkpoint frontier {actual:?} does not match authoritative frontier {expected:?}"
+            ),
+            Self::TransactionCountMismatch { expected, actual } => write!(
+                formatter,
+                "decoded restart checkpoint has {actual} transaction entries, expected {expected}"
+            ),
+            Self::TransactionEntryMismatch {
+                index,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "decoded restart checkpoint transaction entry {index} ({:?}:{:?}) does not match authoritative identity {}",
+                actual.epoch(),
+                actual.sequence(),
+                expected.transaction()
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartCheckpointBaselineValidationEvidenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CurrentPrefix(source) | Self::SelectedPrefix(source) => Some(source.as_ref()),
+            Self::ExpectedBaselinePreparation(source) => Some(source),
+            Self::CurrentPersistentLineageRequired
+            | Self::ZeroPersistentLogId { .. }
+            | Self::ForeignPersistentLogId { .. }
+            | Self::ZeroCheckpointFrontier { .. }
+            | Self::CheckpointBeyondDurableFrontier { .. }
+            | Self::CheckpointFrontierNotRecordBoundary { .. }
+            | Self::DurableFrontierMismatch { .. }
+            | Self::TransactionCountMismatch { .. }
+            | Self::TransactionEntryMismatch { .. } => None,
+        }
+    }
+}
+
+/// Failure to read the current prefix or validate decoded checkpoint evidence.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointBaselineValidationError<SourceError> {
+    /// The current durable-prefix source failed authoritatively.
+    Source(SourceError),
+    /// Decoded or source-relative checkpoint evidence was invalid.
+    Evidence(Box<DurableTransactionRestartCheckpointBaselineValidationEvidenceError>),
+}
+
+impl<SourceError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCheckpointBaselineValidationError<SourceError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => {
+                write!(
+                    formatter,
+                    "restart checkpoint validation source failed: {source}"
+                )
+            }
+            Self::Evidence(source) => {
+                write!(formatter, "restart checkpoint validation failed: {source}")
+            }
+        }
+    }
+}
+
+impl<SourceError> Error for DurableTransactionRestartCheckpointBaselineValidationError<SourceError>
+where
+    SourceError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Evidence(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+fn restart_checkpoint_entry_matches_observation(
+    expected: &DurableTransactionRestartCheckpointBaselineEntry,
+    actual: DurableTransactionRestartCheckpointBaselineEntryObservation,
+) -> bool {
+    let expected_state_matches = match (expected.state(), actual.state()) {
+        (
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted,
+            DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted,
+        ) => true,
+        (
+            DurableTransactionRestartCheckpointBaselineState::Committed {
+                commit_position: expected,
+            },
+            DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                commit_position: actual,
+            },
+        ) => expected == actual,
+        (
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted,
+            DurableTransactionRestartCheckpointBaselineStateObservation::Committed { .. },
+        )
+        | (
+            DurableTransactionRestartCheckpointBaselineState::Committed { .. },
+            DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted,
+        ) => false,
+    };
+    let expected_transaction = expected.transaction();
+    expected_transaction.epoch() == actual.epoch()
+        && expected_transaction.sequence() == actual.sequence()
+        && expected.first_owned_page_position() == actual.first_owned_page_position()
+        && expected.last_owned_page_position() == actual.last_owned_page_position()
+        && expected.owned_page_record_count() == actual.owned_page_record_count()
+        && expected_state_matches
+}
+
+fn compare_restart_checkpoint_baseline_observation(
+    expected: DurableTransactionRestartCheckpointBaseline,
+    actual: &DurableTransactionRestartCheckpointBaselineObservation<'_>,
+) -> Result<
+    DurableTransactionRestartCheckpointBaseline,
+    DurableTransactionRestartCheckpointBaselineValidationEvidenceError,
+> {
+    if expected.durable_frontier() != actual.durable_frontier() {
+        return Err(
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::DurableFrontierMismatch {
+                expected: expected.durable_frontier(),
+                actual: actual.durable_frontier(),
+            },
+        );
+    }
+    if expected.transactions().len() != actual.transactions().len() {
+        return Err(
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::TransactionCountMismatch {
+                expected: expected.transactions().len(),
+                actual: actual.transactions().len(),
+            },
+        );
+    }
+    for (index, (expected_entry, actual_entry)) in expected
+        .transactions()
+        .iter()
+        .zip(actual.transactions())
+        .enumerate()
+    {
+        if !restart_checkpoint_entry_matches_observation(expected_entry, *actual_entry) {
+            return Err(
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::TransactionEntryMismatch {
+                    index,
+                    expected: Box::new(expected_entry.clone()),
+                    actual: *actual_entry,
+                },
+            );
+        }
+    }
+    Ok(expected)
+}
+
+fn current_restart_prefix_error(
+    source: DurableTransactionRestartAnalysisEvidenceError,
+) -> DurableTransactionRestartCheckpointBaselineValidationEvidenceError {
+    DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CurrentPrefix(Box::new(
+        source,
+    ))
+}
+
+fn validate_restart_checkpoint_baseline_evidence<const N: usize>(
+    lineage: &LogLineage,
+    current_frontier: Option<&LogSequenceNumber>,
+    observations: &[DurableTransactionRestartObservation<N>],
+    checkpoint: &DurableTransactionRestartCheckpointBaselineObservation<'_>,
+) -> Result<
+    DurableTransactionRestartCheckpointBaseline,
+    DurableTransactionRestartCheckpointBaselineValidationEvidenceError,
+> {
+    let Some(checkpoint_frontier) = checkpoint.durable_frontier() else {
+        let empty_analysis = analyze_durable_transaction_restart_evidence::<N>(lineage, None, &[])
+            .map_err(|source| {
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::SelectedPrefix(
+                    Box::new(source),
+                )
+            })?;
+        let expected = prepare_restart_checkpoint_baseline(&empty_analysis).map_err(
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ExpectedBaselinePreparation,
+        )?;
+        return compare_restart_checkpoint_baseline_observation(expected, checkpoint);
+    };
+
+    let current_frontier_value = match current_frontier {
+        None if observations.is_empty() => {
+            return Err(
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CheckpointBeyondDurableFrontier {
+                    checkpoint_frontier,
+                    durable_frontier: None,
+                },
+            );
+        }
+        None => {
+            let source = analyze_durable_transaction_restart_evidence(lineage, None, observations)
+                .err()
+                .ok_or(
+                    DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CheckpointBeyondDurableFrontier {
+                        checkpoint_frontier,
+                        durable_frontier: None,
+                    },
+                )?;
+            return Err(current_restart_prefix_error(source));
+        }
+        Some(frontier) if !lineage.same_lineage(frontier.lineage()) => {
+            return Err(current_restart_prefix_error(
+                DurableTransactionRestartAnalysisEvidenceError::ForeignFrontier {
+                    frontier: frontier.clone(),
+                },
+            ));
+        }
+        Some(frontier) if frontier.get() == 0 => {
+            return Err(current_restart_prefix_error(
+                DurableTransactionRestartAnalysisEvidenceError::ZeroFrontier {
+                    frontier: frontier.clone(),
+                },
+            ));
+        }
+        Some(frontier) if observations.is_empty() => {
+            return Err(current_restart_prefix_error(
+                DurableTransactionRestartAnalysisEvidenceError::FrontierWithoutRecords {
+                    frontier: frontier.clone(),
+                },
+            ));
+        }
+        Some(frontier) => frontier.get(),
+    };
+
+    if checkpoint_frontier > current_frontier_value {
+        return Err(
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CheckpointBeyondDurableFrontier {
+                checkpoint_frontier,
+                durable_frontier: Some(current_frontier_value),
+            },
+        );
+    }
+
+    let Some(boundary_index) = observations
+        .iter()
+        .position(|observation| observation.position().get() == checkpoint_frontier)
+    else {
+        match analyze_durable_transaction_restart_evidence(lineage, current_frontier, observations)
+        {
+            Ok(_) => {
+                return Err(
+                    DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CheckpointFrontierNotRecordBoundary {
+                        checkpoint_frontier,
+                        durable_frontier: current_frontier_value,
+                    },
+                );
+            }
+            Err(source) => return Err(current_restart_prefix_error(source)),
+        }
+    };
+    let selected_frontier = lineage.position(checkpoint_frontier);
+    let selected = &observations[..=boundary_index];
+    let analysis =
+        analyze_durable_transaction_restart_evidence(lineage, Some(&selected_frontier), selected)
+            .map_err(|source| {
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::SelectedPrefix(
+                Box::new(source),
+            )
+        })?;
+    let expected = prepare_restart_checkpoint_baseline(&analysis).map_err(
+        DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ExpectedBaselinePreparation,
+    )?;
+    compare_restart_checkpoint_baseline_observation(expected, checkpoint)
+}
+
+fn validate_restart_checkpoint_baseline_against_current_prefix<Source, const N: usize>(
+    source: &mut Source,
+    checkpoint: &DurableTransactionRestartCheckpointBaselineObservation<'_>,
+) -> Result<
+    DurableTransactionRestartCheckpointBaseline,
+    DurableTransactionRestartCheckpointBaselineValidationError<Source::Error>,
+>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    let lineage = source.lineage().clone();
+    let Some(expected_id) = lineage.persistent_id() else {
+        return Err(
+            DurableTransactionRestartCheckpointBaselineValidationError::Evidence(Box::new(
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CurrentPersistentLineageRequired,
+            )),
+        );
+    };
+    let Some(actual_id) = PersistentLogId::new(checkpoint.persistent_log_id()) else {
+        return Err(
+            DurableTransactionRestartCheckpointBaselineValidationError::Evidence(Box::new(
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ZeroPersistentLogId {
+                    persistent_log_id: checkpoint.persistent_log_id(),
+                },
+            )),
+        );
+    };
+    if actual_id != expected_id {
+        return Err(
+            DurableTransactionRestartCheckpointBaselineValidationError::Evidence(Box::new(
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ForeignPersistentLogId {
+                    expected: expected_id,
+                    actual: actual_id,
+                },
+            )),
+        );
+    }
+    if checkpoint.durable_frontier() == Some(0) {
+        return Err(
+            DurableTransactionRestartCheckpointBaselineValidationError::Evidence(Box::new(
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ZeroCheckpointFrontier {
+                    checkpoint_frontier: 0,
+                },
+            )),
+        );
+    }
+
+    match source.with_durable_transaction_restart_observations(|current_frontier, observations| {
+        validate_restart_checkpoint_baseline_evidence(
+            &lineage,
+            current_frontier,
+            observations,
+            checkpoint,
+        )
+    }) {
+        Ok(Ok(baseline)) => Ok(baseline),
+        Ok(Err(source)) => Err(
+            DurableTransactionRestartCheckpointBaselineValidationError::Evidence(Box::new(source)),
+        ),
+        Err(source) => {
+            Err(DurableTransactionRestartCheckpointBaselineValidationError::Source(source))
+        }
+    }
 }
 
 /// Invalid complete-prefix evidence supplied to restart analysis.
@@ -10400,6 +11123,105 @@ mod tests {
         }
     }
 
+    type FakeRestartAnalyzedStorage = RestartAnalyzedTransactionPageStorage<
+        FakeDurablePageRecoverySource,
+        FakeBatchCommittedPageRecoveryStore,
+        1,
+    >;
+
+    fn restart_analyzed_checkpoint_owner(
+        lineage: &LogLineage,
+        durable_frontier: Option<LogSequenceNumber>,
+        observations: Vec<DurableTransactionRestartObservation<1>>,
+    ) -> Result<FakeRestartAnalyzedStorage, TestError> {
+        let mut source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
+        source.restart_frontier = durable_frontier;
+        source.restart_observations = observations;
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        let page_recovered = UnrecoveredTransactionPageStorage::new(source, store)
+            .recover()
+            .map_err(|_| TestError("checkpoint owner page recovery"))?;
+        page_recovered
+            .analyze_restart()
+            .map_err(|_| TestError("checkpoint owner restart analysis"))
+    }
+
+    fn batch_restart_analyzed_checkpoint_owner(
+        lineage: &LogLineage,
+        page_numbers: &[u64],
+    ) -> Result<FakeRestartAnalyzedStorage, TestError> {
+        let source = batch_recovery_source(lineage, page_numbers)?;
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        let page_recovered = UnrecoveredTransactionPageStorage::new(source, store)
+            .recover()
+            .map_err(|_| TestError("batch checkpoint owner page recovery"))?;
+        page_recovered
+            .analyze_restart()
+            .map_err(|_| TestError("batch checkpoint owner restart analysis"))
+    }
+
+    fn decoded_checkpoint_entry(
+        entry: &DurableTransactionRestartCheckpointBaselineEntry,
+    ) -> DurableTransactionRestartCheckpointBaselineEntryObservation {
+        let state = match entry.state() {
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted => {
+                DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted
+            }
+            DurableTransactionRestartCheckpointBaselineState::Committed { commit_position } => {
+                DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                    commit_position,
+                }
+            }
+        };
+        DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+            entry.transaction().epoch(),
+            entry.transaction().sequence(),
+            entry.first_owned_page_position(),
+            entry.last_owned_page_position(),
+            entry.owned_page_record_count(),
+            state,
+        )
+    }
+
+    fn decoded_checkpoint_entries(
+        baseline: &DurableTransactionRestartCheckpointBaseline,
+    ) -> Vec<DurableTransactionRestartCheckpointBaselineEntryObservation> {
+        baseline
+            .transactions()
+            .iter()
+            .map(decoded_checkpoint_entry)
+            .collect()
+    }
+
+    fn decoded_checkpoint_observation<'evidence>(
+        baseline: &DurableTransactionRestartCheckpointBaseline,
+        transactions: &'evidence [DurableTransactionRestartCheckpointBaselineEntryObservation],
+    ) -> DurableTransactionRestartCheckpointBaselineObservation<'evidence> {
+        DurableTransactionRestartCheckpointBaselineObservation::new(
+            baseline.persistent_log_id().get(),
+            baseline.durable_frontier(),
+            transactions,
+        )
+    }
+
+    fn checkpoint_validation_evidence_error(
+        result: Result<
+            DurableTransactionRestartCheckpointBaseline,
+            DurableTransactionRestartCheckpointBaselineValidationError<FakeFault>,
+        >,
+    ) -> Result<DurableTransactionRestartCheckpointBaselineValidationEvidenceError, TestError> {
+        match result {
+            Err(DurableTransactionRestartCheckpointBaselineValidationError::Evidence(source)) => {
+                Ok(*source)
+            }
+            Err(DurableTransactionRestartCheckpointBaselineValidationError::Source(_)) => Err(
+                TestError("expected checkpoint validation evidence error, found source error"),
+            ),
+            Ok(_) => Err(TestError("expected checkpoint validation evidence error")),
+        }
+    }
+
     #[test]
     fn restart_analysis_accepts_authoritatively_empty_prefix() -> Result<(), TestError> {
         let lineage = LogLineage::new();
@@ -10523,6 +11345,496 @@ mod tests {
             )
         );
         assert!(transactions.is_empty());
+    }
+
+    #[test]
+    fn decoded_checkpoint_validation_returns_exact_authoritative_current_baseline()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1300).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81, 82, 83])?;
+        let baseline = owner
+            .prepare_restart_checkpoint_baseline()
+            .map_err(|_| TestError("prepare current checkpoint baseline"))?;
+        let entries = decoded_checkpoint_entries(&baseline);
+        let observation = decoded_checkpoint_observation(&baseline, &entries);
+        let store_observations = owner.parts().1.observations.borrow().clone();
+        let store_attempts = owner.parts().1.attempts.clone();
+
+        let validated = owner
+            .validate_restart_checkpoint_baseline_against_current_prefix(&observation)
+            .map_err(|_| TestError("validate current checkpoint baseline"))?;
+
+        assert_eq!(validated, baseline);
+        assert_eq!(owner.parts().0.restart_callbacks, 2);
+        assert_eq!(
+            owner.parts().1.observations.borrow().as_slice(),
+            store_observations
+        );
+        assert_eq!(owner.parts().1.attempts, store_attempts);
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_checkpoint_validation_distinguishes_empty_and_raw_only_stale_prefixes()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1301).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let transaction = durable_identity(130, 1)?;
+        let observations = vec![
+            restart_raw_page(&lineage, 90, 2)?,
+            restart_commit(&lineage, transaction, 4)?,
+        ];
+        let mut owner =
+            restart_analyzed_checkpoint_owner(&lineage, Some(lineage.position(4)), observations)?;
+        let no_entries = [];
+        let empty = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            None,
+            &no_entries,
+        );
+
+        let validated_empty = owner
+            .validate_restart_checkpoint_baseline_against_current_prefix(&empty)
+            .map_err(|_| TestError("validate empty checkpoint baseline"))?;
+
+        assert_eq!(validated_empty.durable_frontier(), None);
+        assert!(validated_empty.transactions().is_empty());
+
+        let raw_only = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            Some(2),
+            &no_entries,
+        );
+        let validated_raw = owner
+            .validate_restart_checkpoint_baseline_against_current_prefix(&raw_only)
+            .map_err(|_| TestError("validate raw-only checkpoint baseline"))?;
+
+        assert_eq!(validated_raw.durable_frontier(), Some(2));
+        assert!(validated_raw.transactions().is_empty());
+        assert_eq!(owner.parts().0.restart_callbacks, 3);
+        assert!(owner.parts().1.observations.borrow().is_empty());
+        assert!(owner.parts().1.attempts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_checkpoint_validation_rejects_identity_and_zero_frontier_before_callback()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1302).ok_or(TestError("persistent log id"))?;
+        let foreign_log_id =
+            PersistentLogId::new(0x1303).ok_or(TestError("foreign persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        let no_entries = [];
+        let callbacks = owner.parts().0.restart_callbacks;
+
+        let zero_id =
+            DurableTransactionRestartCheckpointBaselineObservation::new(0, None, &no_entries);
+        assert_eq!(
+            checkpoint_validation_evidence_error(
+                owner.validate_restart_checkpoint_baseline_against_current_prefix(&zero_id)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ZeroPersistentLogId {
+                persistent_log_id: 0
+            }
+        );
+
+        let foreign_id = DurableTransactionRestartCheckpointBaselineObservation::new(
+            foreign_log_id.get(),
+            None,
+            &no_entries,
+        );
+        assert_eq!(
+            checkpoint_validation_evidence_error(
+                owner.validate_restart_checkpoint_baseline_against_current_prefix(&foreign_id)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ForeignPersistentLogId {
+                expected: persistent_log_id,
+                actual: foreign_log_id,
+            }
+        );
+
+        let zero_frontier = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            Some(0),
+            &no_entries,
+        );
+        assert_eq!(
+            checkpoint_validation_evidence_error(
+                owner.validate_restart_checkpoint_baseline_against_current_prefix(&zero_frontier)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ZeroCheckpointFrontier {
+                checkpoint_frontier: 0
+            }
+        );
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks);
+
+        let ephemeral = LogLineage::new();
+        let mut ephemeral_owner = batch_restart_analyzed_checkpoint_owner(&ephemeral, &[82])?;
+        let apparently_persistent = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            None,
+            &no_entries,
+        );
+        let ephemeral_callbacks = ephemeral_owner.parts().0.restart_callbacks;
+        assert_eq!(
+            checkpoint_validation_evidence_error(
+                ephemeral_owner
+                    .validate_restart_checkpoint_baseline_against_current_prefix(
+                        &apparently_persistent
+                    )
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CurrentPersistentLineageRequired
+        );
+        assert_eq!(
+            ephemeral_owner.parts().0.restart_callbacks,
+            ephemeral_callbacks
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_checkpoint_validation_rejects_future_gap_and_invalid_current_frontiers()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1304).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let no_entries = [];
+        let mut dense_owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        let future = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            Some(3),
+            &no_entries,
+        );
+        assert_eq!(
+            checkpoint_validation_evidence_error(
+                dense_owner
+                    .validate_restart_checkpoint_baseline_against_current_prefix(&future)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CheckpointBeyondDurableFrontier {
+                checkpoint_frontier: 3,
+                durable_frontier: Some(2),
+            }
+        );
+
+        let transaction = durable_identity(131, 1)?;
+        let observations = vec![
+            restart_raw_page(&lineage, 90, 2)?,
+            restart_commit(&lineage, transaction, 4)?,
+        ];
+        let mut gapped_owner =
+            restart_analyzed_checkpoint_owner(&lineage, Some(lineage.position(4)), observations)?;
+        let gap = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            Some(3),
+            &no_entries,
+        );
+        assert_eq!(
+            checkpoint_validation_evidence_error(
+                gapped_owner.validate_restart_checkpoint_baseline_against_current_prefix(&gap)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CheckpointFrontierNotRecordBoundary {
+                checkpoint_frontier: 3,
+                durable_frontier: 4,
+            }
+        );
+
+        let checkpoint = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            Some(2),
+            &no_entries,
+        );
+        let foreign = LogLineage::new();
+        gapped_owner.parts_mut().0.restart_frontier = Some(foreign.position(4));
+        assert!(matches!(
+            checkpoint_validation_evidence_error(
+                gapped_owner
+                    .validate_restart_checkpoint_baseline_against_current_prefix(&checkpoint)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CurrentPrefix(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartAnalysisEvidenceError::ForeignFrontier { frontier }
+                        if frontier == &foreign.position(4)
+                )
+        ));
+
+        gapped_owner.parts_mut().0.restart_frontier = Some(lineage.position(0));
+        assert!(matches!(
+            checkpoint_validation_evidence_error(
+                gapped_owner
+                    .validate_restart_checkpoint_baseline_against_current_prefix(&checkpoint)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CurrentPrefix(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartAnalysisEvidenceError::ZeroFrontier { frontier }
+                        if frontier == &lineage.position(0)
+                )
+        ));
+
+        gapped_owner.parts_mut().0.restart_frontier = None;
+        assert!(matches!(
+            checkpoint_validation_evidence_error(
+                gapped_owner
+                    .validate_restart_checkpoint_baseline_against_current_prefix(&checkpoint)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CurrentPrefix(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartAnalysisEvidenceError::FrontierMissing {
+                        record_count: 2
+                    }
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_checkpoint_validation_compares_every_transaction_entry_field()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1305).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        let baseline = owner
+            .prepare_restart_checkpoint_baseline()
+            .map_err(|_| TestError("prepare mismatch baseline"))?;
+        let entries = decoded_checkpoint_entries(&baseline);
+        let original = entries[0];
+        let wrong_entries = [
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                0,
+                original.sequence(),
+                original.first_owned_page_position(),
+                original.last_owned_page_position(),
+                original.owned_page_record_count(),
+                original.state(),
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                0,
+                original.first_owned_page_position(),
+                original.last_owned_page_position(),
+                original.owned_page_record_count(),
+                original.state(),
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                original.sequence(),
+                None,
+                original.last_owned_page_position(),
+                original.owned_page_record_count(),
+                original.state(),
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                original.sequence(),
+                Some(9),
+                original.last_owned_page_position(),
+                original.owned_page_record_count(),
+                original.state(),
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                original.sequence(),
+                original.first_owned_page_position(),
+                None,
+                original.owned_page_record_count(),
+                original.state(),
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                original.sequence(),
+                original.first_owned_page_position(),
+                Some(9),
+                original.owned_page_record_count(),
+                original.state(),
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                original.sequence(),
+                original.first_owned_page_position(),
+                original.last_owned_page_position(),
+                0,
+                original.state(),
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                original.sequence(),
+                original.first_owned_page_position(),
+                original.last_owned_page_position(),
+                original.owned_page_record_count(),
+                DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted,
+            ),
+            DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                original.epoch(),
+                original.sequence(),
+                original.first_owned_page_position(),
+                original.last_owned_page_position(),
+                original.owned_page_record_count(),
+                DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                    commit_position: 9,
+                },
+            ),
+        ];
+
+        for actual in wrong_entries {
+            let actual_entries = [actual];
+            let observation = DurableTransactionRestartCheckpointBaselineObservation::new(
+                persistent_log_id.get(),
+                baseline.durable_frontier(),
+                &actual_entries,
+            );
+            assert!(matches!(
+                checkpoint_validation_evidence_error(
+                    owner.validate_restart_checkpoint_baseline_against_current_prefix(&observation)
+                )?,
+                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::TransactionEntryMismatch {
+                    index: 0,
+                    expected,
+                    actual: rejected,
+                } if expected.as_ref() == &baseline.transactions()[0] && rejected == actual
+            ));
+        }
+
+        let no_entries = [];
+        let missing = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            baseline.durable_frontier(),
+            &no_entries,
+        );
+        assert_eq!(
+            checkpoint_validation_evidence_error(
+                owner.validate_restart_checkpoint_baseline_against_current_prefix(&missing)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::TransactionCountMismatch {
+                expected: 1,
+                actual: 0,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_checkpoint_validation_ignores_suffix_after_stale_boundary_but_validates_selected_prefix()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1306).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81, 82])?;
+        let baseline = owner
+            .prepare_restart_checkpoint_baseline()
+            .map_err(|_| TestError("prepare stale checkpoint baseline"))?;
+        let entries = decoded_checkpoint_entries(&baseline);
+        let stale = decoded_checkpoint_observation(&baseline, &entries);
+        let duplicate_owner = baseline.transactions()[0].transaction();
+        let duplicate_commit = restart_commit(&lineage, duplicate_owner, 6)?;
+        {
+            let (source, _) = owner.parts_mut();
+            source.restart_observations.push(duplicate_commit);
+            source.restart_frontier = Some(lineage.position(6));
+        }
+
+        let validated = owner
+            .validate_restart_checkpoint_baseline_against_current_prefix(&stale)
+            .map_err(|_| TestError("stale checkpoint rejected by malformed suffix"))?;
+        assert_eq!(validated, baseline);
+
+        let selected_suffix = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            Some(6),
+            &entries,
+        );
+        assert!(matches!(
+            checkpoint_validation_evidence_error(
+                owner.validate_restart_checkpoint_baseline_against_current_prefix(&selected_suffix)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::SelectedPrefix(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartAnalysisEvidenceError::DuplicateCommit {
+                        transaction,
+                        first_commit_position,
+                        duplicate_commit_position,
+                    } if *transaction == duplicate_owner
+                        && first_commit_position == &lineage.position(2)
+                        && duplicate_commit_position == &lineage.position(6)
+                )
+        ));
+
+        let missing_boundary = DurableTransactionRestartCheckpointBaselineObservation::new(
+            persistent_log_id.get(),
+            Some(5),
+            &entries,
+        );
+        assert!(matches!(
+            checkpoint_validation_evidence_error(
+                owner.validate_restart_checkpoint_baseline_against_current_prefix(&missing_boundary)
+            )?,
+            DurableTransactionRestartCheckpointBaselineValidationEvidenceError::CurrentPrefix(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartAnalysisEvidenceError::DuplicateCommit { .. }
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn decoded_checkpoint_validation_preserves_source_errors_before_and_after_callback()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1307).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        let baseline = owner
+            .prepare_restart_checkpoint_baseline()
+            .map_err(|_| TestError("prepare source-error baseline"))?;
+        let entries = decoded_checkpoint_entries(&baseline);
+        let observation = decoded_checkpoint_observation(&baseline, &entries);
+        let callbacks = owner.parts().0.restart_callbacks;
+
+        owner.parts_mut().0.restart_before_callback_error = Some(FakeFault("before validation"));
+        let before = owner
+            .validate_restart_checkpoint_baseline_against_current_prefix(&observation)
+            .err()
+            .ok_or(TestError("before-callback validation source error"))?;
+        assert!(matches!(
+            before,
+            DurableTransactionRestartCheckpointBaselineValidationError::Source(FakeFault(
+                "before validation"
+            ))
+        ));
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks);
+
+        owner.parts_mut().0.restart_after_callback_error = Some(FakeFault("after validation"));
+        let after = owner
+            .validate_restart_checkpoint_baseline_against_current_prefix(&observation)
+            .err()
+            .ok_or(TestError("after-callback validation source error"))?;
+        assert_eq!(
+            Error::source(&after).map(ToString::to_string),
+            Some(String::from("after validation"))
+        );
+        assert!(matches!(
+            after,
+            DurableTransactionRestartCheckpointBaselineValidationError::Source(FakeFault(
+                "after validation"
+            ))
+        ));
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 1);
+
+        let validated = owner
+            .validate_restart_checkpoint_baseline_against_current_prefix(&observation)
+            .map_err(|_| TestError("validation did not recover after source faults"))?;
+        assert_eq!(validated, baseline);
+        assert_eq!(owner.parts().0.restart_callbacks, callbacks + 2);
+        Ok(())
     }
 
     #[test]

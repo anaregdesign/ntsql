@@ -1656,6 +1656,9 @@ mod tests {
     use ntsql_transaction::{
         CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
         CommittedTransactionPagesRecoveryError, CoordinatedCommitError,
+        DurableTransactionRestartCheckpointBaselineEntryObservation,
+        DurableTransactionRestartCheckpointBaselineObservation,
+        DurableTransactionRestartCheckpointBaselineStateObservation,
         DurableTransactionRestartState, TransactionCoordinator, TransactionLifecycleStatus,
         TransactionResolutionFailure, UnrecoveredTransactionPageStorage, flush_committed_page,
         recover_committed_transaction_pages,
@@ -2294,6 +2297,35 @@ mod tests {
             assert_eq!(entry.owned_page_record_count(), 1);
             assert_eq!(entry.state().commit_position(), commit_position);
         }
+        let decoded_checkpoint_entries = checkpoint_baseline
+            .transactions()
+            .iter()
+            .map(|entry| {
+                let state = match entry.state().commit_position() {
+                    Some(commit_position) => {
+                        DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                            commit_position,
+                        }
+                    }
+                    None => {
+                        DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted
+                    }
+                };
+                DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                    entry.transaction().epoch(),
+                    entry.transaction().sequence(),
+                    entry.first_owned_page_position(),
+                    entry.last_owned_page_position(),
+                    entry.owned_page_record_count(),
+                    state,
+                )
+            })
+            .collect::<Vec<_>>();
+        let decoded_checkpoint = DurableTransactionRestartCheckpointBaselineObservation::new(
+            checkpoint_baseline.persistent_log_id().get(),
+            checkpoint_baseline.durable_frontier(),
+            &decoded_checkpoint_entries,
+        );
         let (log, store) = recovered.parts_mut();
         let recovered_behind = store
             .page(last_page)
@@ -2341,6 +2373,11 @@ mod tests {
             Some(expected_restart_frontier.get())
         );
         assert_eq!(checkpoint_baseline.transactions().len(), 5);
+        let page_count = recovered.parts().1.pages().len();
+        let validated_checkpoint = recovered
+            .validate_restart_checkpoint_baseline_against_current_prefix(&decoded_checkpoint)?;
+        assert_eq!(validated_checkpoint, checkpoint_baseline);
+        assert_eq!(recovered.parts().1.pages().len(), page_count);
 
         let (_log, store, report, analysis) = recovered.into_parts();
         assert_eq!(report.pages().len(), 4);

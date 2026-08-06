@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #118
 - Extends: ADR 0029, ADR 0031, ADR 0032
-- Extended by: ADR 0034, ADR 0037, ADR 0045
+- Extended by: ADR 0034, ADR 0037, ADR 0045, ADR 0053
 
 ## Context
 
@@ -57,9 +57,12 @@ Construction consumes both values. The unrecovered state exposes:
 - no candidate or permit; and
 - no recovered-state constructor.
 
-Its only authority-bearing operation is consuming `recover`. Dropping it simply
-drops both adapters. Compile-fail coverage makes unavailable accessors
-load-bearing outside the owning crate.
+Its original authority-bearing operation is consuming `recover`. ADR 0053 adds
+one separately bounded consuming completeness-checkpoint selection before that
+operation, but it exposes neither adapter and every decline, absence, or
+rejection fallback delegates back to this exact `recover` transition. Dropping
+either owner simply drops its retained adapters. Compile-fail coverage makes
+unavailable accessors load-bearing outside the owning crate.
 
 The generic state cannot prevent a caller from deliberately bypassing it and
 using the existing low-level adapter constructors. It is the reviewed

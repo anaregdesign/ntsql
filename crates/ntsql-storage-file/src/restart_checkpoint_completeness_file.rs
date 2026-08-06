@@ -11,6 +11,7 @@ use ntsql_transaction::{
     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
     DurableTransactionRestartCheckpointCompletenessBaselineSource,
     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+    TransactionPageStorageRestartCheckpointCompletenessSelection,
     UnrecoveredTransactionPageStorage,
 };
 use ntsql_wal::PersistentLogId;
@@ -630,6 +631,15 @@ pub struct UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint<const
     checkpoint: FileRestartCheckpointCompletenessBaselineSource,
 }
 
+/// Owning pre-recovery completeness selection for the filesystem composition.
+pub type FileTransactionPageStorageRestartCheckpointCompletenessSelection<const N: usize> =
+    TransactionPageStorageRestartCheckpointCompletenessSelection<
+        FileCommitLog<N>,
+        FilePageStore<N>,
+        FileRestartCheckpointCompletenessBaselineSource,
+        N,
+    >;
+
 impl<const N: usize> fmt::Debug
     for UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint<N>
 {
@@ -645,14 +655,12 @@ impl<const N: usize> fmt::Debug
 }
 
 impl<const N: usize> UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint<N> {
-    /// Separates the already-locked unrecovered owner and untrusted source.
-    pub fn into_parts(
+    /// Loads and validates the locked completeness slot before recovery writes.
+    pub fn select_restart_checkpoint_completeness(
         self,
-    ) -> (
-        UnrecoveredTransactionPageStorage<FileCommitLog<N>, FilePageStore<N>, N>,
-        FileRestartCheckpointCompletenessBaselineSource,
-    ) {
-        (self.storage, self.checkpoint)
+    ) -> FileTransactionPageStorageRestartCheckpointCompletenessSelection<N> {
+        self.storage
+            .select_restart_checkpoint_completeness(self.checkpoint)
     }
 }
 

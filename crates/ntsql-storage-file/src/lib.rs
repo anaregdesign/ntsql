@@ -208,6 +208,7 @@ pub use restart_checkpoint_completeness_file::{
     FileRestartCheckpointCompletenessBaselineSource,
     FileRestartCheckpointCompletenessBaselineSourceError,
     FileTransactionPageStorageCompletenessCheckpointOpenError,
+    FileTransactionPageStorageRestartCheckpointCompletenessSelection,
     UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint,
     open_transaction_page_storage_with_completeness_checkpoint,
 };

@@ -3401,6 +3401,1156 @@ where
     }
 }
 
+impl<Source, Store, const N: usize> UnrecoveredTransactionPageStorage<Source, Store, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N>
+        + DurableTransactionPageRecoverySource<N>
+        + DurableTransactionRestartAnalysisSource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    /// Loads and validates one completeness checkpoint before recovery mutates the store.
+    ///
+    /// Retrieval completes before any WAL callback or page observation begins.
+    /// Every outcome retains this exact unrecovered owner and the supplied
+    /// checkpoint source. A selected checkpoint must be explicitly declined
+    /// before full recovery can run, while rejection preserves its exact cause.
+    pub fn select_restart_checkpoint_completeness<CheckpointSource>(
+        mut self,
+        mut checkpoint_source: CheckpointSource,
+    ) -> TransactionPageStorageRestartCheckpointCompletenessSelection<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+    where
+        CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+    {
+        let checkpoint = match checkpoint_source.load_restart_checkpoint_completeness_baseline() {
+            Ok(checkpoint) => checkpoint,
+            Err(source) => {
+                return TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                        RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                            storage: self,
+                            checkpoint_source,
+                            error:
+                                DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
+                                    source,
+                                ),
+                        },
+                    );
+            }
+        };
+        let Some(checkpoint) = checkpoint else {
+            return TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(
+                AbsentTransactionPageStorageRestartCheckpointCompleteness {
+                    storage: self,
+                    checkpoint_source,
+                },
+            );
+        };
+
+        match validate_restart_checkpoint_completeness_baseline_against_current_prefix(
+            &mut self.source,
+            &self.store,
+            &checkpoint.as_observation(),
+        ) {
+            Ok(baseline) => {
+                TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(
+                    SelectedTransactionPageStorageRestartCheckpointCompleteness {
+                        storage: self,
+                        checkpoint_source,
+                        baseline,
+                    },
+                )
+            }
+            Err(source) => {
+                TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                    RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                        storage: self,
+                        checkpoint_source,
+                        error:
+                            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                                Box::new(source),
+                            ),
+                    },
+                )
+            }
+        }
+    }
+}
+
+/// Exact error retained by a rejected pre-recovery completeness selection.
+pub type TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError<
+    <CheckpointSource as DurableTransactionRestartCheckpointCompletenessBaselineSource>::Error,
+    <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+    <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+>;
+
+/// Owning result of loading and validating completeness before page recovery.
+///
+/// The variants are deliberately not interchangeable. Safe code must explicitly
+/// decline a selected checkpoint or acknowledge absence/rejection before it can
+/// obtain the full-recovery owner.
+#[must_use = "checkpoint selection must be handled or dropped"]
+pub enum TransactionPageStorageRestartCheckpointCompletenessSelection<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+{
+    /// One present checkpoint exactly matched the unrecovered WAL and store.
+    Selected(
+        SelectedTransactionPageStorageRestartCheckpointCompleteness<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    ),
+    /// The locked source contained no selected checkpoint.
+    Absent(
+        AbsentTransactionPageStorageRestartCheckpointCompleteness<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    ),
+    /// Loading or exact validation failed with a retained cause.
+    Rejected(
+        RejectedTransactionPageStorageRestartCheckpointCompleteness<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    ),
+}
+
+/// Owning pre-recovery state with one exact selected completeness checkpoint.
+///
+/// The authoritative baseline is private and cannot escape as replay, repair,
+/// publication, or retention authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::SelectedTransactionPageStorageRestartCheckpointCompleteness;
+///
+/// fn cannot_extract_baseline<Source, Store, CheckpointSource, const N: usize>(
+///     selected: &SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = selected.baseline();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartPageEntry,
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness,
+/// };
+///
+/// fn cannot_extract_pages<Source, Store, CheckpointSource, const N: usize>(
+///     selected: &SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> &[DurableTransactionRestartPageEntry] {
+///     selected.pages()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartReplayStart,
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness,
+/// };
+///
+/// fn cannot_extract_replay_start<Source, Store, CheckpointSource, const N: usize>(
+///     selected: &SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> &DurableTransactionRestartReplayStart {
+///     selected.replay_start()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::SelectedTransactionPageStorageRestartCheckpointCompleteness;
+///
+/// fn cannot_extract_selected_adapters<Source, Store, CheckpointSource, const N: usize>(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = selected.into_parts();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::SelectedTransactionPageStorageRestartCheckpointCompleteness;
+///
+/// fn cannot_recover_selected<Source, Store, CheckpointSource, const N: usize>(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = selected.recover();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness,
+///     UnrecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_forge_selected<Source, Store, CheckpointSource, const N: usize>(
+///     storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+///     checkpoint_source: CheckpointSource,
+///     baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+/// ) -> SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     N,
+/// > {
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness {
+///         storage,
+///         checkpoint_source,
+///         baseline,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartReplayStart,
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness,
+/// };
+///
+/// fn cannot_substitute_replay<Source, Store, CheckpointSource, const N: usize>(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> DurableTransactionRestartReplayStart {
+///     selected.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::SelectedTransactionPageStorageRestartCheckpointCompleteness;
+///
+/// fn cannot_substitute_page_write<'attempt, Source, Store, CheckpointSource, const N: usize>(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> PageWritePermit<'attempt> {
+///     selected.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::SelectedTransactionPageStorageRestartCheckpointCompleteness;
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_substitute_wal_position<Source, Store, CheckpointSource, const N: usize>(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> LogSequenceNumber {
+///     selected.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness,
+/// };
+///
+/// fn cannot_substitute_publication_permit<
+///     'attempt,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'attempt> {
+///     selected.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::SelectedTransactionPageStorageRestartCheckpointCompleteness;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_retain_or_reclaim_log<Log, Source, Store, CheckpointSource, const N: usize>(
+///     log: &mut Log,
+///     selected: &SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Log: LogDurability,
+/// {
+///     let _ = log.flush_through(selected);
+/// }
+/// ```
+#[must_use = "selected checkpoint must be retained, explicitly declined, or dropped"]
+pub struct SelectedTransactionPageStorageRestartCheckpointCompleteness<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+    checkpoint_source: CheckpointSource,
+    baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    SelectedTransactionPageStorageRestartCheckpointCompleteness<Source, Store, CheckpointSource, N>
+{
+    /// Returns the persistent log identity of the exact selected baseline.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.baseline.persistent_log_id()
+    }
+
+    /// Returns the selected numeric frontier, or `None` for an empty prefix.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.baseline.durable_frontier()
+    }
+
+    /// Returns the number of selected transaction entries.
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.baseline.transactions().len()
+    }
+
+    /// Returns the number of selected page entries.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.baseline.pages().len()
+    }
+
+    /// Explicitly discards selected evidence and permits only complete recovery.
+    pub fn decline_checkpoint(
+        self,
+    ) -> UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N> {
+        let Self {
+            storage,
+            checkpoint_source,
+            baseline: _,
+        } = self;
+        UncheckpointedTransactionPageStorage {
+            storage,
+            checkpoint_source,
+        }
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for SelectedTransactionPageStorageRestartCheckpointCompleteness<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SelectedTransactionPageStorageRestartCheckpointCompleteness")
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("durable_frontier", &self.durable_frontier())
+            .field("transaction_count", &self.transaction_count())
+            .field("page_count", &self.page_count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owning pre-recovery state for one locked but unpublished checkpoint slot.
+#[must_use = "checkpoint absence must be acknowledged or dropped"]
+pub struct AbsentTransactionPageStorageRestartCheckpointCompleteness<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+    checkpoint_source: CheckpointSource,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    AbsentTransactionPageStorageRestartCheckpointCompleteness<Source, Store, CheckpointSource, N>
+{
+    /// Acknowledges absence and permits only complete recovery.
+    pub fn continue_with_full_recovery(
+        self,
+    ) -> UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N> {
+        UncheckpointedTransactionPageStorage {
+            storage: self.storage,
+            checkpoint_source: self.checkpoint_source,
+        }
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for AbsentTransactionPageStorageRestartCheckpointCompleteness<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AbsentTransactionPageStorageRestartCheckpointCompleteness")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owning pre-recovery state retaining an exact source or validation rejection.
+///
+/// Rejection cannot silently become recovery:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource, DurableTransactionRestartAnalysisSource,
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+///     RejectedTransactionPageStorageRestartCheckpointCompleteness,
+/// };
+///
+/// fn cannot_recover_rejected<Source, Store, CheckpointSource, const N: usize>(
+///     rejected: RejectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+///     Store: DurablePageStoreSnapshotSource<N>,
+///     CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// {
+///     let _ = rejected.recover();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource, DurableTransactionRestartAnalysisSource,
+///     DurableTransactionRestartCheckpointCompletenessBaselineSource,
+///     RejectedTransactionPageStorageRestartCheckpointCompleteness,
+/// };
+///
+/// fn cannot_extract_rejected_adapters<Source, Store, CheckpointSource, const N: usize>(
+///     rejected: RejectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+///     Store: DurablePageStoreSnapshotSource<N>,
+///     CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+/// {
+///     let _ = rejected.into_parts();
+/// }
+/// ```
+#[must_use = "rejected checkpoint must be inspected, explicitly bypassed, or dropped"]
+pub struct RejectedTransactionPageStorageRestartCheckpointCompleteness<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+{
+    storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+    checkpoint_source: CheckpointSource,
+    error: TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RejectedTransactionPageStorageRestartCheckpointCompleteness<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+{
+    /// Returns the exact checkpoint-source or baseline-validation rejection.
+    #[must_use]
+    pub const fn error(
+        &self,
+    ) -> &TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    > {
+        &self.error
+    }
+
+    /// Explicitly bypasses the rejected checkpoint while returning its cause.
+    pub fn continue_with_full_recovery(
+        self,
+    ) -> (
+        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+        TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    ) {
+        (
+            UncheckpointedTransactionPageStorage {
+                storage: self.storage,
+                checkpoint_source: self.checkpoint_source,
+            },
+            self.error,
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for RejectedTransactionPageStorageRestartCheckpointCompleteness<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+    TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RejectedTransactionPageStorageRestartCheckpointCompleteness")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
+    for RejectedTransactionPageStorageRestartCheckpointCompleteness<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+    TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "restart checkpoint completeness selection rejected: {}",
+            self.error
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> Error
+    for RejectedTransactionPageStorageRestartCheckpointCompleteness<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+    TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Owning state that has explicitly chosen the existing complete recovery path.
+///
+/// Neither storage adapter nor the retained checkpoint source can escape before
+/// recovery and restart analysis complete:
+///
+/// ```compile_fail
+/// use ntsql_transaction::UncheckpointedTransactionPageStorage;
+///
+/// fn cannot_extract_uncheckpointed<Source, Store, CheckpointSource, const N: usize>(
+///     storage: UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+/// ) {
+///     let _ = storage.into_parts();
+/// }
+/// ```
+#[must_use = "uncheckpointed storage must complete full recovery or be dropped"]
+pub struct UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, const N: usize> {
+    storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+    checkpoint_source: CheckpointSource,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    /// Delegates exactly once to the existing complete committed-page recovery.
+    pub fn recover(
+        self,
+    ) -> Result<
+        RecoveredTransactionPageStorageWithCompletenessCheckpoint<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+        FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    > {
+        let Self {
+            storage,
+            checkpoint_source,
+        } = self;
+        match storage.recover() {
+            Ok(storage) => Ok(RecoveredTransactionPageStorageWithCompletenessCheckpoint {
+                storage,
+                checkpoint_source,
+            }),
+            Err(storage) => Err(
+                FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint {
+                    storage,
+                    checkpoint_source,
+                },
+            ),
+        }
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UncheckpointedTransactionPageStorage")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Page-recovered intermediate that retains the same completeness source.
+///
+/// ```compile_fail
+/// use ntsql_transaction::RecoveredTransactionPageStorageWithCompletenessCheckpoint;
+///
+/// fn cannot_extract_checkpoint_before_analysis<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     storage: RecoveredTransactionPageStorageWithCompletenessCheckpoint<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = storage.into_parts();
+/// }
+/// ```
+#[must_use = "page-recovered storage must be restart-analyzed or dropped"]
+pub struct RecoveredTransactionPageStorageWithCompletenessCheckpoint<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    storage: RecoveredTransactionPageStorage<Source, Store, N>,
+    checkpoint_source: CheckpointSource,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RecoveredTransactionPageStorageWithCompletenessCheckpoint<Source, Store, CheckpointSource, N>
+{
+    /// Returns the exact complete ordered full-recovery report.
+    pub const fn recovery_report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
+        self.storage.recovery_report()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RecoveredTransactionPageStorageWithCompletenessCheckpoint<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    /// Runs the existing restart analysis while retaining the checkpoint source.
+    pub fn analyze_restart(
+        self,
+    ) -> Result<
+        RestartAnalyzedTransactionPageStorageWithCompletenessCheckpoint<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+        FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    > {
+        let Self {
+            storage,
+            checkpoint_source,
+        } = self;
+        match storage.analyze_restart() {
+            Ok(storage) => Ok(
+                RestartAnalyzedTransactionPageStorageWithCompletenessCheckpoint {
+                    storage,
+                    checkpoint_source,
+                },
+            ),
+            Err(storage) => Err(
+                FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint {
+                    storage,
+                    _checkpoint_source: checkpoint_source,
+                },
+            ),
+        }
+    }
+}
+
+/// Full-recovery failure retaining the same completeness source for exact retry.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore, DurableTransactionPageRecoveryInventory,
+///     DurableTransactionPageRecoverySource,
+///     FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint,
+/// };
+///
+/// fn cannot_extract_checkpoint_from_failed_recovery<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     storage: FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionPageRecoveryInventory<N>
+///         + DurableTransactionPageRecoverySource<N>,
+///     Store: CommittedTransactionPageRecoveryStore<N>,
+/// {
+///     let _ = storage.into_parts();
+/// }
+/// ```
+#[must_use = "failed full recovery must be inspected, retried, or dropped"]
+pub struct FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    storage: FailedTransactionPageStorageRecovery<Source, Store, N>,
+    checkpoint_source: CheckpointSource,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    /// Returns the exact existing complete-recovery failure.
+    #[must_use]
+    pub const fn error(
+        &self,
+    ) -> &CommittedTransactionPagesRecoveryError<
+        <Source as DurableTransactionPageRecoveryInventory<N>>::Error,
+        <Source as DurableTransactionPageRecoverySource<N>>::Error,
+        Store::ObservationError,
+        Store::WriteError,
+        N,
+    > {
+        self.storage.error()
+    }
+
+    /// Delegates only to the existing fresh complete-recovery retry.
+    pub fn retry(
+        self,
+    ) -> Result<
+        RecoveredTransactionPageStorageWithCompletenessCheckpoint<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+        Self,
+    > {
+        let Self {
+            storage,
+            checkpoint_source,
+        } = self;
+        match storage.retry() {
+            Ok(storage) => Ok(RecoveredTransactionPageStorageWithCompletenessCheckpoint {
+                storage,
+                checkpoint_source,
+            }),
+            Err(storage) => Err(Self {
+                storage,
+                checkpoint_source,
+            }),
+        }
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+    FailedTransactionPageStorageRecovery<Source, Store, N>: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint")
+            .field("failure", &self.storage)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+    FailedTransactionPageStorageRecovery<Source, Store, N>: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.storage.fmt(formatter)
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> Error
+    for FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+    FailedTransactionPageStorageRecovery<Source, Store, N>: Error + 'static,
+    Source: 'static,
+    Store: 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.storage)
+    }
+}
+
+/// Restart-analyzed live owner retaining the same completeness source/publisher.
+#[must_use = "restart-analyzed storage owns all startup adapters"]
+pub struct RestartAnalyzedTransactionPageStorageWithCompletenessCheckpoint<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    storage: RestartAnalyzedTransactionPageStorage<Source, Store, N>,
+    checkpoint_source: CheckpointSource,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RestartAnalyzedTransactionPageStorageWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    /// Returns the exact full-recovery report.
+    pub const fn recovery_report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
+        self.storage.recovery_report()
+    }
+
+    /// Returns the exact complete restart analysis.
+    pub const fn restart_analysis(&self) -> &DurableTransactionRestartAnalysis {
+        self.storage.restart_analysis()
+    }
+
+    /// Borrows the startup-validated WAL source and page store.
+    pub const fn parts(&self) -> (&Source, &Store) {
+        self.storage.parts()
+    }
+
+    /// Borrows the startup-validated WAL source and page store for live work.
+    pub const fn parts_mut(&mut self) -> (&mut Source, &mut Store) {
+        self.storage.parts_mut()
+    }
+
+    /// Releases all adapters and immutable startup evidence after analysis.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Source,
+        Store,
+        CommittedTransactionPagesRecoveryOutcome<N>,
+        DurableTransactionRestartAnalysis,
+        CheckpointSource,
+    ) {
+        let (source, store, report, analysis) = self.storage.into_parts();
+        (source, store, report, analysis, self.checkpoint_source)
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RestartAnalyzedTransactionPageStorageWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    /// Publishes current completeness through the same retained checkpoint source.
+    pub fn publish_restart_checkpoint_completeness_baseline_from_current_prefix(
+        &mut self,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationResult<
+        Source::Error,
+        Store::ObservationError,
+        CheckpointSource::Error,
+    > {
+        self.storage
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix(
+                &mut self.checkpoint_source,
+            )
+    }
+}
+
+/// Fail-closed restart-analysis owner retaining the completeness source lock.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint,
+/// };
+///
+/// fn cannot_extract_checkpoint_from_failed_analysis<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     storage: FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+/// {
+///     let _ = storage.into_parts();
+/// }
+/// ```
+#[must_use = "failed restart analysis retains all adapters until dropped"]
+pub struct FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    storage: FailedTransactionPageStorageRestartAnalysis<Source, Store, N>,
+    _checkpoint_source: CheckpointSource,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+{
+    /// Returns the exact successful full-recovery report.
+    pub const fn recovery_report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
+        self.storage.recovery_report()
+    }
+
+    /// Returns the exact existing restart-analysis failure.
+    pub const fn error(&self) -> &DurableTransactionRestartAnalysisError<Source::Error> {
+        self.storage.error()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    FailedTransactionPageStorageRestartAnalysis<Source, Store, N>: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint")
+            .field("failure", &self.storage)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    FailedTransactionPageStorageRestartAnalysis<Source, Store, N>: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.storage.fmt(formatter)
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> Error
+    for FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N> + 'static,
+    Store: 'static,
+    FailedTransactionPageStorageRestartAnalysis<Source, Store, N>: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.storage)
+    }
+}
+
 /// Owning startup failure that permits only inspection, drop, or a fresh retry.
 ///
 /// Neither adapter can escape this state:
@@ -19542,6 +20692,565 @@ mod tests {
             DurableTransactionRestartAnalysisError::Source(FakeFault("after restart evidence"))
         ));
         assert_eq!(after.callbacks, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pre_recovery_completeness_selection_requires_decline_and_retains_source_through_retry()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1590).ok_or(TestError("selection persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let first_page = PageNumber::new(81).ok_or(TestError("selection first page"))?;
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[81])?;
+        owner.parts_mut().1.current.clear();
+        let baseline = owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("selection baseline preparation"))?;
+        assert_eq!(baseline.pages().len(), 1);
+        assert!(baseline.pages().iter().all(|entry| matches!(
+            entry.state(),
+            DurableTransactionRestartPageState::StoreMissing { .. }
+        )));
+
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.parts_mut().0.restart_events = Some(Rc::clone(&events));
+        let callbacks_before = owner.parts().0.restart_callbacks;
+        let observations_before = owner.parts().1.observations.borrow().len();
+        let attempts_before = owner.parts().1.attempts.len();
+        owner.parts_mut().1.write_fault = Some((
+            first_page,
+            FakeRecoveryWriteFault::Before(FakeFault("batch write")),
+        ));
+        let (source, store, _, _) = owner.into_parts();
+        let mut checkpoint = FakeCompletenessCheckpointPublisher::new(Some(
+            owned_decoded_completeness_checkpoint(&baseline),
+        ));
+        checkpoint.events = Some(Rc::clone(&events));
+
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(TestError("exact pre-recovery checkpoint was not selected"));
+        };
+        assert_eq!(selected.persistent_log_id(), persistent_log_id);
+        assert_eq!(selected.durable_frontier(), baseline.durable_frontier());
+        assert_eq!(selected.transaction_count(), baseline.transactions().len());
+        assert_eq!(selected.page_count(), baseline.pages().len());
+        assert!(
+            format!("{selected:?}").contains("SelectedTransactionPageStorage"),
+            "selected debug output lost its state name"
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["completeness-checkpoint-read", "wal"]
+        );
+
+        let failure = selected
+            .decline_checkpoint()
+            .recover()
+            .err()
+            .ok_or(TestError("armed full recovery unexpectedly succeeded"))?;
+        assert!(matches!(
+            failure.error(),
+            CommittedTransactionPagesRecoveryError::Page {
+                page_number,
+                source: CommittedTransactionPageRecoveryError::StoreWrite { state },
+                ..
+            } if *page_number == first_page
+                && state.as_ref().cause() == &FakeFault("batch write")
+        ));
+
+        let recovered = failure
+            .retry()
+            .map_err(|_| TestError("selection fallback retry failed"))?;
+        assert_eq!(recovered.recovery_report().pages().len(), 1);
+        let mut analyzed = recovered
+            .analyze_restart()
+            .map_err(|_| TestError("selection fallback restart analysis failed"))?;
+        assert_eq!(
+            analyzed.restart_analysis().durable_frontier(),
+            Some(&lineage.position(2))
+        );
+        let receipt = analyzed
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("retained completeness source did not publish"))?;
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        assert_eq!(receipt.page_count(), 1);
+
+        let (source, store, report, analysis, checkpoint) = analyzed.into_parts();
+        assert_eq!(report.pages().len(), 1);
+        assert_eq!(analysis.transactions().len(), 1);
+        assert_eq!(checkpoint.load_calls, 1);
+        assert_eq!(checkpoint.publication_calls, 1);
+        assert_eq!(source.restart_callbacks, callbacks_before + 3);
+        assert_eq!(store.observations.borrow().len(), observations_before + 4);
+        assert_eq!(store.attempts.len(), attempts_before + 2);
+        assert_eq!(store.attempts[attempts_before..], [first_page, first_page]);
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "completeness-checkpoint-read",
+                "wal",
+                "wal",
+                "wal",
+                "completeness-checkpoint-publish",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pre_recovery_completeness_selection_accepts_unchanged_store_behind_evidence()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1593).ok_or(TestError("behind persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page_number = PageNumber::new(93).ok_or(TestError("behind page number"))?;
+        let mut owner = restart_analyzed_checkpoint_owner(
+            &lineage,
+            Some(lineage.position(3)),
+            vec![
+                restart_raw_page(&lineage, page_number.get(), 1)?,
+                restart_raw_page(&lineage, page_number.get(), 3)?,
+            ],
+        )?;
+        owner.parts_mut().1.current.push(FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(page_number.get()).map_err(|_| TestError("behind page byte"))?,
+            page_position: lineage.position(1),
+        });
+        let baseline = owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("behind baseline preparation"))?;
+        assert!(matches!(
+            baseline.pages(),
+            [entry]
+                if matches!(
+                    entry.state(),
+                    DurableTransactionRestartPageState::StoreBehind {
+                        stored_position: 1,
+                        required: DurableTransactionRestartRequiredPageImage::Raw {
+                            page_position: 3,
+                        },
+                    }
+                )
+        ));
+
+        let checkpoint = FakeCompletenessCheckpointPublisher::new(Some(
+            owned_decoded_completeness_checkpoint(&baseline),
+        ));
+        let (source, store, _, _) = owner.into_parts();
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(TestError(
+                "unchanged store-behind checkpoint was not selected",
+            ));
+        };
+        assert_eq!(selected.persistent_log_id(), persistent_log_id);
+        assert_eq!(selected.durable_frontier(), Some(3));
+        assert_eq!(selected.page_count(), 1);
+
+        let analyzed = selected
+            .decline_checkpoint()
+            .recover()
+            .map_err(|_| TestError("behind full recovery failed"))?
+            .analyze_restart()
+            .map_err(|_| TestError("behind restart analysis failed"))?;
+        let (_, store, report, _, checkpoint) = analyzed.into_parts();
+        assert!(report.pages().is_empty());
+        assert!(store.attempts.is_empty());
+        assert_eq!(checkpoint.load_calls, 1);
+        assert_eq!(checkpoint.publication_calls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn pre_recovery_completeness_absence_and_source_rejection_do_not_observe_storage()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1591).ok_or(TestError("absence persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let mut checkpoint = FakeCompletenessCheckpointPublisher::new(None);
+        checkpoint.events = Some(Rc::clone(&events));
+
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(absent) =
+            selection
+        else {
+            return Err(TestError("empty completeness slot was not absent"));
+        };
+        assert_eq!(events.borrow().as_slice(), ["completeness-checkpoint-read"]);
+        let mut analyzed = absent
+            .continue_with_full_recovery()
+            .recover()
+            .map_err(|_| TestError("absent full recovery failed"))?
+            .analyze_restart()
+            .map_err(|_| TestError("absent restart analysis failed"))?;
+        let receipt = analyzed
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("absent retained source publication failed"))?;
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        assert_eq!(receipt.durable_frontier(), None);
+        assert_eq!(receipt.transaction_count(), 0);
+        assert_eq!(receipt.page_count(), 0);
+        let (source, store, _, _, checkpoint) = analyzed.into_parts();
+        assert_eq!(checkpoint.load_calls, 1);
+        assert_eq!(checkpoint.publication_calls, 1);
+        assert_eq!(source.restart_callbacks, 2);
+        assert!(store.observations.borrow().is_empty());
+        assert!(store.attempts.is_empty());
+
+        let mut source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
+        let events = Rc::new(RefCell::new(Vec::new()));
+        source.restart_events = Some(Rc::clone(&events));
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        let mut checkpoint = FakeCompletenessCheckpointSource::new(None);
+        checkpoint.fault = Some(FakeFault("selection checkpoint source"));
+        checkpoint.events = Some(Rc::clone(&events));
+
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+            selection
+        else {
+            return Err(TestError("checkpoint source failure was not rejected"));
+        };
+        assert_eq!(
+            rejected.to_string(),
+            "restart checkpoint completeness selection rejected: restart checkpoint completeness source failed: selection checkpoint source"
+        );
+        assert_eq!(
+            Error::source(&rejected).map(ToString::to_string),
+            Some(String::from(
+                "restart checkpoint completeness source failed: selection checkpoint source"
+            ))
+        );
+        assert!(matches!(
+            rejected.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
+                FakeFault("selection checkpoint source")
+            )
+        ));
+        assert_eq!(events.borrow().as_slice(), ["completeness-checkpoint"]);
+
+        let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+        assert!(matches!(
+            rejection,
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
+                FakeFault("selection checkpoint source")
+            )
+        ));
+        let analyzed = uncheckpointed
+            .recover()
+            .map_err(|_| TestError("source-rejected full recovery failed"))?
+            .analyze_restart()
+            .map_err(|_| TestError("source-rejected restart analysis failed"))?;
+        let (source, store, _, _, checkpoint) = analyzed.into_parts();
+        assert_eq!(checkpoint.calls, 1);
+        assert_eq!(source.restart_callbacks, 1);
+        assert!(store.observations.borrow().is_empty());
+        assert!(store.attempts.is_empty());
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["completeness-checkpoint", "wal"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pre_recovery_completeness_rejects_early_identity_and_advanced_snapshot_then_falls_back()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1592).ok_or(TestError("rejection persistent log id"))?;
+        let foreign_log_id =
+            PersistentLogId::new(0x2592).ok_or(TestError("foreign persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+
+        for actual in [0, foreign_log_id.get()] {
+            let source = FakeDurablePageRecoverySource::new(
+                lineage.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            let store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+            let checkpoint =
+                OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+                    OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+                        actual,
+                        None,
+                        Vec::new(),
+                    ),
+                    Vec::new(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation::new(
+                        DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation::AfterFrontier,
+                        None,
+                        None,
+                        None,
+                    ),
+                );
+            let checkpoint = FakeCompletenessCheckpointSource::new(Some(checkpoint));
+
+            let selection = UnrecoveredTransactionPageStorage::new(source, store)
+                .select_restart_checkpoint_completeness(checkpoint);
+            let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+                selection
+            else {
+                return Err(TestError("invalid checkpoint identity was not rejected"));
+            };
+            assert!(matches!(
+                rejected.error(),
+                DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                    source
+                ) if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineValidationError::Evidence(
+                        evidence
+                    ) if matches!(
+                        evidence.as_ref(),
+                        DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::Baseline(
+                            baseline
+                        ) if (actual == 0
+                            && matches!(
+                                baseline.as_ref(),
+                                DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ZeroPersistentLogId {
+                                    persistent_log_id: 0
+                                }
+                            ))
+                            || (actual == foreign_log_id.get()
+                                && matches!(
+                                    baseline.as_ref(),
+                                    DurableTransactionRestartCheckpointBaselineValidationEvidenceError::ForeignPersistentLogId {
+                                        expected,
+                                        actual: rejected_actual,
+                                    } if *expected == persistent_log_id
+                                        && *rejected_actual == foreign_log_id
+                                ))
+                    )
+                )
+            ));
+            let (uncheckpointed, _) = rejected.continue_with_full_recovery();
+            let analyzed = uncheckpointed
+                .recover()
+                .map_err(|_| TestError("identity-rejected full recovery failed"))?
+                .analyze_restart()
+                .map_err(|_| TestError("identity-rejected restart analysis failed"))?;
+            let (source, store, _, _, checkpoint) = analyzed.into_parts();
+            assert_eq!(checkpoint.calls, 1);
+            assert_eq!(source.restart_callbacks, 1);
+            assert!(store.observations.borrow().is_empty());
+            assert!(store.attempts.is_empty());
+        }
+
+        let source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        let checkpoint =
+            OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+                OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+                    persistent_log_id.get(),
+                    None,
+                    Vec::new(),
+                ),
+                vec![
+                    DurableTransactionRestartCheckpointCompletenessBaselinePageObservation::new(
+                        91,
+                        DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreCurrent,
+                        Some(
+                            DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation::Raw {
+                                page_position: 1,
+                            },
+                        ),
+                        Some(1),
+                    ),
+                ],
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation::new(
+                    DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation::AfterFrontier,
+                    None,
+                    None,
+                    None,
+                ),
+            );
+        let checkpoint = FakeCompletenessCheckpointSource::new(Some(checkpoint));
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+            selection
+        else {
+            return Err(TestError(
+                "empty-frontier checkpoint with a stored page was not rejected",
+            ));
+        };
+        assert!(matches!(
+            rejected.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                validation
+            ) if matches!(
+                validation.as_ref(),
+                DurableTransactionRestartCheckpointCompletenessBaselineValidationError::Evidence(
+                    evidence
+                ) if matches!(
+                    evidence.as_ref(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::PageCountMismatch {
+                        expected: 0,
+                        actual: 1,
+                    }
+                )
+            )
+        ));
+        let (uncheckpointed, _) = rejected.continue_with_full_recovery();
+        let analyzed = uncheckpointed
+            .recover()
+            .map_err(|_| TestError("empty-frontier full recovery failed"))?
+            .analyze_restart()
+            .map_err(|_| TestError("empty-frontier restart analysis failed"))?;
+        let (source, store, _, _, checkpoint) = analyzed.into_parts();
+        assert_eq!(checkpoint.calls, 1);
+        assert_eq!(source.restart_callbacks, 2);
+        assert!(store.observations.borrow().is_empty());
+        assert!(store.attempts.is_empty());
+
+        let page_number = PageNumber::new(91).ok_or(TestError("advanced selected page"))?;
+        let page_byte =
+            u8::try_from(page_number.get()).map_err(|_| TestError("advanced page byte"))?;
+        let first_owner = durable_identity(159, 1)?;
+        let second_owner = durable_identity(159, 2)?;
+        let old_observations = vec![
+            restart_owned_page(&lineage, first_owner, page_number.get(), 1)?,
+            restart_commit(&lineage, first_owner, 2)?,
+        ];
+        let mut old_owner = restart_analyzed_checkpoint_owner(
+            &lineage,
+            Some(lineage.position(2)),
+            old_observations,
+        )?;
+        old_owner.parts_mut().1.current.push(FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(1),
+            byte: page_byte,
+            page_position: lineage.position(1),
+        });
+        let old_baseline = old_owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("old selection baseline"))?;
+        let checkpoint = FakeCompletenessCheckpointSource::new(Some(
+            owned_decoded_completeness_checkpoint(&old_baseline),
+        ));
+
+        let mut source = FakeDurablePageRecoverySource::new(
+            lineage.clone(),
+            vec![
+                physical_page_observation(&lineage, page_number.get(), 1, page_byte, 1)?,
+                physical_page_observation(&lineage, page_number.get(), 3, page_byte, 3)?,
+            ],
+            vec![
+                durable_page_observation(
+                    &lineage,
+                    first_owner,
+                    page_number.get(),
+                    1,
+                    page_byte,
+                    1,
+                )?,
+                durable_page_observation(
+                    &lineage,
+                    second_owner,
+                    page_number.get(),
+                    3,
+                    page_byte,
+                    3,
+                )?,
+            ],
+            vec![
+                durable_commit_observation(&lineage, first_owner, 2)?,
+                durable_commit_observation(&lineage, second_owner, 4)?,
+            ],
+        );
+        source.restart_frontier = Some(lineage.position(4));
+        source.restart_observations = vec![
+            restart_owned_page(&lineage, first_owner, page_number.get(), 1)?,
+            restart_commit(&lineage, first_owner, 2)?,
+            restart_owned_page(&lineage, second_owner, page_number.get(), 3)?,
+            restart_commit(&lineage, second_owner, 4)?,
+        ];
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        store.current.push(FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(3),
+            byte: page_byte,
+            page_position: lineage.position(3),
+        });
+
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+            selection
+        else {
+            return Err(TestError(
+                "advanced selected page checkpoint was not rejected",
+            ));
+        };
+        assert!(matches!(
+            rejected.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                validation
+            ) if matches!(
+                validation.as_ref(),
+                DurableTransactionRestartCheckpointCompletenessBaselineValidationError::Evidence(
+                    evidence
+                ) if matches!(
+                    evidence.as_ref(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::CompletenessEvidence(
+                        completeness
+                    ) if matches!(
+                        completeness.as_ref(),
+                        DurableTransactionRestartCompletenessError::Evidence(completeness)
+                            if matches!(
+                                completeness.as_ref(),
+                                DurableTransactionRestartCompletenessEvidenceError::SnapshotBeyondFrontier {
+                                    page_number: actual_page,
+                                    position: 3,
+                                    frontier: 2,
+                                } if *actual_page == page_number
+                            )
+                    )
+                )
+            )
+        ));
+
+        let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+        assert!(matches!(
+            rejection,
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(_)
+        ));
+        let recovered = uncheckpointed
+            .recover()
+            .map_err(|_| TestError("advanced-checkpoint full recovery failed"))?;
+        assert!(matches!(
+            recovered.recovery_report().pages(),
+            [CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }]
+        ));
+        let analyzed = recovered
+            .analyze_restart()
+            .map_err(|_| TestError("advanced-checkpoint restart analysis failed"))?;
+        let (source, store, _, analysis, checkpoint) = analyzed.into_parts();
+        assert_eq!(checkpoint.calls, 1);
+        assert_eq!(source.restart_callbacks, 2);
+        assert_eq!(analysis.durable_frontier(), Some(&lineage.position(4)));
+        assert!(store.attempts.is_empty());
         Ok(())
     }
 }

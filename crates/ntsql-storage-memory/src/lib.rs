@@ -2871,7 +2871,8 @@ mod tests {
         DurableTransactionRestartRequiredPageImage, DurableTransactionRestartState,
         OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
         RestartAnalyzedTransactionPageStorage, TransactionCoordinator, TransactionLifecycleStatus,
-        TransactionResolutionFailure, UnrecoveredTransactionPageStorage, flush_committed_page,
+        TransactionPageStorageRestartCheckpointCompletenessSelection, TransactionResolutionFailure,
+        UnrecoveredTransactionPageStorage, flush_committed_page,
         recover_committed_transaction_pages,
     };
     use ntsql_wal::CommitError;
@@ -5052,6 +5053,175 @@ mod tests {
         ));
 
         assert!(recovered.restart_analysis().durable_frontier().is_some());
+        let (log, store, _, _) = recovered.into_parts();
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_checkpoint,
+        );
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+            selection
+        else {
+            return Err(io::Error::other(
+                "advanced selected page was not rejected before recovery",
+            )
+            .into());
+        };
+        assert!(matches!(
+            rejected.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                validation
+            ) if matches!(
+                validation.as_ref(),
+                DurableTransactionRestartCheckpointCompletenessBaselineValidationError::Evidence(
+                    evidence
+                ) if matches!(
+                    evidence.as_ref(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::CompletenessEvidence(
+                        completeness
+                    ) if matches!(
+                        completeness.as_ref(),
+                        DurableTransactionRestartCompletenessError::Evidence(snapshot_evidence)
+                            if matches!(
+                                snapshot_evidence.as_ref(),
+                                DurableTransactionRestartCompletenessEvidenceError::SnapshotBeyondFrontier {
+                                    page_number,
+                                    ..
+                                } if *page_number == current_page_number
+                            )
+                    )
+                )
+            )
+        ));
+        let (uncheckpointed, _) = rejected.continue_with_full_recovery();
+        let recovered = uncheckpointed.recover()?.analyze_restart()?;
+        assert!(
+            recovered
+                .recovery_report()
+                .pages()
+                .iter()
+                .all(|page| matches!(
+                    page,
+                    CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+                        | CommittedTransactionPageRecoveryOutcome::NoCommittedPage { .. }
+                ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completeness_checkpoint_selection_retains_memory_source_through_decline_and_publication()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x1593)
+            .ok_or_else(|| io::Error::other("selection persistent log id"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 210)?;
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let original_record_count = owner.parts().0.records.len();
+        let original_pages = owner.parts().1.pages().to_vec();
+        let (log, store, _, _) = owner.into_parts();
+
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("current memory checkpoint was not selected").into());
+        };
+        assert_eq!(selected.persistent_log_id(), persistent_log_id);
+        assert_eq!(selected.durable_frontier(), baseline.durable_frontier());
+        assert_eq!(selected.transaction_count(), baseline.transactions().len());
+        assert_eq!(selected.page_count(), baseline.pages().len());
+
+        let mut recovered = selected.decline_checkpoint().recover()?.analyze_restart()?;
+        assert!(recovered.recovery_report().pages().iter().all(|page| {
+            matches!(
+                page,
+                CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+                    | CommittedTransactionPageRecoveryOutcome::NoCommittedPage { .. }
+            )
+        }));
+        let receipt =
+            recovered.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        assert_eq!(receipt.page_count(), baseline.pages().len());
+
+        let (log, store, _, _, checkpoint) = recovered.into_parts();
+        assert_eq!(log.records.len(), original_record_count);
+        assert_eq!(store.pages(), original_pages.as_slice());
+        let published = checkpoint
+            .slot()
+            .ok_or_else(|| io::Error::other("retained memory source did not publish"))?;
+        assert_completeness_observation_matches_baseline(published, &baseline);
+        Ok(())
+    }
+
+    #[test]
+    fn completeness_checkpoint_selection_absence_and_source_fault_use_explicit_full_recovery()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x1594)
+            .ok_or_else(|| io::Error::other("fallback persistent log id"))?;
+
+        let log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id);
+        let store = InMemoryPageStore::new(&log);
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(
+                InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+            );
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(absent) =
+            selection
+        else {
+            return Err(io::Error::other("empty memory checkpoint was not absent").into());
+        };
+        let mut recovered = absent
+            .continue_with_full_recovery()
+            .recover()?
+            .analyze_restart()?;
+        let receipt =
+            recovered.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        assert_eq!(receipt.durable_frontier(), None);
+        let (_, _, _, _, checkpoint) = recovered.into_parts();
+        assert!(checkpoint.slot().is_some());
+
+        let log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id);
+        let store = InMemoryPageStore::new(&log);
+        let mut checkpoint =
+            InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty();
+        checkpoint.arm_fault(RestartCheckpointCompletenessBaselineSourceFaultPoint::BeforeLoad)?;
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+            selection
+        else {
+            return Err(io::Error::other("memory source fault was not rejected").into());
+        };
+        assert!(matches!(
+            rejected.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
+                InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::InjectedFault(
+                    RestartCheckpointCompletenessBaselineSourceFaultPoint::BeforeLoad
+                )
+            )
+        ));
+        let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+        assert!(matches!(
+            rejection,
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
+                InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::InjectedFault(
+                    RestartCheckpointCompletenessBaselineSourceFaultPoint::BeforeLoad
+                )
+            )
+        ));
+        let mut recovered = uncheckpointed.recover()?.analyze_restart()?;
+        let receipt =
+            recovered.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        let (_, _, _, _, checkpoint) = recovered.into_parts();
+        assert!(checkpoint.slot().is_some());
+        assert_eq!(checkpoint.armed_fault(), None);
         Ok(())
     }
 }

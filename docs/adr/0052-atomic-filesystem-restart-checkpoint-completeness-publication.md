@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #157
 - Extends: ADR 0046, ADR 0049, ADR 0051
+- Extended by: ADR 0053
 - Follows: #155
 
 ## Context
@@ -298,8 +299,10 @@ opened value before return.
 The successful
 `UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint` privately
 retains the existing unrecovered WAL/page-store owner and the completeness
-source; `into_parts` separates those already locked values so the existing
-consuming recovery and restart-analysis transitions can proceed.
+source. ADR 0053 removes its former `into_parts` escape: consuming pre-recovery
+selection now moves all three values directly into `Selected`, `Absent`, or
+`Rejected` ownership and retains them through any explicit full-recovery
+fallback.
 
 This order is independent of ADR 0051's operation data dependencies:
 validation reads the checkpoint and then the WAL and store, while publication
@@ -373,8 +376,8 @@ compatibility result.
 - Fixed-order composition distinguishes each stage, releases every acquired
   prefix after error, retains all three locks on success, rejects WAL/store and
   storage/completeness identity mismatches before returning ownership, and
-  permits the existing recovery and restart transition only after explicit
-  separation.
+  permits the existing recovery and restart transition only through consuming
+  selection and an explicit selected-decline, absence, or rejection fallback.
 - Publication replaces a stale candidate, publishes exact empty and exact
   nonempty baselines byte-for-byte equal to the codec, returns receipt
   identifiers including page count, and leaves no candidate.
@@ -424,7 +427,6 @@ semantics, and its tests are untouched.
 
 Loaded completeness bytes remain untrusted and acquire authority only through
 ADR 0050 validation against the current WAL prefix and current page store.
-Startup consumption of a validated completeness baseline, replay execution,
-dirty-page repair, indeterminate resolution, and WAL retention or reclamation
-remain later independently reviewed boundaries; this decision grants none of
-them.
+ADR 0053 later adds consuming startup selection while retaining this same locked
+source. Replay execution, dirty-page repair, indeterminate resolution, and WAL
+retention or reclamation remain later independently reviewed boundaries.

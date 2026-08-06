@@ -13,15 +13,18 @@ use ntsql_storage_file::{
     FileRestartCheckpointCompletenessBaselinePublicationFaultPoint,
     FileRestartCheckpointCompletenessBaselineSource, FileRestartCheckpointSlotIoStage,
     FileTransactionRestartAnalysisSourceError, encode_restart_checkpoint_completeness_baseline,
+    open_transaction_page_storage_with_completeness_checkpoint,
 };
 use ntsql_transaction::{
+    CommittedTransactionPageRecoveryOutcome,
     DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError,
     DurableTransactionRestartCheckpointCompletenessBaselineSource,
     DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError,
     DurableTransactionRestartCheckpointCompletenessBaselineValidationError,
     DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError,
     DurableTransactionRestartCompletenessError, DurableTransactionRestartCompletenessEvidenceError,
-    RestartAnalyzedTransactionPageStorage, TransactionCoordinator,
+    DurableTransactionRestartPageState, RestartAnalyzedTransactionPageStorage,
+    TransactionCoordinator, TransactionPageStorageRestartCheckpointCompletenessSelection,
     UnrecoveredTransactionPageStorage, flush_committed_page,
 };
 use ntsql_wal::{LogDurability, PersistentLogId};
@@ -134,6 +137,91 @@ fn publication_reconciles_stale_candidate_replaces_current_and_loads_untrusted()
 }
 
 #[test]
+fn pre_recovery_selection_accepts_missing_page_then_retains_slot_through_full_recovery()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("pre-recovery-selected")?;
+    let persistent_log_id = persistent_log_id(15901)?;
+    let mut owner = analyzed_owner(directory.path(), persistent_log_id)?;
+    let page_number = 159_u64;
+    append_committed_page_without_store_flush(&mut owner, page_number, 1, [0x15, 0x91])?;
+    let baseline = owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+    assert!(matches!(
+        baseline.pages(),
+        [entry]
+            if entry.page_number().get() == page_number
+                && matches!(
+                    entry.state(),
+                    DurableTransactionRestartPageState::StoreMissing { .. }
+                )
+    ));
+
+    let slot_path = directory.path().join("completeness");
+    let mut checkpoint =
+        FileRestartCheckpointCompletenessBaselineSource::create_new(&slot_path, persistent_log_id)?;
+    let receipt = owner
+        .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut checkpoint)?;
+    assert_eq!(receipt.page_count(), 1);
+    drop(owner);
+    drop(checkpoint);
+
+    let opened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        directory.path().join("wal.bin"),
+        directory.path().join("pages.bin"),
+        &slot_path,
+    )?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let selection = opened.select_restart_checkpoint_completeness();
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        selection
+    else {
+        return Err(io::Error::other("missing-page checkpoint was not selected").into());
+    };
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert_eq!(selected.persistent_log_id(), persistent_log_id);
+    assert_eq!(selected.durable_frontier(), baseline.durable_frontier());
+    assert_eq!(selected.transaction_count(), baseline.transactions().len());
+    assert_eq!(selected.page_count(), 1);
+
+    let uncheckpointed = selected.decline_checkpoint();
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let recovered = uncheckpointed.recover()?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert!(matches!(
+        recovered.recovery_report().pages(),
+        [CommittedTransactionPageRecoveryOutcome::Recovered { .. }]
+    ));
+    let mut analyzed = recovered.analyze_restart()?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let replacement =
+        analyzed.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+    assert_eq!(replacement.persistent_log_id(), persistent_log_id);
+    assert_eq!(replacement.page_count(), 1);
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+
+    let (log, store, _, _, checkpoint) = analyzed.into_parts();
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let page_number =
+        PageNumber::new(page_number).ok_or_else(|| io::Error::other("page number is zero"))?;
+    let stored = store
+        .page(page_number)
+        .ok_or_else(|| io::Error::other("full recovery did not persist selected page"))?;
+    assert_eq!(stored.page_version(), PageVersion::new(1));
+    assert_eq!(stored.bytes(), &[0x15, 0x91]);
+    assert_eq!(checkpoint.persistent_log_id(), persistent_log_id);
+    drop((log, store, checkpoint));
+    drop(FileCommitLog::<2>::open_transaction_page_capable(
+        directory.path().join("wal.bin"),
+    )?);
+    drop(FilePageStore::<2>::open(
+        directory.path().join("pages.bin"),
+    )?);
+    drop(FileRestartCheckpointCompletenessBaselineSource::open(
+        &slot_path,
+    )?);
+    Ok(())
+}
+
+#[test]
 fn published_completeness_validates_after_safe_suffix_and_rejects_advanced_selected_page()
 -> Result<(), Box<dyn Error>> {
     let directory = TestDirectory::new("stale-suffix")?;
@@ -205,6 +293,66 @@ fn published_completeness_validates_after_safe_suffix_and_rejects_advanced_selec
     assert_eq!(*frontier, selected_frontier);
     assert!(*position > selected_frontier);
     assert_eq!(fs::read(slot_path.join("current"))?, published_bytes);
+
+    drop(owner);
+    drop(checkpoint);
+    let opened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        directory.path().join("wal.bin"),
+        directory.path().join("pages.bin"),
+        &slot_path,
+    )?;
+    let selection = opened.select_restart_checkpoint_completeness();
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+        selection
+    else {
+        return Err(io::Error::other(
+            "advanced selected page checkpoint was not rejected before recovery",
+        )
+        .into());
+    };
+    assert!(matches!(
+        rejected.error(),
+        DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+            validation
+        ) if matches!(
+            validation.as_ref(),
+            DurableTransactionRestartCheckpointCompletenessBaselineValidationError::Evidence(
+                evidence
+            ) if matches!(
+                evidence.as_ref(),
+                DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::CompletenessEvidence(
+                    completeness
+                ) if matches!(
+                    completeness.as_ref(),
+                    DurableTransactionRestartCompletenessError::Evidence(completeness)
+                        if matches!(
+                            completeness.as_ref(),
+                            DurableTransactionRestartCompletenessEvidenceError::SnapshotBeyondFrontier {
+                                page_number,
+                                ..
+                            } if page_number.get() == selected_page
+                        )
+                )
+            )
+        )
+    ));
+    let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+    assert!(matches!(
+        rejection,
+        DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(_)
+    ));
+    let recovered = uncheckpointed.recover()?;
+    assert!(recovered.recovery_report().pages().iter().all(|page| {
+        matches!(
+            page,
+            CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+        )
+    }));
+    let mut analyzed = recovered.analyze_restart()?;
+    let replacement =
+        analyzed.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+    assert_eq!(replacement.persistent_log_id(), persistent_log_id);
+    assert_eq!(replacement.page_count(), 2);
     Ok(())
 }
 
@@ -528,6 +676,45 @@ fn append_committed_page(
     )?;
     let committed = coordinator.commit(active, log)?;
     flush_committed_page(&committed, log, store, dirty)?;
+    Ok(())
+}
+
+fn append_committed_page_without_store_flush(
+    owner: &mut FileOwner,
+    page_number: u64,
+    page_version: u64,
+    bytes: [u8; 2],
+) -> Result<(), Box<dyn Error>> {
+    let (log, _) = owner.parts_mut();
+    let lineage = LogDurability::lineage(log).clone();
+    let mut coordinator = TransactionCoordinator::open(log)?;
+    let active = coordinator.begin()?;
+    let (active, dirty) = coordinator.stage_page_write(
+        active,
+        unlogged_page(&lineage, page_number, page_version, bytes)?,
+        log,
+    )?;
+    let committed = coordinator.commit(active, log)?;
+    drop((committed, dirty));
+    Ok(())
+}
+
+fn assert_file_composition_locked(directory: &Path, slot_path: &Path) -> Result<(), io::Error> {
+    if FileCommitLog::<2>::open_transaction_page_capable(directory.join("wal.bin")).is_ok() {
+        return Err(io::Error::other(
+            "filesystem selection released its WAL lock",
+        ));
+    }
+    if FilePageStore::<2>::open(directory.join("pages.bin")).is_ok() {
+        return Err(io::Error::other(
+            "filesystem selection released its page-store lock",
+        ));
+    }
+    if FileRestartCheckpointCompletenessBaselineSource::open(slot_path).is_ok() {
+        return Err(io::Error::other(
+            "filesystem selection released its completeness-control lock",
+        ));
+    }
     Ok(())
 }
 

@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #126
 - Extends: ADR 0033, ADR 0034, ADR 0035, ADR 0036
-- Extended by: ADR 0038, ADR 0047
+- Extended by: ADR 0038, ADR 0047, ADR 0053
 
 ## Context
 
@@ -232,6 +232,11 @@ The locks remain advisory and process-local safety still relies on cooperating
 openers. Hostile path replacement, non-cooperating writers, unsupported lock
 semantics, or storage that violates successful synchronization guarantees remain
 outside this contract.
+
+ADR 0053 later wraps this unchanged recovery/analysis path with one retained
+completeness source. That wrapper does not release the WAL or page store at the
+page-recovered intermediate, and it releases or transfers the third source only
+with the same final `into_parts` boundary or drop.
 
 ## Concrete Scenarios
 

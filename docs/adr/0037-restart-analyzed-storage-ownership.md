@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #126
 - Extends: ADR 0033, ADR 0034, ADR 0035, ADR 0036
+- Extended by: ADR 0038
 
 ## Context
 
@@ -344,3 +345,7 @@ The restart-analyzed owner is now the smallest safe composition boundary for a
 separately reviewed persistent checkpoint baseline. Dirty-page analysis, replay
 start, redo, undo/compensation, coordinator restoration, log reclamation,
 database lifecycle, and external compatibility remain future work.
+
+ADR 0038 adds the first persistable, non-authorizing checkpoint baseline
+projection exclusively to this final owner. It does not change the startup
+transition or make the stored point-in-time analysis current after live writes.

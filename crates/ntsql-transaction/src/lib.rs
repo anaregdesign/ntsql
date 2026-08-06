@@ -17,7 +17,8 @@ use ntsql_page::{
     flush_dirty_page, reconcile_durable_page, stage_page_write,
 };
 use ntsql_wal::{
-    CommitError, CommitLog, LogDurability, LogLineage, LogSequenceNumber, commit_durability,
+    CommitError, CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId,
+    commit_durability,
 };
 
 /// Persistence-owned source of nonzero coordinator epochs.
@@ -3627,6 +3628,19 @@ impl<Source, Store, const N: usize> RestartAnalyzedTransactionPageStorage<Source
         &self.analysis
     }
 
+    /// Prepares an inert persistable baseline from the exact startup analysis.
+    ///
+    /// This is not a complete checkpoint: it contains no dirty-page table,
+    /// replay start, publication evidence, or log-reclamation authority.
+    pub fn prepare_restart_checkpoint_baseline(
+        &self,
+    ) -> Result<
+        DurableTransactionRestartCheckpointBaseline,
+        DurableTransactionRestartCheckpointBaselineError,
+    > {
+        prepare_restart_checkpoint_baseline(&self.analysis)
+    }
+
     /// Borrows the startup-validated source and store for read-only inspection.
     pub const fn parts(&self) -> (&Source, &Store) {
         (&self.storage.storage.source, &self.storage.storage.store)
@@ -4059,6 +4073,336 @@ impl DurableTransactionRestartAnalysis {
     ) {
         (self.lineage, self.durable_frontier, self.transactions)
     }
+}
+
+/// Persistable commit classification in one restart checkpoint baseline entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointBaselineState {
+    /// No commit for this identity occurred in the analyzed durable prefix.
+    Uncommitted,
+    /// Exactly one commit followed every owned-page record for this identity.
+    Committed {
+        /// Numeric durable position of the sole commit record.
+        commit_position: u64,
+    },
+}
+
+impl DurableTransactionRestartCheckpointBaselineState {
+    /// Returns the sole numeric commit position, or `None` when uncommitted.
+    #[must_use]
+    pub const fn commit_position(self) -> Option<u64> {
+        match self {
+            Self::Uncommitted => None,
+            Self::Committed { commit_position } => Some(commit_position),
+        }
+    }
+}
+
+/// Inert persistable transaction-table entry for one analyzed durable prefix.
+///
+/// An entry cannot reconstruct transaction lifecycle or page-write authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselineEntry, TransactionId,
+/// };
+///
+/// fn cannot_reconstruct_transaction(
+///     entry: DurableTransactionRestartCheckpointBaselineEntry,
+/// ) -> TransactionId {
+///     entry.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaselineEntry;
+///
+/// fn cannot_authorize_page_write<'attempt>(
+///     entry: DurableTransactionRestartCheckpointBaselineEntry,
+/// ) -> PageWritePermit<'attempt> {
+///     entry.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit,
+///     DurableTransactionRestartCheckpointBaselineEntry,
+/// };
+///
+/// fn cannot_authorize_recovery<'attempt>(
+///     entry: DurableTransactionRestartCheckpointBaselineEntry,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     entry.into()
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableTransactionRestartCheckpointBaselineEntry {
+    transaction: DurableTransactionIdentityObservation,
+    first_owned_page_position: Option<u64>,
+    last_owned_page_position: Option<u64>,
+    owned_page_record_count: u64,
+    state: DurableTransactionRestartCheckpointBaselineState,
+}
+
+impl DurableTransactionRestartCheckpointBaselineEntry {
+    /// Returns the exact persisted transaction identity.
+    #[must_use]
+    pub const fn transaction(&self) -> DurableTransactionIdentityObservation {
+        self.transaction
+    }
+
+    /// Returns the first numeric owned-page position, if one was analyzed.
+    #[must_use]
+    pub const fn first_owned_page_position(&self) -> Option<u64> {
+        self.first_owned_page_position
+    }
+
+    /// Returns the last numeric owned-page position, if one was analyzed.
+    #[must_use]
+    pub const fn last_owned_page_position(&self) -> Option<u64> {
+        self.last_owned_page_position
+    }
+
+    /// Returns the exact portable owned-page record count.
+    #[must_use]
+    pub const fn owned_page_record_count(&self) -> u64 {
+        self.owned_page_record_count
+    }
+
+    /// Returns the persistable commit classification.
+    #[must_use]
+    pub const fn state(&self) -> DurableTransactionRestartCheckpointBaselineState {
+        self.state
+    }
+}
+
+/// Inert persistable transaction restart baseline for one durable WAL prefix.
+///
+/// This value is not a complete checkpoint. It has no dirty-page table, redo or
+/// undo start, encoded bytes, publication proof, replay command, or retention
+/// authority.
+///
+/// Its private fields prevent direct construction:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline,
+///     DurableTransactionRestartCheckpointBaselineEntry,
+/// };
+/// use ntsql_wal::PersistentLogId;
+///
+/// fn cannot_forge(
+///     persistent_log_id: PersistentLogId,
+///     transactions: Vec<DurableTransactionRestartCheckpointBaselineEntry>,
+/// ) -> DurableTransactionRestartCheckpointBaseline {
+///     DurableTransactionRestartCheckpointBaseline {
+///         persistent_log_id,
+///         durable_frontier: None,
+///         transactions,
+///     }
+/// }
+/// ```
+///
+/// The baseline exposes no runtime lineage capability:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaseline;
+/// use ntsql_wal::LogLineage;
+///
+/// fn cannot_extract_lineage(
+///     baseline: &DurableTransactionRestartCheckpointBaseline,
+/// ) -> &LogLineage {
+///     baseline.lineage()
+/// }
+/// ```
+///
+/// It cannot become a lineage-bound log position:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaseline;
+/// use ntsql_wal::LogSequenceNumber;
+///
+/// fn cannot_reconstruct_position(
+///     baseline: DurableTransactionRestartCheckpointBaseline,
+/// ) -> LogSequenceNumber {
+///     baseline.into()
+/// }
+/// ```
+///
+/// It cannot satisfy a log durability fence:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCheckpointBaseline;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_flush_checkpoint<Log: LogDurability>(
+///     log: &mut Log,
+///     baseline: &DurableTransactionRestartCheckpointBaseline,
+/// ) {
+///     let _ = log.flush_through(baseline);
+/// }
+/// ```
+///
+/// It cannot become a recovered storage owner:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaseline, RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Store, const N: usize>(
+///     baseline: DurableTransactionRestartCheckpointBaseline,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     baseline.into()
+/// }
+/// ```
+///
+/// A detached analysis cannot bypass the analyzed storage-owner gate:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartAnalysis;
+///
+/// fn cannot_prepare_from_detached_analysis(
+///     analysis: &DurableTransactionRestartAnalysis,
+/// ) {
+///     let _ = analysis.prepare_restart_checkpoint_baseline();
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct DurableTransactionRestartCheckpointBaseline {
+    persistent_log_id: PersistentLogId,
+    durable_frontier: Option<u64>,
+    transactions: Vec<DurableTransactionRestartCheckpointBaselineEntry>,
+}
+
+impl DurableTransactionRestartCheckpointBaseline {
+    /// Returns the exact adapter-owned persistent log identity.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the numeric durable frontier, or `None` for zero durable records.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.durable_frontier
+    }
+
+    /// Returns entries in strict persisted-identity order.
+    pub fn transactions(&self) -> &[DurableTransactionRestartCheckpointBaselineEntry] {
+        &self.transactions
+    }
+}
+
+/// Failure to prepare a persistable transaction restart checkpoint baseline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointBaselineError {
+    /// The analyzed WAL lineage has no stable adapter-owned identity.
+    PersistentLineageRequired,
+    /// The exact transaction table could not reserve its required capacity.
+    TransactionCapacityExhausted {
+        /// Number of transaction entries in the analyzed table.
+        transaction_count: usize,
+    },
+    /// A platform-width analyzed count could not fit the portable `u64` field.
+    ///
+    /// This is defensive on supported targets, whose `usize` is at most 64 bits.
+    OwnedPageCountWidthExceeded {
+        /// Identity whose exact count could not be represented.
+        transaction: DurableTransactionIdentityObservation,
+        /// Rejected platform-width count.
+        record_count: usize,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartCheckpointBaselineError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PersistentLineageRequired => {
+                formatter.write_str("restart checkpoint baseline requires a persistent log lineage")
+            }
+            Self::TransactionCapacityExhausted { transaction_count } => write!(
+                formatter,
+                "restart checkpoint baseline transaction capacity is exhausted for {transaction_count} entries"
+            ),
+            Self::OwnedPageCountWidthExceeded {
+                transaction,
+                record_count,
+            } => write!(
+                formatter,
+                "transaction {transaction} owned-page count {record_count} exceeds the portable checkpoint width"
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartCheckpointBaselineError {}
+
+fn reserve_restart_checkpoint_baseline_transactions(
+    transactions: &mut Vec<DurableTransactionRestartCheckpointBaselineEntry>,
+    transaction_count: usize,
+) -> Result<(), DurableTransactionRestartCheckpointBaselineError> {
+    transactions
+        .try_reserve_exact(transaction_count)
+        .map_err(|_| {
+            DurableTransactionRestartCheckpointBaselineError::TransactionCapacityExhausted {
+                transaction_count,
+            }
+        })
+}
+
+fn prepare_restart_checkpoint_baseline(
+    analysis: &DurableTransactionRestartAnalysis,
+) -> Result<
+    DurableTransactionRestartCheckpointBaseline,
+    DurableTransactionRestartCheckpointBaselineError,
+> {
+    let persistent_log_id = analysis
+        .lineage()
+        .persistent_id()
+        .ok_or(DurableTransactionRestartCheckpointBaselineError::PersistentLineageRequired)?;
+    let transaction_count = analysis.transactions().len();
+    let mut transactions = Vec::new();
+    reserve_restart_checkpoint_baseline_transactions(&mut transactions, transaction_count)?;
+
+    for entry in analysis.transactions() {
+        let transaction = entry.transaction();
+        let owned_page_record_count =
+            u64::try_from(entry.owned_page_record_count()).map_err(|_| {
+                DurableTransactionRestartCheckpointBaselineError::OwnedPageCountWidthExceeded {
+                    transaction,
+                    record_count: entry.owned_page_record_count(),
+                }
+            })?;
+        let state = match entry.state() {
+            DurableTransactionRestartState::Uncommitted => {
+                DurableTransactionRestartCheckpointBaselineState::Uncommitted
+            }
+            DurableTransactionRestartState::Committed { commit_position } => {
+                DurableTransactionRestartCheckpointBaselineState::Committed {
+                    commit_position: commit_position.get(),
+                }
+            }
+        };
+        transactions.push(DurableTransactionRestartCheckpointBaselineEntry {
+            transaction,
+            first_owned_page_position: entry
+                .first_owned_page_position()
+                .map(LogSequenceNumber::get),
+            last_owned_page_position: entry.last_owned_page_position().map(LogSequenceNumber::get),
+            owned_page_record_count,
+            state,
+        });
+    }
+
+    Ok(DurableTransactionRestartCheckpointBaseline {
+        persistent_log_id,
+        durable_frontier: analysis.durable_frontier().map(LogSequenceNumber::get),
+        transactions,
+    })
 }
 
 /// Invalid complete-prefix evidence supplied to restart analysis.
@@ -9858,6 +10202,10 @@ mod tests {
                 Some(&lineage.position(commit_position))
             );
         }
+        assert_eq!(
+            recovered.prepare_restart_checkpoint_baseline().err(),
+            Some(DurableTransactionRestartCheckpointBaselineError::PersistentLineageRequired)
+        );
         let (source, store) = recovered.parts_mut();
         assert_eq!(source.inventory_calls, 2);
         assert_eq!(source.callbacks, 5);
@@ -10066,6 +10414,115 @@ mod tests {
         assert!(analysis.transactions().is_empty());
         assert_eq!(source.callbacks, 1);
         Ok(())
+    }
+
+    #[test]
+    fn restart_checkpoint_baseline_distinguishes_empty_and_raw_only_prefixes()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1280).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let mut empty_source =
+            FakeDurableTransactionRestartSource::new(lineage.clone(), None, Vec::new());
+
+        let empty_analysis = analyze_durable_transaction_restart(&mut empty_source)
+            .map_err(|_| TestError("empty persistent restart analysis"))?;
+        let empty = prepare_restart_checkpoint_baseline(&empty_analysis)
+            .map_err(|_| TestError("empty restart checkpoint baseline"))?;
+
+        assert_eq!(empty.persistent_log_id(), persistent_log_id);
+        assert_eq!(empty.durable_frontier(), None);
+        assert!(empty.transactions().is_empty());
+
+        let mut raw_source = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(9)),
+            vec![restart_raw_page(&lineage, 90, 9)?],
+        );
+        let raw_analysis = analyze_durable_transaction_restart(&mut raw_source)
+            .map_err(|_| TestError("raw-only persistent restart analysis"))?;
+        let raw = prepare_restart_checkpoint_baseline(&raw_analysis)
+            .map_err(|_| TestError("raw-only restart checkpoint baseline"))?;
+
+        assert_eq!(raw.persistent_log_id(), persistent_log_id);
+        assert_eq!(raw.durable_frontier(), Some(9));
+        assert!(raw.transactions().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn restart_checkpoint_baseline_preserves_exact_sorted_transaction_table()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1281).ok_or(TestError("persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let uncommitted = durable_identity(40, 1)?;
+        let committed = durable_identity(41, 2)?;
+        let commit_only = durable_identity(42, 3)?;
+        let observations = vec![
+            restart_raw_page(&lineage, 90, 2)?,
+            restart_owned_page(&lineage, committed, 91, 4)?,
+            restart_owned_page(&lineage, uncommitted, 92, 7)?,
+            restart_owned_page(&lineage, committed, 93, 8)?,
+            restart_commit(&lineage, committed, 10)?,
+            restart_commit(&lineage, commit_only, 12)?,
+            restart_owned_page(&lineage, uncommitted, 94, 15)?,
+        ];
+        let mut source = FakeDurableTransactionRestartSource::new(
+            lineage.clone(),
+            Some(lineage.position(15)),
+            observations,
+        );
+        let analysis = analyze_durable_transaction_restart(&mut source)
+            .map_err(|_| TestError("persistent interleaved restart analysis"))?;
+
+        let baseline = prepare_restart_checkpoint_baseline(&analysis)
+            .map_err(|_| TestError("interleaved restart checkpoint baseline"))?;
+
+        assert_eq!(baseline.persistent_log_id(), persistent_log_id);
+        assert_eq!(baseline.durable_frontier(), Some(15));
+        assert_eq!(
+            baseline
+                .transactions()
+                .iter()
+                .map(DurableTransactionRestartCheckpointBaselineEntry::transaction)
+                .collect::<Vec<_>>(),
+            [uncommitted, committed, commit_only]
+        );
+        let transactions = baseline.transactions();
+        assert_eq!(transactions[0].first_owned_page_position(), Some(7));
+        assert_eq!(transactions[0].last_owned_page_position(), Some(15));
+        assert_eq!(transactions[0].owned_page_record_count(), 2);
+        assert_eq!(
+            transactions[0].state(),
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted
+        );
+
+        assert_eq!(transactions[1].first_owned_page_position(), Some(4));
+        assert_eq!(transactions[1].last_owned_page_position(), Some(8));
+        assert_eq!(transactions[1].owned_page_record_count(), 2);
+        assert_eq!(transactions[1].state().commit_position(), Some(10));
+
+        assert_eq!(transactions[2].first_owned_page_position(), None);
+        assert_eq!(transactions[2].last_owned_page_position(), None);
+        assert_eq!(transactions[2].owned_page_record_count(), 0);
+        assert_eq!(transactions[2].state().commit_position(), Some(12));
+        Ok(())
+    }
+
+    #[test]
+    fn restart_checkpoint_baseline_capacity_failure_is_typed() {
+        let mut transactions = Vec::new();
+
+        assert_eq!(
+            reserve_restart_checkpoint_baseline_transactions(&mut transactions, usize::MAX),
+            Err(
+                DurableTransactionRestartCheckpointBaselineError::TransactionCapacityExhausted {
+                    transaction_count: usize::MAX
+                }
+            )
+        );
+        assert!(transactions.is_empty());
     }
 
     #[test]

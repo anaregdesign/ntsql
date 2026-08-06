@@ -2050,7 +2050,9 @@ mod tests {
     #[test]
     fn batch_recovery_uses_sorted_owned_inventory_stops_and_reruns_fresh()
     -> Result<(), Box<dyn Error>> {
-        let mut log = InMemoryCommitLog::<1>::new();
+        let persistent_log_id = PersistentLogId::new(0x1282)
+            .ok_or_else(|| io::Error::other("persistent log id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id);
         let mut store = InMemoryPageStore::new(&log);
         let mut coordinator = TransactionCoordinator::open(&mut log)?;
 
@@ -2271,6 +2273,27 @@ mod tests {
             analysis.transactions()[4].state(),
             &DurableTransactionRestartState::Uncommitted
         );
+        let checkpoint_baseline = recovered.prepare_restart_checkpoint_baseline()?;
+        assert_eq!(checkpoint_baseline.persistent_log_id(), persistent_log_id);
+        assert_eq!(
+            checkpoint_baseline.durable_frontier(),
+            Some(expected_restart_frontier.get())
+        );
+        assert_eq!(
+            checkpoint_baseline.transactions().len(),
+            expected_transactions.len()
+        );
+        for (entry, (owner, page_position, commit_position)) in checkpoint_baseline
+            .transactions()
+            .iter()
+            .zip(expected_transactions)
+        {
+            assert!(entry.transaction().matches_transaction_id(owner));
+            assert_eq!(entry.first_owned_page_position(), Some(page_position));
+            assert_eq!(entry.last_owned_page_position(), Some(page_position));
+            assert_eq!(entry.owned_page_record_count(), 1);
+            assert_eq!(entry.state().commit_position(), commit_position);
+        }
         let (log, store) = recovered.parts_mut();
         let recovered_behind = store
             .page(last_page)
@@ -2313,6 +2336,11 @@ mod tests {
             recovered.restart_analysis().durable_frontier(),
             Some(&expected_restart_frontier)
         );
+        assert_eq!(
+            checkpoint_baseline.durable_frontier(),
+            Some(expected_restart_frontier.get())
+        );
+        assert_eq!(checkpoint_baseline.transactions().len(), 5);
 
         let (_log, store, report, analysis) = recovered.into_parts();
         assert_eq!(report.pages().len(), 4);

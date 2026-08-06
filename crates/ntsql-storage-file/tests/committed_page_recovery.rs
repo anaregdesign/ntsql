@@ -9,14 +9,16 @@ use ntsql_page::{
     PageAddress, PageImage, PageNumber, PageVersion, flush_dirty_page, stage_page_write,
 };
 use ntsql_storage_file::{
-    FaultPoint, FileCommitLog, FileCommittedPageRecoverySourceError,
-    FileCommittedPageRecoveryStoreError, FilePageStore, FilePageStoreError, PageStoreFaultPoint,
+    FaultPoint, FileCommitLog, FileCommittedPageRecoveryInventoryError,
+    FileCommittedPageRecoverySourceError, FileCommittedPageRecoveryStoreError, FilePageStore,
+    FilePageStoreError, PageStoreFaultPoint,
 };
 use ntsql_transaction::{
     CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
     CommittedTransactionPageRecoverySourceState, CommittedTransactionPageRecoveryTarget,
-    CoordinatedCommitError, TransactionCoordinator, TransactionId, flush_committed_page,
-    recover_committed_transaction_page,
+    CommittedTransactionPagesRecoveryError, CoordinatedCommitError,
+    DurableTransactionPageRecoveryInventory, TransactionCoordinator, TransactionId,
+    flush_committed_page, recover_committed_transaction_page, recover_committed_transaction_pages,
 };
 use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
 
@@ -253,6 +255,220 @@ fn filesystem_recovery_faults_require_fresh_authoritative_reruns() -> Result<(),
 }
 
 #[test]
+fn filesystem_batch_recovery_is_sorted_fail_fast_idempotent_and_persistent()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("committed-pages-recovery")?;
+    let log_path = directory.path().join("commit-log.bin");
+    let store_path = directory.path().join("pages.bin");
+    let persistent_id = persistent_log_id(520)?;
+    let mut log =
+        FileCommitLog::<1>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+    let mut store = FilePageStore::<1>::create_new(&store_path, persistent_id)?;
+    let mut coordinator = TransactionCoordinator::open(&mut log)?;
+
+    let last_page = page_number(83)?;
+    let behind_active = coordinator.begin()?;
+    let behind_page = unlogged_page(log.lineage(), 83, 100, [0xA3])?;
+    let (behind_active, behind_dirty) =
+        coordinator.stage_page_write(behind_active, behind_page, &mut log)?;
+    let behind_commit = coordinator.commit(behind_active, &mut log)?;
+    flush_committed_page(&behind_commit, &mut log, &mut store, behind_dirty)?;
+
+    let first_page = page_number(81)?;
+    let exact_active = coordinator.begin()?;
+    let exact_page = unlogged_page(log.lineage(), 81, 81, [0x81])?;
+    let (exact_active, exact_dirty) =
+        coordinator.stage_page_write(exact_active, exact_page, &mut log)?;
+    let exact_commit = coordinator.commit(exact_active, &mut log)?;
+    flush_committed_page(&exact_commit, &mut log, &mut store, exact_dirty)?;
+
+    let failed_page = page_number(82)?;
+    let missing_active = coordinator.begin()?;
+    let missing_page = unlogged_page(log.lineage(), 82, 82, [0x82])?;
+    let (missing_active, missing_dirty) =
+        coordinator.stage_page_write(missing_active, missing_page, &mut log)?;
+    coordinator.commit(missing_active, &mut log)?;
+    drop(missing_dirty);
+
+    let latest_active = coordinator.begin()?;
+    let latest_page = unlogged_page(log.lineage(), 83, 1, [0x03])?;
+    let (latest_active, latest_dirty) =
+        coordinator.stage_page_write(latest_active, latest_page, &mut log)?;
+    coordinator.commit(latest_active, &mut log)?;
+    drop(latest_dirty);
+
+    let uncommitted_page_number = page_number(84)?;
+    let uncommitted_active = coordinator.begin()?;
+    let uncommitted_page = unlogged_page(log.lineage(), 84, 84, [0x84])?;
+    let (uncommitted_active, uncommitted_dirty) =
+        coordinator.stage_page_write(uncommitted_active, uncommitted_page, &mut log)?;
+    log.flush_through(uncommitted_dirty.required_position())?;
+    drop(uncommitted_active);
+    drop(uncommitted_dirty);
+
+    let raw_page_number = page_number(85)?;
+    let raw_page = unlogged_page(log.lineage(), 85, 85, [0x85])?;
+    let raw_dirty = stage_page_write(&mut log, raw_page)?;
+    log.flush_through(raw_dirty.required_position())?;
+    drop(raw_dirty);
+
+    let volatile_page_number = page_number(86)?;
+    let volatile_active = coordinator.begin()?;
+    let volatile_page = unlogged_page(log.lineage(), 86, 86, [0x86])?;
+    let (volatile_active, volatile_dirty) =
+        coordinator.stage_page_write(volatile_active, volatile_page, &mut log)?;
+    log.arm_fault(FaultPoint::BeforeFlush)?;
+    assert!(matches!(
+        coordinator.commit(volatile_active, &mut log),
+        Err(CoordinatedCommitError::Indeterminate(_))
+    ));
+    drop(volatile_dirty);
+    drop(coordinator);
+
+    assert_eq!(log.records().len(), 12);
+    assert_eq!(log.durable_records().len(), 10);
+    assert_eq!(
+        log.records()[10]
+            .transaction_page_write()
+            .map(|record| record.page_write().page_number()),
+        Some(volatile_page_number)
+    );
+    assert!(log.records()[11].transaction_epoch().is_some());
+    assert!(log.records()[11].transaction_page_write().is_none());
+    assert_eq!(
+        log.durable_transaction_page_numbers()?,
+        [first_page, failed_page, last_page, uncommitted_page_number]
+    );
+
+    let behind = store
+        .page(last_page)
+        .ok_or_else(|| io::Error::other("behind filesystem page disappeared"))?;
+    assert_eq!(behind.page_version(), PageVersion::new(100));
+    assert_eq!(behind.bytes(), &[0xA3]);
+    store.arm_fault(PageStoreFaultPoint::BeforeWrite)?;
+
+    let result = recover_committed_transaction_pages(&mut log, &mut store);
+    let Err(CommittedTransactionPagesRecoveryError::Page {
+        completed,
+        page_number,
+        source: CommittedTransactionPageRecoveryError::StoreWrite { state: write_state },
+    }) = result
+    else {
+        return Err(io::Error::other("filesystem batch did not stop at the fault").into());
+    };
+    assert_eq!(page_number, failed_page);
+    assert_eq!(completed.pages().len(), 1);
+    assert_eq!(completed.pages()[0].page_number(), first_page);
+    assert_eq!(
+        write_state.as_ref().cause(),
+        &FileCommittedPageRecoveryStoreError::PageStore(FilePageStoreError::InjectedFault(
+            PageStoreFaultPoint::BeforeWrite
+        ))
+    );
+    assert!(store.page(first_page).is_some());
+    assert!(store.page(failed_page).is_none());
+    let behind = store.page(last_page).ok_or_else(|| {
+        io::Error::other("behind filesystem page was touched after later-page failure")
+    })?;
+    assert_eq!(behind.page_version(), PageVersion::new(100));
+    assert_eq!(behind.bytes(), &[0xA3]);
+    assert!(store.page(uncommitted_page_number).is_none());
+    assert!(store.page(raw_page_number).is_none());
+    assert!(store.page(volatile_page_number).is_none());
+
+    let rerun = recover_committed_transaction_pages(&mut log, &mut store)?;
+    assert_eq!(
+        rerun
+            .pages()
+            .iter()
+            .map(CommittedTransactionPageRecoveryOutcome::page_number)
+            .collect::<Vec<_>>(),
+        [first_page, failed_page, last_page, uncommitted_page_number]
+    );
+    assert!(matches!(
+        rerun.pages()[0],
+        CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+    ));
+    assert!(matches!(
+        rerun.pages()[1],
+        CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+    ));
+    assert!(matches!(
+        rerun.pages()[2],
+        CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+    ));
+    assert_eq!(
+        rerun.pages()[3],
+        CommittedTransactionPageRecoveryOutcome::NoCommittedPage {
+            page_number: uncommitted_page_number
+        }
+    );
+    let recovered_behind = store
+        .page(last_page)
+        .ok_or_else(|| io::Error::other("behind filesystem page was not recovered"))?;
+    assert_eq!(recovered_behind.page_version(), PageVersion::new(1));
+    assert_eq!(recovered_behind.bytes(), &[0x03]);
+    let sequences = [
+        store
+            .page(first_page)
+            .ok_or_else(|| io::Error::other("exact page disappeared"))?
+            .store_sequence(),
+        store
+            .page(failed_page)
+            .ok_or_else(|| io::Error::other("missing page was not recovered"))?
+            .store_sequence(),
+        recovered_behind.store_sequence(),
+    ];
+
+    let idempotent = recover_committed_transaction_pages(&mut log, &mut store)?;
+    assert!(idempotent.pages()[..3].iter().all(|outcome| matches!(
+        outcome,
+        CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+    )));
+    assert_eq!(
+        idempotent.pages()[3],
+        CommittedTransactionPageRecoveryOutcome::NoCommittedPage {
+            page_number: uncommitted_page_number
+        }
+    );
+    assert_eq!(
+        [
+            store
+                .page(first_page)
+                .ok_or_else(|| io::Error::other("exact page disappeared after idempotent run"))?
+                .store_sequence(),
+            store
+                .page(failed_page)
+                .ok_or_else(|| io::Error::other("missing page disappeared after idempotent run"))?
+                .store_sequence(),
+            store
+                .page(last_page)
+                .ok_or_else(|| io::Error::other("behind page disappeared after idempotent run"))?
+                .store_sequence(),
+        ],
+        sequences
+    );
+    drop(store);
+
+    let reopened = FilePageStore::<1>::open(&store_path)?;
+    for (number, version, bytes) in [
+        (first_page, 81, [0x81]),
+        (failed_page, 82, [0x82]),
+        (last_page, 1, [0x03]),
+    ] {
+        let page = reopened
+            .page(number)
+            .ok_or_else(|| io::Error::other("recovered filesystem page is missing"))?;
+        assert_eq!(page.page_version(), PageVersion::new(version));
+        assert_eq!(page.bytes(), &bytes);
+    }
+    assert!(reopened.page(uncommitted_page_number).is_none());
+    assert!(reopened.page(raw_page_number).is_none());
+    assert!(reopened.page(volatile_page_number).is_none());
+    Ok(())
+}
+
+#[test]
 fn transaction_page_recovery_rejects_older_file_wal_formats_before_callback()
 -> Result<(), Box<dyn Error>> {
     let directory = TestDirectory::new("unsupported-recovery")?;
@@ -264,6 +480,22 @@ fn transaction_page_recovery_rejects_older_file_wal_formats_before_callback()
     let mut v1_called = false;
     let mut v2_called = false;
 
+    assert_eq!(
+        v1.durable_transaction_page_numbers(),
+        Err(
+            FileCommittedPageRecoveryInventoryError::TransactionPageSupportUnavailable {
+                version: 1
+            }
+        )
+    );
+    assert_eq!(
+        v2.durable_transaction_page_numbers(),
+        Err(
+            FileCommittedPageRecoveryInventoryError::TransactionPageSupportUnavailable {
+                version: 2
+            }
+        )
+    );
     let v1_result = <FileCommitLog<0> as ntsql_transaction::DurableTransactionPageRecoverySource<
         0,
     >>::with_durable_page_evidence(&mut v1, page_number, |_, _, _| {

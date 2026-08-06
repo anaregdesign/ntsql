@@ -12,9 +12,9 @@ use ntsql_transaction::{
     DurableCommittedTransactionPageRecoveryComparison,
     DurableCommittedTransactionPageRecoveryComparisonError, DurableTransactionCommitObservation,
     DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
-    DurableTransactionPageObservationBytesError, DurableTransactionPageRecoverySource,
-    TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
-    TransactionPageWriteRecord, TransactionRecoverySource,
+    DurableTransactionPageObservationBytesError, DurableTransactionPageRecoveryInventory,
+    DurableTransactionPageRecoverySource, TransactionCommitRecord, TransactionEpochSource,
+    TransactionId, TransactionPageLog, TransactionPageWriteRecord, TransactionRecoverySource,
     compare_committed_transaction_page_recovery_candidate,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
@@ -763,6 +763,25 @@ impl fmt::Display for InMemoryLogReopenError {
 
 impl Error for InMemoryLogReopenError {}
 
+/// Failure to inventory durable transaction-owned pages in memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryCommittedPageRecoveryInventoryError {
+    /// The owned-page inventory could not reserve its durable-prefix upper bound.
+    PageCapacityExhausted,
+}
+
+impl fmt::Display for InMemoryCommittedPageRecoveryInventoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PageCapacityExhausted => {
+                formatter.write_str("in-memory recovery page inventory capacity is exhausted")
+            }
+        }
+    }
+}
+
+impl Error for InMemoryCommittedPageRecoveryInventoryError {}
+
 /// Projection whose recovery evidence could not reserve memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InMemoryPageRecoveryProjection {
@@ -1056,6 +1075,26 @@ impl<const N: usize> TransactionRecoverySource for InMemoryCommitLog<N> {
             }
         };
         Ok((self.lineage.clone(), lookup))
+    }
+}
+
+impl<const N: usize> DurableTransactionPageRecoveryInventory<N> for InMemoryCommitLog<N> {
+    type Error = InMemoryCommittedPageRecoveryInventoryError;
+
+    fn durable_transaction_page_numbers(&mut self) -> Result<Vec<PageNumber>, Self::Error> {
+        let mut page_numbers = Vec::new();
+        page_numbers
+            .try_reserve(self.durable_len)
+            .map_err(|_| InMemoryCommittedPageRecoveryInventoryError::PageCapacityExhausted)?;
+
+        for record in self.durable_records() {
+            if let Some(page) = record.transaction_page_write() {
+                page_numbers.push(page.page_write().page_number());
+            }
+        }
+        page_numbers.sort_unstable();
+        page_numbers.dedup();
+        Ok(page_numbers)
     }
 }
 
@@ -1480,9 +1519,12 @@ impl<const N: usize> CommittedTransactionPageRecoveryStore<N> for InMemoryPageSt
 mod tests {
     use std::{error::Error, io};
 
+    use ntsql_page::{PageAddress, PageImage};
     use ntsql_transaction::{
-        CoordinatedCommitError, TransactionCoordinator, TransactionLifecycleStatus,
-        TransactionResolutionFailure,
+        CommittedTransactionPageRecoveryError, CommittedTransactionPageRecoveryOutcome,
+        CommittedTransactionPagesRecoveryError, CoordinatedCommitError, TransactionCoordinator,
+        TransactionLifecycleStatus, TransactionResolutionFailure, flush_committed_page,
+        recover_committed_transaction_pages,
     };
     use ntsql_wal::CommitError;
 
@@ -1725,6 +1767,210 @@ mod tests {
                 )
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn batch_recovery_uses_sorted_owned_inventory_stops_and_reruns_fresh()
+    -> Result<(), Box<dyn Error>> {
+        let mut log = InMemoryCommitLog::<1>::new();
+        let mut store = InMemoryPageStore::new(&log);
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+
+        let behind_page_number =
+            PageNumber::new(83).ok_or_else(|| io::Error::other("behind page is zero"))?;
+        let behind_active = coordinator.begin()?;
+        let behind_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), behind_page_number),
+            PageVersion::new(100),
+            PageImage::new([0xA3])?,
+        );
+        let (behind_active, behind_dirty) =
+            coordinator.stage_page_write(behind_active, behind_page, &mut log)?;
+        let behind_commit = coordinator.commit(behind_active, &mut log)?;
+        flush_committed_page(&behind_commit, &mut log, &mut store, behind_dirty)?;
+
+        let first_page =
+            PageNumber::new(81).ok_or_else(|| io::Error::other("first page is zero"))?;
+        let exact_active = coordinator.begin()?;
+        let exact_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), first_page),
+            PageVersion::new(81),
+            PageImage::new([0x81])?,
+        );
+        let (exact_active, exact_dirty) =
+            coordinator.stage_page_write(exact_active, exact_page, &mut log)?;
+        let exact_commit = coordinator.commit(exact_active, &mut log)?;
+        flush_committed_page(&exact_commit, &mut log, &mut store, exact_dirty)?;
+
+        let failed_page =
+            PageNumber::new(82).ok_or_else(|| io::Error::other("failed page is zero"))?;
+        let missing_active = coordinator.begin()?;
+        let missing_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), failed_page),
+            PageVersion::new(82),
+            PageImage::new([0x82])?,
+        );
+        let (missing_active, missing_dirty) =
+            coordinator.stage_page_write(missing_active, missing_page, &mut log)?;
+        coordinator.commit(missing_active, &mut log)?;
+        drop(missing_dirty);
+
+        let latest_active = coordinator.begin()?;
+        let latest_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), behind_page_number),
+            PageVersion::new(1),
+            PageImage::new([0x03])?,
+        );
+        let (latest_active, latest_dirty) =
+            coordinator.stage_page_write(latest_active, latest_page, &mut log)?;
+        coordinator.commit(latest_active, &mut log)?;
+        drop(latest_dirty);
+
+        let uncommitted_active = coordinator.begin()?;
+        let uncommitted_page_number =
+            PageNumber::new(84).ok_or_else(|| io::Error::other("uncommitted page is zero"))?;
+        let uncommitted_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), uncommitted_page_number),
+            PageVersion::new(84),
+            PageImage::new([0x84])?,
+        );
+        let (uncommitted_active, uncommitted_dirty) =
+            coordinator.stage_page_write(uncommitted_active, uncommitted_page, &mut log)?;
+        log.flush_through(uncommitted_dirty.required_position())?;
+        drop(uncommitted_active);
+        drop(uncommitted_dirty);
+
+        let raw_page_number =
+            PageNumber::new(85).ok_or_else(|| io::Error::other("raw page is zero"))?;
+        let raw_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), raw_page_number),
+            PageVersion::new(85),
+            PageImage::new([0x85])?,
+        );
+        let raw_dirty = ntsql_page::stage_page_write(&mut log, raw_page)?;
+        log.flush_through(raw_dirty.required_position())?;
+        drop(raw_dirty);
+
+        let volatile_active = coordinator.begin()?;
+        let volatile_page_number =
+            PageNumber::new(86).ok_or_else(|| io::Error::other("volatile page is zero"))?;
+        let volatile_page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), volatile_page_number),
+            PageVersion::new(86),
+            PageImage::new([0x86])?,
+        );
+        let (volatile_active, volatile_dirty) =
+            coordinator.stage_page_write(volatile_active, volatile_page, &mut log)?;
+        log.arm_fault(FaultPoint::BeforeFlush)?;
+        assert!(matches!(
+            coordinator.commit(volatile_active, &mut log),
+            Err(CoordinatedCommitError::Indeterminate(_))
+        ));
+        drop(volatile_dirty);
+        drop(coordinator);
+
+        assert_eq!(log.records().len(), 12);
+        assert_eq!(log.durable_records().len(), 10);
+        assert_eq!(
+            log.records()[10]
+                .transaction_page_write()
+                .map(|record| record.page_write().page_number()),
+            Some(volatile_page_number)
+        );
+        assert!(log.records()[11].transaction_id().is_some());
+        assert!(log.records()[11].transaction_page_write().is_none());
+        assert_eq!(
+            log.durable_transaction_page_numbers()?,
+            [81, 82, 83, 84]
+                .into_iter()
+                .map(|number| PageNumber::new(number).ok_or_else(|| io::Error::other("page zero")))
+                .collect::<Result<Vec<_>, _>>()?
+        );
+
+        let last_page = behind_page_number;
+        let behind = store
+            .page(last_page)
+            .ok_or_else(|| io::Error::other("behind page disappeared"))?;
+        assert_eq!(behind.page_version(), PageVersion::new(100));
+        assert_eq!(behind.bytes(), &[0xA3]);
+        store.arm_fault(PageStoreFaultPoint::BeforeWrite)?;
+
+        let result = recover_committed_transaction_pages(&mut log, &mut store);
+        let Err(CommittedTransactionPagesRecoveryError::Page {
+            completed,
+            page_number,
+            source: CommittedTransactionPageRecoveryError::StoreWrite { state: write_state },
+        }) = result
+        else {
+            return Err(io::Error::other("batch did not stop at the injected fault").into());
+        };
+        assert_eq!(page_number, failed_page);
+        assert_eq!(completed.pages().len(), 1);
+        assert_eq!(completed.pages()[0].page_number(), first_page);
+        assert_eq!(
+            write_state.as_ref().cause(),
+            &InMemoryCommittedPageRecoveryStoreError::InjectedFault(
+                PageStoreFaultPoint::BeforeWrite
+            )
+        );
+        assert!(store.page(first_page).is_some());
+        assert!(store.page(failed_page).is_none());
+        let behind = store
+            .page(last_page)
+            .ok_or_else(|| io::Error::other("behind page was touched after later-page failure"))?;
+        assert_eq!(behind.page_version(), PageVersion::new(100));
+        assert_eq!(behind.bytes(), &[0xA3]);
+        assert!(store.page(uncommitted_page_number).is_none());
+        assert!(store.page(raw_page_number).is_none());
+        assert!(store.page(volatile_page_number).is_none());
+
+        let rerun = recover_committed_transaction_pages(&mut log, &mut store)?;
+        assert_eq!(
+            rerun
+                .pages()
+                .iter()
+                .map(CommittedTransactionPageRecoveryOutcome::page_number)
+                .collect::<Vec<_>>(),
+            [first_page, failed_page, last_page, uncommitted_page_number]
+        );
+        assert!(matches!(
+            rerun.pages()[0],
+            CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+        ));
+        assert!(matches!(
+            rerun.pages()[1],
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        ));
+        assert!(matches!(
+            rerun.pages()[2],
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        ));
+        assert_eq!(
+            rerun.pages()[3],
+            CommittedTransactionPageRecoveryOutcome::NoCommittedPage {
+                page_number: uncommitted_page_number
+            }
+        );
+        let recovered_behind = store
+            .page(last_page)
+            .ok_or_else(|| io::Error::other("behind page was not recovered"))?;
+        assert_eq!(recovered_behind.page_version(), PageVersion::new(1));
+        assert_eq!(recovered_behind.bytes(), &[0x03]);
+
+        let page_count = store.pages().len();
+        let idempotent = recover_committed_transaction_pages(&mut log, &mut store)?;
+        assert!(idempotent.pages()[..3].iter().all(|outcome| matches!(
+            outcome,
+            CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+        )));
+        assert_eq!(
+            idempotent.pages()[3],
+            CommittedTransactionPageRecoveryOutcome::NoCommittedPage {
+                page_number: uncommitted_page_number
+            }
+        );
+        assert_eq!(store.pages().len(), page_count);
         Ok(())
     }
 }

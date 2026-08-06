@@ -2454,6 +2454,40 @@ where
     })
 }
 
+/// Read-only source of authoritative current page-store snapshots.
+///
+/// This capability exposes no page mutation method. Implementations must return
+/// the current snapshot for the requested page while the shared borrow is held.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableCommittedTransactionPageRecoveryCandidate, DurablePageStoreSnapshotSource,
+/// };
+///
+/// fn cannot_recover_through_snapshot_port<Store, const N: usize>(
+///     store: &mut Store,
+///     candidate: &DurableCommittedTransactionPageRecoveryCandidate<'_, '_, N>,
+/// )
+/// where
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     let _ = store.compare_and_replace(candidate);
+/// }
+/// ```
+pub trait DurablePageStoreSnapshotSource<const N: usize> {
+    /// Adapter-specific current-snapshot observation failure.
+    type ObservationError;
+
+    /// Returns the exact lineage this store protects.
+    fn lineage(&self) -> &LogLineage;
+
+    /// Observes the authoritative current snapshot under store ownership.
+    fn observe_page(
+        &self,
+        page_number: PageNumber,
+    ) -> Result<Option<StoredPageSnapshotObservation<N>>, Self::ObservationError>;
+}
+
 /// Recovery-only page-store port with atomic source recheck and replacement.
 ///
 /// `compare_and_replace` must validate the permit against the candidate, recheck
@@ -2496,20 +2530,11 @@ where
 ///     let _ = store.compare_and_replace(candidate, permit);
 /// }
 /// ```
-pub trait CommittedTransactionPageRecoveryStore<const N: usize> {
-    /// Adapter-specific current-snapshot observation failure.
-    type ObservationError;
+pub trait CommittedTransactionPageRecoveryStore<const N: usize>:
+    DurablePageStoreSnapshotSource<N>
+{
     /// Adapter-specific compare-and-replace failure.
     type WriteError;
-
-    /// Returns the exact lineage this store protects.
-    fn lineage(&self) -> &LogLineage;
-
-    /// Observes the authoritative current snapshot under store ownership.
-    fn observe_page(
-        &self,
-        page_number: PageNumber,
-    ) -> Result<Option<StoredPageSnapshotObservation<N>>, Self::ObservationError>;
 
     /// Atomically rechecks the source and durably replaces it with the target.
     fn compare_and_replace(
@@ -3801,6 +3826,59 @@ where
     }
 }
 
+impl<Source, Store, const N: usize> RestartAnalyzedTransactionPageStorage<Source, Store, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Derives transaction, page-store, and replay-start evidence in one window.
+    ///
+    /// The complete WAL stream is validated before the page store is observed.
+    /// Every snapshot read occurs inside the same stable source callback while a
+    /// shared store borrow excludes safe in-process mutation through this owner.
+    /// The result is inert and grants no replay, publication, or reclamation
+    /// authority.
+    pub fn analyze_current_restart_completeness(
+        &mut self,
+    ) -> Result<
+        DurableTransactionRestartCompletenessAnalysis,
+        DurableTransactionRestartCompletenessError<Source::Error, Store::ObservationError>,
+    > {
+        let source_lineage = self.storage.storage.source.lineage().clone();
+        let store_lineage = self.storage.storage.store.lineage().clone();
+        if !source_lineage.same_lineage(&store_lineage) {
+            return Err(
+                DurableTransactionRestartCompletenessError::LineageMismatch {
+                    source_lineage,
+                    store_lineage,
+                },
+            );
+        }
+
+        let storage = &mut self.storage.storage;
+        let store = &storage.store;
+        match storage
+            .source
+            .with_durable_transaction_restart_observations(
+                |durable_frontier, observations| {
+                    analyze_durable_transaction_restart_completeness_evidence::<
+                        Source::Error,
+                        Store,
+                        N,
+                    >(
+                        &source_lineage,
+                        durable_frontier,
+                        observations,
+                        store,
+                    )
+                },
+            ) {
+            Ok(result) => result,
+            Err(source) => Err(DurableTransactionRestartCompletenessError::Source(source)),
+        }
+    }
+}
+
 /// Fail-closed restart-analysis state that retains the recovered storage pair.
 ///
 /// The unchanged owned prefix provides no meaningful in-place retry, and neither
@@ -4201,6 +4279,659 @@ impl DurableTransactionRestartAnalysis {
         Vec<DurableTransactionRestartEntry>,
     ) {
         (self.lineage, self.durable_frontier, self.transactions)
+    }
+}
+
+/// Latest full page image required by one analyzed durable WAL prefix.
+///
+/// Numeric positions are inert metadata. This value is not a page image, replay
+/// command, write permit, or lineage-bound WAL capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum DurableTransactionRestartRequiredPageImage {
+    /// Latest required image came from the nontransactional page path.
+    Raw {
+        /// Numeric position of the complete raw page image.
+        page_position: u64,
+    },
+    /// Latest required image belongs to a transaction committed in the prefix.
+    CommittedTransaction {
+        /// Persisted owner of the complete page image.
+        transaction: DurableTransactionIdentityObservation,
+        /// Numeric position of the complete transaction-owned page image.
+        page_position: u64,
+        /// Numeric position of the matching durable commit.
+        commit_position: u64,
+    },
+}
+
+impl DurableTransactionRestartRequiredPageImage {
+    /// Returns the exact numeric position of the required full image.
+    #[must_use]
+    pub const fn page_position(&self) -> u64 {
+        match self {
+            Self::Raw { page_position } | Self::CommittedTransaction { page_position, .. } => {
+                *page_position
+            }
+        }
+    }
+
+    /// Returns the persisted transaction owner for a committed image.
+    #[must_use]
+    pub const fn transaction(&self) -> Option<DurableTransactionIdentityObservation> {
+        match self {
+            Self::Raw { .. } => None,
+            Self::CommittedTransaction { transaction, .. } => Some(*transaction),
+        }
+    }
+
+    /// Returns the matching numeric commit position for a committed image.
+    #[must_use]
+    pub const fn commit_position(&self) -> Option<u64> {
+        match self {
+            Self::Raw { .. } => None,
+            Self::CommittedTransaction {
+                commit_position, ..
+            } => Some(*commit_position),
+        }
+    }
+}
+
+/// Point-in-time page-store state relative to the required durable full image.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum DurableTransactionRestartPageState {
+    /// The page has only uncommitted transaction-owned images in this prefix.
+    NoRequiredImage,
+    /// A required durable image exists but no stored snapshot exists.
+    StoreMissing {
+        /// Latest currently required full image.
+        required: DurableTransactionRestartRequiredPageImage,
+    },
+    /// The stored snapshot exactly matches the latest required full image.
+    StoreCurrent {
+        /// Latest currently required full image.
+        required: DurableTransactionRestartRequiredPageImage,
+        /// Numeric WAL position backing the exact stored snapshot.
+        stored_position: u64,
+    },
+    /// The stored snapshot is valid but precedes the latest required full image.
+    StoreBehind {
+        /// Numeric WAL position backing the current stored snapshot.
+        stored_position: u64,
+        /// Later currently required full image.
+        required: DurableTransactionRestartRequiredPageImage,
+    },
+}
+
+impl DurableTransactionRestartPageState {
+    /// Returns the latest required full image, if one exists.
+    #[must_use]
+    pub const fn required_image(&self) -> Option<&DurableTransactionRestartRequiredPageImage> {
+        match self {
+            Self::NoRequiredImage => None,
+            Self::StoreMissing { required }
+            | Self::StoreCurrent { required, .. }
+            | Self::StoreBehind { required, .. } => Some(required),
+        }
+    }
+
+    /// Returns the snapshot's numeric backing position, if one exists.
+    #[must_use]
+    pub const fn stored_position(&self) -> Option<u64> {
+        match self {
+            Self::NoRequiredImage | Self::StoreMissing { .. } => None,
+            Self::StoreCurrent {
+                stored_position, ..
+            }
+            | Self::StoreBehind {
+                stored_position, ..
+            } => Some(*stored_position),
+        }
+    }
+
+    /// Reports whether this page contributes a current dirty-page replay floor.
+    #[must_use]
+    pub const fn is_dirty(&self) -> bool {
+        matches!(self, Self::StoreMissing { .. } | Self::StoreBehind { .. })
+    }
+}
+
+/// Deterministic completeness entry for one page present in the durable WAL.
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::DurableTransactionRestartPageEntry;
+///
+/// fn cannot_create_dirty<const N: usize>(
+///     entry: DurableTransactionRestartPageEntry,
+/// ) -> DirtyPage<N> {
+///     entry.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageNumber;
+/// use ntsql_transaction::{
+///     DurableTransactionRestartPageEntry, DurableTransactionRestartPageState,
+/// };
+///
+/// fn cannot_forge(
+///     page_number: PageNumber,
+///     state: DurableTransactionRestartPageState,
+/// ) -> DurableTransactionRestartPageEntry {
+///     DurableTransactionRestartPageEntry { page_number, state }
+/// }
+/// ```
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct DurableTransactionRestartPageEntry {
+    page_number: PageNumber,
+    state: DurableTransactionRestartPageState,
+}
+
+impl DurableTransactionRestartPageEntry {
+    /// Returns the page classified by this entry.
+    #[must_use]
+    pub const fn page_number(&self) -> PageNumber {
+        self.page_number
+    }
+
+    /// Returns the exact point-in-time page-store classification.
+    pub const fn state(&self) -> &DurableTransactionRestartPageState {
+        &self.state
+    }
+}
+
+/// Deterministic reason an exact position floors a future replay scan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartReplayStartCause {
+    /// A required full image has no current stored snapshot.
+    StoreMissing {
+        /// Dirty page whose required image establishes the floor.
+        page_number: PageNumber,
+    },
+    /// A stored snapshot precedes its required full image.
+    StoreBehind {
+        /// Dirty page whose required image establishes the floor.
+        page_number: PageNumber,
+    },
+    /// A currently uncommitted transaction may commit after this analysis.
+    UncommittedTransaction {
+        /// Persisted transaction whose first owned image establishes the floor.
+        transaction: DurableTransactionIdentityObservation,
+    },
+}
+
+/// Inert lower bound derived for a future restart scan.
+///
+/// No numeric successor is inferred. `AfterFrontier` means a future consumer
+/// would begin with records strictly after the named frontier; `AtPosition`
+/// retains an exact inclusive numeric lower bound. This value grants no replay,
+/// durability, truncation, or reclamation authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum DurableTransactionRestartReplayStart {
+    /// No current dirty page or uncommitted owner requires an earlier record.
+    AfterFrontier {
+        /// Numeric analyzed frontier, or `None` for an empty durable prefix.
+        frontier: Option<u64>,
+    },
+    /// At least one page or uncommitted owner requires an inclusive earlier scan.
+    AtPosition {
+        /// Exact numeric lower bound; no density or successor rule is implied.
+        position: u64,
+        /// Deterministic evidence establishing this minimum.
+        cause: DurableTransactionRestartReplayStartCause,
+    },
+}
+
+impl DurableTransactionRestartReplayStart {
+    /// Returns the analyzed frontier only for the no-earlier-record case.
+    #[must_use]
+    pub const fn frontier(&self) -> Option<u64> {
+        match self {
+            Self::AfterFrontier { frontier } => *frontier,
+            Self::AtPosition { .. } => None,
+        }
+    }
+
+    /// Returns the exact inclusive numeric lower bound, if one is required.
+    #[must_use]
+    pub const fn position(&self) -> Option<u64> {
+        match self {
+            Self::AfterFrontier { .. } => None,
+            Self::AtPosition { position, .. } => Some(*position),
+        }
+    }
+
+    /// Returns the evidence that established an inclusive lower bound.
+    #[must_use]
+    pub const fn cause(&self) -> Option<DurableTransactionRestartReplayStartCause> {
+        match self {
+            Self::AfterFrontier { .. } => None,
+            Self::AtPosition { cause, .. } => Some(*cause),
+        }
+    }
+}
+
+/// One-window transaction and page completeness analysis for a durable prefix.
+///
+/// The value is inert point-in-time evidence. It cannot be constructed outside
+/// the owning operation or converted into recovered storage:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCompletenessAnalysis,
+///     RecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_release_storage<Source, Store, const N: usize>(
+///     analysis: DurableTransactionRestartCompletenessAnalysis,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     analysis.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::DurableTransactionRestartCompletenessAnalysis;
+///
+/// fn cannot_authorize_page_write<'attempt>(
+///     analysis: DurableTransactionRestartCompletenessAnalysis,
+/// ) -> PageWritePermit<'attempt> {
+///     analysis.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::DirtyPage;
+/// use ntsql_transaction::DurableTransactionRestartCompletenessAnalysis;
+///
+/// fn cannot_create_dirty_page<const N: usize>(
+///     analysis: DurableTransactionRestartCompletenessAnalysis,
+/// ) -> DirtyPage<N> {
+///     analysis.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, DurableTransactionRestartCompletenessAnalysis,
+/// };
+///
+/// fn cannot_restore_transaction(
+///     analysis: DurableTransactionRestartCompletenessAnalysis,
+/// ) -> ActiveTransaction {
+///     analysis.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryWritePermit,
+///     DurableTransactionRestartCompletenessAnalysis,
+/// };
+///
+/// fn cannot_authorize_recovery<'attempt>(
+///     analysis: DurableTransactionRestartCompletenessAnalysis,
+/// ) -> CommittedTransactionPageRecoveryWritePermit<'attempt> {
+///     analysis.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointBaselinePublicationReceipt,
+///     DurableTransactionRestartCompletenessAnalysis,
+/// };
+///
+/// fn cannot_authorize_publication(
+///     analysis: DurableTransactionRestartCompletenessAnalysis,
+/// ) -> DurableTransactionRestartCheckpointBaselinePublicationReceipt {
+///     analysis.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartCompletenessAnalysis;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_use_replay_start_as_log_authority<Log: LogDurability>(
+///     log: &mut Log,
+///     analysis: &DurableTransactionRestartCompletenessAnalysis,
+/// ) {
+///     let _ = log.flush_through(analysis.replay_start());
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysis, DurableTransactionRestartCompletenessAnalysis,
+///     DurableTransactionRestartPageEntry, DurableTransactionRestartReplayStart,
+/// };
+///
+/// fn cannot_forge(
+///     transaction_analysis: DurableTransactionRestartAnalysis,
+///     pages: Vec<DurableTransactionRestartPageEntry>,
+///     replay_start: DurableTransactionRestartReplayStart,
+/// ) -> DurableTransactionRestartCompletenessAnalysis {
+///     DurableTransactionRestartCompletenessAnalysis {
+///         transaction_analysis,
+///         pages,
+///         replay_start,
+///     }
+/// }
+/// ```
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct DurableTransactionRestartCompletenessAnalysis {
+    transaction_analysis: DurableTransactionRestartAnalysis,
+    pages: Vec<DurableTransactionRestartPageEntry>,
+    replay_start: DurableTransactionRestartReplayStart,
+}
+
+impl DurableTransactionRestartCompletenessAnalysis {
+    /// Returns transaction metadata derived in the same stable source window.
+    pub const fn transaction_analysis(&self) -> &DurableTransactionRestartAnalysis {
+        &self.transaction_analysis
+    }
+
+    /// Returns page entries in strict numeric page-number order.
+    pub fn pages(&self) -> &[DurableTransactionRestartPageEntry] {
+        &self.pages
+    }
+
+    /// Returns the inert replay lower bound derived from both tables.
+    pub const fn replay_start(&self) -> &DurableTransactionRestartReplayStart {
+        &self.replay_start
+    }
+}
+
+/// Invalid page/store evidence encountered after complete WAL validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCompletenessEvidenceError {
+    /// Existing complete-stream restart analysis rejected the supplied prefix.
+    RestartAnalysis {
+        /// Exact ADR 0034 evidence failure.
+        source: Box<DurableTransactionRestartAnalysisEvidenceError>,
+    },
+    /// The deterministic page-number inventory could not reserve its upper bound.
+    PageInventoryCapacityExhausted {
+        /// Logical record count used as the page-count upper bound.
+        record_count: usize,
+    },
+    /// The output page table could not reserve its exact capacity.
+    PageTableCapacityExhausted {
+        /// Number of distinct WAL pages to classify.
+        page_count: usize,
+    },
+    /// A validated analysis unexpectedly retained a page without a frontier.
+    AnalyzedPageFrontierMissing {
+        /// Page that required a nonempty analyzed prefix.
+        page_number: PageNumber,
+    },
+    /// A transaction-owned page was absent from the validated transaction table.
+    OwnedPageTransactionMissing {
+        /// Page containing the unclassified owned record.
+        page_number: PageNumber,
+        /// Persisted owner missing from the analysis.
+        transaction: DurableTransactionIdentityObservation,
+        /// Numeric position of the owned page record.
+        page_position: u64,
+    },
+    /// A validated uncommitted entry unexpectedly has no owned-page range.
+    UncommittedTransactionPageRangeMissing {
+        /// Persisted uncommitted transaction without a first page position.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// The store returned a snapshot for a different page.
+    UnexpectedSnapshotPage {
+        /// Requested page.
+        expected: PageNumber,
+        /// Page returned by the store.
+        actual: PageNumber,
+    },
+    /// The snapshot position belongs to another WAL lineage.
+    ForeignSnapshotLineage {
+        /// Page whose snapshot was rejected.
+        page_number: PageNumber,
+        /// Foreign snapshot position.
+        position: LogSequenceNumber,
+    },
+    /// The snapshot claims a position beyond the analyzed durable frontier.
+    SnapshotBeyondFrontier {
+        /// Page whose snapshot was rejected.
+        page_number: PageNumber,
+        /// Snapshot position beyond the analyzed prefix.
+        position: u64,
+        /// Numeric durable frontier of the analyzed prefix.
+        frontier: u64,
+    },
+    /// No full-image page record backs the snapshot position in this prefix.
+    SnapshotPositionUnbacked {
+        /// Page whose snapshot was rejected.
+        page_number: PageNumber,
+        /// Unbacked numeric snapshot position.
+        position: u64,
+    },
+    /// Snapshot metadata or bytes contradict its backing WAL image.
+    SnapshotPayloadContradiction {
+        /// Page whose snapshot was rejected.
+        page_number: PageNumber,
+        /// Numeric backing position with contradictory payload.
+        position: u64,
+    },
+    /// The store contains an image whose transaction is still uncommitted.
+    SnapshotBackedByUncommittedTransactionPage {
+        /// Page containing the uncommitted stored image.
+        page_number: PageNumber,
+        /// Persisted owner that remains uncommitted.
+        transaction: DurableTransactionIdentityObservation,
+        /// Numeric position of the stored transaction-owned image.
+        page_position: u64,
+    },
+    /// A valid stored image exists but no required image was retained.
+    RequiredPageImageMissing {
+        /// Page whose required-image derivation contradicted its snapshot.
+        page_number: PageNumber,
+        /// Valid numeric position backing the stored snapshot.
+        stored_position: u64,
+    },
+    /// A valid snapshot appears after the selected latest required image.
+    SnapshotBeyondRequiredImage {
+        /// Page whose ordering contradicted the selected required image.
+        page_number: PageNumber,
+        /// Valid numeric position backing the stored snapshot.
+        stored_position: u64,
+        /// Selected numeric required-image position.
+        required_position: u64,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartCompletenessEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RestartAnalysis { source } => {
+                write!(formatter, "restart analysis failed: {source}")
+            }
+            Self::PageInventoryCapacityExhausted { record_count } => write!(
+                formatter,
+                "restart page inventory capacity is exhausted for {record_count} records"
+            ),
+            Self::PageTableCapacityExhausted { page_count } => write!(
+                formatter,
+                "restart page table capacity is exhausted for {page_count} pages"
+            ),
+            Self::AnalyzedPageFrontierMissing { page_number } => write!(
+                formatter,
+                "page {} is present in restart analysis without a durable frontier",
+                page_number.get()
+            ),
+            Self::OwnedPageTransactionMissing {
+                page_number,
+                transaction,
+                page_position,
+            } => write!(
+                formatter,
+                "page {} owned by transaction {transaction} at position {page_position} is absent from restart analysis",
+                page_number.get()
+            ),
+            Self::UncommittedTransactionPageRangeMissing { transaction } => write!(
+                formatter,
+                "uncommitted transaction {transaction} has no first owned-page position"
+            ),
+            Self::UnexpectedSnapshotPage { expected, actual } => write!(
+                formatter,
+                "expected page {} but page-store observation returned page {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::ForeignSnapshotLineage {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} snapshot position {} belongs to another WAL lineage",
+                page_number.get(),
+                position.get()
+            ),
+            Self::SnapshotBeyondFrontier {
+                page_number,
+                position,
+                frontier,
+            } => write!(
+                formatter,
+                "page {} snapshot position {position} is beyond durable frontier {frontier}",
+                page_number.get()
+            ),
+            Self::SnapshotPositionUnbacked {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} snapshot position {position} has no backing full-image record",
+                page_number.get()
+            ),
+            Self::SnapshotPayloadContradiction {
+                page_number,
+                position,
+            } => write!(
+                formatter,
+                "page {} snapshot payload contradicts WAL position {position}",
+                page_number.get()
+            ),
+            Self::SnapshotBackedByUncommittedTransactionPage {
+                page_number,
+                transaction,
+                page_position,
+            } => write!(
+                formatter,
+                "page {} snapshot at position {page_position} is owned by uncommitted transaction {transaction}",
+                page_number.get()
+            ),
+            Self::RequiredPageImageMissing {
+                page_number,
+                stored_position,
+            } => write!(
+                formatter,
+                "page {} has stored position {stored_position} but no required image",
+                page_number.get()
+            ),
+            Self::SnapshotBeyondRequiredImage {
+                page_number,
+                stored_position,
+                required_position,
+            } => write!(
+                formatter,
+                "page {} stored position {stored_position} is beyond required image {required_position}",
+                page_number.get()
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartCompletenessEvidenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RestartAnalysis { source } => Some(source.as_ref()),
+            Self::PageInventoryCapacityExhausted { .. }
+            | Self::PageTableCapacityExhausted { .. }
+            | Self::AnalyzedPageFrontierMissing { .. }
+            | Self::OwnedPageTransactionMissing { .. }
+            | Self::UncommittedTransactionPageRangeMissing { .. }
+            | Self::UnexpectedSnapshotPage { .. }
+            | Self::ForeignSnapshotLineage { .. }
+            | Self::SnapshotBeyondFrontier { .. }
+            | Self::SnapshotPositionUnbacked { .. }
+            | Self::SnapshotPayloadContradiction { .. }
+            | Self::SnapshotBackedByUncommittedTransactionPage { .. }
+            | Self::RequiredPageImageMissing { .. }
+            | Self::SnapshotBeyondRequiredImage { .. } => None,
+        }
+    }
+}
+
+/// Failure to obtain one stable transaction/page completeness analysis.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCompletenessError<SourceError, StoreError> {
+    /// WAL and page store do not protect one lineage; neither source is observed.
+    LineageMismatch {
+        /// Durable restart source lineage.
+        source_lineage: LogLineage,
+        /// Page-store lineage.
+        store_lineage: LogLineage,
+    },
+    /// The stable durable restart source failed.
+    Source(SourceError),
+    /// One current page-store snapshot could not be observed.
+    StoreObservation {
+        /// Page whose snapshot observation failed.
+        page_number: PageNumber,
+        /// Exact adapter observation failure.
+        source: StoreError,
+    },
+    /// Stable-prefix or page/store evidence was contradictory.
+    Evidence(Box<DurableTransactionRestartCompletenessEvidenceError>),
+}
+
+impl<SourceError: fmt::Display, StoreError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCompletenessError<SourceError, StoreError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LineageMismatch { .. } => formatter.write_str(
+                "restart-analysis source and page snapshot source belong to different lineages",
+            ),
+            Self::Source(source) => write!(formatter, "restart-analysis source failed: {source}"),
+            Self::StoreObservation {
+                page_number,
+                source,
+            } => write!(
+                formatter,
+                "page-store observation for page {} failed: {source}",
+                page_number.get()
+            ),
+            Self::Evidence(source) => {
+                write!(formatter, "restart completeness analysis failed: {source}")
+            }
+        }
+    }
+}
+
+impl<SourceError, StoreError> Error
+    for DurableTransactionRestartCompletenessError<SourceError, StoreError>
+where
+    SourceError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::StoreObservation { source, .. } => Some(source),
+            Self::Evidence(source) => Some(source.as_ref()),
+            Self::LineageMismatch { .. } => None,
+        }
     }
 }
 
@@ -6454,6 +7185,381 @@ where
     }
 }
 
+fn restart_transaction_entry(
+    analysis: &DurableTransactionRestartAnalysis,
+    page_number: PageNumber,
+    transaction: DurableTransactionIdentityObservation,
+    page_position: u64,
+) -> Result<&DurableTransactionRestartEntry, DurableTransactionRestartCompletenessEvidenceError> {
+    analysis
+        .transactions
+        .binary_search_by_key(&transaction, |entry| entry.transaction)
+        .map(|index| &analysis.transactions[index])
+        .map_err(|_| {
+            DurableTransactionRestartCompletenessEvidenceError::OwnedPageTransactionMissing {
+                page_number,
+                transaction,
+                page_position,
+            }
+        })
+}
+
+fn latest_required_restart_page_image<const N: usize>(
+    analysis: &DurableTransactionRestartAnalysis,
+    page_number: PageNumber,
+    observations: &[DurableTransactionRestartObservation<N>],
+) -> Result<
+    Option<DurableTransactionRestartRequiredPageImage>,
+    DurableTransactionRestartCompletenessEvidenceError,
+> {
+    let mut required = None;
+    for observation in observations {
+        match observation {
+            DurableTransactionRestartObservation::Page(observation)
+                if observation.page_number() == page_number =>
+            {
+                required = Some(DurableTransactionRestartRequiredPageImage::Raw {
+                    page_position: observation.position().get(),
+                });
+            }
+            DurableTransactionRestartObservation::TransactionPage(observation)
+                if observation.page().page_number() == page_number =>
+            {
+                let transaction = observation.owner();
+                let page_position = observation.position().get();
+                let entry =
+                    restart_transaction_entry(analysis, page_number, transaction, page_position)?;
+                if let DurableTransactionRestartState::Committed { commit_position } = entry.state()
+                {
+                    required = Some(
+                        DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                            transaction,
+                            page_position,
+                            commit_position: commit_position.get(),
+                        },
+                    );
+                }
+            }
+            DurableTransactionRestartObservation::Page(_)
+            | DurableTransactionRestartObservation::TransactionPage(_)
+            | DurableTransactionRestartObservation::Commit(_) => {}
+        }
+    }
+    Ok(required)
+}
+
+fn snapshot_payload_matches<const N: usize>(
+    snapshot: &StoredPageSnapshotObservation<N>,
+    page_version: PageVersion,
+    bytes: &[u8; N],
+) -> bool {
+    snapshot.page_version() == page_version && snapshot.image().bytes() == bytes
+}
+
+fn validate_restart_page_snapshot<const N: usize>(
+    lineage: &LogLineage,
+    analysis: &DurableTransactionRestartAnalysis,
+    observations: &[DurableTransactionRestartObservation<N>],
+    page_number: PageNumber,
+    snapshot: &StoredPageSnapshotObservation<N>,
+) -> Result<u64, DurableTransactionRestartCompletenessEvidenceError> {
+    if snapshot.page_number() != page_number {
+        return Err(
+            DurableTransactionRestartCompletenessEvidenceError::UnexpectedSnapshotPage {
+                expected: page_number,
+                actual: snapshot.page_number(),
+            },
+        );
+    }
+    if !lineage.same_lineage(snapshot.required_position().lineage()) {
+        return Err(
+            DurableTransactionRestartCompletenessEvidenceError::ForeignSnapshotLineage {
+                page_number,
+                position: snapshot.required_position().clone(),
+            },
+        );
+    }
+
+    let Some(frontier) = analysis.durable_frontier() else {
+        return Err(
+            DurableTransactionRestartCompletenessEvidenceError::AnalyzedPageFrontierMissing {
+                page_number,
+            },
+        );
+    };
+    let position = snapshot.required_position().get();
+    if position > frontier.get() {
+        return Err(
+            DurableTransactionRestartCompletenessEvidenceError::SnapshotBeyondFrontier {
+                page_number,
+                position,
+                frontier: frontier.get(),
+            },
+        );
+    }
+
+    let Ok(index) =
+        observations.binary_search_by_key(&position, |observation| observation.position().get())
+    else {
+        return Err(
+            DurableTransactionRestartCompletenessEvidenceError::SnapshotPositionUnbacked {
+                page_number,
+                position,
+            },
+        );
+    };
+    match &observations[index] {
+        DurableTransactionRestartObservation::Page(observation)
+            if observation.page_number() == page_number =>
+        {
+            if !snapshot_payload_matches(
+                snapshot,
+                observation.page_version(),
+                observation.image().bytes(),
+            ) {
+                return Err(
+                    DurableTransactionRestartCompletenessEvidenceError::SnapshotPayloadContradiction {
+                        page_number,
+                        position,
+                    },
+                );
+            }
+        }
+        DurableTransactionRestartObservation::TransactionPage(observation)
+            if observation.page().page_number() == page_number =>
+        {
+            if !snapshot_payload_matches(
+                snapshot,
+                observation.page().page_version(),
+                observation.page().image().bytes(),
+            ) {
+                return Err(
+                    DurableTransactionRestartCompletenessEvidenceError::SnapshotPayloadContradiction {
+                        page_number,
+                        position,
+                    },
+                );
+            }
+            let transaction = observation.owner();
+            let entry = restart_transaction_entry(analysis, page_number, transaction, position)?;
+            if matches!(entry.state(), DurableTransactionRestartState::Uncommitted) {
+                return Err(
+                    DurableTransactionRestartCompletenessEvidenceError::SnapshotBackedByUncommittedTransactionPage {
+                        page_number,
+                        transaction,
+                        page_position: position,
+                    },
+                );
+            }
+        }
+        DurableTransactionRestartObservation::Page(_)
+        | DurableTransactionRestartObservation::TransactionPage(_)
+        | DurableTransactionRestartObservation::Commit(_) => {
+            return Err(
+                DurableTransactionRestartCompletenessEvidenceError::SnapshotPositionUnbacked {
+                    page_number,
+                    position,
+                },
+            );
+        }
+    }
+    Ok(position)
+}
+
+fn lower_restart_replay_start(
+    current: &mut Option<(u64, DurableTransactionRestartReplayStartCause)>,
+    position: u64,
+    cause: DurableTransactionRestartReplayStartCause,
+) {
+    match current {
+        Some((current_position, _)) if *current_position <= position => {}
+        Some((current_position, current_cause)) => {
+            *current_position = position;
+            *current_cause = cause;
+        }
+        None => *current = Some((position, cause)),
+    }
+}
+
+fn analyze_durable_transaction_restart_completeness_evidence<SourceError, Store, const N: usize>(
+    lineage: &LogLineage,
+    durable_frontier: Option<&LogSequenceNumber>,
+    observations: &[DurableTransactionRestartObservation<N>],
+    store: &Store,
+) -> Result<
+    DurableTransactionRestartCompletenessAnalysis,
+    DurableTransactionRestartCompletenessError<SourceError, Store::ObservationError>,
+>
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    let transaction_analysis =
+        analyze_durable_transaction_restart_evidence(lineage, durable_frontier, observations)
+            .map_err(|source| {
+                DurableTransactionRestartCompletenessError::Evidence(Box::new(
+                    DurableTransactionRestartCompletenessEvidenceError::RestartAnalysis {
+                        source: Box::new(source),
+                    },
+                ))
+            })?;
+
+    let mut page_numbers = Vec::new();
+    page_numbers.try_reserve(observations.len()).map_err(|_| {
+        DurableTransactionRestartCompletenessError::Evidence(Box::new(
+            DurableTransactionRestartCompletenessEvidenceError::PageInventoryCapacityExhausted {
+                record_count: observations.len(),
+            },
+        ))
+    })?;
+    for observation in observations {
+        match observation {
+            DurableTransactionRestartObservation::Page(observation) => {
+                page_numbers.push(observation.page_number());
+            }
+            DurableTransactionRestartObservation::TransactionPage(observation) => {
+                page_numbers.push(observation.page().page_number());
+            }
+            DurableTransactionRestartObservation::Commit(_) => {}
+        }
+    }
+    page_numbers.sort_unstable();
+    page_numbers.dedup();
+
+    let mut pages = Vec::new();
+    pages.try_reserve_exact(page_numbers.len()).map_err(|_| {
+        DurableTransactionRestartCompletenessError::Evidence(Box::new(
+            DurableTransactionRestartCompletenessEvidenceError::PageTableCapacityExhausted {
+                page_count: page_numbers.len(),
+            },
+        ))
+    })?;
+
+    let mut replay_floor = None;
+    for transaction in transaction_analysis.transactions() {
+        if matches!(
+            transaction.state(),
+            DurableTransactionRestartState::Uncommitted
+        ) {
+            let Some(first_position) = transaction.first_owned_page_position() else {
+                return Err(DurableTransactionRestartCompletenessError::Evidence(
+                    Box::new(
+                        DurableTransactionRestartCompletenessEvidenceError::UncommittedTransactionPageRangeMissing {
+                            transaction: transaction.transaction(),
+                        },
+                    ),
+                ));
+            };
+            lower_restart_replay_start(
+                &mut replay_floor,
+                first_position.get(),
+                DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                    transaction: transaction.transaction(),
+                },
+            );
+        }
+    }
+
+    for page_number in page_numbers {
+        let required =
+            latest_required_restart_page_image(&transaction_analysis, page_number, observations)
+                .map_err(|source| {
+                    DurableTransactionRestartCompletenessError::Evidence(Box::new(source))
+                })?;
+        let snapshot = store.observe_page(page_number).map_err(|source| {
+            DurableTransactionRestartCompletenessError::StoreObservation {
+                page_number,
+                source,
+            }
+        })?;
+        let stored_position = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                validate_restart_page_snapshot(
+                    lineage,
+                    &transaction_analysis,
+                    observations,
+                    page_number,
+                    snapshot,
+                )
+            })
+            .transpose()
+            .map_err(|source| {
+                DurableTransactionRestartCompletenessError::Evidence(Box::new(source))
+            })?;
+
+        let state = match (required, stored_position) {
+            (None, None) => DurableTransactionRestartPageState::NoRequiredImage,
+            (None, Some(stored_position)) => {
+                return Err(DurableTransactionRestartCompletenessError::Evidence(
+                    Box::new(
+                        DurableTransactionRestartCompletenessEvidenceError::RequiredPageImageMissing {
+                            page_number,
+                            stored_position,
+                        },
+                    ),
+                ));
+            }
+            (Some(required), None) => {
+                lower_restart_replay_start(
+                    &mut replay_floor,
+                    required.page_position(),
+                    DurableTransactionRestartReplayStartCause::StoreMissing { page_number },
+                );
+                DurableTransactionRestartPageState::StoreMissing { required }
+            }
+            (Some(required), Some(stored_position))
+                if stored_position == required.page_position() =>
+            {
+                DurableTransactionRestartPageState::StoreCurrent {
+                    required,
+                    stored_position,
+                }
+            }
+            (Some(required), Some(stored_position))
+                if stored_position < required.page_position() =>
+            {
+                lower_restart_replay_start(
+                    &mut replay_floor,
+                    required.page_position(),
+                    DurableTransactionRestartReplayStartCause::StoreBehind { page_number },
+                );
+                DurableTransactionRestartPageState::StoreBehind {
+                    stored_position,
+                    required,
+                }
+            }
+            (Some(required), Some(stored_position)) => {
+                return Err(DurableTransactionRestartCompletenessError::Evidence(
+                    Box::new(
+                        DurableTransactionRestartCompletenessEvidenceError::SnapshotBeyondRequiredImage {
+                            page_number,
+                            stored_position,
+                            required_position: required.page_position(),
+                        },
+                    ),
+                ));
+            }
+        };
+        pages.push(DurableTransactionRestartPageEntry { page_number, state });
+    }
+
+    let replay_start = match replay_floor {
+        Some((position, cause)) => {
+            DurableTransactionRestartReplayStart::AtPosition { position, cause }
+        }
+        None => DurableTransactionRestartReplayStart::AfterFrontier {
+            frontier: transaction_analysis
+                .durable_frontier()
+                .map(LogSequenceNumber::get),
+        },
+    };
+    Ok(DurableTransactionRestartCompletenessAnalysis {
+        transaction_analysis,
+        pages,
+        replay_start,
+    })
+}
+
 /// Read-only in-process lifecycle phase recorded by the coordinator.
 ///
 /// This phase is not persistent recovery evidence and deliberately carries no
@@ -8703,9 +9809,8 @@ mod tests {
         }
     }
 
-    impl CommittedTransactionPageRecoveryStore<1> for FakeCommittedPageRecoveryStore {
+    impl DurablePageStoreSnapshotSource<1> for FakeCommittedPageRecoveryStore {
         type ObservationError = FakeFault;
-        type WriteError = FakeFault;
 
         fn lineage(&self) -> &LogLineage {
             &self.lineage
@@ -8721,6 +9826,10 @@ mod tests {
                 None => self.current_observation(),
             }
         }
+    }
+
+    impl CommittedTransactionPageRecoveryStore<1> for FakeCommittedPageRecoveryStore {
+        type WriteError = FakeFault;
 
         fn compare_and_replace(
             &mut self,
@@ -8761,6 +9870,8 @@ mod tests {
     struct FakeBatchCommittedPageRecoveryStore {
         lineage: LogLineage,
         current: Vec<FakeRecoverySnapshot>,
+        observation_fault: Option<(PageNumber, FakeFault)>,
+        observation_override: Option<(PageNumber, FakeRecoverySnapshot)>,
         write_fault: Option<(PageNumber, FakeRecoveryWriteFault)>,
         observations: RefCell<Vec<PageNumber>>,
         attempts: Vec<PageNumber>,
@@ -8771,6 +9882,8 @@ mod tests {
             Self {
                 lineage,
                 current: Vec::new(),
+                observation_fault: None,
+                observation_override: None,
                 write_fault: None,
                 observations: RefCell::new(Vec::new()),
                 attempts: Vec::new(),
@@ -8789,9 +9902,8 @@ mod tests {
         }
     }
 
-    impl CommittedTransactionPageRecoveryStore<1> for FakeBatchCommittedPageRecoveryStore {
+    impl DurablePageStoreSnapshotSource<1> for FakeBatchCommittedPageRecoveryStore {
         type ObservationError = FakeFault;
-        type WriteError = FakeFault;
 
         fn lineage(&self) -> &LogLineage {
             &self.lineage
@@ -8802,8 +9914,22 @@ mod tests {
             page_number: PageNumber,
         ) -> Result<Option<StoredPageSnapshotObservation<1>>, Self::ObservationError> {
             self.observations.borrow_mut().push(page_number);
+            if let Some((fault_page, source)) = self.observation_fault
+                && fault_page == page_number
+            {
+                return Err(source);
+            }
+            if let Some((override_page, snapshot)) = &self.observation_override
+                && *override_page == page_number
+            {
+                return snapshot.observation().map(Some);
+            }
             self.current_observation(page_number)
         }
+    }
+
+    impl CommittedTransactionPageRecoveryStore<1> for FakeBatchCommittedPageRecoveryStore {
+        type WriteError = FakeFault;
 
         fn compare_and_replace(
             &mut self,
@@ -11861,6 +12987,465 @@ mod tests {
             DurableTransactionRestartAnalysisError::Source(FakeFault("restart source"))
         ));
         assert!(Error::source(&failure).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn current_restart_completeness_uses_one_window_and_floors_uncommitted_and_dirty_pages()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let first_committed = durable_identity(91, 1)?;
+        let uncommitted = durable_identity(91, 2)?;
+        let later_committed = durable_identity(91, 3)?;
+        let raw_missing_page = PageNumber::new(10).ok_or(TestError("raw missing page"))?;
+        let later_raw_page = PageNumber::new(30).ok_or(TestError("later raw page"))?;
+        let uncommitted_page = PageNumber::new(40).ok_or(TestError("uncommitted page"))?;
+        let committed_current_page =
+            PageNumber::new(50).ok_or(TestError("committed current page"))?;
+        let observations = vec![
+            restart_owned_page(&lineage, first_committed, later_raw_page.get(), 1)?,
+            restart_commit(&lineage, first_committed, 2)?,
+            restart_owned_page(&lineage, uncommitted, uncommitted_page.get(), 3)?,
+            restart_raw_page(&lineage, later_raw_page.get(), 4)?,
+            restart_owned_page(&lineage, later_committed, committed_current_page.get(), 5)?,
+            restart_commit(&lineage, later_committed, 6)?,
+            restart_raw_page(&lineage, raw_missing_page.get(), 7)?,
+        ];
+        let mut owner =
+            restart_analyzed_checkpoint_owner(&lineage, Some(lineage.position(7)), observations)?;
+        let stored_older_committed = FakeRecoverySnapshot {
+            page_number: later_raw_page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(later_raw_page.get())
+                .map_err(|_| TestError("later raw page byte"))?,
+            page_position: lineage.position(1),
+        };
+        let stored_current_committed = FakeRecoverySnapshot {
+            page_number: committed_current_page,
+            page_version: PageVersion::new(5),
+            byte: u8::try_from(committed_current_page.get())
+                .map_err(|_| TestError("committed current page byte"))?,
+            page_position: lineage.position(5),
+        };
+        owner.parts_mut().1.current = vec![
+            stored_older_committed.clone(),
+            stored_current_committed.clone(),
+        ];
+
+        let completeness = owner
+            .analyze_current_restart_completeness()
+            .map_err(|_| TestError("current restart completeness"))?;
+
+        assert_eq!(
+            completeness
+                .transaction_analysis()
+                .durable_frontier()
+                .map(LogSequenceNumber::get),
+            Some(7)
+        );
+        assert_eq!(completeness.transaction_analysis().transactions().len(), 3);
+        assert_eq!(
+            completeness
+                .pages()
+                .iter()
+                .map(DurableTransactionRestartPageEntry::page_number)
+                .collect::<Vec<_>>(),
+            [
+                raw_missing_page,
+                later_raw_page,
+                uncommitted_page,
+                committed_current_page,
+            ]
+        );
+        assert_eq!(
+            completeness.pages()[0].state(),
+            &DurableTransactionRestartPageState::StoreMissing {
+                required: DurableTransactionRestartRequiredPageImage::Raw { page_position: 7 },
+            }
+        );
+        assert_eq!(
+            completeness.pages()[1].state(),
+            &DurableTransactionRestartPageState::StoreBehind {
+                stored_position: 1,
+                required: DurableTransactionRestartRequiredPageImage::Raw { page_position: 4 },
+            }
+        );
+        assert_eq!(
+            completeness.pages()[2].state(),
+            &DurableTransactionRestartPageState::NoRequiredImage
+        );
+        assert_eq!(
+            completeness.pages()[3].state(),
+            &DurableTransactionRestartPageState::StoreCurrent {
+                required: DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                    transaction: later_committed,
+                    page_position: 5,
+                    commit_position: 6,
+                },
+                stored_position: 5,
+            }
+        );
+        assert_eq!(
+            completeness.replay_start(),
+            &DurableTransactionRestartReplayStart::AtPosition {
+                position: 3,
+                cause: DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                    transaction: uncommitted,
+                },
+            }
+        );
+
+        let (source, store) = owner.parts();
+        assert_eq!(source.restart_callbacks, 2);
+        assert_eq!(
+            store.observations.borrow().as_slice(),
+            &[
+                raw_missing_page,
+                later_raw_page,
+                uncommitted_page,
+                committed_current_page,
+            ]
+        );
+        assert!(store.attempts.is_empty());
+        assert_eq!(
+            store.current,
+            [stored_older_committed, stored_current_committed]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_restart_completeness_handles_empty_and_after_frontier_without_arithmetic()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let mut empty = restart_analyzed_checkpoint_owner(&lineage, None, Vec::new())?;
+        let empty_completeness = empty
+            .analyze_current_restart_completeness()
+            .map_err(|_| TestError("empty restart completeness"))?;
+        assert!(empty_completeness.pages().is_empty());
+        assert!(
+            empty_completeness
+                .transaction_analysis()
+                .transactions()
+                .is_empty()
+        );
+        assert_eq!(
+            empty_completeness.replay_start(),
+            &DurableTransactionRestartReplayStart::AfterFrontier { frontier: None }
+        );
+        assert!(empty.parts().1.observations.borrow().is_empty());
+
+        let commit_only = durable_identity(92, 1)?;
+        let page_number = PageNumber::new(11).ok_or(TestError("current raw page"))?;
+        let observations = vec![
+            restart_raw_page(&lineage, page_number.get(), 1)?,
+            restart_commit(&lineage, commit_only, 2)?,
+        ];
+        let mut current =
+            restart_analyzed_checkpoint_owner(&lineage, Some(lineage.position(2)), observations)?;
+        current.parts_mut().1.current.push(FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(page_number.get())
+                .map_err(|_| TestError("current raw page byte"))?,
+            page_position: lineage.position(1),
+        });
+        let current_completeness = current
+            .analyze_current_restart_completeness()
+            .map_err(|_| TestError("current-page restart completeness"))?;
+        assert_eq!(current_completeness.pages().len(), 1);
+        assert!(matches!(
+            current_completeness.pages()[0].state(),
+            DurableTransactionRestartPageState::StoreCurrent { .. }
+        ));
+        assert_eq!(
+            current_completeness.replay_start(),
+            &DurableTransactionRestartReplayStart::AfterFrontier { frontier: Some(2) }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn current_restart_completeness_preserves_lineage_source_store_and_stream_failures()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(12).ok_or(TestError("failure page"))?;
+        let mut lineage_mismatch = restart_analyzed_checkpoint_owner(&lineage, None, Vec::new())?;
+        lineage_mismatch.parts_mut().1.lineage = LogLineage::new();
+        let mismatch = lineage_mismatch
+            .analyze_current_restart_completeness()
+            .err()
+            .ok_or(TestError("foreign store lineage accepted"))?;
+        assert!(matches!(
+            mismatch,
+            DurableTransactionRestartCompletenessError::LineageMismatch { .. }
+        ));
+        assert_eq!(lineage_mismatch.parts().0.restart_callbacks, 1);
+        assert!(lineage_mismatch.parts().1.observations.borrow().is_empty());
+
+        let mut malformed = restart_analyzed_checkpoint_owner(&lineage, None, Vec::new())?;
+        malformed.parts_mut().0.restart_frontier = Some(lineage.position(1));
+        malformed.parts_mut().0.restart_observations = vec![
+            restart_raw_page(&lineage, page_number.get(), 1)?,
+            restart_raw_page(&lineage, page_number.get(), 1)?,
+        ];
+        let malformed_error = malformed
+            .analyze_current_restart_completeness()
+            .err()
+            .ok_or(TestError("malformed stream reached page store"))?;
+        assert!(matches!(
+            malformed_error,
+            DurableTransactionRestartCompletenessError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCompletenessEvidenceError::RestartAnalysis {
+                        source,
+                    } if matches!(
+                        source.as_ref(),
+                        DurableTransactionRestartAnalysisEvidenceError::DuplicateRecordPosition {
+                            position,
+                            ..
+                        } if position == &lineage.position(1)
+                    )
+                )
+        ));
+        assert!(malformed.parts().1.observations.borrow().is_empty());
+
+        let observations = vec![restart_raw_page(&lineage, page_number.get(), 1)?];
+        let mut store_failure =
+            restart_analyzed_checkpoint_owner(&lineage, Some(lineage.position(1)), observations)?;
+        store_failure.parts_mut().1.observation_fault =
+            Some((page_number, FakeFault("snapshot unavailable")));
+        let store_error = store_failure
+            .analyze_current_restart_completeness()
+            .err()
+            .ok_or(TestError("store observation failure ignored"))?;
+        assert!(matches!(
+            store_error,
+            DurableTransactionRestartCompletenessError::StoreObservation {
+                page_number: actual,
+                source: FakeFault("snapshot unavailable"),
+            } if actual == page_number
+        ));
+        assert!(Error::source(&store_error).is_some());
+
+        store_failure.parts_mut().1.observation_fault = None;
+        store_failure.parts_mut().0.restart_after_callback_error =
+            Some(FakeFault("source after callback"));
+        let source_error = store_failure
+            .analyze_current_restart_completeness()
+            .err()
+            .ok_or(TestError("post-callback source failure ignored"))?;
+        assert!(matches!(
+            source_error,
+            DurableTransactionRestartCompletenessError::Source(FakeFault("source after callback"))
+        ));
+        assert!(Error::source(&source_error).is_some());
+        assert_eq!(
+            store_failure.parts().1.observations.borrow().as_slice(),
+            &[page_number, page_number]
+        );
+        assert!(store_failure.parts().1.attempts.is_empty());
+        Ok(())
+    }
+
+    fn one_page_completeness_owner(
+        lineage: &LogLineage,
+        observations: Vec<DurableTransactionRestartObservation<1>>,
+        frontier: u64,
+        snapshot: FakeRecoverySnapshot,
+    ) -> Result<FakeRestartAnalyzedStorage, TestError> {
+        let mut owner = restart_analyzed_checkpoint_owner(
+            lineage,
+            Some(lineage.position(frontier)),
+            observations,
+        )?;
+        owner.parts_mut().1.current.push(snapshot);
+        Ok(owner)
+    }
+
+    #[test]
+    fn current_restart_completeness_rejects_snapshot_contradictions() -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let page_number = PageNumber::new(13).ok_or(TestError("contradiction page"))?;
+        let other_page = PageNumber::new(14).ok_or(TestError("other contradiction page"))?;
+
+        let mut payload = one_page_completeness_owner(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            1,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(99),
+                byte: 0xFF,
+                page_position: lineage.position(1),
+            },
+        )?;
+        assert!(matches!(
+            payload
+                .analyze_current_restart_completeness()
+                .err(),
+            Some(DurableTransactionRestartCompletenessError::Evidence(source))
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCompletenessEvidenceError::SnapshotPayloadContradiction {
+                        page_number: actual,
+                        position: 1,
+                    } if *actual == page_number
+                )
+        ));
+
+        let commit_only = durable_identity(93, 1)?;
+        let mut unbacked = one_page_completeness_owner(
+            &lineage,
+            vec![
+                restart_raw_page(&lineage, page_number.get(), 1)?,
+                restart_commit(&lineage, commit_only, 2)?,
+            ],
+            2,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(2),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("unbacked page byte"))?,
+                page_position: lineage.position(2),
+            },
+        )?;
+        assert!(matches!(
+            unbacked
+                .analyze_current_restart_completeness()
+                .err(),
+            Some(DurableTransactionRestartCompletenessError::Evidence(source))
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCompletenessEvidenceError::SnapshotPositionUnbacked {
+                        page_number: actual,
+                        position: 2,
+                    } if *actual == page_number
+                )
+        ));
+
+        let mut beyond = one_page_completeness_owner(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            1,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(2),
+                byte: u8::try_from(page_number.get()).map_err(|_| TestError("beyond page byte"))?,
+                page_position: lineage.position(2),
+            },
+        )?;
+        assert!(matches!(
+            beyond
+                .analyze_current_restart_completeness()
+                .err(),
+            Some(DurableTransactionRestartCompletenessError::Evidence(source))
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCompletenessEvidenceError::SnapshotBeyondFrontier {
+                        page_number: actual,
+                        position: 2,
+                        frontier: 1,
+                    } if *actual == page_number
+                )
+        ));
+
+        let mut wrong_page = one_page_completeness_owner(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            1,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("wrong page seed byte"))?,
+                page_position: lineage.position(1),
+            },
+        )?;
+        wrong_page.parts_mut().1.observation_override = Some((
+            page_number,
+            FakeRecoverySnapshot {
+                page_number: other_page,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("wrong page override byte"))?,
+                page_position: lineage.position(1),
+            },
+        ));
+        assert!(matches!(
+            wrong_page
+                .analyze_current_restart_completeness()
+                .err(),
+            Some(DurableTransactionRestartCompletenessError::Evidence(source))
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCompletenessEvidenceError::UnexpectedSnapshotPage {
+                        expected,
+                        actual,
+                    } if *expected == page_number && *actual == other_page
+                )
+        ));
+
+        let foreign = LogLineage::new();
+        let mut foreign_snapshot = one_page_completeness_owner(
+            &lineage,
+            vec![restart_raw_page(&lineage, page_number.get(), 1)?],
+            1,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("foreign page byte"))?,
+                page_position: foreign.position(1),
+            },
+        )?;
+        assert!(matches!(
+            foreign_snapshot
+                .analyze_current_restart_completeness()
+                .err(),
+            Some(DurableTransactionRestartCompletenessError::Evidence(source))
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCompletenessEvidenceError::ForeignSnapshotLineage {
+                        page_number: actual,
+                        ..
+                    } if *actual == page_number
+                )
+        ));
+
+        let uncommitted = durable_identity(93, 2)?;
+        let mut no_steal = one_page_completeness_owner(
+            &lineage,
+            vec![restart_owned_page(
+                &lineage,
+                uncommitted,
+                page_number.get(),
+                1,
+            )?],
+            1,
+            FakeRecoverySnapshot {
+                page_number,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(page_number.get())
+                    .map_err(|_| TestError("uncommitted page byte"))?,
+                page_position: lineage.position(1),
+            },
+        )?;
+        assert!(matches!(
+            no_steal
+                .analyze_current_restart_completeness()
+                .err(),
+            Some(DurableTransactionRestartCompletenessError::Evidence(source))
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCompletenessEvidenceError::SnapshotBackedByUncommittedTransactionPage {
+                        page_number: actual,
+                        transaction,
+                        page_position: 1,
+                    } if *actual == page_number && *transaction == uncommitted
+                )
+        ));
         Ok(())
     }
 

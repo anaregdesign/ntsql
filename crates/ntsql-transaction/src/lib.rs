@@ -3311,6 +3311,243 @@ where
     Ok(CommittedTransactionPagesRecoveryOutcome { pages })
 }
 
+/// Owning startup state that has not completed committed-page recovery.
+///
+/// The source and store remain private until [`Self::recover`] succeeds:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore, DurableTransactionPageRecoveryInventory,
+///     DurableTransactionPageRecoverySource, UnrecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_access_unrecovered<Source, Store, const N: usize>(
+///     mut storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+/// )
+/// where
+///     Source: DurableTransactionPageRecoveryInventory<N>
+///         + DurableTransactionPageRecoverySource<N>,
+///     Store: CommittedTransactionPageRecoveryStore<N>,
+/// {
+///     let _ = storage.parts_mut();
+/// }
+/// ```
+#[must_use = "unrecovered storage must be recovered or dropped"]
+pub struct UnrecoveredTransactionPageStorage<Source, Store, const N: usize> {
+    source: Source,
+    store: Store,
+    page_width: PhantomData<[u8; N]>,
+}
+
+impl<Source, Store, const N: usize> UnrecoveredTransactionPageStorage<Source, Store, N> {
+    /// Takes exclusive ownership of one recovery source and page store.
+    pub fn new(source: Source, store: Store) -> Self {
+        Self {
+            source,
+            store,
+            page_width: PhantomData,
+        }
+    }
+}
+
+impl<Source, Store, const N: usize> UnrecoveredTransactionPageStorage<Source, Store, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    /// Runs one complete deterministic batch and releases access only on success.
+    pub fn recover(
+        mut self,
+    ) -> Result<
+        RecoveredTransactionPageStorage<Source, Store, N>,
+        FailedTransactionPageStorageRecovery<Source, Store, N>,
+    > {
+        match recover_committed_transaction_pages(&mut self.source, &mut self.store) {
+            Ok(report) => Ok(RecoveredTransactionPageStorage {
+                storage: self,
+                report,
+            }),
+            Err(error) => Err(FailedTransactionPageStorageRecovery {
+                storage: self,
+                error,
+            }),
+        }
+    }
+}
+
+/// Owning startup failure that permits only inspection, drop, or a fresh retry.
+///
+/// Neither adapter can escape this state:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPageRecoveryStore, DurableTransactionPageRecoveryInventory,
+///     DurableTransactionPageRecoverySource, FailedTransactionPageStorageRecovery,
+/// };
+///
+/// fn cannot_extract_failed<Source, Store, const N: usize>(
+///     failure: FailedTransactionPageStorageRecovery<Source, Store, N>,
+/// )
+/// where
+///     Source: DurableTransactionPageRecoveryInventory<N>
+///         + DurableTransactionPageRecoverySource<N>,
+///     Store: CommittedTransactionPageRecoveryStore<N>,
+/// {
+///     let _ = failure.into_parts();
+/// }
+/// ```
+#[must_use = "failed recovery must be inspected, retried, or dropped"]
+pub struct FailedTransactionPageStorageRecovery<Source, Store, const N: usize>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+    error: CommittedTransactionPagesRecoveryError<
+        <Source as DurableTransactionPageRecoveryInventory<N>>::Error,
+        <Source as DurableTransactionPageRecoverySource<N>>::Error,
+        Store::ObservationError,
+        Store::WriteError,
+        N,
+    >,
+}
+
+impl<Source, Store, const N: usize> FailedTransactionPageStorageRecovery<Source, Store, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    /// Returns the exact failed batch result without exposing either adapter.
+    #[must_use]
+    pub const fn error(
+        &self,
+    ) -> &CommittedTransactionPagesRecoveryError<
+        <Source as DurableTransactionPageRecoveryInventory<N>>::Error,
+        <Source as DurableTransactionPageRecoverySource<N>>::Error,
+        Store::ObservationError,
+        Store::WriteError,
+        N,
+    > {
+        &self.error
+    }
+
+    /// Consumes the failure and starts a fresh complete batch from inventory.
+    pub fn retry(
+        self,
+    ) -> Result<
+        RecoveredTransactionPageStorage<Source, Store, N>,
+        FailedTransactionPageStorageRecovery<Source, Store, N>,
+    > {
+        self.storage.recover()
+    }
+}
+
+impl<Source, Store, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRecovery<Source, Store, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+    CommittedTransactionPagesRecoveryError<
+        <Source as DurableTransactionPageRecoveryInventory<N>>::Error,
+        <Source as DurableTransactionPageRecoverySource<N>>::Error,
+        Store::ObservationError,
+        Store::WriteError,
+        N,
+    >: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRecovery")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRecovery<Source, Store, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+    CommittedTransactionPagesRecoveryError<
+        <Source as DurableTransactionPageRecoveryInventory<N>>::Error,
+        <Source as DurableTransactionPageRecoverySource<N>>::Error,
+        Store::ObservationError,
+        Store::WriteError,
+        N,
+    >: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction-page storage recovery failed: {}",
+            self.error
+        )
+    }
+}
+
+impl<Source, Store, const N: usize> Error for FailedTransactionPageStorageRecovery<Source, Store, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N> + DurableTransactionPageRecoverySource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+    <Source as DurableTransactionPageRecoveryInventory<N>>::Error: Error + 'static,
+    <Source as DurableTransactionPageRecoverySource<N>>::Error: Error + 'static,
+    Store::ObservationError: Error + 'static,
+    Store::WriteError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Owning startup state released only after complete committed-page recovery.
+///
+/// Its private transition state and report prevent direct construction:
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CommittedTransactionPagesRecoveryOutcome, RecoveredTransactionPageStorage,
+///     UnrecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_forge_recovered<Source, Store, const N: usize>(
+///     source: Source,
+///     store: Store,
+///     report: CommittedTransactionPagesRecoveryOutcome<N>,
+/// ) -> RecoveredTransactionPageStorage<Source, Store, N> {
+///     RecoveredTransactionPageStorage {
+///         storage: UnrecoveredTransactionPageStorage::new(source, store),
+///         report,
+///     }
+/// }
+/// ```
+#[must_use = "recovered storage owns the live source and page store"]
+pub struct RecoveredTransactionPageStorage<Source, Store, const N: usize> {
+    storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
+    report: CommittedTransactionPagesRecoveryOutcome<N>,
+}
+
+impl<Source, Store, const N: usize> RecoveredTransactionPageStorage<Source, Store, N> {
+    /// Returns the exact complete ordered startup recovery report.
+    pub const fn report(&self) -> &CommittedTransactionPagesRecoveryOutcome<N> {
+        &self.report
+    }
+
+    /// Borrows the recovered source and store for read-only inspection.
+    pub const fn parts(&self) -> (&Source, &Store) {
+        (&self.storage.source, &self.storage.store)
+    }
+
+    /// Borrows the recovered source and store for subsequent live operations.
+    pub const fn parts_mut(&mut self) -> (&mut Source, &mut Store) {
+        (&mut self.storage.source, &mut self.storage.store)
+    }
+
+    /// Consumes the recovered state and returns both adapters and startup report.
+    pub fn into_parts(self) -> (Source, Store, CommittedTransactionPagesRecoveryOutcome<N>) {
+        (self.storage.source, self.storage.store, self.report)
+    }
+}
+
 /// Read-only in-process lifecycle phase recorded by the coordinator.
 ///
 /// This phase is not persistent recovery evidence and deliberately carries no
@@ -8493,6 +8730,69 @@ mod tests {
             [first_page, failed_page, failed_page, last_page]
         );
         assert_eq!(store.current.len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn owning_recovery_state_retains_failure_and_releases_parts_only_after_fresh_retry()
+    -> Result<(), TestError> {
+        let lineage = LogLineage::new();
+        let first_page = PageNumber::new(81).ok_or(TestError("first owning page"))?;
+        let failed_page = PageNumber::new(82).ok_or(TestError("failed owning page"))?;
+        let last_page = PageNumber::new(83).ok_or(TestError("last owning page"))?;
+        let source = batch_recovery_source(&lineage, &[81, 82, 83])?;
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        store.write_fault = Some((
+            failed_page,
+            FakeRecoveryWriteFault::Before(FakeFault("batch write")),
+        ));
+
+        let failure = UnrecoveredTransactionPageStorage::new(source, store)
+            .recover()
+            .err()
+            .ok_or(TestError("owning recovery unexpectedly succeeded"))?;
+        let CommittedTransactionPagesRecoveryError::Page {
+            page_number,
+            completed,
+            source: CommittedTransactionPageRecoveryError::StoreWrite { state },
+        } = failure.error()
+        else {
+            return Err(TestError("owning recovery lost exact batch failure"));
+        };
+        assert_eq!(*page_number, failed_page);
+        assert_eq!(completed.pages().len(), 1);
+        assert_eq!(completed.pages()[0].page_number(), first_page);
+        assert_eq!(state.as_ref().cause(), &FakeFault("batch write"));
+        assert!(Error::source(&failure).is_some());
+
+        let mut recovered = failure
+            .retry()
+            .map_err(|_| TestError("fresh owning retry failed"))?;
+        assert_eq!(
+            recovered
+                .report()
+                .pages()
+                .iter()
+                .map(CommittedTransactionPageRecoveryOutcome::page_number)
+                .collect::<Vec<_>>(),
+            [first_page, failed_page, last_page]
+        );
+        assert!(matches!(
+            recovered.report().pages()[0],
+            CommittedTransactionPageRecoveryOutcome::AlreadyCurrent { .. }
+        ));
+        let (source, store) = recovered.parts_mut();
+        assert_eq!(source.inventory_calls, 2);
+        assert_eq!(source.callbacks, 5);
+        assert_eq!(
+            store.attempts,
+            [first_page, failed_page, failed_page, last_page]
+        );
+
+        let (source, store, report) = recovered.into_parts();
+        assert_eq!(source.inventory_calls, 2);
+        assert_eq!(store.current.len(), 3);
+        assert_eq!(report.pages().len(), 3);
         Ok(())
     }
 }

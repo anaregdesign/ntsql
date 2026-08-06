@@ -3460,7 +3460,7 @@ where
                     SelectedTransactionPageStorageRestartCheckpointCompleteness {
                         storage: self,
                         checkpoint_source,
-                        baseline,
+                        baseline: Box::new(baseline),
                     },
                 )
             }
@@ -3750,7 +3750,7 @@ pub struct SelectedTransactionPageStorageRestartCheckpointCompleteness<
 > {
     storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
     checkpoint_source: CheckpointSource,
-    baseline: DurableTransactionRestartCheckpointCompletenessBaseline,
+    baseline: Box<DurableTransactionRestartCheckpointCompletenessBaseline>,
 }
 
 impl<Source, Store, CheckpointSource, const N: usize>
@@ -3796,6 +3796,48 @@ impl<Source, Store, CheckpointSource, const N: usize>
     }
 }
 
+impl<Source, Store, CheckpointSource, const N: usize>
+    SelectedTransactionPageStorageRestartCheckpointCompleteness<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Revalidates the selected checkpoint and owns its exact current replay window.
+    ///
+    /// Planning enters the retained WAL source exactly once. The selected prefix,
+    /// complete current stream, and owned replay observations are all established
+    /// inside that one stable callback. No store write or recovery operation occurs.
+    pub fn plan_replay_window(
+        mut self,
+    ) -> Result<
+        PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+        FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    > {
+        match plan_selected_restart_checkpoint_replay(
+            &mut self.storage.source,
+            &self.storage.store,
+            &self.baseline,
+        ) {
+            Ok(plan) => Ok(PlannedTransactionPageStorageRestartCheckpointReplay {
+                selected: self,
+                current_analysis: plan.current_analysis,
+                replay_observations: plan.replay_observations,
+            }),
+            Err(error) => Err(
+                FailedTransactionPageStorageRestartCheckpointReplayPlanning {
+                    selected: self,
+                    error,
+                },
+            ),
+        }
+    }
+}
+
 impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
     for SelectedTransactionPageStorageRestartCheckpointCompleteness<
         Source,
@@ -3812,6 +3854,663 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
             .field("transaction_count", &self.transaction_count())
             .field("page_count", &self.page_count())
             .finish_non_exhaustive()
+    }
+}
+
+/// Exact replay-window materialization failure inside one stable WAL callback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartCheckpointReplayWindowError {
+    /// The exact replay window could not reserve its complete record count.
+    CapacityExhausted {
+        /// Number of records selected for owned materialization.
+        record_count: usize,
+    },
+    /// An inclusive replay position rederived from the selected checkpoint was absent.
+    InclusiveStartNotRecordBoundary {
+        /// Missing inclusive numeric record position.
+        position: u64,
+    },
+    /// A selected checkpoint frontier was absent from the validated current stream.
+    CheckpointFrontierNotRecordBoundary {
+        /// Missing checkpoint frontier.
+        frontier: u64,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartCheckpointReplayWindowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityExhausted { record_count } => write!(
+                formatter,
+                "restart checkpoint replay window capacity is exhausted for {record_count} records"
+            ),
+            Self::InclusiveStartNotRecordBoundary { position } => write!(
+                formatter,
+                "restart checkpoint replay start {position} is not a current logical record boundary"
+            ),
+            Self::CheckpointFrontierNotRecordBoundary { frontier } => write!(
+                formatter,
+                "restart checkpoint frontier {frontier} is not a current logical record boundary"
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartCheckpointReplayWindowError {}
+
+/// Opaque exact baseline rederived when a retained selected baseline changed.
+///
+/// The complete rederived baseline remains private so a failed plan cannot
+/// release page, replay, or checkpoint evidence. Identifying metadata is exposed
+/// only for diagnosis; the failed owner separately retains the original baseline.
+#[derive(Debug)]
+pub struct DurableTransactionRestartCheckpointReplayBaselineMismatch {
+    rederived: Box<DurableTransactionRestartCheckpointCompletenessBaseline>,
+}
+
+impl DurableTransactionRestartCheckpointReplayBaselineMismatch {
+    /// Returns the persistent lineage identity of the rederived baseline.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.rederived.persistent_log_id()
+    }
+
+    /// Returns the rederived checkpoint frontier.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.rederived.durable_frontier()
+    }
+
+    /// Returns the rederived transaction-entry count.
+    #[must_use]
+    pub fn transaction_count(&self) -> usize {
+        self.rederived.transactions().len()
+    }
+
+    /// Returns the rederived page-entry count.
+    #[must_use]
+    pub fn page_count(&self) -> usize {
+        self.rederived.pages().len()
+    }
+
+    /// Returns the rederived inclusive replay position, when present.
+    #[must_use]
+    pub const fn inclusive_replay_start(&self) -> Option<u64> {
+        self.rederived.replay_start().position()
+    }
+}
+
+impl fmt::Display for DurableTransactionRestartCheckpointReplayBaselineMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "rederived selected checkpoint baseline at frontier {:?} with {} transactions and {} pages differs from retained selection",
+            self.durable_frontier(),
+            self.transaction_count(),
+            self.page_count()
+        )
+    }
+}
+
+impl Error for DurableTransactionRestartCheckpointReplayBaselineMismatch {}
+
+/// Evidence failure while planning one selected checkpoint replay window.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointReplayPlanningEvidenceError<SourceError, StoreError> {
+    /// The privately retained selected baseline no longer matched current evidence.
+    CheckpointRevalidation(
+        Box<
+            DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError<
+                SourceError,
+                StoreError,
+            >,
+        >,
+    ),
+    /// Valid current selected-prefix evidence no longer equals the retained baseline.
+    SelectedBaselineMismatch(DurableTransactionRestartCheckpointReplayBaselineMismatch),
+    /// The complete current durable logical stream was invalid.
+    CurrentAnalysis(Box<DurableTransactionRestartAnalysisEvidenceError>),
+    /// The validated current stream could not form the exact owned replay window.
+    ReplayWindow(DurableTransactionRestartCheckpointReplayWindowError),
+}
+
+impl<SourceError: fmt::Display, StoreError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCheckpointReplayPlanningEvidenceError<SourceError, StoreError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CheckpointRevalidation(source) => {
+                write!(
+                    formatter,
+                    "selected restart checkpoint revalidation failed: {source}"
+                )
+            }
+            Self::SelectedBaselineMismatch(source) => source.fmt(formatter),
+            Self::CurrentAnalysis(source) => {
+                write!(
+                    formatter,
+                    "complete current restart analysis failed: {source}"
+                )
+            }
+            Self::ReplayWindow(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<SourceError, StoreError> Error
+    for DurableTransactionRestartCheckpointReplayPlanningEvidenceError<SourceError, StoreError>
+where
+    SourceError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CheckpointRevalidation(source) => Some(source.as_ref()),
+            Self::SelectedBaselineMismatch(source) => Some(source),
+            Self::CurrentAnalysis(source) => Some(source.as_ref()),
+            Self::ReplayWindow(source) => Some(source),
+        }
+    }
+}
+
+/// Failure to obtain one exact owned replay plan from selected startup storage.
+#[derive(Debug)]
+pub enum DurableTransactionRestartCheckpointReplayPlanningError<SourceError, StoreError> {
+    /// The retained WAL and page store no longer identify one lineage.
+    LineageMismatch {
+        /// Durable restart source lineage.
+        source_lineage: LogLineage,
+        /// Page-store lineage.
+        store_lineage: LogLineage,
+    },
+    /// The WAL source failed before or after its stable callback.
+    Source(SourceError),
+    /// Stable callback evidence failed validation or materialization.
+    Evidence(
+        Box<
+            DurableTransactionRestartCheckpointReplayPlanningEvidenceError<SourceError, StoreError>,
+        >,
+    ),
+}
+
+impl<SourceError: fmt::Display, StoreError: fmt::Display> fmt::Display
+    for DurableTransactionRestartCheckpointReplayPlanningError<SourceError, StoreError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LineageMismatch { .. } => formatter.write_str(
+                "restart replay source and page snapshot source belong to different lineages",
+            ),
+            Self::Source(source) => {
+                write!(formatter, "restart replay planning source failed: {source}")
+            }
+            Self::Evidence(source) => {
+                write!(formatter, "restart replay planning failed: {source}")
+            }
+        }
+    }
+}
+
+impl<SourceError, StoreError> Error
+    for DurableTransactionRestartCheckpointReplayPlanningError<SourceError, StoreError>
+where
+    SourceError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::Evidence(source) => Some(source.as_ref()),
+            Self::LineageMismatch { .. } => None,
+        }
+    }
+}
+
+/// Exact planning error retained by an owning failed replay-planning state.
+pub type TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, const N: usize> =
+    DurableTransactionRestartCheckpointReplayPlanningError<
+        <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+        <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+    >;
+
+/// Owning selected-checkpoint state with one private exact current replay plan.
+///
+/// The plan exposes identifying counts and frontiers only. Its selected baseline,
+/// complete-current analysis, full-image replay observations, adapters, and
+/// checkpoint source remain private.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysis,
+///     PlannedTransactionPageStorageRestartCheckpointReplay,
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness,
+/// };
+///
+/// fn cannot_forge_plan<Source, Store, CheckpointSource, const N: usize>(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+///     current_analysis: DurableTransactionRestartAnalysis,
+/// ) -> PlannedTransactionPageStorageRestartCheckpointReplay<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     N,
+/// > {
+///     PlannedTransactionPageStorageRestartCheckpointReplay {
+///         selected,
+///         current_analysis,
+///         replay_observations: Vec::new(),
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::PlannedTransactionPageStorageRestartCheckpointReplay;
+///
+/// fn cannot_extract_plan<Source, Store, CheckpointSource, const N: usize>(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = planned.replay_observations;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartAnalysis,
+///     PlannedTransactionPageStorageRestartCheckpointReplay,
+/// };
+///
+/// fn cannot_extract_analysis<Source, Store, CheckpointSource, const N: usize>(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> DurableTransactionRestartAnalysis {
+///     planned.current_analysis
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     PlannedTransactionPageStorageRestartCheckpointReplay,
+///     UnrecoveredTransactionPageStorage,
+/// };
+///
+/// fn cannot_substitute_storage<Source, Store, CheckpointSource, const N: usize>(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> UnrecoveredTransactionPageStorage<Source, Store, N> {
+///     planned
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::PageWritePermit;
+/// use ntsql_transaction::PlannedTransactionPageStorageRestartCheckpointReplay;
+///
+/// fn cannot_authorize_page_write<
+///     'attempt,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> PageWritePermit<'attempt> {
+///     planned.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
+///     PlannedTransactionPageStorageRestartCheckpointReplay,
+/// };
+///
+/// fn cannot_authorize_publication<
+///     'attempt,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'attempt> {
+///     planned.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, PlannedTransactionPageStorageRestartCheckpointReplay,
+/// };
+///
+/// fn cannot_restore_transaction<Source, Store, CheckpointSource, const N: usize>(
+///     planned: PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> ActiveTransaction {
+///     planned.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::PlannedTransactionPageStorageRestartCheckpointReplay;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_retain_or_reclaim_log<
+///     Log,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     log: &mut Log,
+///     planned: &PlannedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Log: LogDurability,
+/// {
+///     let _ = log.flush_through(planned);
+/// }
+/// ```
+#[must_use = "planned replay must be retained, explicitly declined, or dropped"]
+pub struct PlannedTransactionPageStorageRestartCheckpointReplay<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    current_analysis: DurableTransactionRestartAnalysis,
+    replay_observations: Vec<OwnedDurableTransactionRestartReplayObservation<N>>,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+{
+    /// Returns the persistent lineage identity retained by the selected checkpoint.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.selected.persistent_log_id()
+    }
+
+    /// Returns the selected checkpoint frontier, or `None` for its empty prefix.
+    #[must_use]
+    pub const fn checkpoint_frontier(&self) -> Option<u64> {
+        self.selected.durable_frontier()
+    }
+
+    /// Returns the complete current durable frontier covered by this replay plan.
+    #[must_use]
+    pub fn current_frontier(&self) -> Option<u64> {
+        self.current_analysis
+            .durable_frontier()
+            .map(LogSequenceNumber::get)
+    }
+
+    /// Returns the inclusive replay position when the selected plan requires one.
+    #[must_use]
+    pub const fn inclusive_replay_start(&self) -> Option<u64> {
+        self.selected.baseline.replay_start().position()
+    }
+
+    /// Returns the exact number of owned logical records in the replay window.
+    #[must_use]
+    pub const fn replay_record_count(&self) -> usize {
+        self.replay_observations.len()
+    }
+
+    /// Returns the number of transactions in the complete-current analysis.
+    #[must_use]
+    pub fn current_transaction_count(&self) -> usize {
+        self.current_analysis.transactions().len()
+    }
+
+    /// Discards the private plan and selected baseline before granting full recovery.
+    pub fn decline_replay_plan(
+        self,
+    ) -> UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N> {
+        let Self {
+            selected,
+            current_analysis: _,
+            replay_observations: _,
+        } = self;
+        selected.decline_checkpoint()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlannedTransactionPageStorageRestartCheckpointReplay")
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("checkpoint_frontier", &self.checkpoint_frontier())
+            .field("current_frontier", &self.current_frontier())
+            .field("inclusive_replay_start", &self.inclusive_replay_start())
+            .field("replay_record_count", &self.replay_record_count())
+            .field(
+                "current_transaction_count",
+                &self.current_transaction_count(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Owning replay-planning failure retaining the exact original selected state.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource, DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartCheckpointReplayPlanning,
+///     SelectedTransactionPageStorageRestartCheckpointCompleteness,
+///     TransactionPageStorageRestartCheckpointReplayPlanningError,
+/// };
+///
+/// fn cannot_forge_failure<Source, Store, CheckpointSource, const N: usize>(
+///     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+///     error: TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>,
+/// ) -> FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     N,
+/// >
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     FailedTransactionPageStorageRestartCheckpointReplayPlanning { selected, error }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource, DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartCheckpointReplayPlanning,
+/// };
+///
+/// fn cannot_extract_error<Source, Store, CheckpointSource, const N: usize>(
+///     failed: FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     let _ = failed.error;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreSnapshotSource, DurableTransactionRestartAnalysisSource,
+///     FailedTransactionPageStorageRestartCheckpointReplayPlanning,
+/// };
+///
+/// fn cannot_retry<Source, Store, CheckpointSource, const N: usize>(
+///     failed: FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>,
+///     Store: DurablePageStoreSnapshotSource<N>,
+/// {
+///     let _ = failed.retry();
+/// }
+/// ```
+#[must_use = "failed replay planning must be inspected, explicitly bypassed, or dropped"]
+pub struct FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    error: TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageRestartCheckpointReplayPlanning<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Returns the exact source, lineage, evidence, boundary, or capacity failure.
+    #[must_use]
+    pub const fn error(
+        &self,
+    ) -> &TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N> {
+        &self.error
+    }
+
+    /// Explicitly bypasses the failed selected plan while returning its exact cause.
+    pub fn continue_with_full_recovery(
+        self,
+    ) -> (
+        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+        TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>,
+    ) {
+        (self.selected.decline_checkpoint(), self.error)
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRestartCheckpointReplayPlanning")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction-page replay planning failed: {}",
+            self.error
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> Error
+    for FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -5396,6 +6095,61 @@ impl<const N: usize> DurableTransactionRestartObservation<N> {
             Self::Page(observation) => observation.position(),
             Self::TransactionPage(observation) => observation.position(),
             Self::Commit(observation) => observation.position(),
+        }
+    }
+}
+
+/// Exact owned logical WAL record retained by one private replay plan.
+///
+/// This mirrors the stable callback observation without widening `Clone` on
+/// page images or source observations. Full fixed-width images are copied so a
+/// later consuming repair transition does not need to re-enter the WAL source.
+#[derive(Debug, Eq, PartialEq)]
+enum OwnedDurableTransactionRestartReplayObservation<const N: usize> {
+    Page {
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: [u8; N],
+        position: LogSequenceNumber,
+    },
+    TransactionPage {
+        transaction: DurableTransactionIdentityObservation,
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: [u8; N],
+        position: LogSequenceNumber,
+    },
+    Commit {
+        transaction: DurableTransactionIdentityObservation,
+        position: LogSequenceNumber,
+    },
+}
+
+impl<const N: usize> From<&DurableTransactionRestartObservation<N>>
+    for OwnedDurableTransactionRestartReplayObservation<N>
+{
+    fn from(observation: &DurableTransactionRestartObservation<N>) -> Self {
+        match observation {
+            DurableTransactionRestartObservation::Page(observation) => Self::Page {
+                page_number: observation.page_number(),
+                page_version: observation.page_version(),
+                bytes: *observation.image().bytes(),
+                position: observation.position().clone(),
+            },
+            DurableTransactionRestartObservation::TransactionPage(observation) => {
+                let page = observation.page();
+                Self::TransactionPage {
+                    transaction: observation.owner(),
+                    page_number: page.page_number(),
+                    page_version: page.page_version(),
+                    bytes: *page.image().bytes(),
+                    position: observation.position().clone(),
+                }
+            }
+            DurableTransactionRestartObservation::Commit(observation) => Self::Commit {
+                transaction: observation.transaction(),
+                position: observation.position().clone(),
+            },
         }
     }
 }
@@ -10256,12 +11010,12 @@ fn compare_restart_checkpoint_completeness_baseline_observation<SourceError, Sto
     Ok(expected)
 }
 
-fn validate_restart_checkpoint_completeness_baseline_evidence<SourceError, Store, const N: usize>(
+fn derive_restart_checkpoint_completeness_baseline_evidence<SourceError, Store, const N: usize>(
     lineage: &LogLineage,
     current_frontier: Option<&LogSequenceNumber>,
     observations: &[DurableTransactionRestartObservation<N>],
     store: &Store,
-    checkpoint: &DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+    checkpoint_frontier: Option<u64>,
 ) -> Result<
     DurableTransactionRestartCheckpointCompletenessBaseline,
     DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError<
@@ -10276,7 +11030,7 @@ where
         lineage,
         current_frontier,
         observations,
-        checkpoint.transactions().durable_frontier(),
+        checkpoint_frontier,
     )
     .map_err(|source| {
         DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::Baseline(
@@ -10300,7 +11054,213 @@ where
         DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::BaselinePreparation,
     )?;
 
+    Ok(expected)
+}
+
+fn validate_restart_checkpoint_completeness_baseline_evidence<SourceError, Store, const N: usize>(
+    lineage: &LogLineage,
+    current_frontier: Option<&LogSequenceNumber>,
+    observations: &[DurableTransactionRestartObservation<N>],
+    store: &Store,
+    checkpoint: &DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+) -> Result<
+    DurableTransactionRestartCheckpointCompletenessBaseline,
+    DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError<
+        SourceError,
+        Store::ObservationError,
+    >,
+>
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    let expected = derive_restart_checkpoint_completeness_baseline_evidence::<SourceError, Store, N>(
+        lineage,
+        current_frontier,
+        observations,
+        store,
+        checkpoint.transactions().durable_frontier(),
+    )?;
+
     compare_restart_checkpoint_completeness_baseline_observation(expected, checkpoint)
+}
+
+struct MaterializedTransactionRestartCheckpointReplay<const N: usize> {
+    current_analysis: DurableTransactionRestartAnalysis,
+    replay_observations: Vec<OwnedDurableTransactionRestartReplayObservation<N>>,
+}
+
+fn select_restart_checkpoint_replay_window<'observations, const N: usize>(
+    observations: &'observations [DurableTransactionRestartObservation<N>],
+    replay_start: &DurableTransactionRestartReplayStart,
+) -> Result<
+    &'observations [DurableTransactionRestartObservation<N>],
+    DurableTransactionRestartCheckpointReplayWindowError,
+> {
+    match replay_start {
+        DurableTransactionRestartReplayStart::AtPosition { position, .. } => {
+            let Some(index) = observations
+                .iter()
+                .position(|observation| observation.position().get() == *position)
+            else {
+                return Err(
+                    DurableTransactionRestartCheckpointReplayWindowError::InclusiveStartNotRecordBoundary {
+                        position: *position,
+                    },
+                );
+            };
+            observations.get(index..).ok_or(
+                DurableTransactionRestartCheckpointReplayWindowError::InclusiveStartNotRecordBoundary {
+                    position: *position,
+                },
+            )
+        }
+        DurableTransactionRestartReplayStart::AfterFrontier { frontier: None } => Ok(observations),
+        DurableTransactionRestartReplayStart::AfterFrontier {
+            frontier: Some(frontier),
+        } => {
+            let Some(index) = observations
+                .iter()
+                .position(|observation| observation.position().get() == *frontier)
+            else {
+                return Err(
+                    DurableTransactionRestartCheckpointReplayWindowError::CheckpointFrontierNotRecordBoundary {
+                        frontier: *frontier,
+                    },
+                );
+            };
+            let Some(start_index) = index.checked_add(1) else {
+                return Err(
+                    DurableTransactionRestartCheckpointReplayWindowError::CheckpointFrontierNotRecordBoundary {
+                        frontier: *frontier,
+                    },
+                );
+            };
+            observations.get(start_index..).ok_or(
+                DurableTransactionRestartCheckpointReplayWindowError::CheckpointFrontierNotRecordBoundary {
+                    frontier: *frontier,
+                },
+            )
+        }
+    }
+}
+
+fn reserve_restart_checkpoint_replay_observations<const N: usize>(
+    replay_observations: &mut Vec<OwnedDurableTransactionRestartReplayObservation<N>>,
+    record_count: usize,
+) -> Result<(), DurableTransactionRestartCheckpointReplayWindowError> {
+    replay_observations
+        .try_reserve_exact(record_count)
+        .map_err(
+            |_| DurableTransactionRestartCheckpointReplayWindowError::CapacityExhausted {
+                record_count,
+            },
+        )
+}
+
+fn plan_selected_restart_checkpoint_replay_evidence<SourceError, Store, const N: usize>(
+    lineage: &LogLineage,
+    current_frontier: Option<&LogSequenceNumber>,
+    observations: &[DurableTransactionRestartObservation<N>],
+    store: &Store,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<
+    MaterializedTransactionRestartCheckpointReplay<N>,
+    DurableTransactionRestartCheckpointReplayPlanningEvidenceError<
+        SourceError,
+        Store::ObservationError,
+    >,
+>
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    let rederived =
+        derive_restart_checkpoint_completeness_baseline_evidence::<SourceError, Store, N>(
+            lineage,
+            current_frontier,
+            observations,
+            store,
+            baseline.durable_frontier(),
+        )
+        .map_err(|source| {
+            DurableTransactionRestartCheckpointReplayPlanningEvidenceError::CheckpointRevalidation(
+                Box::new(source),
+            )
+        })?;
+    if rederived != *baseline {
+        return Err(
+            DurableTransactionRestartCheckpointReplayPlanningEvidenceError::SelectedBaselineMismatch(
+                DurableTransactionRestartCheckpointReplayBaselineMismatch {
+                    rederived: Box::new(rederived),
+                },
+            ),
+        );
+    }
+
+    let current_analysis =
+        analyze_durable_transaction_restart_evidence(lineage, current_frontier, observations)
+            .map_err(|source| {
+                DurableTransactionRestartCheckpointReplayPlanningEvidenceError::CurrentAnalysis(
+                    Box::new(source),
+                )
+            })?;
+
+    let replay_window =
+        select_restart_checkpoint_replay_window(observations, baseline.replay_start()).map_err(
+            DurableTransactionRestartCheckpointReplayPlanningEvidenceError::ReplayWindow,
+        )?;
+    let mut replay_observations = Vec::new();
+    reserve_restart_checkpoint_replay_observations(&mut replay_observations, replay_window.len())
+        .map_err(DurableTransactionRestartCheckpointReplayPlanningEvidenceError::ReplayWindow)?;
+    replay_observations.extend(
+        replay_window
+            .iter()
+            .map(OwnedDurableTransactionRestartReplayObservation::from),
+    );
+
+    Ok(MaterializedTransactionRestartCheckpointReplay {
+        current_analysis,
+        replay_observations,
+    })
+}
+
+fn plan_selected_restart_checkpoint_replay<Source, Store, const N: usize>(
+    source: &mut Source,
+    store: &Store,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<
+    MaterializedTransactionRestartCheckpointReplay<N>,
+    DurableTransactionRestartCheckpointReplayPlanningError<Source::Error, Store::ObservationError>,
+>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    let lineage = source.lineage().clone();
+    let store_lineage = store.lineage().clone();
+    if !lineage.same_lineage(&store_lineage) {
+        return Err(
+            DurableTransactionRestartCheckpointReplayPlanningError::LineageMismatch {
+                source_lineage: lineage,
+                store_lineage,
+            },
+        );
+    }
+
+    match source.with_durable_transaction_restart_observations(|current_frontier, observations| {
+        plan_selected_restart_checkpoint_replay_evidence::<Source::Error, Store, N>(
+            &lineage,
+            current_frontier,
+            observations,
+            store,
+            baseline,
+        )
+    }) {
+        Ok(Ok(plan)) => Ok(plan),
+        Ok(Err(source)) => {
+            Err(DurableTransactionRestartCheckpointReplayPlanningError::Evidence(Box::new(source)))
+        }
+        Err(source) => Err(DurableTransactionRestartCheckpointReplayPlanningError::Source(source)),
+    }
 }
 
 fn validate_restart_checkpoint_completeness_baseline_against_current_prefix<
@@ -13535,6 +14495,12 @@ mod tests {
         restart_observations: Vec<DurableTransactionRestartObservation<1>>,
         restart_before_callback_error: Option<FakeFault>,
         restart_after_callback_error: Option<FakeFault>,
+        restart_before_callback_error_on_callback: Option<(usize, FakeFault)>,
+        restart_after_callback_error_on_callback: Option<(usize, FakeFault)>,
+        restart_replacement_after_callback: Option<(
+            Option<LogSequenceNumber>,
+            Vec<DurableTransactionRestartObservation<1>>,
+        )>,
         restart_callbacks: usize,
         restart_events: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
@@ -13569,6 +14535,9 @@ mod tests {
                 restart_observations: Vec::new(),
                 restart_before_callback_error: None,
                 restart_after_callback_error: None,
+                restart_before_callback_error_on_callback: None,
+                restart_after_callback_error_on_callback: None,
+                restart_replacement_after_callback: None,
                 restart_callbacks: 0,
                 restart_events: None,
             }
@@ -13607,15 +14576,42 @@ mod tests {
             if let Some(source) = self.restart_before_callback_error.take() {
                 return Err(source);
             }
+            let callback = self
+                .restart_callbacks
+                .checked_add(1)
+                .ok_or(FakeFault("restart callback count exhausted"))?;
+            if matches!(
+                self.restart_before_callback_error_on_callback,
+                Some((scheduled, _)) if scheduled == callback
+            ) {
+                let Some((_, source)) = self.restart_before_callback_error_on_callback.take()
+                else {
+                    return Err(FakeFault("scheduled restart source failure disappeared"));
+                };
+                return Err(source);
+            }
             if let Some(events) = &self.restart_events {
                 events.borrow_mut().push("wal");
             }
-            self.restart_callbacks += 1;
+            self.restart_callbacks = callback;
             let output = operation(self.restart_frontier.as_ref(), &self.restart_observations);
-            match self.restart_after_callback_error.take() {
-                Some(source) => Err(source),
-                None => Ok(output),
+            if let Some((frontier, observations)) = self.restart_replacement_after_callback.take() {
+                self.restart_frontier = frontier;
+                self.restart_observations = observations;
             }
+            if matches!(
+                self.restart_after_callback_error_on_callback,
+                Some((scheduled, _)) if scheduled == callback
+            ) {
+                let Some((_, source)) = self.restart_after_callback_error_on_callback.take() else {
+                    return Err(FakeFault("scheduled restart source failure disappeared"));
+                };
+                return Err(source);
+            }
+            if let Some(source) = self.restart_after_callback_error.take() {
+                return Err(source);
+            }
+            Ok(output)
         }
     }
 
@@ -13770,6 +14766,7 @@ mod tests {
         observation_override: Option<(PageNumber, FakeRecoverySnapshot)>,
         write_fault: Option<(PageNumber, FakeRecoveryWriteFault)>,
         observations: RefCell<Vec<PageNumber>>,
+        observation_fault_on_attempt: Option<(usize, PageNumber, FakeFault)>,
         attempts: Vec<PageNumber>,
     }
 
@@ -13782,6 +14779,7 @@ mod tests {
                 observation_override: None,
                 write_fault: None,
                 observations: RefCell::new(Vec::new()),
+                observation_fault_on_attempt: None,
                 attempts: Vec::new(),
             }
         }
@@ -13810,6 +14808,17 @@ mod tests {
             page_number: PageNumber,
         ) -> Result<Option<StoredPageSnapshotObservation<1>>, Self::ObservationError> {
             self.observations.borrow_mut().push(page_number);
+            let observation_attempt = self.observations.borrow().len();
+            if matches!(
+                self.observation_fault_on_attempt,
+                Some((scheduled, fault_page, _))
+                    if scheduled == observation_attempt && fault_page == page_number
+            ) {
+                let Some((_, _, source)) = self.observation_fault_on_attempt else {
+                    return Err(FakeFault("scheduled store observation failure disappeared"));
+                };
+                return Err(source);
+            }
             if let Some((fault_page, source)) = self.observation_fault
                 && fault_page == page_number
             {
@@ -19316,6 +20325,62 @@ mod tests {
         }
     }
 
+    type FakeSelectedRestartCheckpoint =
+        SelectedTransactionPageStorageRestartCheckpointCompleteness<
+            FakeDurablePageRecoverySource,
+            FakeBatchCommittedPageRecoveryStore,
+            FakeCompletenessCheckpointSource,
+            1,
+        >;
+
+    fn fake_restart_source(
+        lineage: &LogLineage,
+        durable_frontier: Option<LogSequenceNumber>,
+        observations: Vec<DurableTransactionRestartObservation<1>>,
+    ) -> FakeDurablePageRecoverySource {
+        let mut source =
+            FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
+        source.restart_frontier = durable_frontier;
+        source.restart_observations = observations;
+        source
+    }
+
+    fn fake_completeness_baseline(
+        lineage: &LogLineage,
+        durable_frontier: Option<LogSequenceNumber>,
+        observations: Vec<DurableTransactionRestartObservation<1>>,
+        snapshots: Vec<FakeRecoverySnapshot>,
+    ) -> Result<DurableTransactionRestartCheckpointCompletenessBaseline, TestError> {
+        let mut owner = restart_analyzed_checkpoint_owner(lineage, durable_frontier, observations)?;
+        owner.parts_mut().1.current = snapshots;
+        owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("prepare fake completeness baseline"))
+    }
+
+    fn select_fake_restart_checkpoint(
+        source: FakeDurablePageRecoverySource,
+        store: FakeBatchCommittedPageRecoveryStore,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> Result<FakeSelectedRestartCheckpoint, TestError> {
+        let checkpoint = FakeCompletenessCheckpointSource::new(Some(
+            owned_decoded_completeness_checkpoint(baseline),
+        ));
+        match UnrecoveredTransactionPageStorage::new(source, store)
+            .select_restart_checkpoint_completeness(checkpoint)
+        {
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) => {
+                Ok(selected)
+            }
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(_) => {
+                Err(TestError("fake replay checkpoint was absent"))
+            }
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(_) => {
+                Err(TestError("fake replay checkpoint was rejected"))
+            }
+        }
+    }
+
     struct FakeCompletenessCheckpointPublisher {
         checkpoint: Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
         publication_fault: Option<FakeCheckpointPublicationFault>,
@@ -21252,5 +22317,456 @@ mod tests {
         assert_eq!(analysis.durable_frontier(), Some(&lineage.position(4)));
         assert!(store.attempts.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn selected_checkpoint_replay_planning_materializes_every_start_shape() -> Result<(), TestError>
+    {
+        let persistent_log_id =
+            PersistentLogId::new(0x1610).ok_or(TestError("replay persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let empty_baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+
+        let empty_selected = select_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        let empty = empty_selected
+            .plan_replay_window()
+            .map_err(|_| TestError("empty replay planning failed"))?;
+        assert_eq!(empty.checkpoint_frontier(), None);
+        assert_eq!(empty.current_frontier(), None);
+        assert_eq!(empty.inclusive_replay_start(), None);
+        assert_eq!(empty.replay_record_count(), 0);
+        assert_eq!(empty.current_transaction_count(), 0);
+        assert!(empty.replay_observations.is_empty());
+
+        let transaction = durable_identity(161, 1)?;
+        let full_stream = vec![
+            restart_raw_page(&lineage, 91, 1)?,
+            restart_owned_page(&lineage, transaction, 92, 3)?,
+            restart_commit(&lineage, transaction, 4)?,
+        ];
+        let expected_full_stream = full_stream
+            .iter()
+            .map(OwnedDurableTransactionRestartReplayObservation::from)
+            .collect::<Vec<_>>();
+        let full_selected = select_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(4)), full_stream),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        let full = full_selected
+            .plan_replay_window()
+            .map_err(|_| TestError("full-stream replay planning failed"))?;
+        assert_eq!(full.checkpoint_frontier(), None);
+        assert_eq!(full.current_frontier(), Some(4));
+        assert_eq!(full.replay_record_count(), 3);
+        assert_eq!(full.current_transaction_count(), 1);
+        assert_eq!(full.replay_observations, expected_full_stream);
+        assert_eq!(full.selected.storage.source.restart_callbacks, 2);
+        assert_eq!(full.selected.checkpoint_source.calls, 1);
+        let analyzed = full
+            .decline_replay_plan()
+            .recover()
+            .map_err(|_| TestError("full-stream fallback recovery failed"))?
+            .analyze_restart()
+            .map_err(|_| TestError("full-stream fallback analysis failed"))?;
+        let (source, store, _, analysis, checkpoint) = analyzed.into_parts();
+        assert_eq!(source.restart_callbacks, 3);
+        assert_eq!(analysis.durable_frontier(), Some(&lineage.position(4)));
+        assert!(store.attempts.is_empty());
+        assert_eq!(checkpoint.calls, 1);
+
+        let committed = durable_identity(161, 2)?;
+        let committed_page =
+            PageNumber::new(93).ok_or(TestError("committed replay page number"))?;
+        let committed_snapshot = FakeRecoverySnapshot {
+            page_number: committed_page,
+            page_version: PageVersion::new(1),
+            byte: 93,
+            page_position: lineage.position(1),
+        };
+        let committed_baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_owned_page(&lineage, committed, committed_page.get(), 1)?,
+                restart_commit(&lineage, committed, 2)?,
+            ],
+            vec![committed_snapshot.clone()],
+        )?;
+        assert_eq!(
+            committed_baseline.replay_start(),
+            &DurableTransactionRestartReplayStart::AfterFrontier { frontier: Some(2) }
+        );
+
+        let exact_selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(2)),
+                vec![
+                    restart_owned_page(&lineage, committed, committed_page.get(), 1)?,
+                    restart_commit(&lineage, committed, 2)?,
+                ],
+            ),
+            {
+                let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+                store.current.push(committed_snapshot.clone());
+                store
+            },
+            &committed_baseline,
+        )?;
+        let exact = exact_selected
+            .plan_replay_window()
+            .map_err(|_| TestError("exact-frontier replay planning failed"))?;
+        assert_eq!(exact.checkpoint_frontier(), Some(2));
+        assert_eq!(exact.current_frontier(), Some(2));
+        assert_eq!(exact.replay_record_count(), 0);
+        assert!(exact.replay_observations.is_empty());
+
+        let suffix = restart_raw_page(&lineage, 94, 4)?;
+        let expected_suffix = OwnedDurableTransactionRestartReplayObservation::from(&suffix);
+        let suffix_selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(4)),
+                vec![
+                    restart_owned_page(&lineage, committed, committed_page.get(), 1)?,
+                    restart_commit(&lineage, committed, 2)?,
+                    suffix,
+                ],
+            ),
+            {
+                let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+                store.current.push(committed_snapshot);
+                store
+            },
+            &committed_baseline,
+        )?;
+        let suffix = suffix_selected
+            .plan_replay_window()
+            .map_err(|_| TestError("suffix replay planning failed"))?;
+        assert_eq!(suffix.checkpoint_frontier(), Some(2));
+        assert_eq!(suffix.current_frontier(), Some(4));
+        assert_eq!(suffix.inclusive_replay_start(), None);
+        assert_eq!(suffix.replay_observations, [expected_suffix]);
+        assert_eq!(
+            suffix
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [committed_page, committed_page]
+        );
+        assert!(suffix.selected.storage.store.attempts.is_empty());
+
+        let uncommitted = durable_identity(161, 3)?;
+        let inclusive_baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_owned_page(&lineage, uncommitted, 95, 1)?,
+                restart_raw_page(&lineage, 96, 2)?,
+            ],
+            Vec::new(),
+        )?;
+        assert_eq!(inclusive_baseline.replay_start().position(), Some(1));
+        let inclusive_stream = vec![
+            restart_owned_page(&lineage, uncommitted, 95, 1)?,
+            restart_raw_page(&lineage, 96, 2)?,
+            restart_commit(&lineage, uncommitted, 4)?,
+        ];
+        let expected_inclusive = inclusive_stream
+            .iter()
+            .map(OwnedDurableTransactionRestartReplayObservation::from)
+            .collect::<Vec<_>>();
+        let inclusive_selected = select_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(4)), inclusive_stream),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &inclusive_baseline,
+        )?;
+        let inclusive = inclusive_selected
+            .plan_replay_window()
+            .map_err(|_| TestError("inclusive replay planning failed"))?;
+        assert_eq!(inclusive.checkpoint_frontier(), Some(2));
+        assert_eq!(inclusive.current_frontier(), Some(4));
+        assert_eq!(inclusive.inclusive_replay_start(), Some(1));
+        assert_eq!(inclusive.replay_record_count(), 3);
+        assert_eq!(inclusive.current_transaction_count(), 1);
+        assert_eq!(inclusive.replay_observations, expected_inclusive);
+        assert_eq!(inclusive.selected.storage.source.restart_callbacks, 2);
+        assert_eq!(inclusive.selected.checkpoint_source.calls, 1);
+        assert_eq!(
+            inclusive.selected.storage.store.observations.borrow().len(),
+            4
+        );
+        assert!(inclusive.selected.storage.store.attempts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_checkpoint_replay_planning_fails_closed_by_exact_stage() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1611).ok_or(TestError("failure persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let committed = durable_identity(162, 1)?;
+        let page_number = PageNumber::new(97).ok_or(TestError("failure page number"))?;
+        let snapshot = FakeRecoverySnapshot {
+            page_number,
+            page_version: PageVersion::new(1),
+            byte: 97,
+            page_position: lineage.position(1),
+        };
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_owned_page(&lineage, committed, page_number.get(), 1)?,
+                restart_commit(&lineage, committed, 2)?,
+            ],
+            vec![snapshot.clone()],
+        )?;
+
+        let malformed_selected = select_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(4)),
+                vec![
+                    restart_owned_page(&lineage, committed, page_number.get(), 1)?,
+                    restart_commit(&lineage, committed, 2)?,
+                    restart_commit(&lineage, committed, 4)?,
+                ],
+            ),
+            {
+                let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+                store.current.push(snapshot.clone());
+                store
+            },
+            &baseline,
+        )?;
+        let malformed = malformed_selected
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("malformed suffix produced a replay plan"))?;
+        assert!(matches!(
+            malformed.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointReplayPlanningEvidenceError::CurrentAnalysis(
+                        current
+                    ) if matches!(
+                        current.as_ref(),
+                        DurableTransactionRestartAnalysisEvidenceError::DuplicateCommit {
+                            transaction,
+                            first_commit_position,
+                            duplicate_commit_position,
+                        } if *transaction == committed
+                            && first_commit_position == &lineage.position(2)
+                            && duplicate_commit_position == &lineage.position(4)
+                    )
+                )
+        ));
+        assert_eq!(
+            Error::source(&malformed).map(ToString::to_string),
+            Some(String::from(
+                "restart replay planning failed: complete current restart analysis failed: transaction 162:1 has duplicate commits at positions 2 and 4"
+            ))
+        );
+        let (uncheckpointed, malformed_error) = malformed.continue_with_full_recovery();
+        assert!(matches!(
+            malformed_error,
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(_)
+        ));
+        let recovered = uncheckpointed
+            .recover()
+            .map_err(|_| TestError("malformed fallback recovery failed"))?;
+        assert!(matches!(
+            recovered.analyze_restart().err(),
+            Some(
+                FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint {
+                    storage: FailedTransactionPageStorageRestartAnalysis {
+                        error: DurableTransactionRestartAnalysisError::Evidence(_),
+                        ..
+                    },
+                    ..
+                }
+            )
+        ));
+
+        let raw_baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, 98, 1)?],
+            Vec::new(),
+        )?;
+        let mut changing_source = fake_restart_source(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, 98, 1)?],
+        );
+        changing_source.restart_replacement_after_callback = Some((
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, 99, 1)?],
+        ));
+        let changed_selected = select_fake_restart_checkpoint(
+            changing_source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &raw_baseline,
+        )?;
+        let changed = changed_selected
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("changed selected prefix produced a replay plan"))?;
+        assert!(matches!(
+            changed.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointReplayPlanningEvidenceError::SelectedBaselineMismatch(
+                        mismatch
+                    ) if mismatch.durable_frontier() == Some(1)
+                        && mismatch.page_count() == 1
+                        && mismatch.inclusive_replay_start() == Some(1)
+                )
+        ));
+        assert_eq!(changed.selected.storage.source.restart_callbacks, 2);
+        assert_eq!(changed.selected.checkpoint_source.calls, 1);
+
+        let mut store_fault_source = fake_restart_source(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, 98, 1)?],
+        );
+        store_fault_source.restart_events = Some(Rc::new(RefCell::new(Vec::new())));
+        let mut store_fault = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        let raw_page = PageNumber::new(98).ok_or(TestError("raw failure page"))?;
+        store_fault.observation_fault_on_attempt =
+            Some((2, raw_page, FakeFault("planned store observation")));
+        let store_selected =
+            select_fake_restart_checkpoint(store_fault_source, store_fault, &raw_baseline)?;
+        let store_failed = store_selected
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("planned store failure produced success"))?;
+        assert!(matches!(
+            store_failed.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointReplayPlanningEvidenceError::CheckpointRevalidation(
+                        revalidation
+                    ) if matches!(
+                        revalidation.as_ref(),
+                        DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError::CompletenessEvidence(
+                            completeness
+                        ) if matches!(
+                            completeness.as_ref(),
+                            DurableTransactionRestartCompletenessError::StoreObservation {
+                                page_number,
+                                source: FakeFault("planned store observation"),
+                            } if *page_number == raw_page
+                        )
+                    )
+                )
+        ));
+        assert_eq!(
+            store_failed
+                .selected
+                .storage
+                .store
+                .observations
+                .borrow()
+                .as_slice(),
+            [raw_page, raw_page]
+        );
+        assert!(store_failed.selected.storage.store.attempts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn selected_checkpoint_replay_planning_preserves_callback_source_failures_and_fallback()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1612).ok_or(TestError("source persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+
+        for (after_callback, expected_callbacks) in [(false, 1), (true, 2)] {
+            let mut source = fake_restart_source(&lineage, None, Vec::new());
+            if after_callback {
+                source.restart_after_callback_error_on_callback =
+                    Some((2, FakeFault("planning source after callback")));
+            } else {
+                source.restart_before_callback_error_on_callback =
+                    Some((2, FakeFault("planning source before callback")));
+            }
+            let selected = select_fake_restart_checkpoint(
+                source,
+                FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+                &baseline,
+            )?;
+            let failed = selected.plan_replay_window().err().ok_or(TestError(
+                "scheduled planning source failure became success",
+            ))?;
+            let expected = if after_callback {
+                FakeFault("planning source after callback")
+            } else {
+                FakeFault("planning source before callback")
+            };
+            assert!(matches!(
+                failed.error(),
+                DurableTransactionRestartCheckpointReplayPlanningError::Source(actual)
+                    if *actual == expected
+            ));
+            assert_eq!(
+                Error::source(&failed).map(ToString::to_string),
+                Some(format!("restart replay planning source failed: {expected}"))
+            );
+            assert_eq!(
+                failed.selected.storage.source.restart_callbacks,
+                expected_callbacks
+            );
+            assert_eq!(failed.selected.checkpoint_source.calls, 1);
+
+            let (uncheckpointed, error) = failed.continue_with_full_recovery();
+            assert!(matches!(
+                error,
+                DurableTransactionRestartCheckpointReplayPlanningError::Source(actual)
+                    if actual == expected
+            ));
+            let analyzed = uncheckpointed
+                .recover()
+                .map_err(|_| TestError("source-failed fallback recovery failed"))?
+                .analyze_restart()
+                .map_err(|_| TestError("source-failed fallback analysis failed"))?;
+            let (source, store, report, analysis, checkpoint) = analyzed.into_parts();
+            assert_eq!(source.restart_callbacks, expected_callbacks + 1);
+            assert!(store.attempts.is_empty());
+            assert!(report.pages().is_empty());
+            assert_eq!(analysis.durable_frontier(), None);
+            assert_eq!(checkpoint.calls, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn replay_window_capacity_failure_is_typed_without_allocating_records() {
+        let mut replay_observations: Vec<OwnedDurableTransactionRestartReplayObservation<1>> =
+            Vec::new();
+
+        assert_eq!(
+            reserve_restart_checkpoint_replay_observations(&mut replay_observations, usize::MAX),
+            Err(
+                DurableTransactionRestartCheckpointReplayWindowError::CapacityExhausted {
+                    record_count: usize::MAX
+                }
+            )
+        );
+        assert!(replay_observations.is_empty());
     }
 }

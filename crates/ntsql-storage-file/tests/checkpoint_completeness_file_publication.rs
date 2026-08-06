@@ -222,6 +222,104 @@ fn pre_recovery_selection_accepts_missing_page_then_retains_slot_through_full_re
 }
 
 #[test]
+fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("selected-replay-plan")?;
+    let persistent_log_id = persistent_log_id(16101)?;
+    let mut owner = analyzed_owner(directory.path(), persistent_log_id)?;
+    let checkpoint_page = 161_u64;
+    let suffix_page = 162_u64;
+    append_committed_page(&mut owner, checkpoint_page, 1, [0x16, 0x11])?;
+    let baseline = owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+    let checkpoint_frontier = baseline
+        .durable_frontier()
+        .ok_or_else(|| io::Error::other("filesystem replay checkpoint frontier is empty"))?;
+    assert_eq!(baseline.replay_start().position(), None);
+
+    let slot_path = directory.path().join("completeness");
+    let mut checkpoint =
+        FileRestartCheckpointCompletenessBaselineSource::create_new(&slot_path, persistent_log_id)?;
+    let receipt = owner
+        .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut checkpoint)?;
+    assert_eq!(receipt.durable_frontier(), Some(checkpoint_frontier));
+    append_committed_page_without_store_flush(&mut owner, suffix_page, 2, [0x16, 0x12])?;
+    let current_frontier = owner
+        .parts()
+        .0
+        .durable_position()
+        .ok_or_else(|| io::Error::other("filesystem replay suffix is not durable"))?;
+    assert!(current_frontier.get() > checkpoint_frontier);
+    drop(owner);
+    drop(checkpoint);
+
+    let opened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        directory.path().join("wal.bin"),
+        directory.path().join("pages.bin"),
+        &slot_path,
+    )?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let selection = opened.select_restart_checkpoint_completeness();
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        selection
+    else {
+        return Err(io::Error::other("filesystem replay checkpoint was not selected").into());
+    };
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+
+    let planned = selected.plan_replay_window()?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert_eq!(planned.persistent_log_id(), persistent_log_id);
+    assert_eq!(planned.checkpoint_frontier(), Some(checkpoint_frontier));
+    assert_eq!(planned.current_frontier(), Some(current_frontier.get()));
+    assert_eq!(planned.inclusive_replay_start(), None);
+    assert_eq!(planned.replay_record_count(), 2);
+    assert_eq!(planned.current_transaction_count(), 2);
+
+    let uncheckpointed = planned.decline_replay_plan();
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let recovered = uncheckpointed.recover()?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert!(recovered.recovery_report().pages().iter().any(|page| {
+        matches!(
+            page,
+            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
+        ) && page.page_number().get() == suffix_page
+    }));
+    let analyzed = recovered.analyze_restart()?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert_eq!(
+        analyzed
+            .restart_analysis()
+            .durable_frontier()
+            .map(ntsql_wal::LogSequenceNumber::get),
+        Some(current_frontier.get())
+    );
+
+    let (log, store, _, _, checkpoint) = analyzed.into_parts();
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let suffix_page =
+        PageNumber::new(suffix_page).ok_or_else(|| io::Error::other("suffix page is zero"))?;
+    let stored = store
+        .page(suffix_page)
+        .ok_or_else(|| io::Error::other("planned suffix was not recovered"))?;
+    assert_eq!(stored.page_version(), PageVersion::new(2));
+    assert_eq!(stored.bytes(), &[0x16, 0x12]);
+    assert_eq!(checkpoint.persistent_log_id(), persistent_log_id);
+    drop((log, store, checkpoint));
+
+    drop(FileCommitLog::<2>::open_transaction_page_capable(
+        directory.path().join("wal.bin"),
+    )?);
+    drop(FilePageStore::<2>::open(
+        directory.path().join("pages.bin"),
+    )?);
+    drop(FileRestartCheckpointCompletenessBaselineSource::open(
+        &slot_path,
+    )?);
+    Ok(())
+}
+
+#[test]
 fn published_completeness_validates_after_safe_suffix_and_rejects_advanced_selected_page()
 -> Result<(), Box<dyn Error>> {
     let directory = TestDirectory::new("stale-suffix")?;

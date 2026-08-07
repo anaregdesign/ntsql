@@ -5,7 +5,7 @@
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
   ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014, ADR 0015, ADR 0016,
-  ADR 0017, ADR 0018, ADR 0019, ADR 0020, ADR 0061, ADR 0062
+  ADR 0017, ADR 0018, ADR 0019, ADR 0020, ADR 0061, ADR 0062, ADR 0063
 
 ## Context
 
@@ -102,11 +102,12 @@ adapter graphs remain unchanged.
 
 `ntsql-database` owns only repository-authored logical database identity,
 required file-role identity, exact composition comparison, lifecycle generation,
-and staged database ownership. It depends only on `ntsql-wal` for the existing
-`PersistentLogId` invariant. It owns no paths, handles, locks, bytes, codec,
-recovery effect, global identity allocator, or client diagnostic. Memory and
-filesystem adapters may depend inward on this boundary; the database domain
-never depends back on either adapter.
+validated manifest lifecycle/format/feature requirements, and staged database
+ownership. It depends only on `ntsql-wal` for the existing `PersistentLogId`
+invariant. It owns no paths, handles, locks, bytes, codec, recovery effect,
+global identity allocator, or client diagnostic. Memory and filesystem adapters
+may depend inward on this boundary; the database domain never depends back on
+either adapter.
 
 `ntsql-wal` owns the I/O-free ordering invariant that a commit record is
 appended and its exact assigned position is flushed before a durable
@@ -145,7 +146,10 @@ versioned ntsql-specific transaction/page WAL and page-store bytes plus
 synchronous file barriers, implements transaction and page domain ports, and
 depends inward on their three owning crates. It holds a standard-library
 advisory exclusive lock on each open file but owns no SQL Server file format,
-client diagnostic, or domain policy. No domain crate may depend on it.
+client diagnostic, or domain policy. It also owns the pure fixed database
+manifest codec; decoding returns only a validated inert `ntsql-database` value
+and performs no file I/O or authority transition. No domain crate may depend on
+it.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and
@@ -190,9 +194,11 @@ catch-all package solely to avoid an explicit dependency.
   canonical seeds and compare concrete durable observations with model state.
 - `ntsql-database` unit tests validate nonzero identities, exact successor
   generations, complete distinct file-role sets, stable exact-composition
-  mismatches, and fail-closed staged selection/binding. Compile-fail tests reject
-  identity construction, owner extraction, cloning staged owners, and promotion
-  to live authority.
+  mismatches, manifest requirements, successor regression, and fail-closed staged
+  selection/binding. Compile-fail tests reject identity construction, owner
+  extraction, cloning staged owners, and promotion to live authority. Filesystem
+  adapter tests exhaust every manifest field and boundary through a pure-memory
+  golden codec.
 - `ntsql-page` tests prove exact WAL-before-page call ordering, lineage
   rejection before either port call, and terminal store-write ambiguity.
   Compile-fail tests reject construction of the private write permit and clean

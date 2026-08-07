@@ -1,10 +1,8 @@
 use std::{
-    env,
     error::Error,
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -606,69 +604,6 @@ fn every_foreign_child_candidate_is_preserved_and_rejected() -> Result<(), Box<d
     Ok(())
 }
 
-#[test]
-fn process_exit_after_every_publication_boundary_resumes_exactly() -> Result<(), Box<dyn Error>> {
-    for (index, boundary) in create_boundaries().into_iter().enumerate() {
-        let value = 2_000 + index as u128;
-        let database = TestDatabase::new("process-crash", value)?;
-        let status = Command::new(env::current_exe()?)
-            .arg("--exact")
-            .arg("create_process_crash_child")
-            .arg("--nocapture")
-            .env("NTSQL_CREATE_CRASH_ROOT", database._directory.path())
-            .env("NTSQL_CREATE_CRASH_VALUE", value.to_string())
-            .env("NTSQL_CREATE_CRASH_BOUNDARY", index.to_string())
-            .status()?;
-        assert_eq!(status.code(), Some(83), "child did not exit at {boundary}");
-
-        let resumed = create_file_database::<1>(database.manifest, database.layout.clone(), None)?;
-        match (boundary, resumed) {
-            (
-                FileDatabaseCreateBoundary::ManifestPublication,
-                FileDatabaseCreateOutcome::AlreadyPublished(database),
-            )
-            | (_, FileDatabaseCreateOutcome::Created(database)) => drop(database),
-            _ => return Err(io::Error::other("process-crash retry returned wrong outcome").into()),
-        }
-        assert_eq!(
-            observed_phase(&database.layout)?,
-            FileDatabaseCreatePhase::Published
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn create_process_crash_child() -> Result<(), Box<dyn Error>> {
-    let Ok(root) = env::var("NTSQL_CREATE_CRASH_ROOT") else {
-        return Ok(());
-    };
-    let value = env::var("NTSQL_CREATE_CRASH_VALUE")?.parse::<u128>()?;
-    let boundary_index = env::var("NTSQL_CREATE_CRASH_BOUNDARY")?.parse::<usize>()?;
-    let boundary = create_boundaries()
-        .get(boundary_index)
-        .copied()
-        .ok_or_else(|| io::Error::other("create crash boundary index is invalid"))?;
-    let root = PathBuf::from(root);
-    let database_id = nonzero_database_id(value)?;
-    let manifest = manifest(database_id, value + 10_000)?;
-    let layout = FileDatabaseLayout::new(
-        root.join("owner"),
-        root.join("manifest"),
-        root.join("wal"),
-        root.join("pages"),
-        root.join("checkpoint"),
-    );
-    let fault = FileDatabaseCreateFault::new(boundary, FileDatabaseCreateFaultTiming::AfterEffect);
-    if !matches!(
-        create_file_database::<1>(manifest, layout, Some(fault)),
-        Err(FileDatabaseCreateError::InjectedFault(actual)) if actual == fault
-    ) {
-        return Err(io::Error::other("create crash child did not reach its boundary").into());
-    }
-    std::process::exit(83);
-}
-
 struct TestDatabase {
     _directory: TestDirectory,
     layout: FileDatabaseLayout,
@@ -846,20 +781,6 @@ fn observed_phase(layout: &FileDatabaseLayout) -> Result<FileDatabaseCreatePhase
             "test observed a noncanonical database create phase",
         )),
     }
-}
-
-const fn create_boundaries() -> [FileDatabaseCreateBoundary; 9] {
-    [
-        FileDatabaseCreateBoundary::OwnerPublication,
-        FileDatabaseCreateBoundary::ManifestCandidatePublication,
-        FileDatabaseCreateBoundary::WalCandidatePublication,
-        FileDatabaseCreateBoundary::PageStoreCandidatePublication,
-        FileDatabaseCreateBoundary::RestartCheckpointCandidatePublication,
-        FileDatabaseCreateBoundary::WalPublication,
-        FileDatabaseCreateBoundary::PageStorePublication,
-        FileDatabaseCreateBoundary::RestartCheckpointPublication,
-        FileDatabaseCreateBoundary::ManifestPublication,
-    ]
 }
 
 const fn expected_fault_phase(

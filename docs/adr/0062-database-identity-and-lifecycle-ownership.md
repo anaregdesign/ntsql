@@ -5,6 +5,7 @@
 - Issue: #181
 - Extends: ADR 0001, ADR 0012, ADR 0058, ADR 0061
 - Extended by: ADR 0063, ADR 0064
+- Amended by: #184
 
 ## Context
 
@@ -71,10 +72,18 @@ typed errors. Input order has no meaning; accessors return the stable role order
 listed above.
 
 The composition also binds one `DatabaseId`, one lifecycle generation, and one
-`PersistentLogId`. Exact comparison checks database, lifecycle generation, each
-file role in stable order, and persistent WAL identity. It returns the first
+`PersistentLogId`. Full logical comparison checks database, lifecycle generation,
+each file role in stable order, and persistent WAL identity. It returns the first
 typed contradiction. The value contains no path, descriptor, lock, manifest
 bytes, checksum, decoded frame, or authority.
+
+Issue #184 separates that logical composition from the stable identity that child
+headers can physically report. `DatabaseStorageIdentity` projects the database
+ID, persistent WAL ID, and exact role-bound file IDs while deliberately excluding
+`DatabaseLifecycleGeneration`. `DatabaseFileHeaderIdentity` is the per-child
+database-ID, role, and file-ID projection. Lifecycle generation is a manifest
+publication coordinate: an adjacent manifest successor may advance it without
+rewriting otherwise unchanged child storage.
 
 ## Staged Ownership
 
@@ -99,8 +108,9 @@ This issue publicly permits only:
 
 - `UnboundDatabase -> ManifestSelectedDatabase` after the requested database ID
   matches; and
-- `ManifestSelectedDatabase -> RecoveryRequiredDatabase` after exact composition
-  comparison.
+- `ManifestSelectedDatabase -> RecoveryRequiredDatabase` after the selected
+  composition's stable-storage projection exactly matches observations supplied
+  by the retained adapter owner.
 
 There is deliberately no public transition from recovery-required to live, live
 to close-pending, closed to drop-pending, or drop-pending to dropped. Issues
@@ -111,10 +121,11 @@ independently assembled resource set cannot invoke those transitions.
 
 ## Failure and Authority Boundary
 
-Identity-set validation, generation validation, manifest selection, and exact
-composition binding return typed errors. They do not panic, silently normalize,
-choose a fallback database, substitute a role, skip a generation, or return a
-success-shaped owner.
+Identity-set validation, generation validation, manifest selection, stable
+storage binding, and full logical-composition comparison return typed errors.
+They do not panic, silently normalize, choose a fallback database, substitute a
+role, skip a generation, copy manifest generation into an alleged physical
+observation, or return a success-shaped owner.
 
 The generic owner is an opaque value retained by typestate; this crate does not
 claim that an arbitrary caller-supplied value is a filesystem lock. Issue #183
@@ -156,8 +167,11 @@ claim.
   and exhaustion independently.
 - Composition tests accept arbitrary input order and reject missing/duplicate
   roles and duplicate file identities.
-- Exact comparison tests cover every database, generation, role, and WAL-lineage
-  mismatch in stable order.
+- Full logical-comparison tests cover every database, generation, role, and
+  WAL-lineage mismatch in stable order.
+- Stable-storage tests cover database, role-bound file, and WAL-lineage mismatch
+  independently and prove that adjacent manifest generations bind the same
+  unchanged physical child identities.
 - Staged tests prove foreign manifest and child composition evidence retain the
   prior owner for exact retry.
 - Compile-fail tests reject scalar field construction, staged-owner cloning,

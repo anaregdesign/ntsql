@@ -52,6 +52,34 @@ fn successful_acquisition_contends_and_releases_on_owner_drop() -> Result<(), Bo
 }
 
 #[test]
+fn exact_acquisition_reaches_recovery_required_across_manifest_generations()
+-> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new(6, 106)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    let opened = composition.acquire_recovery_required(&slot, composition.manifest)?;
+    assert_eq!(
+        opened.identity(),
+        composition.manifest.composition_identity()
+    );
+    assert_eq!(opened.stage(), DatabaseLifecycleStage::RecoveryRequired);
+    assert!(slot.is_owned());
+    drop(opened);
+
+    let successor = composition.manifest.next_recovery_required()?;
+    let reopened = composition.acquire_recovery_required(&slot, successor)?;
+    assert_eq!(reopened.identity(), successor.composition_identity());
+    assert_eq!(
+        reopened.identity().storage_identity(),
+        composition
+            .manifest
+            .composition_identity()
+            .storage_identity()
+    );
+    Ok(())
+}
+
+#[test]
 fn world_guards_every_database_object_across_distinct_owner_slots() -> Result<(), Box<dyn Error>> {
     let composition = TestComposition::new(11, 111)?;
     let mut world = InMemoryDatabaseOwnershipWorld::new();
@@ -383,6 +411,22 @@ impl TestComposition {
             self.database_id,
             self.manifest_object_id,
             self.manifest,
+            &self.files,
+        )
+    }
+
+    fn acquire_recovery_required(
+        &self,
+        slot: &InMemoryDatabaseOwnershipSlot,
+        manifest: DatabaseManifest,
+    ) -> Result<
+        ntsql_storage_memory::RecoveryRequiredInMemoryDatabase,
+        InMemoryDatabaseOwnershipError,
+    > {
+        slot.try_acquire_recovery_required(
+            self.database_id,
+            self.manifest_object_id,
+            manifest,
             &self.files,
         )
     }

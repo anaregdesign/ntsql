@@ -62,7 +62,7 @@ pub use database_ownership::{
     InMemoryDatabaseFileObservation, InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole,
     InMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSelection,
     InMemoryDatabaseOwnershipSlot, InMemoryDatabaseOwnershipSlotError,
-    InMemoryDatabaseOwnershipWorld,
+    InMemoryDatabaseOwnershipWorld, RecoveryRequiredInMemoryDatabase,
 };
 
 /// One-shot physical-effect boundary for the next matching log operation.

@@ -74,6 +74,28 @@
 //! Open recovery truncates an incomplete final owned-page group to its kind `6`
 //! offset; a complete malformed or interrupted group is corruption.
 //!
+//! ## Database child formats
+//!
+//! Database-aware creation uses one common 48-byte child identity extension:
+//! `NTSQCFI1`, version `1`, length `48`, exact role at byte `12`, reserved
+//! `13..16`, nonzero database ID at `16..32`, and nonzero file ID at `32..48`.
+//! Lifecycle generation is intentionally absent because it belongs to manifest
+//! publication rather than immutable child identity. Each enclosing header
+//! checksum protects the extension.
+//!
+//! WAL V5 has a 192-byte header. It preserves V4 recovery-coordinate geometry
+//! through byte `119`, uses byte `76` to distinguish initial zeroed coordinates
+//! from present reclamation metadata, reserves `120..128`, stores the child
+//! extension at `128..176`, reserves `176..184`, and checksums `0..184` into
+//! `184..192`. Reclamation remains V5, advances its independent WAL generation,
+//! and preserves the child extension. Frames retain V3 encoding.
+//!
+//! Page-store V2 has a 128-byte header. It preserves V1 lineage and page-width
+//! fields, reserves `40..64`, stores the child extension at `64..112`, reserves
+//! `112..120`, and checksums `0..120` into `120..128`. Snapshot frames retain V1
+//! encoding. Completeness-control V2 uses the same 128-byte extension/reserved/
+//! checksum geometry and preserves its V1 slot-publication protocol.
+//!
 //! ## Checksum
 //!
 //! The v1/v2/v3 checksum is an ntsql-owned, deterministic, non-cryptographic
@@ -135,9 +157,10 @@
 //! control file and the selected manifest. The owner control is the stable
 //! cooperative lock across later manifest-inode replacement. Opened child
 //! adapters validate exact manifest format and lineage requirements while
-//! retaining their complete unrecovered state. Successful open returns a private
-//! manifest-selected wrapper retaining every lock; exact-composition authority
-//! remains withheld until successor child headers persist every manifest ID.
+//! retaining their complete unrecovered state. The legacy-compatible opener
+//! returns a private manifest-selected wrapper. The successor-only exact opener
+//! additionally validates each physically parsed child identity and returns
+//! recovery-required authority while retaining every lock.
 //!
 //! ## Filesystem restart checkpoint baseline source
 //!
@@ -159,13 +182,14 @@
 //! transaction-only slot above, and the transaction-only adapter never reads
 //! its entries.
 //!
-//! The two namespaces are distinguished by independent 64-byte control magic:
+//! The two namespaces are distinguished by independent control magic:
 //! the transaction-only slot's `control` starts with `NTSQCKS1`, while the
-//! completeness slot's `control` starts with `NTSQCMS1`. Both share the exact
-//! same reviewed control geometry — version `1`, header length `64`, zero
-//! flags, a nonzero persistent log ID, reserved zero bytes, and the final
-//! checksum — so opening one slot type as the other fails at the control
-//! header magic even when the optional `current` entry is absent.
+//! completeness slot's `control` starts with `NTSQCMS1`. Legacy creation uses
+//! version `1`, header length `64`, zero flags, a nonzero persistent log ID,
+//! reserved zero bytes, and the final checksum. Database-aware completeness
+//! creation uses the V2 geometry described above. Opening one slot type as the
+//! other fails at the control header magic even when the optional `current`
+//! entry is absent.
 //!
 //! Inside the completeness slot the selected `current` entry holds only
 //! `NTSQCMP1` bytes and the fixed unselected `candidate` entry holds only
@@ -184,6 +208,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ntsql_database::{DatabaseFileHeaderIdentity, DatabaseStorageIdentity};
 use ntsql_page::{
     DurablePageWalObservation, PageLog, PageNumber, PageRecoveryObservationBytesError, PageVersion,
     StoredPageSnapshotObservation, UnloggedPage,
@@ -216,6 +241,7 @@ use ntsql_transaction::{
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
+mod database_child_identity_codec;
 mod database_manifest_codec;
 mod database_ownership;
 mod restart_checkpoint_codec;
@@ -223,6 +249,9 @@ mod restart_checkpoint_completeness_codec;
 mod restart_checkpoint_completeness_file;
 mod restart_checkpoint_file;
 
+pub use database_child_identity_codec::{
+    DatabaseChildIdentityDecodeError, DatabaseChildIdentityDecodeErrorReason,
+};
 pub use database_manifest_codec::{
     DATABASE_MANIFEST_V1_LENGTH, DatabaseManifestDecodeError, decode_database_manifest,
     encode_database_manifest,
@@ -231,7 +260,8 @@ pub use database_ownership::{
     DATABASE_OWNER_CONTROL_V1_LENGTH, DatabaseOwnerControlDecodeError, FileDatabaseLayout,
     FileDatabaseLockRole, FileDatabaseOwnership, FileDatabaseOwnershipIoError,
     FileDatabaseOwnershipIoStage, FileDatabaseOwnershipOpenError, FileDatabaseOwnershipSelection,
-    decode_database_owner_control, encode_database_owner_control, open_file_database_ownership,
+    RecoveryRequiredFileDatabase, decode_database_owner_control, encode_database_owner_control,
+    open_file_database_ownership, open_recovery_required_file_database,
 };
 pub use restart_checkpoint_codec::{
     RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,
@@ -276,6 +306,7 @@ const FORMAT_VERSION_V1: u16 = 1;
 const FORMAT_VERSION_V2: u16 = 2;
 const FORMAT_VERSION_V3: u16 = 3;
 const FORMAT_VERSION_V4: u16 = 4;
+const FORMAT_VERSION_V5: u16 = 5;
 const HEADER_LENGTH: usize = 64;
 const HEADER_LENGTH_U16: u16 = 64;
 const HEADER_LENGTH_U64: u64 = 64;
@@ -299,6 +330,13 @@ const HEADER_V4_ANCHOR_VALUE_OFFSET: usize = 80;
 const HEADER_V4_RESERVED_START: usize = 76;
 const HEADER_V4_RESERVED_MIDDLE: usize = 96;
 const HEADER_V4_CHECKSUM_OFFSET: usize = 120;
+const HEADER_V5_LENGTH: usize = 192;
+const HEADER_V5_LENGTH_U16: u16 = 192;
+const HEADER_V5_LENGTH_U64: u64 = 192;
+const HEADER_V5_RECLAMATION_PRESENCE_OFFSET: usize = 76;
+const HEADER_V5_IDENTITY_OFFSET: usize = 128;
+const HEADER_V5_RESERVED_END: usize = 184;
+const HEADER_V5_CHECKSUM_OFFSET: usize = 184;
 const FRAME_CHECKSUM_OFFSET: usize = 48;
 #[cfg(test)]
 const FRAME_CHECKSUM_OFFSET_U64: u64 = 48;
@@ -313,6 +351,7 @@ enum LogFormat {
     V2,
     V3,
     V4,
+    V5,
 }
 
 impl LogFormat {
@@ -322,12 +361,13 @@ impl LogFormat {
             Self::V2 => FORMAT_VERSION_V2,
             Self::V3 => FORMAT_VERSION_V3,
             Self::V4 => FORMAT_VERSION_V4,
+            Self::V5 => FORMAT_VERSION_V5,
         }
     }
 
     const fn frame_version(self) -> u16 {
         match self {
-            Self::V4 => FORMAT_VERSION_V3,
+            Self::V4 | Self::V5 => FORMAT_VERSION_V3,
             Self::V1 | Self::V2 | Self::V3 => self.version(),
         }
     }
@@ -335,12 +375,12 @@ impl LogFormat {
     const fn supports_pages(self) -> bool {
         match self {
             Self::V1 => false,
-            Self::V2 | Self::V3 | Self::V4 => true,
+            Self::V2 | Self::V3 | Self::V4 | Self::V5 => true,
         }
     }
 
     const fn supports_transaction_pages(self) -> bool {
-        matches!(self, Self::V3 | Self::V4)
+        matches!(self, Self::V3 | Self::V4 | Self::V5)
     }
 }
 
@@ -668,6 +708,9 @@ pub enum FileFormatErrorReason {
     HeaderV4Length {
         actual: u16,
     },
+    HeaderV5Length {
+        actual: u16,
+    },
     HeaderFlags {
         actual: u32,
     },
@@ -694,6 +737,10 @@ pub enum FileFormatErrorReason {
     HeaderV4AllocatedEpochHighWaterZero,
     HeaderV4AnchorVersionZero,
     HeaderV4Reserved,
+    HeaderV5ReclamationPresence {
+        actual: u8,
+    },
+    HeaderDatabaseChildIdentity(DatabaseChildIdentityDecodeErrorReason),
     HeaderV4RetainedFirstMismatch {
         expected: Option<u64>,
         actual: Option<u64>,
@@ -816,6 +863,9 @@ impl fmt::Display for FileFormatErrorReason {
             Self::HeaderV4Length { actual } => {
                 write!(formatter, "v4 header length {actual} does not equal 128")
             }
+            Self::HeaderV5Length { actual } => {
+                write!(formatter, "v5 header length {actual} does not equal 192")
+            }
             Self::HeaderFlags { actual } => {
                 write!(formatter, "header flags are nonzero: {actual}")
             }
@@ -857,6 +907,11 @@ impl fmt::Display for FileFormatErrorReason {
                 formatter.write_str("v4 selected-checkpoint anchor version is zero")
             }
             Self::HeaderV4Reserved => formatter.write_str("v4 header reserved bytes are nonzero"),
+            Self::HeaderV5ReclamationPresence { actual } => write!(
+                formatter,
+                "v5 reclamation-metadata presence byte is not canonical: {actual}"
+            ),
+            Self::HeaderDatabaseChildIdentity(source) => source.fmt(formatter),
             Self::HeaderV4RetainedFirstMismatch { expected, actual } => write!(
                 formatter,
                 "v4 retained-first metadata {expected:?} does not match retained records {actual:?}"
@@ -1470,6 +1525,8 @@ pub enum FileTransactionRestartWalReclamationError {
     MissingFileName,
     /// No durable transaction epoch exists to preserve in replacement metadata.
     NoAllocatedEpoch,
+    /// A V5 source lost the stable database-file identity required by replacement.
+    MissingDatabaseFileIdentity,
     /// The opaque domain permit does not describe the currently owned source.
     PermitMismatch,
     /// The current source generation cannot advance.
@@ -1517,6 +1574,9 @@ impl fmt::Display for FileTransactionRestartWalReclamationError {
             Self::NoAllocatedEpoch => {
                 formatter.write_str("no filesystem transaction epoch has been allocated")
             }
+            Self::MissingDatabaseFileIdentity => {
+                formatter.write_str("V5 WAL has no stable database-file identity")
+            }
             Self::PermitMismatch => {
                 formatter.write_str("WAL reclamation permit does not match the selected source")
             }
@@ -1557,6 +1617,7 @@ impl Error for FileTransactionRestartWalReclamationError {
             | Self::UnsupportedPhysicalFormat { .. }
             | Self::MissingFileName
             | Self::NoAllocatedEpoch
+            | Self::MissingDatabaseFileIdentity
             | Self::PermitMismatch
             | Self::GenerationExhausted
             | Self::VolatileLogicalSuffix { .. }
@@ -1954,6 +2015,7 @@ pub struct FileCommitLog<const N: usize = 0> {
     format: LogFormat,
     lineage: LogLineage,
     persistent_id: PersistentLogId,
+    database_file_identity: Option<DatabaseFileHeaderIdentity>,
     generation: u64,
     reclaimed_retained_first: Option<LogSequenceNumber>,
     reclaimed_logical_high_water: Option<LogSequenceNumber>,
@@ -1983,6 +2045,10 @@ impl<const N: usize> LockedFileCommitLogOpen<N> {
 
     pub(crate) const fn physical_format_version(&self) -> u16 {
         self.log.format.version()
+    }
+
+    pub(crate) const fn database_file_identity(&self) -> Option<DatabaseFileHeaderIdentity> {
+        self.log.database_file_identity
     }
 
     pub(crate) fn finish(mut self) -> Result<FileCommitLog<N>, FileOpenError> {
@@ -2016,7 +2082,8 @@ impl FileCommitLog<0> {
             path.as_ref(),
             persistent_id,
             LogFormat::V1,
-            build_header_v1(persistent_id),
+            &build_header_v1(persistent_id),
+            None,
         )
     }
 
@@ -2044,7 +2111,8 @@ impl<const N: usize> FileCommitLog<N> {
             path.as_ref(),
             persistent_id,
             LogFormat::V2,
-            build_header_v2(persistent_id, layout.width_u64),
+            &build_header_v2(persistent_id, layout.width_u64),
+            None,
         )
     }
 
@@ -2070,7 +2138,29 @@ impl<const N: usize> FileCommitLog<N> {
             path.as_ref(),
             persistent_id,
             LogFormat::V3,
-            build_header_v3(persistent_id, layout.width_u64),
+            &build_header_v3(persistent_id, layout.width_u64),
+            None,
+        )
+    }
+
+    /// Creates a new empty V5 WAL carrying one exact stable database-file identity.
+    pub fn create_new_database_transaction_page_capable<P>(
+        path: P,
+        storage_identity: DatabaseStorageIdentity,
+    ) -> Result<Self, FileCreateError>
+    where
+        P: AsRef<Path>,
+    {
+        let layout = PageLayout::for_const::<N>().map_err(FileCreateError::PageWidth)?;
+        let database_file_identity =
+            storage_identity.file_header_identity(ntsql_database::DatabaseFileRole::Wal);
+        let persistent_id = storage_identity.persistent_log_id();
+        Self::create_new_internal(
+            path.as_ref(),
+            persistent_id,
+            LogFormat::V5,
+            &build_header_v5_initial(persistent_id, layout.width_u64, database_file_identity),
+            Some(database_file_identity),
         )
     }
 
@@ -2080,7 +2170,7 @@ impl<const N: usize> FileCommitLog<N> {
         P: AsRef<Path>,
     {
         let layout = PageLayout::for_const::<N>().map_err(FileOpenError::PageWidth)?;
-        Self::open_internal(path.as_ref(), HeaderExpectation::V3OrV4(layout))
+        Self::open_internal(path.as_ref(), HeaderExpectation::V3OrLater(layout))
     }
 
     pub(crate) fn inspect_transaction_page_capable<P>(
@@ -2090,14 +2180,15 @@ impl<const N: usize> FileCommitLog<N> {
         P: AsRef<Path>,
     {
         let layout = PageLayout::for_const::<N>().map_err(FileOpenError::PageWidth)?;
-        Self::inspect_internal(path.as_ref(), HeaderExpectation::V3OrV4(layout))
+        Self::inspect_internal(path.as_ref(), HeaderExpectation::V3OrLater(layout))
     }
 
     fn create_new_internal(
         path: &Path,
         persistent_id: PersistentLogId,
         format: LogFormat,
-        header: [u8; HEADER_LENGTH],
+        header: &[u8],
+        database_file_identity: Option<DatabaseFileHeaderIdentity>,
     ) -> Result<Self, FileCreateError> {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -2114,7 +2205,7 @@ impl<const N: usize> FileCommitLog<N> {
             ))
         })?;
 
-        file.write_all(&header).map_err(|source| {
+        file.write_all(header).map_err(|source| {
             FileCreateError::Io(FileIoError::new(FileIoStage::WriteHeader, source))
         })?;
         file.sync_all().map_err(|source| {
@@ -2133,6 +2224,7 @@ impl<const N: usize> FileCommitLog<N> {
             format,
             lineage: LogLineage::persistent(persistent_id),
             persistent_id,
+            database_file_identity,
             generation: 0,
             reclaimed_retained_first: None,
             reclaimed_logical_high_water: None,
@@ -2196,8 +2288,51 @@ impl<const N: usize> FileCommitLog<N> {
             reclaimed_logical_high_water,
             allocated_epoch_high_water,
             selected_checkpoint_anchor,
+            database_file_identity,
             header_length,
-        ) = if header_version == FORMAT_VERSION_V4 {
+        ) = if header_version == FORMAT_VERSION_V5 {
+            if !expectation.accepts(LogFormat::V5) {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    8,
+                    FileFormatErrorReason::HeaderVersion {
+                        actual: header_version,
+                    },
+                )));
+            }
+            if file_len < HEADER_V5_LENGTH_U64 {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    0,
+                    FileFormatErrorReason::HeaderTooShort { actual: file_len },
+                )));
+            }
+            let mut header_v5 = [0_u8; HEADER_V5_LENGTH];
+            header_v5[..HEADER_LENGTH].copy_from_slice(&header);
+            file.read_exact(&mut header_v5[HEADER_LENGTH..])
+                .map_err(|source| {
+                    FileOpenError::Io(FileIoError::new(FileIoStage::ReadHeader, source))
+                })?;
+            let metadata = parse_header_v5(
+                &header_v5,
+                expectation.page_layout().ok_or_else(|| {
+                    FileOpenError::Format(FileFormatError::new(
+                        HEADER_V2_PAGE_WIDTH_OFFSET as u64,
+                        FileFormatErrorReason::HeaderPageWidthZero,
+                    ))
+                })?,
+            )
+            .map_err(FileOpenError::Format)?;
+            (
+                LogFormat::V5,
+                metadata.persistent_id,
+                metadata.generation,
+                metadata.retained_first,
+                metadata.logical_high_water,
+                metadata.allocated_epoch_high_water,
+                metadata.selected_checkpoint_anchor,
+                Some(metadata.database_file_identity),
+                HEADER_V5_LENGTH_U64,
+            )
+        } else if header_version == FORMAT_VERSION_V4 {
             if !expectation.accepts(LogFormat::V4) {
                 return Err(FileOpenError::Format(FileFormatError::new(
                     8,
@@ -2236,6 +2371,7 @@ impl<const N: usize> FileCommitLog<N> {
                 metadata.logical_high_water,
                 Some(metadata.allocated_epoch_high_water),
                 Some(metadata.selected_checkpoint_anchor),
+                None,
                 HEADER_V4_LENGTH_U64,
             )
         } else {
@@ -2258,6 +2394,7 @@ impl<const N: usize> FileCommitLog<N> {
                 format,
                 persistent_id,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -2306,7 +2443,7 @@ impl<const N: usize> FileCommitLog<N> {
             open_state.apply_frame(decoded, offset)?;
         }
 
-        if format == LogFormat::V4
+        if matches!(format, LogFormat::V4 | LogFormat::V5)
             && open_state.last_completed_position < reclaimed_logical_high_water.unwrap_or(0)
         {
             return Err(FileOpenError::Format(FileFormatError::new(
@@ -2325,7 +2462,7 @@ impl<const N: usize> FileCommitLog<N> {
             }
             None => None,
         };
-        if format == LogFormat::V4 {
+        if matches!(format, LogFormat::V4 | LogFormat::V5) {
             let actual_retained_first = open_state
                 .records
                 .iter()
@@ -2368,6 +2505,7 @@ impl<const N: usize> FileCommitLog<N> {
                 format,
                 lineage,
                 persistent_id,
+                database_file_identity,
                 generation,
                 reclaimed_retained_first: reclaimed_retained_first
                     .map(|position| LogLineage::persistent(persistent_id).position(position)),
@@ -2390,6 +2528,12 @@ impl<const N: usize> FileCommitLog<N> {
     #[must_use]
     pub const fn persistent_id(&self) -> PersistentLogId {
         self.persistent_id
+    }
+
+    /// Returns the stable database-file identity physically carried by V5.
+    #[must_use]
+    pub const fn database_file_identity(&self) -> Option<DatabaseFileHeaderIdentity> {
+        self.database_file_identity
     }
 
     /// Returns the selected WAL file's repository-owned physical format version.
@@ -3070,7 +3214,7 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
         if self.poisoned {
             return Err(FileTransactionRestartWalReclamationError::PoisonedWriter);
         }
-        if !matches!(self.format, LogFormat::V3 | LogFormat::V4) {
+        if !matches!(self.format, LogFormat::V3 | LogFormat::V4 | LogFormat::V5) {
             return Err(
                 FileTransactionRestartWalReclamationError::UnsupportedPhysicalFormat {
                     version: self.format.version(),
@@ -3143,7 +3287,17 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
             }
         })?;
         let logical_high_water = current_high_water.as_ref().map(LogSequenceNumber::get);
-        let frames = build_reclamation_frame_plan(&retained_records, logical_high_water, layout)?;
+        let replacement_format = if self.format == LogFormat::V5 {
+            LogFormat::V5
+        } else {
+            LogFormat::V4
+        };
+        let frames = build_reclamation_frame_plan(
+            &retained_records,
+            logical_high_water,
+            layout,
+            replacement_format,
+        )?;
         let retained_logical_record_count =
             u64::try_from(retained_records.len()).map_err(|_| {
                 FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
@@ -3157,17 +3311,36 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
         })?;
         let permit_anchor = permit.selected_checkpoint_anchor();
         let anchor = (permit_anchor.version(), permit_anchor.value());
-        let header = build_header_v4(
-            self.persistent_id,
-            layout.width_u64,
-            new_generation,
-            permit
-                .retained_first_logical_record()
-                .map(LogSequenceNumber::get),
-            logical_high_water,
-            allocated_epoch_high_water,
-            anchor,
-        );
+        let retained_first = permit
+            .retained_first_logical_record()
+            .map(LogSequenceNumber::get);
+        let header = if replacement_format == LogFormat::V5 {
+            let database_file_identity = self
+                .database_file_identity
+                .ok_or(FileTransactionRestartWalReclamationError::MissingDatabaseFileIdentity)?;
+            WalReclamationHeader::V5(build_header_v5_reclaimed(
+                V4HeaderMetadata {
+                    persistent_id: self.persistent_id,
+                    generation: new_generation,
+                    retained_first,
+                    logical_high_water,
+                    allocated_epoch_high_water,
+                    selected_checkpoint_anchor: anchor,
+                },
+                layout.width_u64,
+                database_file_identity,
+            ))
+        } else {
+            WalReclamationHeader::V4(build_header_v4(
+                self.persistent_id,
+                layout.width_u64,
+                new_generation,
+                retained_first,
+                logical_high_water,
+                allocated_epoch_high_water,
+                anchor,
+            ))
+        };
         let candidate_path = reclamation_candidate_path(&self.path)
             .ok_or(FileTransactionRestartWalReclamationError::MissingFileName)?;
 
@@ -3211,7 +3384,7 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
                 FaultPoint::BeforeReclamationWrite,
             ));
         }
-        if let Err(source) = candidate.write_all(&header) {
+        if let Err(source) = candidate.write_all(header.as_bytes()) {
             self.poisoned = true;
             return Err(FileTransactionRestartWalReclamationError::Io(
                 FileIoError::new(FileIoStage::WriteReclamationHeader, source),
@@ -3288,7 +3461,7 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
                 FileIoError::new(FileIoStage::SeekEnd, source),
             ));
         }
-        self.format = LogFormat::V4;
+        self.format = replacement_format;
         self.generation = new_generation;
         self.reclaimed_retained_first = permit.retained_first_logical_record().cloned();
         self.reclaimed_logical_high_water = current_high_water.clone();
@@ -3307,7 +3480,7 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
                 DurableTransactionRestartWalReclamationReplacementObservation::new(
                     permit.source_generation(),
                     new_generation,
-                    FORMAT_VERSION_V4,
+                    replacement_format.version(),
                 ),
                 permit.retained_first_logical_record().cloned(),
                 permit.durable_frontier().cloned(),
@@ -4301,7 +4474,7 @@ fn remove_reclamation_candidate_for_effect(
 enum HeaderExpectation {
     V1,
     V2(PageLayout),
-    V3OrV4(PageLayout),
+    V3OrLater(PageLayout),
 }
 
 impl HeaderExpectation {
@@ -4309,14 +4482,16 @@ impl HeaderExpectation {
         match self {
             Self::V1 => matches!(format, LogFormat::V1),
             Self::V2(_) => matches!(format, LogFormat::V2),
-            Self::V3OrV4(_) => matches!(format, LogFormat::V3 | LogFormat::V4),
+            Self::V3OrLater(_) => {
+                matches!(format, LogFormat::V3 | LogFormat::V4 | LogFormat::V5)
+            }
         }
     }
 
     const fn page_layout(self) -> Option<PageLayout> {
         match self {
             Self::V1 => None,
-            Self::V2(layout) | Self::V3OrV4(layout) => Some(layout),
+            Self::V2(layout) | Self::V3OrLater(layout) => Some(layout),
         }
     }
 }
@@ -4380,7 +4555,7 @@ fn parse_header(
                 ));
             }
         }
-        HeaderExpectation::V2(layout) | HeaderExpectation::V3OrV4(layout) => {
+        HeaderExpectation::V2(layout) | HeaderExpectation::V3OrLater(layout) => {
             let page_width = read_u64(header, HEADER_V2_PAGE_WIDTH_OFFSET);
             if page_width == 0 {
                 return Err(FileFormatError::new(
@@ -4430,6 +4605,17 @@ struct V4HeaderMetadata {
     logical_high_water: Option<u64>,
     allocated_epoch_high_water: NonZeroU64,
     selected_checkpoint_anchor: (u16, u128),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V5HeaderMetadata {
+    persistent_id: PersistentLogId,
+    generation: u64,
+    retained_first: Option<u64>,
+    logical_high_water: Option<u64>,
+    allocated_epoch_high_water: Option<NonZeroU64>,
+    selected_checkpoint_anchor: Option<(u16, u128)>,
+    database_file_identity: DatabaseFileHeaderIdentity,
 }
 
 fn parse_header_v4(
@@ -4600,6 +4786,160 @@ fn parse_header_v4(
     })
 }
 
+fn parse_header_v5(
+    header: &[u8; HEADER_V5_LENGTH],
+    layout: PageLayout,
+) -> Result<V5HeaderMetadata, FileFormatError> {
+    if header[..8] != HEADER_MAGIC {
+        return Err(FileFormatError::new(0, FileFormatErrorReason::HeaderMagic));
+    }
+    let version = read_u16(header, 8);
+    if version != FORMAT_VERSION_V5 {
+        return Err(FileFormatError::new(
+            8,
+            FileFormatErrorReason::HeaderVersion { actual: version },
+        ));
+    }
+    let length = read_u16(header, 10);
+    if usize::from(length) != HEADER_V5_LENGTH {
+        return Err(FileFormatError::new(
+            10,
+            FileFormatErrorReason::HeaderV5Length { actual: length },
+        ));
+    }
+    let flags = read_u32(header, 12);
+    if flags != 0 {
+        return Err(FileFormatError::new(
+            12,
+            FileFormatErrorReason::HeaderFlags { actual: flags },
+        ));
+    }
+
+    let persistent_id = PersistentLogId::new(read_u128(header, 16))
+        .ok_or_else(|| FileFormatError::new(16, FileFormatErrorReason::LineageIdZero))?;
+    let page_width = read_u64(header, HEADER_V2_PAGE_WIDTH_OFFSET);
+    if page_width == 0 {
+        return Err(FileFormatError::new(
+            HEADER_V2_PAGE_WIDTH_OFFSET as u64,
+            FileFormatErrorReason::HeaderPageWidthZero,
+        ));
+    }
+    if page_width != layout.width_u64 {
+        return Err(FileFormatError::new(
+            HEADER_V2_PAGE_WIDTH_OFFSET as u64,
+            FileFormatErrorReason::HeaderPageWidthMismatch {
+                expected: layout.width_u64,
+                actual: page_width,
+            },
+        ));
+    }
+
+    let (
+        generation,
+        retained_first,
+        logical_high_water,
+        allocated_epoch_high_water,
+        selected_checkpoint_anchor,
+    ) = match header[HEADER_V5_RECLAMATION_PRESENCE_OFFSET] {
+        0 => {
+            if header[HEADER_V4_GENERATION_OFFSET..HEADER_V5_IDENTITY_OFFSET]
+                .iter()
+                .any(|byte| *byte != 0)
+            {
+                return Err(FileFormatError::new(
+                    HEADER_V4_GENERATION_OFFSET as u64,
+                    FileFormatErrorReason::HeaderV4Reserved,
+                ));
+            }
+            (0, None, None, None, None)
+        }
+        1 => {
+            let mut v4_header = [0_u8; HEADER_V4_LENGTH];
+            v4_header[..HEADER_V4_CHECKSUM_OFFSET]
+                .copy_from_slice(&header[..HEADER_V4_CHECKSUM_OFFSET]);
+            write_u16(&mut v4_header, 8, FORMAT_VERSION_V4);
+            write_u16(&mut v4_header, 10, HEADER_V4_LENGTH_U16);
+            v4_header[HEADER_V5_RECLAMATION_PRESENCE_OFFSET] = 0;
+            let checksum = checksum_v1(&v4_header[..HEADER_V4_CHECKSUM_OFFSET]);
+            write_u64(&mut v4_header, HEADER_V4_CHECKSUM_OFFSET, checksum);
+            let metadata = parse_header_v4(&v4_header, layout)?;
+            (
+                metadata.generation,
+                metadata.retained_first,
+                metadata.logical_high_water,
+                Some(metadata.allocated_epoch_high_water),
+                Some(metadata.selected_checkpoint_anchor),
+            )
+        }
+        actual => {
+            return Err(FileFormatError::new(
+                HEADER_V5_RECLAMATION_PRESENCE_OFFSET as u64,
+                FileFormatErrorReason::HeaderV5ReclamationPresence { actual },
+            ));
+        }
+    };
+    if header[HEADER_V4_CHECKSUM_OFFSET..HEADER_V5_IDENTITY_OFFSET]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(FileFormatError::new(
+            HEADER_V4_CHECKSUM_OFFSET as u64,
+            FileFormatErrorReason::HeaderV4Reserved,
+        ));
+    }
+
+    let mut identity_bytes =
+        [0_u8; database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH];
+    identity_bytes.copy_from_slice(
+        &header[HEADER_V5_IDENTITY_OFFSET
+            ..HEADER_V5_IDENTITY_OFFSET
+                + database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH],
+    );
+    let database_file_identity = database_child_identity_codec::decode_database_child_identity(
+        &identity_bytes,
+    )
+    .map_err(|source| {
+        FileFormatError::new(
+            (HEADER_V5_IDENTITY_OFFSET + source.offset()) as u64,
+            FileFormatErrorReason::HeaderDatabaseChildIdentity(source.reason()),
+        )
+    })?;
+    if header[HEADER_V5_IDENTITY_OFFSET
+        + database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH
+        ..HEADER_V5_RESERVED_END]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(FileFormatError::new(
+            (HEADER_V5_IDENTITY_OFFSET
+                + database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH)
+                as u64,
+            FileFormatErrorReason::HeaderV4Reserved,
+        ));
+    }
+    let actual_checksum = read_u64(header, HEADER_V5_CHECKSUM_OFFSET);
+    let expected_checksum = checksum_v1(&header[..HEADER_V5_CHECKSUM_OFFSET]);
+    if actual_checksum != expected_checksum {
+        return Err(FileFormatError::new(
+            HEADER_V5_CHECKSUM_OFFSET as u64,
+            FileFormatErrorReason::HeaderChecksum {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            },
+        ));
+    }
+
+    Ok(V5HeaderMetadata {
+        persistent_id,
+        generation,
+        retained_first,
+        logical_high_water,
+        allocated_epoch_high_water,
+        selected_checkpoint_anchor,
+        database_file_identity,
+    })
+}
+
 fn parse_frame(
     frame: &[u8; FRAME_LENGTH],
     offset: u64,
@@ -4725,6 +5065,68 @@ fn build_header_v4(
     header
 }
 
+fn build_header_v5_initial(
+    persistent_id: PersistentLogId,
+    page_width: u64,
+    database_file_identity: DatabaseFileHeaderIdentity,
+) -> [u8; HEADER_V5_LENGTH] {
+    let mut header = [0_u8; HEADER_V5_LENGTH];
+    header[..8].copy_from_slice(&HEADER_MAGIC);
+    write_u16(&mut header, 8, FORMAT_VERSION_V5);
+    write_u16(&mut header, 10, HEADER_V5_LENGTH_U16);
+    write_u128(&mut header, 16, persistent_id.get());
+    write_u64(&mut header, HEADER_V2_PAGE_WIDTH_OFFSET, page_width);
+    let identity =
+        database_child_identity_codec::encode_database_child_identity(database_file_identity);
+    header[HEADER_V5_IDENTITY_OFFSET..HEADER_V5_IDENTITY_OFFSET + identity.len()]
+        .copy_from_slice(&identity);
+    let checksum = checksum_v1(&header[..HEADER_V5_CHECKSUM_OFFSET]);
+    write_u64(&mut header, HEADER_V5_CHECKSUM_OFFSET, checksum);
+    header
+}
+
+fn build_header_v5_reclaimed(
+    metadata: V4HeaderMetadata,
+    page_width: u64,
+    database_file_identity: DatabaseFileHeaderIdentity,
+) -> [u8; HEADER_V5_LENGTH] {
+    let v4 = build_header_v4(
+        metadata.persistent_id,
+        page_width,
+        metadata.generation,
+        metadata.retained_first,
+        metadata.logical_high_water,
+        metadata.allocated_epoch_high_water,
+        metadata.selected_checkpoint_anchor,
+    );
+    let mut header = [0_u8; HEADER_V5_LENGTH];
+    header[..HEADER_V4_CHECKSUM_OFFSET].copy_from_slice(&v4[..HEADER_V4_CHECKSUM_OFFSET]);
+    write_u16(&mut header, 8, FORMAT_VERSION_V5);
+    write_u16(&mut header, 10, HEADER_V5_LENGTH_U16);
+    header[HEADER_V5_RECLAMATION_PRESENCE_OFFSET] = 1;
+    let identity =
+        database_child_identity_codec::encode_database_child_identity(database_file_identity);
+    header[HEADER_V5_IDENTITY_OFFSET..HEADER_V5_IDENTITY_OFFSET + identity.len()]
+        .copy_from_slice(&identity);
+    let checksum = checksum_v1(&header[..HEADER_V5_CHECKSUM_OFFSET]);
+    write_u64(&mut header, HEADER_V5_CHECKSUM_OFFSET, checksum);
+    header
+}
+
+enum WalReclamationHeader {
+    V4([u8; HEADER_V4_LENGTH]),
+    V5([u8; HEADER_V5_LENGTH]),
+}
+
+impl WalReclamationHeader {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::V4(header) => header,
+            Self::V5(header) => header,
+        }
+    }
+}
+
 fn build_header(
     format: LogFormat,
     persistent_id: PersistentLogId,
@@ -4780,6 +5182,7 @@ fn build_reclamation_frame_plan<const N: usize>(
     records: &[FileLogRecord<N>],
     logical_high_water: Option<u64>,
     layout: PageLayout,
+    format: LogFormat,
 ) -> Result<Vec<[u8; FRAME_LENGTH]>, FileTransactionRestartWalReclamationError> {
     let mut frame_count = usize::from(!records.is_empty());
     for record in records {
@@ -4812,14 +5215,14 @@ fn build_reclamation_frame_plan<const N: usize>(
                 transaction_epoch,
                 transaction_sequence,
             } => frames.push(build_frame(
-                LogFormat::V4,
+                format,
                 FrameKind::CommitRecord,
                 position,
                 *transaction_epoch,
                 *transaction_sequence,
             )),
             FileLogRecordKind::PageWrite(page) => {
-                append_reclamation_page_frames(&mut frames, position, page, None, layout)?;
+                append_reclamation_page_frames(&mut frames, position, page, None, layout, format)?;
             }
             FileLogRecordKind::TransactionPageWrite(transaction_page) => {
                 append_reclamation_page_frames(
@@ -4831,6 +5234,7 @@ fn build_reclamation_frame_plan<const N: usize>(
                         transaction_page.transaction_sequence(),
                     )),
                     layout,
+                    format,
                 )?;
             }
         }
@@ -4839,7 +5243,7 @@ fn build_reclamation_frame_plan<const N: usize>(
         let high_water =
             logical_high_water.ok_or(FileTransactionRestartWalReclamationError::PermitMismatch)?;
         frames.push(build_frame(
-            LogFormat::V4,
+            format,
             FrameKind::DurableThrough,
             high_water,
             0,
@@ -4855,6 +5259,7 @@ fn append_reclamation_page_frames<const N: usize>(
     page: &FilePageWriteRecord<N>,
     owner: Option<StoredTransactionIdentity>,
     layout: PageLayout,
+    format: LogFormat,
 ) -> Result<(), FileTransactionRestartWalReclamationError> {
     let header_kind = if owner.is_some() {
         FrameKind::TransactionPageHeader
@@ -4862,7 +5267,7 @@ fn append_reclamation_page_frames<const N: usize>(
         FrameKind::PageHeader
     };
     frames.push(build_frame(
-        LogFormat::V4,
+        format,
         header_kind,
         position,
         page.page_number().get(),
@@ -4870,7 +5275,7 @@ fn append_reclamation_page_frames<const N: usize>(
     ));
     if let Some(owner) = owner {
         frames.push(build_frame(
-            LogFormat::V4,
+            format,
             FrameKind::TransactionPageOwner,
             position,
             owner.epoch,
@@ -4884,7 +5289,7 @@ fn append_reclamation_page_frames<const N: usize>(
         let end = start + logical_len;
         chunk[..logical_len].copy_from_slice(&page.bytes()[start..end]);
         frames.push(build_frame_with_payload2_bytes(
-            LogFormat::V4,
+            format,
             FrameKind::PageData,
             position,
             u64::try_from(chunk_index).map_err(|_| {
@@ -4982,6 +5387,27 @@ fn write_u128(bytes: &mut [u8], offset: usize, value: u128) {
 const PAGE_STORE_HEADER_MAGIC: [u8; 8] = *b"NTSQPGS1";
 const PAGE_STORE_FRAME_MAGIC: [u8; 4] = *b"NTSP";
 const PAGE_STORE_FORMAT_VERSION: u16 = 1;
+const PAGE_STORE_FORMAT_VERSION_V2: u16 = 2;
+const PAGE_STORE_HEADER_V2_LENGTH: usize = 128;
+const PAGE_STORE_HEADER_V2_LENGTH_U16: u16 = 128;
+const PAGE_STORE_HEADER_V2_LENGTH_U64: u64 = 128;
+const PAGE_STORE_HEADER_V2_IDENTITY_OFFSET: usize = 64;
+const PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET: usize = 120;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PageStoreFormat {
+    V1,
+    V2,
+}
+
+impl PageStoreFormat {
+    const fn version(self) -> u16 {
+        match self {
+            Self::V1 => PAGE_STORE_FORMAT_VERSION,
+            Self::V2 => PAGE_STORE_FORMAT_VERSION_V2,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u16)]
@@ -5176,10 +5602,12 @@ pub enum PageStoreFormatErrorReason {
     HeaderMagic,
     HeaderVersion { actual: u16 },
     HeaderLength { actual: u16 },
+    HeaderV2Length { actual: u16 },
     HeaderFlags { actual: u32 },
     HeaderPageWidthZero,
     HeaderPageWidthMismatch { expected: u64, actual: u64 },
     HeaderReserved,
+    HeaderDatabaseChildIdentity(DatabaseChildIdentityDecodeErrorReason),
     HeaderChecksum { expected: u64, actual: u64 },
     LineageIdZero,
     FrameMagic,
@@ -5223,6 +5651,12 @@ impl fmt::Display for PageStoreFormatErrorReason {
                     "page-store header length {actual} does not equal 64"
                 )
             }
+            Self::HeaderV2Length { actual } => {
+                write!(
+                    formatter,
+                    "page-store V2 header length {actual} does not equal {PAGE_STORE_HEADER_V2_LENGTH}"
+                )
+            }
             Self::HeaderFlags { actual } => {
                 write!(formatter, "page-store header flags are nonzero: {actual}")
             }
@@ -5236,6 +5670,7 @@ impl fmt::Display for PageStoreFormatErrorReason {
             Self::HeaderReserved => {
                 formatter.write_str("page-store header reserved bytes are nonzero")
             }
+            Self::HeaderDatabaseChildIdentity(source) => source.fmt(formatter),
             Self::HeaderChecksum { expected, actual } => write!(
                 formatter,
                 "page-store header checksum mismatch: expected {expected:#018x}, found {actual:#018x}"
@@ -5910,8 +6345,10 @@ impl<const N: usize> FileStoredPage<N> {
 #[derive(Debug)]
 pub struct FilePageStore<const N: usize> {
     file: File,
+    format: PageStoreFormat,
     lineage: LogLineage,
     persistent_id: PersistentLogId,
+    database_file_identity: Option<DatabaseFileHeaderIdentity>,
     pages: Vec<FileStoredPage<N>>,
     next_sequence: Option<u64>,
     armed_fault: Option<PageStoreFaultPoint>,
@@ -5930,6 +6367,14 @@ impl<const N: usize> LockedFilePageStoreOpen<N> {
 
     pub(crate) const fn persistent_id(&self) -> PersistentLogId {
         self.store.persistent_id
+    }
+
+    pub(crate) const fn physical_format_version(&self) -> u16 {
+        self.store.format.version()
+    }
+
+    pub(crate) const fn database_file_identity(&self) -> Option<DatabaseFileHeaderIdentity> {
+        self.store.database_file_identity
     }
 
     pub(crate) fn finish(mut self) -> Result<FilePageStore<N>, PageStoreOpenError> {
@@ -5964,7 +6409,43 @@ impl<const N: usize> FilePageStore<N> {
         P: AsRef<Path>,
     {
         let layout = PageLayout::for_const::<N>().map_err(PageStoreCreateError::PageWidth)?;
-        let path = path.as_ref();
+        Self::create_new_internal(
+            path.as_ref(),
+            persistent_id,
+            PageStoreFormat::V1,
+            &build_page_store_header(persistent_id, layout.width_u64),
+            None,
+        )
+    }
+
+    /// Creates a new empty V2 page store carrying stable database-file identity.
+    pub fn create_new_database<P>(
+        path: P,
+        storage_identity: DatabaseStorageIdentity,
+    ) -> Result<Self, PageStoreCreateError>
+    where
+        P: AsRef<Path>,
+    {
+        let layout = PageLayout::for_const::<N>().map_err(PageStoreCreateError::PageWidth)?;
+        let database_file_identity =
+            storage_identity.file_header_identity(ntsql_database::DatabaseFileRole::PageStore);
+        let persistent_id = storage_identity.persistent_log_id();
+        Self::create_new_internal(
+            path.as_ref(),
+            persistent_id,
+            PageStoreFormat::V2,
+            &build_page_store_header_v2(persistent_id, layout.width_u64, database_file_identity),
+            Some(database_file_identity),
+        )
+    }
+
+    fn create_new_internal(
+        path: &Path,
+        persistent_id: PersistentLogId,
+        format: PageStoreFormat,
+        header: &[u8],
+        database_file_identity: Option<DatabaseFileHeaderIdentity>,
+    ) -> Result<Self, PageStoreCreateError> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .read(true)
@@ -5983,8 +6464,7 @@ impl<const N: usize> FilePageStore<N> {
             ))
         })?;
 
-        let header = build_page_store_header(persistent_id, layout.width_u64);
-        file.write_all(&header).map_err(|source| {
+        file.write_all(header).map_err(|source| {
             PageStoreCreateError::Io(PageStoreIoError::new(PageStoreIoStage::WriteHeader, source))
         })?;
         file.sync_all().map_err(|source| {
@@ -6000,8 +6480,10 @@ impl<const N: usize> FilePageStore<N> {
 
         Ok(Self {
             file,
+            format,
             lineage: LogLineage::persistent(persistent_id),
             persistent_id,
+            database_file_identity,
             pages: Vec::new(),
             next_sequence: Some(1),
             armed_fault: None,
@@ -6063,13 +6545,42 @@ impl<const N: usize> FilePageStore<N> {
         file.read_exact(&mut header).map_err(|source| {
             PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::ReadHeader, source))
         })?;
-        let persistent_id =
-            parse_page_store_header(&header, layout).map_err(PageStoreOpenError::Format)?;
+        let header_version = read_u16(&header, 8);
+        let (format, persistent_id, database_file_identity, header_length) =
+            if header_version == PAGE_STORE_FORMAT_VERSION_V2 {
+                if file_len < PAGE_STORE_HEADER_V2_LENGTH_U64 {
+                    return Err(PageStoreOpenError::Format(PageStoreFormatError::new(
+                        0,
+                        PageStoreFormatErrorReason::HeaderTooShort { actual: file_len },
+                    )));
+                }
+                let mut header_v2 = [0_u8; PAGE_STORE_HEADER_V2_LENGTH];
+                header_v2[..HEADER_LENGTH].copy_from_slice(&header);
+                file.read_exact(&mut header_v2[HEADER_LENGTH..])
+                    .map_err(|source| {
+                        PageStoreOpenError::Io(PageStoreIoError::new(
+                            PageStoreIoStage::ReadHeader,
+                            source,
+                        ))
+                    })?;
+                let metadata = parse_page_store_header_v2(&header_v2, layout)
+                    .map_err(PageStoreOpenError::Format)?;
+                (
+                    PageStoreFormat::V2,
+                    metadata.persistent_id,
+                    Some(metadata.database_file_identity),
+                    PAGE_STORE_HEADER_V2_LENGTH_U64,
+                )
+            } else {
+                let persistent_id =
+                    parse_page_store_header(&header, layout).map_err(PageStoreOpenError::Format)?;
+                (PageStoreFormat::V1, persistent_id, None, HEADER_LENGTH_U64)
+            };
         let lineage = LogLineage::persistent(persistent_id);
 
         let mut open_state = PageStoreOpenState::<N>::new(layout, lineage.clone());
 
-        let frame_region_len = file_len - HEADER_LENGTH_U64;
+        let frame_region_len = file_len - header_length;
         let complete_frame_count = frame_region_len / FRAME_LENGTH_U64;
         let incomplete_tail_len = frame_region_len % FRAME_LENGTH_U64;
 
@@ -6078,7 +6589,7 @@ impl<const N: usize> FilePageStore<N> {
             file.read_exact(&mut frame).map_err(|source| {
                 PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::ReadFrame, source))
             })?;
-            let offset = HEADER_LENGTH_U64 + frame_index * FRAME_LENGTH_U64;
+            let offset = header_length + frame_index * FRAME_LENGTH_U64;
             let decoded =
                 parse_page_store_frame(&frame, offset).map_err(PageStoreOpenError::Format)?;
             open_state.apply_frame(decoded, offset)?;
@@ -6087,7 +6598,7 @@ impl<const N: usize> FilePageStore<N> {
         let repaired_len = match open_state.pending_group_header_offset() {
             Some(offset) => Some(offset),
             None if incomplete_tail_len > 0 => {
-                Some(HEADER_LENGTH_U64 + complete_frame_count * FRAME_LENGTH_U64)
+                Some(header_length + complete_frame_count * FRAME_LENGTH_U64)
             }
             None => None,
         };
@@ -6095,8 +6606,10 @@ impl<const N: usize> FilePageStore<N> {
         Ok(LockedFilePageStoreOpen {
             store: Self {
                 file,
+                format,
                 lineage,
                 persistent_id,
+                database_file_identity,
                 pages: open_state.pages,
                 next_sequence: open_state.next_sequence,
                 armed_fault: None,
@@ -6110,6 +6623,18 @@ impl<const N: usize> FilePageStore<N> {
     #[must_use]
     pub const fn persistent_id(&self) -> PersistentLogId {
         self.persistent_id
+    }
+
+    /// Returns the physically parsed page-store header format version.
+    #[must_use]
+    pub const fn physical_format_version(&self) -> u16 {
+        self.format.version()
+    }
+
+    /// Returns the stable database-file identity physically carried by V2.
+    #[must_use]
+    pub const fn database_file_identity(&self) -> Option<DatabaseFileHeaderIdentity> {
+        self.database_file_identity
     }
 
     /// Arms one fault without replacing an existing plan.
@@ -6646,6 +7171,33 @@ fn build_page_store_header(persistent_id: PersistentLogId, page_width: u64) -> [
     header
 }
 
+fn build_page_store_header_v2(
+    persistent_id: PersistentLogId,
+    page_width: u64,
+    database_file_identity: DatabaseFileHeaderIdentity,
+) -> [u8; PAGE_STORE_HEADER_V2_LENGTH] {
+    let mut header = [0_u8; PAGE_STORE_HEADER_V2_LENGTH];
+    header[..8].copy_from_slice(&PAGE_STORE_HEADER_MAGIC);
+    write_u16(&mut header, 8, PAGE_STORE_FORMAT_VERSION_V2);
+    write_u16(&mut header, 10, PAGE_STORE_HEADER_V2_LENGTH_U16);
+    write_u128(&mut header, 16, persistent_id.get());
+    write_u64(&mut header, 32, page_width);
+    let identity =
+        database_child_identity_codec::encode_database_child_identity(database_file_identity);
+    header[PAGE_STORE_HEADER_V2_IDENTITY_OFFSET
+        ..PAGE_STORE_HEADER_V2_IDENTITY_OFFSET + identity.len()]
+        .copy_from_slice(&identity);
+    let checksum = checksum_v1(&header[..PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET]);
+    write_u64(&mut header, PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET, checksum);
+    header
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PageStoreHeaderV2Metadata {
+    persistent_id: PersistentLogId,
+    database_file_identity: DatabaseFileHeaderIdentity,
+}
+
 fn parse_page_store_header(
     header: &[u8; HEADER_LENGTH],
     layout: PageLayout,
@@ -6722,6 +7274,110 @@ fn parse_page_store_header(
         ));
     }
     Ok(persistent_id)
+}
+
+fn parse_page_store_header_v2(
+    header: &[u8; PAGE_STORE_HEADER_V2_LENGTH],
+    layout: PageLayout,
+) -> Result<PageStoreHeaderV2Metadata, PageStoreFormatError> {
+    if header[..8] != PAGE_STORE_HEADER_MAGIC {
+        return Err(PageStoreFormatError::new(
+            0,
+            PageStoreFormatErrorReason::HeaderMagic,
+        ));
+    }
+    let version = read_u16(header, 8);
+    if version != PAGE_STORE_FORMAT_VERSION_V2 {
+        return Err(PageStoreFormatError::new(
+            8,
+            PageStoreFormatErrorReason::HeaderVersion { actual: version },
+        ));
+    }
+    let length = read_u16(header, 10);
+    if usize::from(length) != PAGE_STORE_HEADER_V2_LENGTH {
+        return Err(PageStoreFormatError::new(
+            10,
+            PageStoreFormatErrorReason::HeaderV2Length { actual: length },
+        ));
+    }
+    let flags = read_u32(header, 12);
+    if flags != 0 {
+        return Err(PageStoreFormatError::new(
+            12,
+            PageStoreFormatErrorReason::HeaderFlags { actual: flags },
+        ));
+    }
+    let persistent_id = PersistentLogId::new(read_u128(header, 16))
+        .ok_or_else(|| PageStoreFormatError::new(16, PageStoreFormatErrorReason::LineageIdZero))?;
+    let page_width = read_u64(header, 32);
+    if page_width == 0 {
+        return Err(PageStoreFormatError::new(
+            32,
+            PageStoreFormatErrorReason::HeaderPageWidthZero,
+        ));
+    }
+    if page_width != layout.width_u64 {
+        return Err(PageStoreFormatError::new(
+            32,
+            PageStoreFormatErrorReason::HeaderPageWidthMismatch {
+                expected: layout.width_u64,
+                actual: page_width,
+            },
+        ));
+    }
+    if header[40..PAGE_STORE_HEADER_V2_IDENTITY_OFFSET]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(PageStoreFormatError::new(
+            40,
+            PageStoreFormatErrorReason::HeaderReserved,
+        ));
+    }
+    let mut identity_bytes =
+        [0_u8; database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH];
+    identity_bytes.copy_from_slice(
+        &header[PAGE_STORE_HEADER_V2_IDENTITY_OFFSET
+            ..PAGE_STORE_HEADER_V2_IDENTITY_OFFSET
+                + database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH],
+    );
+    let database_file_identity = database_child_identity_codec::decode_database_child_identity(
+        &identity_bytes,
+    )
+    .map_err(|source| {
+        PageStoreFormatError::new(
+            (PAGE_STORE_HEADER_V2_IDENTITY_OFFSET + source.offset()) as u64,
+            PageStoreFormatErrorReason::HeaderDatabaseChildIdentity(source.reason()),
+        )
+    })?;
+    if header[PAGE_STORE_HEADER_V2_IDENTITY_OFFSET
+        + database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH
+        ..PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET]
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return Err(PageStoreFormatError::new(
+            (PAGE_STORE_HEADER_V2_IDENTITY_OFFSET
+                + database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH)
+                as u64,
+            PageStoreFormatErrorReason::HeaderReserved,
+        ));
+    }
+    let actual_checksum = read_u64(header, PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET);
+    let expected_checksum = checksum_v1(&header[..PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET]);
+    if actual_checksum != expected_checksum {
+        return Err(PageStoreFormatError::new(
+            PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET as u64,
+            PageStoreFormatErrorReason::HeaderChecksum {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            },
+        ));
+    }
+    Ok(PageStoreHeaderV2Metadata {
+        persistent_id,
+        database_file_identity,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7185,6 +7841,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use ntsql_database::{DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole, DatabaseId};
     use ntsql_page::{
         DurablePageReconciliation, PageAddress, PageImage, PageLog, PageNumber, PageVersion,
         StagePageWriteError, reconcile_durable_page, stage_page_write,
@@ -7204,6 +7861,19 @@ mod tests {
     use super::*;
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn database_file_header_identity(
+        role: DatabaseFileRole,
+    ) -> Result<DatabaseFileHeaderIdentity, io::Error> {
+        let database_id = DatabaseId::new(0x1112_1314_1516_1718_191a_1b1c_1d1e_1f20)
+            .ok_or_else(|| io::Error::other("test database ID is zero"))?;
+        let file_id = DatabaseFileId::new(0x2122_2324_2526_2728_292a_2b2c_2d2e_2f30)
+            .ok_or_else(|| io::Error::other("test file ID is zero"))?;
+        Ok(DatabaseFileHeaderIdentity::new(
+            database_id,
+            DatabaseFileIdentity::new(role, file_id),
+        ))
+    }
 
     struct PoisonBeforeRecoveryCompare(FilePageStore<2>);
 
@@ -9312,7 +9982,7 @@ mod tests {
         assert_eq!(
             parse_header(
                 &header,
-                HeaderExpectation::V3OrV4(PageLayout::for_const::<10>()?)
+                HeaderExpectation::V3OrLater(PageLayout::for_const::<10>()?)
             )?,
             persistent_id(271)?
         );
@@ -9705,6 +10375,72 @@ mod tests {
                 selected_checkpoint_anchor: (0x6162, 0x7172_7374_7576_7778_797a_7b7c_7d7e_7f80,),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn v5_database_header_has_exact_golden_bytes_and_survives_reclamation()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_id = persistent_id(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)?;
+        let identity = database_file_header_identity(DatabaseFileRole::Wal)?;
+        let initial = build_header_v5_initial(persistent_id, 10, identity);
+        let mut expected = [0_u8; HEADER_V5_LENGTH];
+        expected[..8].copy_from_slice(b"NTSQLOG1");
+        expected[8..12].copy_from_slice(&[0, 5, 0, 192]);
+        expected[16..32].copy_from_slice(&persistent_id.get().to_be_bytes());
+        expected[32..40].copy_from_slice(&10_u64.to_be_bytes());
+        expected[128..176].copy_from_slice(&[
+            0x4e, 0x54, 0x53, 0x51, 0x43, 0x46, 0x49, 0x31, 0x00, 0x01, 0x00, 0x30, 0x01, 0x00,
+            0x00, 0x00, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a,
+            0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+        ]);
+        expected[184..192].copy_from_slice(&0xceda_f738_4da6_08cf_u64.to_be_bytes());
+        assert_eq!(initial, expected);
+        assert_eq!(
+            parse_header_v5(&initial, PageLayout::for_const::<10>()?)?,
+            V5HeaderMetadata {
+                persistent_id,
+                generation: 0,
+                retained_first: None,
+                logical_high_water: None,
+                allocated_epoch_high_water: None,
+                selected_checkpoint_anchor: None,
+                database_file_identity: identity,
+            }
+        );
+
+        let allocated_epoch_high_water = NonZeroU64::new(0x5152_5354_5556_5758)
+            .ok_or_else(|| io::Error::other("test epoch is zero"))?;
+        let reclaimed = build_header_v5_reclaimed(
+            V4HeaderMetadata {
+                persistent_id,
+                generation: 0x2122_2324_2526_2728,
+                retained_first: Some(0x3132_3334_3536_3738),
+                logical_high_water: Some(0x4142_4344_4546_4748),
+                allocated_epoch_high_water,
+                selected_checkpoint_anchor: (0x6162, 0x7172_7374_7576_7778_797a_7b7c_7d7e_7f80),
+            },
+            10,
+            identity,
+        );
+        assert_eq!(&reclaimed[128..176], &initial[128..176]);
+        assert_eq!(
+            read_u64(&reclaimed, HEADER_V5_CHECKSUM_OFFSET),
+            0xb749_8c55_7b2f_625f
+        );
+        let metadata = parse_header_v5(&reclaimed, PageLayout::for_const::<10>()?)?;
+        assert_eq!(metadata.database_file_identity, identity);
+        assert_eq!(metadata.generation, 0x2122_2324_2526_2728);
+
+        let mut reserved = initial;
+        reserved[176] = 1;
+        let checksum = checksum_v1(&reserved[..HEADER_V5_CHECKSUM_OFFSET]);
+        write_u64(&mut reserved, HEADER_V5_CHECKSUM_OFFSET, checksum);
+        assert!(parse_header_v5(&reserved, PageLayout::for_const::<10>()?).is_err());
+        let mut bad_checksum = initial;
+        bad_checksum[HEADER_V5_CHECKSUM_OFFSET] ^= 1;
+        assert!(parse_header_v5(&bad_checksum, PageLayout::for_const::<10>()?).is_err());
         Ok(())
     }
 
@@ -12066,6 +12802,48 @@ mod tests {
             0x2305_fa72_23d5_15db
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn page_store_v2_database_header_has_exact_golden_bytes_and_mutation_rejection()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_id = persistent_id(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)?;
+        let identity = database_file_header_identity(DatabaseFileRole::PageStore)?;
+        let header = build_page_store_header_v2(persistent_id, 10, identity);
+        let mut expected = [0_u8; PAGE_STORE_HEADER_V2_LENGTH];
+        expected[..8].copy_from_slice(b"NTSQPGS1");
+        expected[8..12].copy_from_slice(&[0, 2, 0, 128]);
+        expected[16..32].copy_from_slice(&persistent_id.get().to_be_bytes());
+        expected[32..40].copy_from_slice(&10_u64.to_be_bytes());
+        expected[64..112].copy_from_slice(&[
+            0x4e, 0x54, 0x53, 0x51, 0x43, 0x46, 0x49, 0x31, 0x00, 0x01, 0x00, 0x30, 0x02, 0x00,
+            0x00, 0x00, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a,
+            0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+        ]);
+        expected[120..128].copy_from_slice(&0xb2af_61e3_42f5_ce02_u64.to_be_bytes());
+        assert_eq!(header, expected);
+        assert_eq!(
+            parse_page_store_header_v2(&header, PageLayout::for_const::<10>()?)?,
+            PageStoreHeaderV2Metadata {
+                persistent_id,
+                database_file_identity: identity,
+            }
+        );
+
+        let mut reserved = header;
+        reserved[112] = 1;
+        let checksum = checksum_v1(&reserved[..PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET]);
+        write_u64(
+            &mut reserved,
+            PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET,
+            checksum,
+        );
+        assert!(parse_page_store_header_v2(&reserved, PageLayout::for_const::<10>()?).is_err());
+        let mut bad_checksum = header;
+        bad_checksum[PAGE_STORE_HEADER_V2_CHECKSUM_OFFSET] ^= 1;
+        assert!(parse_page_store_header_v2(&bad_checksum, PageLayout::for_const::<10>()?).is_err());
         Ok(())
     }
 

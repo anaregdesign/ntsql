@@ -9,11 +9,13 @@ use std::{
 
 use ntsql_compatibility::CompatibilityContext;
 use ntsql_database::{
-    DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
-    DatabaseCompositionIdentityMismatch, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
-    DatabaseId, DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
-    DatabaseRecoveryFailureCause, DatabaseRecoveryOwner, DatabaseStorageFormatVersion,
-    DatabaseStorageIdentity, FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase,
+    AbandonedDatabase, ClosePendingDatabase, DatabaseCleanCloseCertificate,
+    DatabaseCloseSourceManifestOwner, DatabaseCompositionIdentity,
+    DatabaseCompositionIdentityError, DatabaseCompositionIdentityMismatch, DatabaseFileId,
+    DatabaseFileIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleStage, DatabaseManifest,
+    DatabaseManifestSelectionRejection, DatabaseRecoveryFailureCause, DatabaseRecoveryOwner,
+    DatabaseStorageFormatVersion, DatabaseStorageIdentity, FailedDatabaseClosePreparation,
+    FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase, PreparedDatabaseCloseOwnership,
     RecoveredDatabaseOwnership, RecoveryRequiredDatabase, UnboundDatabase,
 };
 use ntsql_transaction::{
@@ -1437,6 +1439,12 @@ impl RecoveredInMemoryDatabaseOuterOwnership {
     }
 }
 
+impl DatabaseCloseSourceManifestOwner for RecoveredInMemoryDatabaseOuterOwnership {
+    fn close_source_manifest(&self) -> DatabaseManifest {
+        self.manifest()
+    }
+}
+
 impl fmt::Debug for RecoveredInMemoryDatabaseOuterOwnership {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1570,7 +1578,7 @@ type FailedInMemoryDatabaseDomainRecovery<const N: usize> = FailedDatabaseRecove
 >;
 
 /// Recovery-complete memory database owner with one exact target context.
-#[must_use = "live memory database must be closed or dropped"]
+#[must_use = "live memory database must be closed, abandoned, or dropped"]
 pub struct LiveInMemoryDatabase<const N: usize> {
     database: LiveDatabase<LiveInMemoryDatabaseDomainOwner<N>>,
 }
@@ -1634,6 +1642,20 @@ impl<const N: usize> LiveInMemoryDatabase<N> {
     > {
         self.database.owner().transaction()
     }
+
+    /// Consumes Live and binds fresh transaction close evidence to this database.
+    pub fn prepare_close(
+        self,
+    ) -> Result<ClosePendingInMemoryDatabase<N>, FailedInMemoryDatabaseClosePreparation<N>> {
+        self.database
+            .prepare_close()
+            .map(|database| ClosePendingInMemoryDatabase { database })
+    }
+
+    /// Relinquishes live ownership without publishing any clean state.
+    pub fn abandon(self) -> AbandonedDatabase {
+        self.database.abandon()
+    }
 }
 
 impl<const N: usize> fmt::Debug for LiveInMemoryDatabase<N> {
@@ -1645,6 +1667,92 @@ impl<const N: usize> fmt::Debug for LiveInMemoryDatabase<N> {
                 "compatibility_target",
                 self.compatibility_context().target_id(),
             )
+            .finish_non_exhaustive()
+    }
+}
+
+type PreparedInMemoryDatabaseCloseOwnership<const N: usize> = PreparedDatabaseCloseOwnership<
+    RecoveredInMemoryDatabaseOuterOwnership,
+    InMemoryCommitLog<N>,
+    InMemoryPageStore<N>,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+/// Terminal memory-database owner retained when close preparation fails.
+pub type FailedInMemoryDatabaseClosePreparation<const N: usize> = FailedDatabaseClosePreparation<
+    RecoveredInMemoryDatabaseOuterOwnership,
+    InMemoryCommitLog<N>,
+    InMemoryPageStore<N>,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+/// Memory database whose exact clean certificate awaits manifest publication.
+#[must_use = "close-pending memory database must publish or be explicitly abandoned"]
+pub struct ClosePendingInMemoryDatabase<const N: usize> {
+    database: ClosePendingDatabase<PreparedInMemoryDatabaseCloseOwnership<N>>,
+}
+
+impl<const N: usize> ClosePendingInMemoryDatabase<N> {
+    /// Returns the recovery-required source composition.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.database.identity()
+    }
+
+    /// Returns the exact adjacent composition targeted by clean publication.
+    #[must_use]
+    pub const fn target_identity(&self) -> DatabaseCompositionIdentity {
+        self.database.prepared().target_identity()
+    }
+
+    /// Returns the exact adjacent clean manifest awaiting publication.
+    #[must_use]
+    pub const fn target_manifest(&self) -> DatabaseManifest {
+        self.database.prepared().target_manifest()
+    }
+
+    /// Returns the exact clean-close certificate derived from transaction proof.
+    #[must_use]
+    pub const fn certificate(&self) -> DatabaseCleanCloseCertificate {
+        self.database.prepared().certificate()
+    }
+
+    /// Returns the selected recovery-required manifest retained by ownership.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.database.prepared().outer_owner().manifest()
+    }
+
+    /// Returns the immutable exact-target compatibility context.
+    #[must_use]
+    pub const fn compatibility_context(&self) -> &CompatibilityContext {
+        self.database
+            .prepared()
+            .outer_owner()
+            .compatibility_context()
+    }
+
+    /// Returns the database lifecycle stage.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        self.database.stage()
+    }
+
+    /// Relinquishes close-pending ownership without publishing clean state.
+    pub fn abandon(self) -> AbandonedDatabase {
+        self.database.abandon()
+    }
+}
+
+impl<const N: usize> fmt::Debug for ClosePendingInMemoryDatabase<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClosePendingInMemoryDatabase")
+            .field("identity", &self.identity())
+            .field("target_identity", &self.target_identity())
+            .field("certificate", &self.certificate())
             .finish_non_exhaustive()
     }
 }

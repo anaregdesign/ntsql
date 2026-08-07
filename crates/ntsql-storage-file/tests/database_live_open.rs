@@ -49,7 +49,12 @@ fn fresh_open_bootstraps_checkpoint_and_retains_context_and_all_locks() -> Resul
         Err(FileDatabaseOwnershipOpenError::Io(_))
     ));
 
-    drop(live);
+    let abandoned = live.abandon();
+    assert_eq!(abandoned.stage(), DatabaseLifecycleStage::Abandoned);
+    assert_eq!(
+        abandoned.identity(),
+        database.manifest.composition_identity()
+    );
     drop(open_recovery_required_file_database::<1>(
         database.database_id,
         database.layout.clone(),

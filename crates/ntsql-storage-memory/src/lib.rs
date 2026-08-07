@@ -48,8 +48,11 @@ use ntsql_transaction::{
     OwnedDurableTransactionRestartCheckpointBaselineObservation,
     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
     TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
-    TransactionPageWriteRecord, TransactionRecoverySource,
-    TransactionRestartCheckpointPageRepairStore, TransactionRestartCheckpointPageRepairWritePermit,
+    TransactionPageStorageCleanCloseCheckpointPublicationPermit,
+    TransactionPageStorageCleanCloseCheckpointPublisher,
+    TransactionPageStorageCleanCloseCheckpointSource, TransactionPageWriteRecord,
+    TransactionRecoverySource, TransactionRestartCheckpointPageRepairStore,
+    TransactionRestartCheckpointPageRepairWritePermit,
     TransactionRestartCoordinatorEpochAllocationError, TransactionRestartCoordinatorEpochSource,
     compare_committed_transaction_page_recovery_candidate,
     compare_transaction_restart_checkpoint_page_repair_candidate,
@@ -59,6 +62,7 @@ use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, Persist
 mod database_ownership;
 
 pub use database_ownership::{
+    ClosePendingInMemoryDatabase, FailedInMemoryDatabaseClosePreparation,
     InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError, InMemoryDatabaseCreateFault,
     InMemoryDatabaseCreateFaultTiming, InMemoryDatabaseCreateManifestError,
     InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation,
@@ -1889,6 +1893,8 @@ impl Error for RestartCheckpointCompletenessBaselineSourceFaultAlreadyArmed {}
 pub enum InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError {
     /// The configured deterministic one-shot failure was reached.
     InjectedFault(RestartCheckpointCompletenessBaselineSourceFaultPoint),
+    /// A dedicated clean-close candidate load fault was reached.
+    CleanCloseInjectedFault(TransactionPageStorageCleanCloseCheckpointFaultPoint),
     /// The returned nested entry vector could not reserve its exact bound.
     TransactionCapacityExhausted {
         /// Exact number of nested transaction entries that required reservation.
@@ -1908,6 +1914,12 @@ impl fmt::Display for InMemoryTransactionRestartCheckpointCompletenessBaselineSo
                 formatter,
                 "injected completeness checkpoint-source failure {point}"
             ),
+            Self::CleanCloseInjectedFault(point) => {
+                write!(
+                    formatter,
+                    "injected clean-close checkpoint-source failure {point}"
+                )
+            }
             Self::TransactionCapacityExhausted { transaction_count } => write!(
                 formatter,
                 "in-memory completeness checkpoint observation capacity is exhausted for {transaction_count} transaction entries"
@@ -1930,6 +1942,60 @@ pub enum RestartCheckpointCompletenessBaselinePublicationFaultPoint {
     /// Replace the current in-memory completeness slot, then report failure.
     AfterReplace,
 }
+
+/// One-shot failure boundary for the dedicated clean-close checkpoint candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPageStorageCleanCloseCheckpointFaultPoint {
+    /// Fail before replacing the clean-close candidate.
+    BeforePublish,
+    /// Replace the clean-close candidate, then report an indeterminate failure.
+    AfterPublish,
+    /// Fail before loading the current clean-close candidate.
+    BeforeLoad,
+}
+
+impl fmt::Display for TransactionPageStorageCleanCloseCheckpointFaultPoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforePublish => formatter.write_str("before publish"),
+            Self::AfterPublish => formatter.write_str("after publish"),
+            Self::BeforeLoad => formatter.write_str("before load"),
+        }
+    }
+}
+
+/// Refusal to replace an already armed clean-close checkpoint fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransactionPageStorageCleanCloseCheckpointFaultAlreadyArmed {
+    armed: TransactionPageStorageCleanCloseCheckpointFaultPoint,
+    requested: TransactionPageStorageCleanCloseCheckpointFaultPoint,
+}
+
+impl TransactionPageStorageCleanCloseCheckpointFaultAlreadyArmed {
+    /// Returns the fault that remains armed.
+    #[must_use]
+    pub const fn armed(&self) -> TransactionPageStorageCleanCloseCheckpointFaultPoint {
+        self.armed
+    }
+
+    /// Returns the rejected replacement fault.
+    #[must_use]
+    pub const fn requested(&self) -> TransactionPageStorageCleanCloseCheckpointFaultPoint {
+        self.requested
+    }
+}
+
+impl fmt::Display for TransactionPageStorageCleanCloseCheckpointFaultAlreadyArmed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "clean-close checkpoint fault {} is already armed; cannot arm {}",
+            self.armed, self.requested
+        )
+    }
+}
+
+impl Error for TransactionPageStorageCleanCloseCheckpointFaultAlreadyArmed {}
 
 impl fmt::Display for RestartCheckpointCompletenessBaselinePublicationFaultPoint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1997,6 +2063,8 @@ pub enum InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationErro
     },
     /// The configured deterministic one-shot failure was reached.
     InjectedFault(RestartCheckpointCompletenessBaselinePublicationFaultPoint),
+    /// A dedicated clean-close candidate publication fault was reached.
+    CleanCloseInjectedFault(TransactionPageStorageCleanCloseCheckpointFaultPoint),
     /// A complete candidate could not reserve its exact nested entry bound.
     TransactionCapacityExhausted {
         /// Exact number of nested transaction entries that required reservation.
@@ -2029,6 +2097,12 @@ impl fmt::Display for InMemoryTransactionRestartCheckpointCompletenessBaselinePu
                 formatter,
                 "injected completeness checkpoint-publication failure {point}"
             ),
+            Self::CleanCloseInjectedFault(point) => {
+                write!(
+                    formatter,
+                    "injected clean-close checkpoint-publication failure {point}"
+                )
+            }
             Self::TransactionCapacityExhausted { transaction_count } => write!(
                 formatter,
                 "in-memory completeness checkpoint publication capacity is exhausted for {transaction_count} transaction entries"
@@ -2043,15 +2117,16 @@ impl fmt::Display for InMemoryTransactionRestartCheckpointCompletenessBaselinePu
 
 impl Error for InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError {}
 
-/// Deterministic read and publication adapter for one completeness slot.
+/// Deterministic adapter for selected and clean-close completeness slots.
 ///
-/// This slot is distinct from
+/// The restart-selected slot is distinct from
 /// [`InMemoryTransactionRestartCheckpointBaselineSource`]: it retains the
 /// decoded page table and replay lower bound the transaction-only slot cannot
-/// represent, and it owns independent load and publication fault plans. The
-/// constructor seed is untrusted fixture state, not publication evidence.
-/// Runtime replacement is available only through the separately permitted
-/// completeness publisher port.
+/// represent. A second field retains the clean-close candidate and is never
+/// selected by the restart source port. The two namespaces own independent
+/// fault plans. The constructor seed applies only to the selected slot and is
+/// untrusted fixture state, not publication evidence. Runtime replacement is
+/// available only through the corresponding separately permitted publisher.
 ///
 /// It cannot satisfy WAL durability:
 ///
@@ -2135,8 +2210,11 @@ impl Error for InMemoryTransactionRestartCheckpointCompletenessBaselinePublicati
 #[must_use]
 pub struct InMemoryTransactionRestartCheckpointCompletenessBaselineSource {
     slot: Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+    clean_close_candidate:
+        Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
     armed_fault: Option<RestartCheckpointCompletenessBaselineSourceFaultPoint>,
     armed_publication_fault: Option<RestartCheckpointCompletenessBaselinePublicationFaultPoint>,
+    armed_clean_close_fault: Option<TransactionPageStorageCleanCloseCheckpointFaultPoint>,
 }
 
 impl InMemoryTransactionRestartCheckpointCompletenessBaselineSource {
@@ -2144,8 +2222,10 @@ impl InMemoryTransactionRestartCheckpointCompletenessBaselineSource {
     pub const fn empty() -> Self {
         Self {
             slot: None,
+            clean_close_candidate: None,
             armed_fault: None,
             armed_publication_fault: None,
+            armed_clean_close_fault: None,
         }
     }
 
@@ -2155,8 +2235,10 @@ impl InMemoryTransactionRestartCheckpointCompletenessBaselineSource {
     ) -> Self {
         Self {
             slot: Some(slot),
+            clean_close_candidate: None,
             armed_fault: None,
             armed_publication_fault: None,
+            armed_clean_close_fault: None,
         }
     }
 
@@ -2166,6 +2248,14 @@ impl InMemoryTransactionRestartCheckpointCompletenessBaselineSource {
         &self,
     ) -> Option<&OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation> {
         self.slot.as_ref()
+    }
+
+    /// Returns the dedicated clean-close candidate without selecting it for recovery.
+    #[must_use]
+    pub const fn clean_close_candidate(
+        &self,
+    ) -> Option<&OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation> {
+        self.clean_close_candidate.as_ref()
     }
 
     /// Arms one completeness load fault without replacing an existing plan.
@@ -2218,6 +2308,31 @@ impl InMemoryTransactionRestartCheckpointCompletenessBaselineSource {
         self.armed_publication_fault
     }
 
+    /// Arms one dedicated clean-close candidate fault.
+    pub fn arm_clean_close_fault(
+        &mut self,
+        fault: TransactionPageStorageCleanCloseCheckpointFaultPoint,
+    ) -> Result<(), TransactionPageStorageCleanCloseCheckpointFaultAlreadyArmed> {
+        if let Some(armed) = self.armed_clean_close_fault {
+            return Err(
+                TransactionPageStorageCleanCloseCheckpointFaultAlreadyArmed {
+                    armed,
+                    requested: fault,
+                },
+            );
+        }
+        self.armed_clean_close_fault = Some(fault);
+        Ok(())
+    }
+
+    /// Returns the clean-close candidate fault that remains armed.
+    #[must_use]
+    pub const fn armed_clean_close_fault(
+        &self,
+    ) -> Option<TransactionPageStorageCleanCloseCheckpointFaultPoint> {
+        self.armed_clean_close_fault
+    }
+
     fn consume_fault(
         &mut self,
         point: RestartCheckpointCompletenessBaselineSourceFaultPoint,
@@ -2240,6 +2355,88 @@ impl InMemoryTransactionRestartCheckpointCompletenessBaselineSource {
         } else {
             false
         }
+    }
+
+    fn consume_clean_close_fault(
+        &mut self,
+        point: TransactionPageStorageCleanCloseCheckpointFaultPoint,
+    ) -> bool {
+        if self.armed_clean_close_fault == Some(point) {
+            self.armed_clean_close_fault = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn clone_completeness_observation(
+        slot: &OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+    ) -> Result<
+        OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError,
+    > {
+        let slot_transactions = slot.transactions();
+        let transaction_count = slot_transactions.transactions().len();
+        let mut transactions = Vec::new();
+        transactions.try_reserve_exact(transaction_count).map_err(|_| {
+            InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::TransactionCapacityExhausted {
+                transaction_count,
+            }
+        })?;
+        transactions.extend_from_slice(slot_transactions.transactions());
+
+        let page_count = slot.pages().len();
+        let mut pages = Vec::new();
+        pages.try_reserve_exact(page_count).map_err(|_| {
+            InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::PageCapacityExhausted {
+                page_count,
+            }
+        })?;
+        pages.extend_from_slice(slot.pages());
+
+        Ok(
+            OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+                OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+                    slot_transactions.persistent_log_id(),
+                    slot_transactions.durable_frontier(),
+                    transactions,
+                ),
+                pages,
+                slot.replay(),
+            ),
+        )
+    }
+
+    fn validate_completeness_publication_permit(
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+        permit_persistent_log_id: u128,
+        permit_durable_frontier: Option<u64>,
+        permit_transaction_count: usize,
+        permit_page_count: usize,
+    ) -> Result<(), InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError> {
+        let baseline_persistent_log_id = baseline.persistent_log_id().get();
+        let baseline_durable_frontier = baseline.durable_frontier();
+        let baseline_transaction_count = baseline.transactions().len();
+        let baseline_page_count = baseline.pages().len();
+        if baseline_persistent_log_id != permit_persistent_log_id
+            || baseline_durable_frontier != permit_durable_frontier
+            || baseline_transaction_count != permit_transaction_count
+            || baseline_page_count != permit_page_count
+        {
+            return Err(
+                InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError::PublicationPermitMismatch {
+                    baseline_persistent_log_id,
+                    permit_persistent_log_id,
+                    baseline_durable_frontier,
+                    permit_durable_frontier,
+                    baseline_transaction_count,
+                    permit_transaction_count,
+                    baseline_page_count,
+                    permit_page_count,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn lower_completeness_required_image(
@@ -2422,36 +2619,7 @@ impl DurableTransactionRestartCheckpointCompletenessBaselineSource
         let Some(slot) = self.slot.as_ref() else {
             return Ok(None);
         };
-        let slot_transactions = slot.transactions();
-        let transaction_count = slot_transactions.transactions().len();
-        let mut transactions = Vec::new();
-        transactions.try_reserve_exact(transaction_count).map_err(|_| {
-            InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::TransactionCapacityExhausted {
-                transaction_count,
-            }
-        })?;
-        transactions.extend_from_slice(slot_transactions.transactions());
-
-        let page_count = slot.pages().len();
-        let mut pages = Vec::new();
-        pages.try_reserve_exact(page_count).map_err(|_| {
-            InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::PageCapacityExhausted {
-                page_count,
-            }
-        })?;
-        pages.extend_from_slice(slot.pages());
-
-        Ok(Some(
-            OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
-                OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
-                    slot_transactions.persistent_log_id(),
-                    slot_transactions.durable_frontier(),
-                    transactions,
-                ),
-                pages,
-                slot.replay(),
-            ),
-        ))
+        Self::clone_completeness_observation(slot).map(Some)
     }
 }
 
@@ -2465,32 +2633,13 @@ impl DurableTransactionRestartCheckpointCompletenessBaselinePublisher
         baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
         permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
     ) -> Result<(), Self::Error> {
-        let baseline_persistent_log_id = baseline.persistent_log_id().get();
-        let permit_persistent_log_id = permit.persistent_log_id().get();
-        let baseline_durable_frontier = baseline.durable_frontier();
-        let permit_durable_frontier = permit.durable_frontier();
-        let baseline_transaction_count = baseline.transactions().len();
-        let permit_transaction_count = permit.transaction_count();
-        let baseline_page_count = baseline.pages().len();
-        let permit_page_count = permit.page_count();
-        if baseline_persistent_log_id != permit_persistent_log_id
-            || baseline_durable_frontier != permit_durable_frontier
-            || baseline_transaction_count != permit_transaction_count
-            || baseline_page_count != permit_page_count
-        {
-            return Err(
-                InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError::PublicationPermitMismatch {
-                    baseline_persistent_log_id,
-                    permit_persistent_log_id,
-                    baseline_durable_frontier,
-                    permit_durable_frontier,
-                    baseline_transaction_count,
-                    permit_transaction_count,
-                    baseline_page_count,
-                    permit_page_count,
-                },
-            );
-        }
+        Self::validate_completeness_publication_permit(
+            baseline,
+            permit.persistent_log_id().get(),
+            permit.durable_frontier(),
+            permit.transaction_count(),
+            permit.page_count(),
+        )?;
 
         if self.consume_publication_fault(
             RestartCheckpointCompletenessBaselinePublicationFaultPoint::BeforeReplace,
@@ -2511,6 +2660,78 @@ impl DurableTransactionRestartCheckpointCompletenessBaselinePublisher
             Err(
                 InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError::InjectedFault(
                     RestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterReplace,
+                ),
+            )
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl TransactionPageStorageCleanCloseCheckpointSource
+    for InMemoryTransactionRestartCheckpointCompletenessBaselineSource
+{
+    type Error = InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError;
+
+    fn load_transaction_page_storage_clean_close_checkpoint(
+        &mut self,
+    ) -> Result<
+        Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+        Self::Error,
+    > {
+        if self.consume_clean_close_fault(
+            TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforeLoad,
+        ) {
+            return Err(
+                InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::CleanCloseInjectedFault(
+                    TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforeLoad,
+                ),
+            );
+        }
+        self.clean_close_candidate
+            .as_ref()
+            .map(Self::clone_completeness_observation)
+            .transpose()
+    }
+}
+
+impl TransactionPageStorageCleanCloseCheckpointPublisher
+    for InMemoryTransactionRestartCheckpointCompletenessBaselineSource
+{
+    type Error = InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError;
+
+    fn publish_transaction_page_storage_clean_close_checkpoint(
+        &mut self,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+        permit: TransactionPageStorageCleanCloseCheckpointPublicationPermit<'_>,
+    ) -> Result<(), Self::Error> {
+        Self::validate_completeness_publication_permit(
+            baseline,
+            permit.persistent_log_id().get(),
+            permit.durable_frontier(),
+            permit.transaction_count(),
+            permit.page_count(),
+        )?;
+
+        if self.consume_clean_close_fault(
+            TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforePublish,
+        ) {
+            return Err(
+                InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError::CleanCloseInjectedFault(
+                    TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforePublish,
+                ),
+            );
+        }
+
+        let replacement = Self::lower_restart_checkpoint_completeness_baseline(baseline)?;
+        self.clean_close_candidate = Some(replacement);
+
+        if self.consume_clean_close_fault(
+            TransactionPageStorageCleanCloseCheckpointFaultPoint::AfterPublish,
+        ) {
+            Err(
+                InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError::CleanCloseInjectedFault(
+                    TransactionPageStorageCleanCloseCheckpointFaultPoint::AfterPublish,
                 ),
             )
         } else {

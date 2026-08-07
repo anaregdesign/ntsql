@@ -9,12 +9,13 @@ use std::{
 
 use ntsql_compatibility::CompatibilityContext;
 use ntsql_database::{
-    DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
-    DatabaseCompositionIdentityMismatch, DatabaseFileHeaderIdentity, DatabaseFileRole, DatabaseId,
-    DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
-    DatabaseRecoveryFailureCause, DatabaseRecoveryOwner, DatabaseStorageFormatVersion,
-    DatabaseStorageIdentity, FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase,
-    RecoveredDatabaseOwnership, RecoveryRequiredDatabase, UnboundDatabase,
+    AbandonedDatabase, DatabaseCloseSourceManifestOwner, DatabaseCompositionIdentity,
+    DatabaseCompositionIdentityError, DatabaseCompositionIdentityMismatch,
+    DatabaseFileHeaderIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleStage,
+    DatabaseManifest, DatabaseManifestSelectionRejection, DatabaseRecoveryFailureCause,
+    DatabaseRecoveryOwner, DatabaseStorageFormatVersion, DatabaseStorageIdentity,
+    FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase, RecoveredDatabaseOwnership,
+    RecoveryRequiredDatabase, UnboundDatabase,
 };
 use ntsql_transaction::{
     FailedTransactionPageStorageRecoveryHandoff, TransactionCoordinator,
@@ -1619,6 +1620,12 @@ impl RecoveredFileDatabaseOuterOwnership {
     }
 }
 
+impl DatabaseCloseSourceManifestOwner for RecoveredFileDatabaseOuterOwnership {
+    fn close_source_manifest(&self) -> DatabaseManifest {
+        self.manifest()
+    }
+}
+
 impl fmt::Debug for RecoveredFileDatabaseOuterOwnership {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1754,7 +1761,7 @@ type FailedFileDatabaseDomainRecovery<const N: usize> = FailedDatabaseRecovery<
 >;
 
 /// Recovery-complete filesystem database owner with one exact target context.
-#[must_use = "live filesystem database must be closed or dropped"]
+#[must_use = "live filesystem database must be closed, abandoned, or dropped"]
 pub struct LiveFileDatabase<const N: usize> {
     database: LiveDatabase<LiveFileDatabaseDomainOwner<N>>,
 }
@@ -1817,6 +1824,11 @@ impl<const N: usize> LiveFileDatabase<N> {
         N,
     > {
         self.database.owner().transaction()
+    }
+
+    /// Relinquishes live ownership without publishing any clean state.
+    pub fn abandon(self) -> AbandonedDatabase {
+        self.database.abandon()
     }
 }
 

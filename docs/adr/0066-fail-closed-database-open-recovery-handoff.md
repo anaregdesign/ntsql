@@ -5,7 +5,7 @@
 - Issue: #185
 - Extends: ADR 0001, ADR 0037, ADR 0052, ADR 0053, ADR 0058, ADR 0059,
   ADR 0060, ADR 0062, ADR 0063, ADR 0064, ADR 0065
-- Extended by: ADR 0067
+- Extended by: ADR 0067, ADR 0068
 - Follows: #184
 
 ## Context

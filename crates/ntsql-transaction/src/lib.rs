@@ -9345,6 +9345,1516 @@ where
     }
 }
 
+type TransactionPageStorageCleanCloseCheckpointPublicationAttemptBrand<'attempt> =
+    (&'attempt (), fn(&'attempt ()) -> &'attempt ());
+
+/// Single-attempt authority to publish a dedicated clean-close checkpoint.
+///
+/// The target slot is distinct from the restart-selected checkpoint used by a
+/// recovery-required open. Private fields and the invariant brand prevent
+/// construction, cloning, or retention beyond one owning close operation.
+///
+/// ```compile_fail
+/// use ntsql_transaction::TransactionPageStorageCleanCloseCheckpointPublicationPermit;
+///
+/// fn cannot_clone(
+///     permit: TransactionPageStorageCleanCloseCheckpointPublicationPermit<'_>,
+/// ) {
+///     let _copy = permit.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use std::marker::PhantomData;
+/// use ntsql_transaction::TransactionPageStorageCleanCloseCheckpointPublicationPermit;
+///
+/// let _forged = TransactionPageStorageCleanCloseCheckpointPublicationPermit {
+///     persistent_log_id: todo!(),
+///     durable_frontier: None,
+///     checkpoint_anchor: todo!(),
+///     transaction_count: 0,
+///     page_count: 0,
+///     attempt_brand: PhantomData,
+/// };
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub struct TransactionPageStorageCleanCloseCheckpointPublicationPermit<'attempt> {
+    persistent_log_id: PersistentLogId,
+    durable_frontier: Option<u64>,
+    checkpoint_anchor: DurableTransactionRestartSelectedCheckpointAnchor,
+    transaction_count: usize,
+    page_count: usize,
+    attempt_brand:
+        PhantomData<TransactionPageStorageCleanCloseCheckpointPublicationAttemptBrand<'attempt>>,
+}
+
+impl TransactionPageStorageCleanCloseCheckpointPublicationPermit<'_> {
+    /// Returns the persistent WAL identity of the authorized checkpoint.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the exact optional durable frontier.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.durable_frontier
+    }
+
+    /// Returns the versioned anchor of the exact authorized checkpoint.
+    pub const fn checkpoint_anchor(&self) -> DurableTransactionRestartSelectedCheckpointAnchor {
+        self.checkpoint_anchor
+    }
+
+    /// Returns the exact transaction-entry count.
+    #[must_use]
+    pub const fn transaction_count(&self) -> usize {
+        self.transaction_count
+    }
+
+    /// Returns the exact page-entry count.
+    #[must_use]
+    pub const fn page_count(&self) -> usize {
+        self.page_count
+    }
+}
+
+fn with_transaction_page_storage_clean_close_checkpoint_publication_permit<Output, Operation>(
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    operation: Operation,
+) -> Output
+where
+    Operation: for<'attempt> FnOnce(
+        TransactionPageStorageCleanCloseCheckpointPublicationPermit<'attempt>,
+    ) -> Output,
+{
+    operation(
+        TransactionPageStorageCleanCloseCheckpointPublicationPermit {
+            persistent_log_id: baseline.persistent_log_id(),
+            durable_frontier: baseline.durable_frontier(),
+            checkpoint_anchor: selected_restart_checkpoint_anchor(baseline),
+            transaction_count: baseline.transactions().len(),
+            page_count: baseline.pages().len(),
+            attempt_brand: PhantomData,
+        },
+    )
+}
+
+/// Publisher for the durable clean-close checkpoint candidate.
+///
+/// The adapter must publish into a namespace physically disjoint from the
+/// restart-selected checkpoint. A crash or any returned error may leave this
+/// candidate absent, present, or unreadable, but must not alter the checkpoint
+/// selected by a recovery-required open.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaseline,
+///     TransactionPageStorageCleanCloseCheckpointPublisher,
+/// };
+///
+/// fn cannot_publish_without_permit<Publisher>(
+///     publisher: &mut Publisher,
+///     baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+/// )
+/// where
+///     Publisher: TransactionPageStorageCleanCloseCheckpointPublisher,
+/// {
+///     publisher.publish_transaction_page_storage_clean_close_checkpoint(baseline);
+/// }
+/// ```
+pub trait TransactionPageStorageCleanCloseCheckpointPublisher {
+    /// Adapter-specific outcome-indeterminate candidate publication failure.
+    type Error;
+
+    /// Atomically replaces only the clean-close candidate with `baseline`.
+    fn publish_transaction_page_storage_clean_close_checkpoint(
+        &mut self,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+        permit: TransactionPageStorageCleanCloseCheckpointPublicationPermit<'_>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Read port for the dedicated durable clean-close checkpoint candidate.
+///
+/// Loading this candidate never selects or replaces the recovery checkpoint.
+pub trait TransactionPageStorageCleanCloseCheckpointSource {
+    /// Adapter-specific candidate load failure.
+    type Error;
+
+    /// Loads one fresh untrusted observation from the clean-close candidate.
+    fn load_transaction_page_storage_clean_close_checkpoint(
+        &mut self,
+    ) -> Result<
+        Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+        Self::Error,
+    >;
+}
+
+/// Portable persisted count field carried by clean-close evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPageStorageCleanCloseCountField {
+    /// Number of transaction checkpoint entries.
+    TransactionEntries,
+    /// Number of page checkpoint entries.
+    PageEntries,
+}
+
+/// Non-current page classification that rejects a clean-close attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPageStorageCleanClosePageState {
+    /// No committed or raw image currently requires this page.
+    NoRequiredImage,
+    /// The required page is absent from the page store.
+    StoreMissing,
+    /// The page store trails the latest required durable image.
+    StoreBehind,
+}
+
+/// Exact domain evidence that rejects transaction-storage clean close.
+#[derive(Debug)]
+pub enum DurableTransactionPageStorageCleanCloseEvidenceError {
+    /// One coordinator lifecycle can still mutate or requires resolution.
+    CoordinatorLifecycleNotTerminal {
+        /// Transaction retaining the nonterminal lifecycle.
+        transaction: TransactionId,
+        /// Rejected lifecycle.
+        status: TransactionLifecycleStatus,
+    },
+    /// A staged page has not completed the coordinator-owned flush path.
+    CoordinatorPageStillStaged {
+        /// Transaction owning the staged page.
+        transaction: TransactionId,
+        /// Page whose write obligation remains.
+        page_number: PageNumber,
+    },
+    /// A committed coordinator lifecycle has no matching durable commit.
+    CoordinatorCommitMissingFromDurableState {
+        /// Live transaction missing from fresh durable evidence.
+        transaction: TransactionId,
+    },
+    /// A no-commit coordinator lifecycle contradicts a durable commit.
+    CoordinatorNoCommitContradictsDurableState {
+        /// Live transaction contradicted by fresh durable evidence.
+        transaction: TransactionId,
+    },
+    /// A durable committed transaction is absent from the live coordinator.
+    DurableCommitMissingFromCoordinator {
+        /// Persisted transaction missing from the coordinator registry.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// Current durable WAL still contains unresolved transactions.
+    UnresolvedDurableTransactions {
+        /// Number of unresolved durable transactions.
+        count: usize,
+    },
+    /// Current WAL/page state requires replay at or before an exact position.
+    ReplayRequired {
+        /// Exact inert replay lower bound.
+        replay_start: Box<DurableTransactionRestartReplayStart>,
+    },
+    /// One current page is not stored at its required durable image.
+    PageNotCurrent {
+        /// Rejected page.
+        page_number: PageNumber,
+        /// Rejected current classification.
+        state: TransactionPageStorageCleanClosePageState,
+    },
+    /// An in-memory count cannot fit the portable clean-certificate width.
+    PortableCountWidthExceeded {
+        /// Certificate field that overflowed.
+        field: TransactionPageStorageCleanCloseCountField,
+        /// Rejected exact count.
+        count: u128,
+    },
+    /// Fresh allocator metadata names another WAL lineage.
+    RetentionMetadataLineageMismatch {
+        /// Current transaction-storage lineage.
+        expected: LogLineage,
+        /// Rejected metadata lineage.
+        actual: LogLineage,
+    },
+    /// Fresh allocator metadata differs from the live coordinator epoch.
+    AllocatedEpochHighWaterMismatch {
+        /// Live coordinator epoch.
+        expected: u64,
+        /// Rejected durable allocator high-water.
+        actual: u64,
+    },
+    /// A durable transaction identity exceeds the allocator high-water.
+    DurableTransactionEpochAboveAllocatedHighWater {
+        /// Rejected durable transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Fresh durable allocator high-water.
+        allocated_epoch_high_water: u64,
+    },
+    /// Fresh source-format retention metadata names another WAL lineage.
+    ForeignRetentionSourceConstraint {
+        /// Rejected source-format constraint.
+        position: LogSequenceNumber,
+    },
+    /// Current WAL/page completeness changed across checkpoint publication.
+    CurrentBaselineChanged {
+        /// Baseline published by this attempt.
+        expected: DurableTransactionRestartSelectedCheckpointAnchor,
+        /// Fresh baseline observed after publication.
+        actual: DurableTransactionRestartSelectedCheckpointAnchor,
+    },
+    /// Reloaded checkpoint fields do not exactly equal fresh current evidence.
+    ReloadedCheckpointMismatch {
+        /// Anchor of the exact expected current baseline.
+        expected: DurableTransactionRestartSelectedCheckpointAnchor,
+    },
+    /// Allocator or source-format metadata changed across publication.
+    RetentionMetadataChanged {
+        /// Metadata observed before publication.
+        expected: Box<DurableTransactionRestartRetentionMetadataObservation>,
+        /// Metadata observed after publication.
+        actual: Box<DurableTransactionRestartRetentionMetadataObservation>,
+    },
+}
+
+impl fmt::Display for DurableTransactionPageStorageCleanCloseEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CoordinatorLifecycleNotTerminal {
+                transaction,
+                status,
+            } => write!(
+                formatter,
+                "transaction {transaction} retains nonterminal close lifecycle {status:?}"
+            ),
+            Self::CoordinatorPageStillStaged {
+                transaction,
+                page_number,
+            } => write!(
+                formatter,
+                "transaction {transaction} still owns staged page {}",
+                page_number.get()
+            ),
+            Self::CoordinatorCommitMissingFromDurableState { transaction } => write!(
+                formatter,
+                "committed transaction {transaction} is absent from fresh durable state"
+            ),
+            Self::CoordinatorNoCommitContradictsDurableState { transaction } => write!(
+                formatter,
+                "no-commit transaction {transaction} has a fresh durable commit"
+            ),
+            Self::DurableCommitMissingFromCoordinator { transaction } => write!(
+                formatter,
+                "durable committed transaction {transaction} is absent from the live coordinator"
+            ),
+            Self::UnresolvedDurableTransactions { count } => write!(
+                formatter,
+                "clean close rejected {count} unresolved durable transactions"
+            ),
+            Self::ReplayRequired { replay_start } => write!(
+                formatter,
+                "clean close requires replay from position {:?}",
+                replay_start.position()
+            ),
+            Self::PageNotCurrent { page_number, state } => write!(
+                formatter,
+                "clean close page {} is not current: {state:?}",
+                page_number.get()
+            ),
+            Self::PortableCountWidthExceeded { field, count } => write!(
+                formatter,
+                "clean close {field:?} count {count} exceeds the portable width"
+            ),
+            Self::RetentionMetadataLineageMismatch { .. } => {
+                formatter.write_str("clean close retention metadata belongs to another lineage")
+            }
+            Self::AllocatedEpochHighWaterMismatch { expected, actual } => write!(
+                formatter,
+                "clean close allocator high-water {actual} differs from coordinator epoch {expected}"
+            ),
+            Self::DurableTransactionEpochAboveAllocatedHighWater {
+                transaction,
+                allocated_epoch_high_water,
+            } => write!(
+                formatter,
+                "durable transaction {transaction} exceeds clean-close allocator high-water {allocated_epoch_high_water}"
+            ),
+            Self::ForeignRetentionSourceConstraint { position } => write!(
+                formatter,
+                "clean close retention source constraint {} belongs to another lineage",
+                position.get()
+            ),
+            Self::CurrentBaselineChanged { .. } => formatter
+                .write_str("current WAL/page completeness changed during clean-close publication"),
+            Self::ReloadedCheckpointMismatch { .. } => formatter
+                .write_str("reloaded clean-close checkpoint contradicts fresh current evidence"),
+            Self::RetentionMetadataChanged { .. } => {
+                formatter.write_str("retention metadata changed during clean-close publication")
+            }
+        }
+    }
+}
+
+impl Error for DurableTransactionPageStorageCleanCloseEvidenceError {}
+
+/// Failure to derive one fresh generation-aware current completeness baseline.
+#[derive(Debug)]
+pub enum DurableTransactionPageStorageCleanCloseCurrentCompletenessError<WalSourceError, StoreError>
+{
+    /// Complete-prefix or retained-suffix completeness derivation failed.
+    Preparation(
+        DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError<
+            WalSourceError,
+            StoreError,
+        >,
+    ),
+    /// An anchored pruned generation could not materialize its current suffix.
+    ReplayPlanning(
+        Box<DurableTransactionRestartCheckpointReplayPlanningError<WalSourceError, StoreError>>,
+    ),
+}
+
+impl<WalSourceError: fmt::Display, StoreError: fmt::Display> fmt::Display
+    for DurableTransactionPageStorageCleanCloseCurrentCompletenessError<WalSourceError, StoreError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preparation(source) => source.fmt(formatter),
+            Self::ReplayPlanning(source) => {
+                write!(formatter, "clean-close replay planning failed: {source}")
+            }
+        }
+    }
+}
+
+impl<WalSourceError, StoreError> Error
+    for DurableTransactionPageStorageCleanCloseCurrentCompletenessError<WalSourceError, StoreError>
+where
+    WalSourceError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Preparation(source) => Some(source),
+            Self::ReplayPlanning(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+/// Candidate publication failure retaining the exact attempted checkpoint.
+///
+/// The attempted baseline remains private and cannot be reused as authority.
+#[derive(Debug)]
+pub struct TransactionPageStorageCleanCloseCheckpointPublicationError<PublisherError> {
+    attempted: Box<DurableTransactionRestartCheckpointCompletenessBaseline>,
+    source: PublisherError,
+}
+
+impl<PublisherError> TransactionPageStorageCleanCloseCheckpointPublicationError<PublisherError> {
+    fn new(
+        attempted: DurableTransactionRestartCheckpointCompletenessBaseline,
+        source: PublisherError,
+    ) -> Self {
+        Self {
+            attempted: Box::new(attempted),
+            source,
+        }
+    }
+
+    /// Returns the persistent WAL identity of the attempted candidate.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.attempted.persistent_log_id()
+    }
+
+    /// Returns the optional durable frontier of the attempted candidate.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.attempted.durable_frontier()
+    }
+
+    /// Returns the versioned anchor of the attempted candidate.
+    pub fn checkpoint_anchor(&self) -> DurableTransactionRestartSelectedCheckpointAnchor {
+        selected_restart_checkpoint_anchor(&self.attempted)
+    }
+
+    /// Returns the exact adapter failure.
+    #[must_use]
+    pub const fn cause(&self) -> &PublisherError {
+        &self.source
+    }
+}
+
+impl<PublisherError: fmt::Display> fmt::Display
+    for TransactionPageStorageCleanCloseCheckpointPublicationError<PublisherError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "clean-close checkpoint candidate publication for log {} at frontier {:?} is indeterminate: {}",
+            self.persistent_log_id().get(),
+            self.durable_frontier(),
+            self.source
+        )
+    }
+}
+
+impl<PublisherError> Error
+    for TransactionPageStorageCleanCloseCheckpointPublicationError<PublisherError>
+where
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Clean-close failure proven before the checkpoint publication effect boundary.
+#[derive(Debug)]
+pub enum DurableTransactionPageStorageCleanCloseBeforePublicationError<
+    WalSourceError,
+    StoreError,
+    MetadataError,
+> {
+    /// Fresh generation-aware completeness derivation failed.
+    CurrentCompleteness(
+        DurableTransactionPageStorageCleanCloseCurrentCompletenessError<WalSourceError, StoreError>,
+    ),
+    /// Current coordinator, WAL, page, or metadata evidence rejected close.
+    Evidence(DurableTransactionPageStorageCleanCloseEvidenceError),
+    /// Fresh allocator/source-format metadata could not be observed.
+    RetentionMetadataSource(MetadataError),
+}
+
+impl<WalSourceError, StoreError, MetadataError> fmt::Display
+    for DurableTransactionPageStorageCleanCloseBeforePublicationError<
+        WalSourceError,
+        StoreError,
+        MetadataError,
+    >
+where
+    WalSourceError: fmt::Display,
+    StoreError: fmt::Display,
+    MetadataError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentCompleteness(source) => source.fmt(formatter),
+            Self::Evidence(source) => source.fmt(formatter),
+            Self::RetentionMetadataSource(source) => {
+                write!(formatter, "clean-close retention metadata failed: {source}")
+            }
+        }
+    }
+}
+
+impl<WalSourceError, StoreError, MetadataError> Error
+    for DurableTransactionPageStorageCleanCloseBeforePublicationError<
+        WalSourceError,
+        StoreError,
+        MetadataError,
+    >
+where
+    WalSourceError: Error + 'static,
+    StoreError: Error + 'static,
+    MetadataError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CurrentCompleteness(source) => Some(source),
+            Self::Evidence(source) => Some(source),
+            Self::RetentionMetadataSource(source) => Some(source),
+        }
+    }
+}
+
+/// Terminal clean-close failure after the checkpoint publisher was invoked.
+#[derive(Debug)]
+pub enum DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError<
+    WalSourceError,
+    StoreError,
+    MetadataError,
+    CheckpointSourceError,
+    PublisherError,
+> {
+    /// The publication port returned an outcome-indeterminate error.
+    Publication(TransactionPageStorageCleanCloseCheckpointPublicationError<PublisherError>),
+    /// The freshly published slot could not be reloaded.
+    CheckpointReload(CheckpointSourceError),
+    /// Reload reported no selected checkpoint.
+    CheckpointAbsent,
+    /// Fresh post-publication completeness derivation failed.
+    CurrentCompleteness(
+        DurableTransactionPageStorageCleanCloseCurrentCompletenessError<WalSourceError, StoreError>,
+    ),
+    /// Post-publication current evidence contradicted the attempted close.
+    Evidence(DurableTransactionPageStorageCleanCloseEvidenceError),
+    /// Fresh post-publication allocator/source metadata could not be observed.
+    RetentionMetadataSource(MetadataError),
+}
+
+impl<WalSourceError, StoreError, MetadataError, CheckpointSourceError, PublisherError> fmt::Display
+    for DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError<
+        WalSourceError,
+        StoreError,
+        MetadataError,
+        CheckpointSourceError,
+        PublisherError,
+    >
+where
+    WalSourceError: fmt::Display,
+    StoreError: fmt::Display,
+    MetadataError: fmt::Display,
+    CheckpointSourceError: fmt::Display,
+    PublisherError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Publication(source) => source.fmt(formatter),
+            Self::CheckpointReload(source) => {
+                write!(formatter, "clean-close checkpoint reload failed: {source}")
+            }
+            Self::CheckpointAbsent => {
+                formatter.write_str("clean-close checkpoint disappeared after publication")
+            }
+            Self::CurrentCompleteness(source) => source.fmt(formatter),
+            Self::Evidence(source) => source.fmt(formatter),
+            Self::RetentionMetadataSource(source) => write!(
+                formatter,
+                "post-publication clean-close retention metadata failed: {source}"
+            ),
+        }
+    }
+}
+
+impl<WalSourceError, StoreError, MetadataError, CheckpointSourceError, PublisherError> Error
+    for DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError<
+        WalSourceError,
+        StoreError,
+        MetadataError,
+        CheckpointSourceError,
+        PublisherError,
+    >
+where
+    WalSourceError: Error + 'static,
+    StoreError: Error + 'static,
+    MetadataError: Error + 'static,
+    CheckpointSourceError: Error + 'static,
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Publication(source) => Some(source),
+            Self::CheckpointReload(source) => Some(source),
+            Self::CheckpointAbsent => None,
+            Self::CurrentCompleteness(source) => Some(source),
+            Self::Evidence(source) => Some(source),
+            Self::RetentionMetadataSource(source) => Some(source),
+        }
+    }
+}
+
+/// Clean-close preparation failure classified by its physical effect boundary.
+#[derive(Debug)]
+pub enum DurableTransactionPageStorageCleanClosePreparationError<
+    WalSourceError,
+    StoreError,
+    MetadataError,
+    CheckpointSourceError,
+    PublisherError,
+> {
+    /// No checkpoint publication was attempted.
+    BeforePublication(
+        DurableTransactionPageStorageCleanCloseBeforePublicationError<
+            WalSourceError,
+            StoreError,
+            MetadataError,
+        >,
+    ),
+    /// The clean-close candidate publisher was invoked; candidate state is unknown.
+    OutcomeIndeterminate(
+        DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError<
+            WalSourceError,
+            StoreError,
+            MetadataError,
+            CheckpointSourceError,
+            PublisherError,
+        >,
+    ),
+}
+
+impl<WalSourceError, StoreError, MetadataError, CheckpointSourceError, PublisherError>
+    DurableTransactionPageStorageCleanClosePreparationError<
+        WalSourceError,
+        StoreError,
+        MetadataError,
+        CheckpointSourceError,
+        PublisherError,
+    >
+{
+    /// Returns whether the checkpoint publisher effect boundary was crossed.
+    #[must_use]
+    pub const fn outcome_is_indeterminate(&self) -> bool {
+        matches!(self, Self::OutcomeIndeterminate(_))
+    }
+}
+
+impl<WalSourceError, StoreError, MetadataError, CheckpointSourceError, PublisherError> fmt::Display
+    for DurableTransactionPageStorageCleanClosePreparationError<
+        WalSourceError,
+        StoreError,
+        MetadataError,
+        CheckpointSourceError,
+        PublisherError,
+    >
+where
+    WalSourceError: fmt::Display,
+    StoreError: fmt::Display,
+    MetadataError: fmt::Display,
+    CheckpointSourceError: fmt::Display,
+    PublisherError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforePublication(source) => source.fmt(formatter),
+            Self::OutcomeIndeterminate(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<WalSourceError, StoreError, MetadataError, CheckpointSourceError, PublisherError> Error
+    for DurableTransactionPageStorageCleanClosePreparationError<
+        WalSourceError,
+        StoreError,
+        MetadataError,
+        CheckpointSourceError,
+        PublisherError,
+    >
+where
+    WalSourceError: Error + 'static,
+    StoreError: Error + 'static,
+    MetadataError: Error + 'static,
+    CheckpointSourceError: Error + 'static,
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::BeforePublication(source) => Some(source),
+            Self::OutcomeIndeterminate(source) => Some(source),
+        }
+    }
+}
+
+/// Non-forgeable transaction-storage evidence required by database clean close.
+///
+/// The value is neither cloneable nor independently constructible, and it is
+/// exposed only through an owning prepared-close state:
+///
+/// ```compile_fail
+/// use ntsql_transaction::TransactionPageStorageCleanCloseProof;
+///
+/// fn cannot_clone(proof: TransactionPageStorageCleanCloseProof) {
+///     let _copy = proof.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::TransactionPageStorageCleanCloseProof;
+///
+/// let forged = TransactionPageStorageCleanCloseProof {
+///     persistent_log_id: todo!(),
+///     durable_frontier: None,
+///     allocated_epoch_high_water: 1,
+///     checkpoint_anchor: todo!(),
+///     transaction_entry_count: 0,
+///     page_entry_count: 0,
+/// };
+/// ```
+#[derive(Debug)]
+#[must_use]
+pub struct TransactionPageStorageCleanCloseProof {
+    persistent_log_id: PersistentLogId,
+    durable_frontier: Option<u64>,
+    allocated_epoch_high_water: u64,
+    checkpoint_anchor: DurableTransactionRestartSelectedCheckpointAnchor,
+    transaction_entry_count: u64,
+    page_entry_count: u64,
+}
+
+impl TransactionPageStorageCleanCloseProof {
+    /// Returns the persistent WAL identity bound by the proof.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the exact current durable WAL frontier.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        self.durable_frontier
+    }
+
+    /// Returns the greatest durably allocated transaction epoch.
+    #[must_use]
+    pub const fn allocated_epoch_high_water(&self) -> u64 {
+        self.allocated_epoch_high_water
+    }
+
+    /// Returns the versioned fingerprint of the exact reloaded close candidate.
+    pub const fn checkpoint_anchor(&self) -> DurableTransactionRestartSelectedCheckpointAnchor {
+        self.checkpoint_anchor
+    }
+
+    /// Returns the portable transaction-entry count.
+    #[must_use]
+    pub const fn transaction_entry_count(&self) -> u64 {
+        self.transaction_entry_count
+    }
+
+    /// Returns the portable page-entry count.
+    #[must_use]
+    pub const fn page_entry_count(&self) -> u64 {
+        self.page_entry_count
+    }
+}
+
+/// Owning transaction-storage state after fresh clean-close proof succeeds.
+///
+/// The retained adapters and published candidate have no extraction path. A
+/// database composition root must consume this owner in the later manifest
+/// publication transition rather than detaching or reusing the proof.
+///
+/// ```compile_fail
+/// use ntsql_transaction::PreparedTransactionPageStorageCleanClose;
+///
+/// fn cannot_extract_owner<Source, Store, CheckpointSource, const N: usize>(
+///     prepared: PreparedTransactionPageStorageCleanClose<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _owner = prepared.into_analyzed_storage();
+/// }
+/// ```
+#[must_use = "prepared clean close retains all transaction-storage owners and its proof"]
+pub struct PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, const N: usize>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    _analyzed: WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    proof: TransactionPageStorageCleanCloseProof,
+    _published_checkpoint: DurableTransactionRestartCheckpointCompletenessBaseline,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Borrows the exact proof bound to this retained owner.
+    pub const fn proof(&self) -> &TransactionPageStorageCleanCloseProof {
+        &self.proof
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedTransactionPageStorageCleanClose")
+            .field("proof", &self.proof)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Concrete error type for one transaction-storage clean-close transition.
+pub type TransactionPageStorageCleanClosePreparationError<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = DurableTransactionPageStorageCleanClosePreparationError<
+    <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+    <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+    <Source as DurableTransactionRestartRetentionMetadataSource>::Error,
+    <CheckpointSource as TransactionPageStorageCleanCloseCheckpointSource>::Error,
+    <CheckpointSource as TransactionPageStorageCleanCloseCheckpointPublisher>::Error,
+>;
+
+/// Terminal owner retained when transaction-storage clean-close preparation fails.
+///
+/// No retry or adapter-extraction method is provided; callers must keep the
+/// value terminal and reopen from durable state.
+///
+/// ```compile_fail
+/// use ntsql_transaction::FailedTransactionPageStorageCleanClosePreparation;
+///
+/// fn cannot_retry<Source, Store, CheckpointSource, const N: usize>(
+///     failure: FailedTransactionPageStorageCleanClosePreparation<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _retry = failure.retry();
+/// }
+/// ```
+#[must_use = "failed clean-close preparation retains a terminal transaction-storage owner"]
+pub struct FailedTransactionPageStorageCleanClosePreparation<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+{
+    _analyzed: Box<
+        WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    >,
+    error: TransactionPageStorageCleanClosePreparationError<Source, Store, CheckpointSource, N>,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageCleanClosePreparation<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+{
+    /// Returns the exact typed failure without releasing the retained owner.
+    #[must_use]
+    pub const fn error(
+        &self,
+    ) -> &TransactionPageStorageCleanClosePreparationError<Source, Store, CheckpointSource, N> {
+        &self.error
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageCleanClosePreparation<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+    TransactionPageStorageCleanClosePreparationError<Source, Store, CheckpointSource, N>:
+        fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageCleanClosePreparation")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+fn prepare_transaction_page_storage_clean_close_current_baseline<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+>(
+    completed: &mut CompletedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+) -> Result<
+    DurableTransactionRestartCheckpointCompletenessBaseline,
+    DurableTransactionPageStorageCleanCloseCurrentCompletenessError<
+        Source::Error,
+        Store::ObservationError,
+    >,
+>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    match &completed.validation {
+        SelectedRestartCheckpointValidation::CompletePrefix => {
+            prepare_restart_checkpoint_completeness_baseline_from_parts(
+                &mut completed.source,
+                &completed.store,
+            )
+            .map_err(DurableTransactionPageStorageCleanCloseCurrentCompletenessError::Preparation)
+        }
+        SelectedRestartCheckpointValidation::Anchored { planner } => {
+            let lineage = completed.source.lineage().clone();
+            let materialized = planner(
+                &mut completed.source,
+                &completed.store,
+                &completed.evidence.selected_baseline,
+            )
+            .map_err(|source| {
+                DurableTransactionPageStorageCleanCloseCurrentCompletenessError::ReplayPlanning(
+                    Box::new(source),
+                )
+            })?;
+            let analysis =
+                derive_durable_transaction_restart_completeness_from_analysis_evidence::<
+                    Source::Error,
+                    Store,
+                    OwnedDurableTransactionRestartReplayObservation<N>,
+                    N,
+                >(
+                    &lineage,
+                    materialized.current_analysis,
+                    &materialized.retained_observations,
+                    completed.evidence.selected_baseline.pages(),
+                    &completed.store,
+                )
+                .map_err(|source| {
+                    DurableTransactionPageStorageCleanCloseCurrentCompletenessError::Preparation(
+                        DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::CompletenessAnalysis(
+                            source,
+                        ),
+                    )
+                })?;
+            prepare_restart_checkpoint_completeness_baseline(analysis).map_err(|source| {
+                DurableTransactionPageStorageCleanCloseCurrentCompletenessError::Preparation(
+                    DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::BaselinePreparation(
+                        source,
+                    ),
+                )
+            })
+        }
+    }
+}
+
+fn validate_transaction_page_storage_clean_close_coordinator(
+    coordinator: &TransactionCoordinator,
+) -> Result<(), DurableTransactionPageStorageCleanCloseEvidenceError> {
+    for (&transaction, &status) in &coordinator.lifecycles {
+        if !matches!(
+            status,
+            TransactionLifecycleStatus::Committed
+                | TransactionLifecycleStatus::NoDurableCommitRecord
+        ) {
+            return Err(
+                DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorLifecycleNotTerminal {
+                    transaction,
+                    status,
+                },
+            );
+        }
+    }
+    if let Some(&(transaction, page_number)) = coordinator.staged_pages.first() {
+        return Err(
+            DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorPageStillStaged {
+                transaction,
+                page_number,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_transaction_page_storage_clean_close_baseline(
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<(), DurableTransactionPageStorageCleanCloseEvidenceError> {
+    let unresolved_count = baseline
+        .transactions()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.state(),
+                DurableTransactionRestartCheckpointBaselineState::Uncommitted
+            )
+        })
+        .count();
+    if unresolved_count != 0 {
+        return Err(
+            DurableTransactionPageStorageCleanCloseEvidenceError::UnresolvedDurableTransactions {
+                count: unresolved_count,
+            },
+        );
+    }
+    for page in baseline.pages() {
+        let state = match page.state() {
+            DurableTransactionRestartPageState::StoreCurrent { .. } => continue,
+            DurableTransactionRestartPageState::NoRequiredImage => {
+                TransactionPageStorageCleanClosePageState::NoRequiredImage
+            }
+            DurableTransactionRestartPageState::StoreMissing { .. } => {
+                TransactionPageStorageCleanClosePageState::StoreMissing
+            }
+            DurableTransactionRestartPageState::StoreBehind { .. } => {
+                TransactionPageStorageCleanClosePageState::StoreBehind
+            }
+        };
+        return Err(
+            DurableTransactionPageStorageCleanCloseEvidenceError::PageNotCurrent {
+                page_number: page.page_number(),
+                state,
+            },
+        );
+    }
+    if !matches!(
+        baseline.replay_start(),
+        DurableTransactionRestartReplayStart::AfterFrontier { .. }
+    ) {
+        return Err(
+            DurableTransactionPageStorageCleanCloseEvidenceError::ReplayRequired {
+                replay_start: Box::new(baseline.replay_start().clone()),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_transaction_page_storage_clean_close_coordinator_durable_state(
+    coordinator: &TransactionCoordinator,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<(), DurableTransactionPageStorageCleanCloseEvidenceError> {
+    for (&transaction, &status) in &coordinator.lifecycles {
+        let durable = baseline
+            .transactions()
+            .iter()
+            .find(|entry| entry.transaction().matches_transaction_id(transaction));
+        match (status, durable) {
+            (TransactionLifecycleStatus::Committed, Some(_))
+            | (TransactionLifecycleStatus::NoDurableCommitRecord, None) => {}
+            (TransactionLifecycleStatus::Committed, None) => {
+                return Err(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorCommitMissingFromDurableState {
+                        transaction,
+                    },
+                );
+            }
+            (TransactionLifecycleStatus::NoDurableCommitRecord, Some(_)) => {
+                return Err(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorNoCommitContradictsDurableState {
+                        transaction,
+                    },
+                );
+            }
+            (
+                TransactionLifecycleStatus::Active
+                | TransactionLifecycleStatus::CommitAttempted
+                | TransactionLifecycleStatus::Indeterminate
+                | TransactionLifecycleStatus::PageAppendIndeterminate,
+                _,
+            ) => {
+                return Err(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorLifecycleNotTerminal {
+                        transaction,
+                        status,
+                    },
+                );
+            }
+        }
+    }
+    for entry in baseline.transactions() {
+        let transaction = entry.transaction();
+        if transaction.epoch() != coordinator.epoch().get() {
+            continue;
+        }
+        let coordinator_commit = coordinator.lifecycles.iter().any(|(&candidate, &status)| {
+            transaction.matches_transaction_id(candidate)
+                && status == TransactionLifecycleStatus::Committed
+        });
+        if !coordinator_commit {
+            return Err(
+                DurableTransactionPageStorageCleanCloseEvidenceError::DurableCommitMissingFromCoordinator {
+                    transaction,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn portable_transaction_page_storage_clean_close_count(
+    count: u128,
+    field: TransactionPageStorageCleanCloseCountField,
+) -> Result<u64, DurableTransactionPageStorageCleanCloseEvidenceError> {
+    u64::try_from(count).map_err(|_| {
+        DurableTransactionPageStorageCleanCloseEvidenceError::PortableCountWidthExceeded {
+            field,
+            count,
+        }
+    })
+}
+
+fn validate_transaction_page_storage_clean_close_metadata(
+    coordinator: &TransactionCoordinator,
+    lineage: &LogLineage,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    metadata: &DurableTransactionRestartRetentionMetadataObservation,
+) -> Result<(), DurableTransactionPageStorageCleanCloseEvidenceError> {
+    if !lineage.same_lineage(metadata.lineage()) {
+        return Err(
+            DurableTransactionPageStorageCleanCloseEvidenceError::RetentionMetadataLineageMismatch {
+                expected: lineage.clone(),
+                actual: metadata.lineage().clone(),
+            },
+        );
+    }
+    if metadata.allocated_epoch_high_water().get() != coordinator.epoch().get() {
+        return Err(
+            DurableTransactionPageStorageCleanCloseEvidenceError::AllocatedEpochHighWaterMismatch {
+                expected: coordinator.epoch().get(),
+                actual: metadata.allocated_epoch_high_water().get(),
+            },
+        );
+    }
+    for entry in baseline.transactions() {
+        let transaction = entry.transaction();
+        if transaction.epoch() > metadata.allocated_epoch_high_water().get() {
+            return Err(
+                DurableTransactionPageStorageCleanCloseEvidenceError::DurableTransactionEpochAboveAllocatedHighWater {
+                    transaction,
+                    allocated_epoch_high_water: metadata.allocated_epoch_high_water().get(),
+                },
+            );
+        }
+    }
+    if let Some(position) = metadata.oldest_required_log_position()
+        && !lineage.same_lineage(position.lineage())
+    {
+        return Err(
+            DurableTransactionPageStorageCleanCloseEvidenceError::ForeignRetentionSourceConstraint {
+                position: position.clone(),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn transaction_page_storage_clean_close_metadata_matches(
+    expected: &DurableTransactionRestartRetentionMetadataObservation,
+    actual: &DurableTransactionRestartRetentionMetadataObservation,
+) -> bool {
+    expected.lineage().same_lineage(actual.lineage())
+        && expected.allocated_epoch_high_water() == actual.allocated_epoch_high_water()
+        && expected.oldest_required_log_position() == actual.oldest_required_log_position()
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+{
+    /// Consumes live transaction storage and prepares one fresh clean-close proof.
+    ///
+    /// The transition rejects nonterminal coordinator state, unresolved durable
+    /// transactions, and non-current pages before publication. It then publishes,
+    /// reloads, and rederives exact generation-aware completeness. Every failure
+    /// after invoking the publisher is terminally outcome-indeterminate.
+    pub fn prepare_clean_close(
+        mut self,
+    ) -> Result<
+        PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N>,
+        FailedTransactionPageStorageCleanClosePreparation<Source, Store, CheckpointSource, N>,
+    > {
+        if let Err(source) =
+            validate_transaction_page_storage_clean_close_coordinator(&self.completed.coordinator)
+        {
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error: DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                    DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(source),
+                ),
+            });
+        }
+
+        let baseline = match prepare_transaction_page_storage_clean_close_current_baseline(
+            &mut self.completed,
+        ) {
+            Ok(baseline) => baseline,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                        _analyzed: Box::new(self),
+                        error:
+                            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                                DurableTransactionPageStorageCleanCloseBeforePublicationError::CurrentCompleteness(
+                                    source,
+                                ),
+                            ),
+                    });
+            }
+        };
+        if let Err(source) = validate_transaction_page_storage_clean_close_baseline(&baseline) {
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error: DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                    DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(source),
+                ),
+            });
+        }
+        if let Err(source) = validate_transaction_page_storage_clean_close_coordinator_durable_state(
+            &self.completed.coordinator,
+            &baseline,
+        ) {
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error: DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                    DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(source),
+                ),
+            });
+        }
+
+        let transaction_count = match portable_transaction_page_storage_clean_close_count(
+            baseline.transactions().len() as u128,
+            TransactionPageStorageCleanCloseCountField::TransactionEntries,
+        ) {
+            Ok(count) => count,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                    _analyzed: Box::new(self),
+                    error:
+                        DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                            DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                                source,
+                            ),
+                        ),
+                });
+            }
+        };
+        let page_count = match portable_transaction_page_storage_clean_close_count(
+            baseline.pages().len() as u128,
+            TransactionPageStorageCleanCloseCountField::PageEntries,
+        ) {
+            Ok(count) => count,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                    _analyzed: Box::new(self),
+                    error:
+                        DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                            DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                                source,
+                            ),
+                        ),
+                });
+            }
+        };
+
+        let lineage = self.completed.source.lineage().clone();
+        let metadata = match self.completed.source.observe_restart_retention_metadata() {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                    _analyzed: Box::new(self),
+                    error:
+                        DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                            DurableTransactionPageStorageCleanCloseBeforePublicationError::RetentionMetadataSource(
+                                source,
+                            ),
+                        ),
+                });
+            }
+        };
+        if let Err(source) = validate_transaction_page_storage_clean_close_metadata(
+            &self.completed.coordinator,
+            &lineage,
+            &baseline,
+            &metadata,
+        ) {
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error: DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                    DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(source),
+                ),
+            });
+        }
+
+        let publication = with_transaction_page_storage_clean_close_checkpoint_publication_permit(
+            &baseline,
+            |permit| {
+                self.completed
+                    .checkpoint_source
+                    .publish_transaction_page_storage_clean_close_checkpoint(&baseline, permit)
+            },
+        );
+        if let Err(source) = publication {
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error:
+                    DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                        DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Publication(
+                            TransactionPageStorageCleanCloseCheckpointPublicationError::new(
+                                baseline,
+                                source,
+                            ),
+                        ),
+                    ),
+            });
+        }
+
+        let loaded = match self
+            .completed
+            .checkpoint_source
+            .load_transaction_page_storage_clean_close_checkpoint()
+        {
+            Ok(Some(loaded)) => loaded,
+            Ok(None) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                    _analyzed: Box::new(self),
+                    error:
+                        DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                            DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::CheckpointAbsent,
+                        ),
+                });
+            }
+            Err(source) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                    _analyzed: Box::new(self),
+                    error:
+                        DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                            DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::CheckpointReload(
+                                source,
+                            ),
+                        ),
+                });
+            }
+        };
+
+        let rederived = match prepare_transaction_page_storage_clean_close_current_baseline(
+            &mut self.completed,
+        ) {
+            Ok(baseline) => baseline,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                        _analyzed: Box::new(self),
+                        error:
+                            DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                                DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::CurrentCompleteness(
+                                    source,
+                                ),
+                            ),
+                    });
+            }
+        };
+        if baseline != rederived {
+            let source =
+                DurableTransactionPageStorageCleanCloseEvidenceError::CurrentBaselineChanged {
+                    expected: selected_restart_checkpoint_anchor(&baseline),
+                    actual: selected_restart_checkpoint_anchor(&rederived),
+                };
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error:
+                    DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                        DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Evidence(
+                            source,
+                        ),
+                    ),
+            });
+        }
+        if !restart_checkpoint_completeness_baseline_matches_owned_observation(&rederived, &loaded)
+        {
+            let source =
+                DurableTransactionPageStorageCleanCloseEvidenceError::ReloadedCheckpointMismatch {
+                    expected: selected_restart_checkpoint_anchor(&rederived),
+                };
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error:
+                    DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                        DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Evidence(
+                            source,
+                        ),
+                    ),
+            });
+        }
+
+        let reobserved_metadata = match self.completed.source.observe_restart_retention_metadata() {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageCleanClosePreparation {
+                    _analyzed: Box::new(self),
+                    error:
+                        DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                            DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::RetentionMetadataSource(
+                                source,
+                            ),
+                        ),
+                });
+            }
+        };
+        if let Err(source) = validate_transaction_page_storage_clean_close_metadata(
+            &self.completed.coordinator,
+            &lineage,
+            &rederived,
+            &reobserved_metadata,
+        ) {
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error:
+                    DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                        DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Evidence(
+                            source,
+                        ),
+                    ),
+            });
+        }
+        if !transaction_page_storage_clean_close_metadata_matches(&metadata, &reobserved_metadata) {
+            let source =
+                DurableTransactionPageStorageCleanCloseEvidenceError::RetentionMetadataChanged {
+                    expected: Box::new(metadata),
+                    actual: Box::new(reobserved_metadata),
+                };
+            return Err(FailedTransactionPageStorageCleanClosePreparation {
+                _analyzed: Box::new(self),
+                error:
+                    DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                        DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Evidence(
+                            source,
+                        ),
+                    ),
+            });
+        }
+
+        let proof = TransactionPageStorageCleanCloseProof {
+            persistent_log_id: rederived.persistent_log_id(),
+            durable_frontier: rederived.durable_frontier(),
+            allocated_epoch_high_water: reobserved_metadata.allocated_epoch_high_water().get(),
+            checkpoint_anchor: selected_restart_checkpoint_anchor(&rederived),
+            transaction_entry_count: transaction_count,
+            page_entry_count: page_count,
+        };
+        Ok(PreparedTransactionPageStorageCleanClose {
+            _analyzed: self,
+            proof,
+            _published_checkpoint: rederived,
+        })
+    }
+}
+
 impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
     for WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
         Source,
@@ -23893,10 +25403,16 @@ fn lower_restart_replay_start(
     }
 }
 
-fn analyze_durable_transaction_restart_completeness_evidence<SourceError, Store, const N: usize>(
+fn derive_durable_transaction_restart_completeness_from_analysis_evidence<
+    SourceError,
+    Store,
+    Observation,
+    const N: usize,
+>(
     lineage: &LogLineage,
-    durable_frontier: Option<&LogSequenceNumber>,
-    observations: &[DurableTransactionRestartObservation<N>],
+    transaction_analysis: DurableTransactionRestartAnalysis,
+    observations: &[Observation],
+    selected_pages: &[DurableTransactionRestartPageEntry],
     store: &Store,
 ) -> Result<
     DurableTransactionRestartCompletenessAnalysis,
@@ -23904,34 +25420,42 @@ fn analyze_durable_transaction_restart_completeness_evidence<SourceError, Store,
 >
 where
     Store: DurablePageStoreSnapshotSource<N>,
+    Observation: DurableTransactionRestartObservationView<N>,
 {
-    let transaction_analysis =
-        analyze_durable_transaction_restart_evidence(lineage, durable_frontier, observations)
-            .map_err(|source| {
-                DurableTransactionRestartCompletenessError::Evidence(Box::new(
-                    DurableTransactionRestartCompletenessEvidenceError::RestartAnalysis {
-                        source: Box::new(source),
-                    },
-                ))
-            })?;
-
     let mut page_numbers = Vec::new();
-    page_numbers.try_reserve(observations.len()).map_err(|_| {
-        DurableTransactionRestartCompletenessError::Evidence(Box::new(
+    let page_number_capacity = observations
+        .len()
+        .checked_add(selected_pages.len())
+        .ok_or_else(|| {
+            DurableTransactionRestartCompletenessError::Evidence(Box::new(
+                DurableTransactionRestartCompletenessEvidenceError::PageInventoryCapacityExhausted {
+                    record_count: usize::MAX,
+                },
+            ))
+        })?;
+    page_numbers
+        .try_reserve(page_number_capacity)
+        .map_err(|_| {
+            DurableTransactionRestartCompletenessError::Evidence(Box::new(
             DurableTransactionRestartCompletenessEvidenceError::PageInventoryCapacityExhausted {
-                record_count: observations.len(),
+                record_count: page_number_capacity,
             },
         ))
-    })?;
+        })?;
+    page_numbers.extend(
+        selected_pages
+            .iter()
+            .map(DurableTransactionRestartPageEntry::page_number),
+    );
     for observation in observations {
-        match observation {
-            DurableTransactionRestartObservation::Page(observation) => {
-                page_numbers.push(observation.page_number());
+        match observation.as_restart_observation_ref() {
+            DurableTransactionRestartObservationRef::Page { page_number, .. } => {
+                page_numbers.push(page_number);
             }
-            DurableTransactionRestartObservation::TransactionPage(observation) => {
-                page_numbers.push(observation.page().page_number());
+            DurableTransactionRestartObservationRef::TransactionPage { page_number, .. } => {
+                page_numbers.push(page_number);
             }
-            DurableTransactionRestartObservation::Commit(_) => {}
+            DurableTransactionRestartObservationRef::Commit { .. } => {}
         }
     }
     page_numbers.sort_unstable();
@@ -24070,6 +25594,36 @@ where
         pages,
         replay_start,
     })
+}
+
+fn analyze_durable_transaction_restart_completeness_evidence<SourceError, Store, const N: usize>(
+    lineage: &LogLineage,
+    durable_frontier: Option<&LogSequenceNumber>,
+    observations: &[DurableTransactionRestartObservation<N>],
+    store: &Store,
+) -> Result<
+    DurableTransactionRestartCompletenessAnalysis,
+    DurableTransactionRestartCompletenessError<SourceError, Store::ObservationError>,
+>
+where
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    let transaction_analysis =
+        analyze_durable_transaction_restart_evidence(lineage, durable_frontier, observations)
+            .map_err(|source| {
+                DurableTransactionRestartCompletenessError::Evidence(Box::new(
+                    DurableTransactionRestartCompletenessEvidenceError::RestartAnalysis {
+                        source: Box::new(source),
+                    },
+                ))
+            })?;
+
+    derive_durable_transaction_restart_completeness_from_analysis_evidence::<
+        SourceError,
+        Store,
+        DurableTransactionRestartObservation<N>,
+        N,
+    >(lineage, transaction_analysis, observations, &[], store)
 }
 
 /// Read-only in-process lifecycle phase recorded by the coordinator.
@@ -24496,6 +26050,81 @@ impl TransactionCoordinator {
                     },
                 ))
             }
+        }
+    }
+
+    /// Flushes one staged committed page and discharges its coordinator-owned
+    /// close obligation only after the WAL-before-store write succeeds.
+    ///
+    /// The free [`flush_committed_page`] function intentionally cannot mutate
+    /// coordinator bookkeeping. Live database paths that may later request a
+    /// clean close must use this consuming coordinator gate instead.
+    pub fn flush_staged_committed_page<Log, Store, const N: usize>(
+        &mut self,
+        committed: &CommittedTransaction,
+        log: &mut Log,
+        store: &mut Store,
+        page: TransactionDirtyPage<N>,
+    ) -> Result<
+        TransactionCleanPage<N>,
+        CoordinatedTransactionCommittedFlushError<Log::Error, Store::Error, N>,
+    >
+    where
+        Log: LogDurability,
+        Store: PageStore<N>,
+    {
+        let transaction_id = page.transaction_id();
+        if committed.transaction_id() != transaction_id {
+            return Err(CoordinatedTransactionCommittedFlushError::Rejected(
+                CoordinatedTransactionCommittedFlushRejection {
+                    page,
+                    reason: CoordinatedTransactionCommittedFlushRejectionReason::WrongTransaction,
+                },
+            ));
+        }
+        if !self
+            .log_lineage
+            .same_lineage(page.required_position().lineage())
+            || !self
+                .log_lineage
+                .same_lineage(committed.log_position().lineage())
+        {
+            return Err(CoordinatedTransactionCommittedFlushError::Rejected(
+                CoordinatedTransactionCommittedFlushRejection {
+                    page,
+                    reason:
+                        CoordinatedTransactionCommittedFlushRejectionReason::ForeignCoordinatorLineage,
+                },
+            ));
+        }
+        let actual = self.status(transaction_id);
+        if actual != Some(TransactionLifecycleStatus::Committed) {
+            return Err(CoordinatedTransactionCommittedFlushError::Rejected(
+                CoordinatedTransactionCommittedFlushRejection {
+                    page,
+                    reason:
+                        CoordinatedTransactionCommittedFlushRejectionReason::LifecycleMismatch {
+                            actual,
+                        },
+                },
+            ));
+        }
+        let page_number = page.address().number();
+        if !self.staged_pages.contains(&(transaction_id, page_number)) {
+            return Err(CoordinatedTransactionCommittedFlushError::Rejected(
+                CoordinatedTransactionCommittedFlushRejection {
+                    page,
+                    reason: CoordinatedTransactionCommittedFlushRejectionReason::PageNotStaged,
+                },
+            ));
+        }
+
+        match flush_committed_page(committed, log, store, page) {
+            Ok(clean) => {
+                let _ = self.staged_pages.remove(&(transaction_id, page_number));
+                Ok(clean)
+            }
+            Err(source) => Err(CoordinatedTransactionCommittedFlushError::Flush(source)),
         }
     }
 
@@ -25415,6 +27044,117 @@ where
             Self::Rejected(error) => Some(error),
             Self::Append(error) => Some(error),
             Self::InvalidEvidence(error) => Some(error),
+        }
+    }
+}
+
+/// Reason the coordinator rejected a staged committed-page flush before either
+/// injected port was called.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinatedTransactionCommittedFlushRejectionReason {
+    /// The commit token does not identify the staged page owner.
+    WrongTransaction,
+    /// The page or commit belongs to another coordinator WAL lineage.
+    ForeignCoordinatorLineage,
+    /// The coordinator does not retain the required committed lifecycle.
+    LifecycleMismatch {
+        /// Recorded phase, or `None` when the registry entry is absent.
+        actual: Option<TransactionLifecycleStatus>,
+    },
+    /// The page is not one of this coordinator's unresolved staged writes.
+    PageNotStaged,
+}
+
+/// Pre-port coordinated flush rejection that retains the exact dirty page.
+#[derive(Debug, Eq, PartialEq)]
+pub struct CoordinatedTransactionCommittedFlushRejection<const N: usize> {
+    page: TransactionDirtyPage<N>,
+    reason: CoordinatedTransactionCommittedFlushRejectionReason,
+}
+
+impl<const N: usize> CoordinatedTransactionCommittedFlushRejection<N> {
+    /// Returns the retained transaction-owned dirty page.
+    #[must_use]
+    pub const fn page(&self) -> &TransactionDirtyPage<N> {
+        &self.page
+    }
+
+    /// Returns the exact coordinator rejection reason.
+    #[must_use]
+    pub const fn reason(&self) -> CoordinatedTransactionCommittedFlushRejectionReason {
+        self.reason
+    }
+
+    /// Returns the retained transaction-owned dirty page.
+    #[must_use]
+    pub fn into_page(self) -> TransactionDirtyPage<N> {
+        self.page
+    }
+}
+
+impl<const N: usize> fmt::Display for CoordinatedTransactionCommittedFlushRejection<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.reason {
+            CoordinatedTransactionCommittedFlushRejectionReason::WrongTransaction => write!(
+                formatter,
+                "coordinated committed flush transaction does not own page {}",
+                self.page.address().number().get()
+            ),
+            CoordinatedTransactionCommittedFlushRejectionReason::ForeignCoordinatorLineage => {
+                write!(
+                    formatter,
+                    "coordinated committed flush page {} belongs to another WAL lineage",
+                    self.page.address().number().get()
+                )
+            }
+            CoordinatedTransactionCommittedFlushRejectionReason::LifecycleMismatch { actual } => {
+                write!(
+                    formatter,
+                    "coordinated committed flush transaction {} is not committed: {actual:?}",
+                    self.page.transaction_id()
+                )
+            }
+            CoordinatedTransactionCommittedFlushRejectionReason::PageNotStaged => write!(
+                formatter,
+                "coordinated committed flush page {} is not staged",
+                self.page.address().number().get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for CoordinatedTransactionCommittedFlushRejection<N> {}
+
+/// Coordinator-owned committed-page flush failure.
+#[derive(Debug)]
+pub enum CoordinatedTransactionCommittedFlushError<LogError, StoreError, const N: usize> {
+    /// Coordinator evidence rejected the attempt before port access.
+    Rejected(CoordinatedTransactionCommittedFlushRejection<N>),
+    /// The ordinary WAL-before-store flush failed and retained its exact state.
+    Flush(TransactionCommittedFlushError<LogError, StoreError, N>),
+}
+
+impl<LogError: fmt::Display, StoreError: fmt::Display, const N: usize> fmt::Display
+    for CoordinatedTransactionCommittedFlushError<LogError, StoreError, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected(source) => source.fmt(formatter),
+            Self::Flush(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<LogError, StoreError, const N: usize> Error
+    for CoordinatedTransactionCommittedFlushError<LogError, StoreError, N>
+where
+    LogError: Error + 'static,
+    StoreError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Rejected(source) => Some(source),
+            Self::Flush(source) => Some(source),
         }
     }
 }
@@ -26671,6 +28411,7 @@ mod tests {
         retention_metadata_lineage_override: Option<LogLineage>,
         retention_metadata_epoch_override: Option<NonZeroU64>,
         retention_source_constraint: Option<LogSequenceNumber>,
+        retention_source_constraint_after_observation: Option<Option<LogSequenceNumber>>,
         reclamation_observation_error: Option<FakeFault>,
         reclamation_observation_error_after_effect: Option<FakeFault>,
         reclamation_lineage_override: Option<LogLineage>,
@@ -26746,6 +28487,7 @@ mod tests {
                 retention_metadata_lineage_override: None,
                 retention_metadata_epoch_override: None,
                 retention_source_constraint: None,
+                retention_source_constraint_after_observation: None,
                 reclamation_observation_error: None,
                 reclamation_observation_error_after_effect: None,
                 reclamation_lineage_override: None,
@@ -26874,13 +28616,17 @@ mod tests {
                     .and_then(NonZeroU64::new)
                     .ok_or(FakeFault("retention metadata has no allocated epoch"))?,
             };
-            Ok(DurableTransactionRestartRetentionMetadataObservation::new(
+            let observation = DurableTransactionRestartRetentionMetadataObservation::new(
                 self.retention_metadata_lineage_override
                     .clone()
                     .unwrap_or_else(|| self.lineage.clone()),
                 allocated_epoch_high_water,
                 self.retention_source_constraint.clone(),
-            ))
+            );
+            if let Some(replacement) = self.retention_source_constraint_after_observation.take() {
+                self.retention_source_constraint = replacement;
+            }
+            Ok(observation)
         }
     }
 
@@ -33210,8 +34956,17 @@ mod tests {
         publication_fault: Option<FakeCheckpointPublicationFault>,
         publication_checkpoint_override:
             Option<Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>>,
+        load_fault: Option<FakeFault>,
         publication_calls: usize,
         load_calls: usize,
+        clean_close_checkpoint:
+            Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+        clean_close_publication_fault: Option<FakeCheckpointPublicationFault>,
+        clean_close_checkpoint_override:
+            Option<Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>>,
+        clean_close_load_fault: Option<FakeFault>,
+        clean_close_publication_calls: usize,
+        clean_close_load_calls: usize,
         events: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
 
@@ -33225,8 +34980,15 @@ mod tests {
                 checkpoint,
                 publication_fault: None,
                 publication_checkpoint_override: None,
+                load_fault: None,
                 publication_calls: 0,
                 load_calls: 0,
+                clean_close_checkpoint: None,
+                clean_close_publication_fault: None,
+                clean_close_checkpoint_override: None,
+                clean_close_load_fault: None,
+                clean_close_publication_calls: 0,
+                clean_close_load_calls: 0,
                 events: None,
             }
         }
@@ -33287,7 +35049,69 @@ mod tests {
             if let Some(events) = &self.events {
                 events.borrow_mut().push("completeness-checkpoint-read");
             }
+            if let Some(source) = self.load_fault.take() {
+                return Err(source);
+            }
             Ok(self.checkpoint.clone())
+        }
+    }
+
+    impl TransactionPageStorageCleanCloseCheckpointPublisher for FakeCompletenessCheckpointPublisher {
+        type Error = FakeFault;
+
+        fn publish_transaction_page_storage_clean_close_checkpoint(
+            &mut self,
+            baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+            permit: TransactionPageStorageCleanCloseCheckpointPublicationPermit<'_>,
+        ) -> Result<(), Self::Error> {
+            self.clean_close_publication_calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("clean-close-checkpoint-publish");
+            }
+            if permit.persistent_log_id() != baseline.persistent_log_id()
+                || permit.durable_frontier() != baseline.durable_frontier()
+                || permit.checkpoint_anchor() != selected_restart_checkpoint_anchor(baseline)
+                || permit.transaction_count() != baseline.transactions().len()
+                || permit.page_count() != baseline.pages().len()
+            {
+                return Err(FakeFault("clean-close publication permit mismatch"));
+            }
+
+            let checkpoint = self
+                .clean_close_checkpoint_override
+                .take()
+                .unwrap_or_else(|| Some(owned_decoded_completeness_checkpoint(baseline)));
+            match self.clean_close_publication_fault.take() {
+                Some(FakeCheckpointPublicationFault::Before(source)) => Err(source),
+                Some(FakeCheckpointPublicationFault::After(source)) => {
+                    self.clean_close_checkpoint = checkpoint;
+                    Err(source)
+                }
+                None => {
+                    self.clean_close_checkpoint = checkpoint;
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    impl TransactionPageStorageCleanCloseCheckpointSource for FakeCompletenessCheckpointPublisher {
+        type Error = FakeFault;
+
+        fn load_transaction_page_storage_clean_close_checkpoint(
+            &mut self,
+        ) -> Result<
+            Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
+            Self::Error,
+        > {
+            self.clean_close_load_calls += 1;
+            if let Some(events) = &self.events {
+                events.borrow_mut().push("clean-close-checkpoint-read");
+            }
+            if let Some(source) = self.clean_close_load_fault.take() {
+                return Err(source);
+            }
+            Ok(self.clean_close_checkpoint.clone())
         }
     }
 
@@ -40593,5 +42417,986 @@ mod tests {
             FailedTransactionPageStorageRecoveryHandoff::TransactionRestorationRejected(_)
         ));
         Ok(())
+    }
+
+    type FakeCleanCloseOwner = WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        FakeDurablePageRecoverySource,
+        FakeBatchCommittedPageRecoveryStore,
+        FakeCompletenessCheckpointPublisher,
+        1,
+    >;
+
+    fn complete_fake_clean_close_owner(
+        source: FakeDurablePageRecoverySource,
+        store: FakeBatchCommittedPageRecoveryStore,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> Result<FakeCleanCloseOwner, TestError> {
+        complete_transaction_page_storage_recovery_handoff(fake_recovery_handoff_selection(
+            source,
+            store,
+            FakeCompletenessCheckpointPublisher::new(Some(owned_decoded_completeness_checkpoint(
+                baseline,
+            ))),
+        ))
+        .map_err(|_| TestError("clean-close recovery handoff"))
+    }
+
+    fn empty_fake_clean_close_owner(
+        lineage: &LogLineage,
+    ) -> Result<
+        (
+            FakeCleanCloseOwner,
+            DurableTransactionRestartCheckpointCompletenessBaseline,
+        ),
+        TestError,
+    > {
+        let baseline = fake_completeness_baseline(lineage, None, Vec::new(), Vec::new())?;
+        let owner = complete_fake_clean_close_owner(
+            fake_restart_source(lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        Ok((owner, baseline))
+    }
+
+    fn committed_fake_clean_close_owner(
+        lineage: &LogLineage,
+    ) -> Result<(FakeCleanCloseOwner, DurableTransactionIdentityObservation), TestError> {
+        let transaction = durable_identity(1, 1)?;
+        let baseline = fake_completeness_baseline(
+            lineage,
+            Some(lineage.position(1)),
+            vec![restart_commit(lineage, transaction, 1)?],
+            Vec::new(),
+        )?;
+        let owner = complete_fake_clean_close_owner(
+            fake_restart_source(
+                lineage,
+                Some(lineage.position(1)),
+                vec![restart_commit(lineage, transaction, 1)?],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        Ok((owner, transaction))
+    }
+
+    fn install_fake_current_commit(
+        owner: &mut FakeCleanCloseOwner,
+        transaction: TransactionId,
+    ) -> Result<DurableTransactionIdentityObservation, TestError> {
+        let observation = durable_identity(transaction.epoch().get(), transaction.sequence())?;
+        let lineage = owner.completed.source.lineage.clone();
+        owner.completed.source.restart_frontier = Some(lineage.position(1));
+        owner.completed.source.restart_observations =
+            vec![restart_commit(&lineage, observation, 1)?];
+        Ok(observation)
+    }
+
+    #[test]
+    fn clean_close_reloads_fresh_checkpoint_and_binds_exact_proof() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1900).ok_or(TestError("clean-close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let (mut owner, baseline) = empty_fake_clean_close_owner(&lineage)?;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        owner.completed.source.restart_events = Some(Rc::clone(&events));
+        owner.completed.source.reclamation_events = Some(Rc::clone(&events));
+        owner.completed.checkpoint_source.events = Some(Rc::clone(&events));
+        let selected_checkpoint = owner.completed.checkpoint_source.checkpoint.clone();
+        let publication_calls = owner
+            .completed
+            .checkpoint_source
+            .clean_close_publication_calls;
+        let load_calls = owner.completed.checkpoint_source.clean_close_load_calls;
+
+        let prepared = owner
+            .prepare_clean_close()
+            .map_err(|_| TestError("clean-close preparation"))?;
+
+        assert_eq!(prepared.proof().persistent_log_id(), persistent_log_id);
+        assert_eq!(prepared.proof().durable_frontier(), None);
+        assert_eq!(prepared.proof().allocated_epoch_high_water(), 1);
+        assert_eq!(
+            prepared.proof().checkpoint_anchor(),
+            selected_restart_checkpoint_anchor(&baseline)
+        );
+        assert_eq!(prepared.proof().transaction_entry_count(), 0);
+        assert_eq!(prepared.proof().page_entry_count(), 0);
+        assert_eq!(
+            prepared
+                ._analyzed
+                .completed
+                .checkpoint_source
+                .clean_close_publication_calls,
+            publication_calls + 1
+        );
+        assert_eq!(
+            prepared
+                ._analyzed
+                .completed
+                .checkpoint_source
+                .clean_close_load_calls,
+            load_calls + 1
+        );
+        assert_eq!(
+            prepared._analyzed.completed.checkpoint_source.checkpoint,
+            selected_checkpoint
+        );
+        assert_eq!(
+            prepared
+                ._analyzed
+                .completed
+                .checkpoint_source
+                .clean_close_checkpoint,
+            Some(owned_decoded_completeness_checkpoint(&baseline))
+        );
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "wal",
+                "retention-metadata",
+                "clean-close-checkpoint-publish",
+                "clean-close-checkpoint-read",
+                "wal",
+                "retention-metadata",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_anchored_candidate_preserves_recovery_checkpoint() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1901).ok_or(TestError("anchored close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let source = anchored_restart_source(&lineage, None, Vec::new(), &baseline, 1)?;
+        let mut owner = complete_fake_clean_close_owner(
+            source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage),
+            &baseline,
+        )?;
+        let active = owner.completed.coordinator.begin()?;
+        let transaction = active.transaction_id();
+        owner
+            .completed
+            .coordinator
+            .lifecycles
+            .insert(transaction, TransactionLifecycleStatus::Committed);
+        let _durable = install_fake_current_commit(&mut owner, transaction)?;
+        let complete_prefix_callbacks = owner.completed.source.restart_callbacks;
+        let retained_callbacks = owner.completed.source.retained_restart_callbacks;
+        let selected_checkpoint = owner.completed.checkpoint_source.checkpoint.clone();
+        let selected_anchor = selected_restart_checkpoint_anchor(&baseline);
+
+        let prepared = owner
+            .prepare_clean_close()
+            .map_err(|_| TestError("anchored clean-close preparation"))?;
+
+        assert_eq!(prepared.proof().persistent_log_id(), persistent_log_id);
+        assert_ne!(prepared.proof().checkpoint_anchor(), selected_anchor);
+        assert_eq!(prepared.proof().transaction_entry_count(), 1);
+        assert_eq!(
+            prepared._analyzed.completed.checkpoint_source.checkpoint,
+            selected_checkpoint
+        );
+        assert_eq!(
+            prepared._analyzed.completed.source.reclamation_anchor,
+            Some(selected_anchor)
+        );
+        assert_eq!(
+            prepared._analyzed.completed.source.restart_callbacks,
+            complete_prefix_callbacks
+        );
+        assert_eq!(
+            prepared
+                ._analyzed
+                .completed
+                .source
+                .retained_restart_callbacks,
+            retained_callbacks + 2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_anchored_path_rejects_selected_page_backing_loss() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1902).ok_or(TestError("anchored page-loss persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let first_page = PageNumber::new(201).ok_or(TestError("anchored first page"))?;
+        let second_page = PageNumber::new(202).ok_or(TestError("anchored second page"))?;
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_raw_page(&lineage, first_page.get(), 1)?,
+                restart_raw_page(&lineage, second_page.get(), 2)?,
+            ],
+            vec![
+                FakeRecoverySnapshot {
+                    page_number: first_page,
+                    page_version: PageVersion::new(1),
+                    byte: 201,
+                    page_position: lineage.position(1),
+                },
+                FakeRecoverySnapshot {
+                    page_number: second_page,
+                    page_version: PageVersion::new(2),
+                    byte: 202,
+                    page_position: lineage.position(2),
+                },
+            ],
+        )?;
+        let source = anchored_restart_source(
+            &lineage,
+            Some(2),
+            vec![
+                restart_raw_page(&lineage, first_page.get(), 1)?,
+                restart_raw_page(&lineage, second_page.get(), 2)?,
+            ],
+            &baseline,
+            1,
+        )?;
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        store.current = vec![
+            FakeRecoverySnapshot {
+                page_number: first_page,
+                page_version: PageVersion::new(1),
+                byte: 201,
+                page_position: lineage.position(1),
+            },
+            FakeRecoverySnapshot {
+                page_number: second_page,
+                page_version: PageVersion::new(2),
+                byte: 202,
+                page_position: lineage.position(2),
+            },
+        ];
+        let mut owner = complete_fake_clean_close_owner(source, store, &baseline)?;
+        owner.completed.source.restart_observations.remove(0);
+        owner.completed.source.reclamation_retained_first_override =
+            Some(Some(lineage.position(2)));
+        let publication_calls = owner
+            .completed
+            .checkpoint_source
+            .clean_close_publication_calls;
+
+        let failure = owner.prepare_clean_close().err().ok_or(TestError(
+            "anchored selected page backing loss was accepted",
+        ))?;
+
+        assert!(matches!(
+            failure.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::CurrentCompleteness(
+                    DurableTransactionPageStorageCleanCloseCurrentCompletenessError::Preparation(
+                        DurableTransactionRestartCheckpointCompletenessBaselineCurrentPreparationError::CompletenessAnalysis(
+                            DurableTransactionRestartCompletenessError::Evidence(source)
+                        )
+                    )
+                )
+            ) if matches!(
+                source.as_ref(),
+                DurableTransactionRestartCompletenessEvidenceError::SnapshotPositionUnbacked {
+                    page_number,
+                    position: 1,
+                } if *page_number == first_page
+            )
+        ));
+        assert_eq!(
+            failure
+                ._analyzed
+                .completed
+                .checkpoint_source
+                .clean_close_publication_calls,
+            publication_calls
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_rejects_every_nonterminal_coordinator_lifecycle_before_publication()
+    -> Result<(), TestError> {
+        for status in [
+            TransactionLifecycleStatus::Active,
+            TransactionLifecycleStatus::CommitAttempted,
+            TransactionLifecycleStatus::Indeterminate,
+            TransactionLifecycleStatus::PageAppendIndeterminate,
+        ] {
+            let persistent_log_id =
+                PersistentLogId::new(0x1910).ok_or(TestError("lifecycle close persistent id"))?;
+            let lineage = LogLineage::persistent(persistent_log_id);
+            let (mut owner, _) = empty_fake_clean_close_owner(&lineage)?;
+            let active = owner.completed.coordinator.begin()?;
+            let transaction = active.transaction_id();
+            owner
+                .completed
+                .coordinator
+                .lifecycles
+                .insert(transaction, status);
+            let publication_calls = owner
+                .completed
+                .checkpoint_source
+                .clean_close_publication_calls;
+
+            let failure = owner
+                .prepare_clean_close()
+                .err()
+                .ok_or(TestError("nonterminal lifecycle was accepted"))?;
+
+            assert!(!failure.error().outcome_is_indeterminate());
+            assert!(matches!(
+                failure.error(),
+                DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                    DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                        DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorLifecycleNotTerminal {
+                            transaction: actual,
+                            status: actual_status,
+                        }
+                    )
+                ) if *actual == transaction && *actual_status == status
+            ));
+            assert_eq!(
+                failure
+                    ._analyzed
+                    .completed
+                    .checkpoint_source
+                    .clean_close_publication_calls,
+                publication_calls
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_accepts_terminal_lifecycles_only_when_durable_state_agrees()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1920).ok_or(TestError("terminal close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+
+        let (mut no_commit, _) = empty_fake_clean_close_owner(&lineage)?;
+        let active = no_commit.completed.coordinator.begin()?;
+        no_commit.completed.coordinator.lifecycles.insert(
+            active.transaction_id(),
+            TransactionLifecycleStatus::NoDurableCommitRecord,
+        );
+        let _prepared = no_commit
+            .prepare_clean_close()
+            .map_err(|_| TestError("matching no-commit lifecycle rejected clean close"))?;
+
+        let (historical_commit, _) = committed_fake_clean_close_owner(&lineage)?;
+        assert!(
+            historical_commit
+                .completed
+                .coordinator
+                .lifecycles
+                .is_empty()
+        );
+        let _prepared = historical_commit
+            .prepare_clean_close()
+            .map_err(|_| TestError("historical durable commit rejected clean close"))?;
+
+        let (mut current_commit, _) = empty_fake_clean_close_owner(&lineage)?;
+        let active = current_commit.completed.coordinator.begin()?;
+        let transaction = active.transaction_id();
+        current_commit
+            .completed
+            .coordinator
+            .lifecycles
+            .insert(transaction, TransactionLifecycleStatus::Committed);
+        let durable = install_fake_current_commit(&mut current_commit, transaction)?;
+        assert!(durable.matches_transaction_id(transaction));
+        let _prepared = current_commit
+            .prepare_clean_close()
+            .map_err(|_| TestError("matching committed lifecycle rejected clean close"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_rejects_every_coordinator_durable_state_contradiction() -> Result<(), TestError>
+    {
+        let persistent_log_id =
+            PersistentLogId::new(0x1921).ok_or(TestError("contradiction close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+
+        let (mut missing_durable, _) = empty_fake_clean_close_owner(&lineage)?;
+        let active = missing_durable.completed.coordinator.begin()?;
+        let missing_transaction = active.transaction_id();
+        missing_durable
+            .completed
+            .coordinator
+            .lifecycles
+            .insert(missing_transaction, TransactionLifecycleStatus::Committed);
+        let missing_durable = missing_durable
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("coordinator-only commit was accepted"))?;
+        assert!(matches!(
+            missing_durable.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorCommitMissingFromDurableState {
+                        transaction,
+                    }
+                )
+            ) if *transaction == missing_transaction
+        ));
+
+        let (mut contradicted_no_commit, _) = empty_fake_clean_close_owner(&lineage)?;
+        let active = contradicted_no_commit.completed.coordinator.begin()?;
+        let transaction_id = active.transaction_id();
+        contradicted_no_commit
+            .completed
+            .coordinator
+            .lifecycles
+            .insert(
+                transaction_id,
+                TransactionLifecycleStatus::NoDurableCommitRecord,
+            );
+        let _durable = install_fake_current_commit(&mut contradicted_no_commit, transaction_id)?;
+        let contradicted_no_commit = contradicted_no_commit
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("durably contradicted no-commit was accepted"))?;
+        assert!(matches!(
+            contradicted_no_commit.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorNoCommitContradictsDurableState {
+                        transaction,
+                    }
+                )
+            ) if *transaction == transaction_id
+        ));
+
+        let (mut missing_coordinator, _) = empty_fake_clean_close_owner(&lineage)?;
+        let epoch = missing_coordinator.completed.coordinator.epoch().get();
+        let transaction = durable_identity(epoch, 1)?;
+        let source_lineage = missing_coordinator.completed.source.lineage.clone();
+        missing_coordinator.completed.source.restart_frontier = Some(source_lineage.position(1));
+        missing_coordinator.completed.source.restart_observations =
+            vec![restart_commit(&source_lineage, transaction, 1)?];
+        let missing_coordinator = missing_coordinator
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("durable commit without coordinator was accepted"))?;
+        assert!(matches!(
+            missing_coordinator.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::DurableCommitMissingFromCoordinator {
+                        transaction: actual,
+                    }
+                )
+            ) if *actual == transaction
+        ));
+
+        let (mut future_epoch, _) = empty_fake_clean_close_owner(&lineage)?;
+        let transaction = durable_identity(2, 1)?;
+        let source_lineage = future_epoch.completed.source.lineage.clone();
+        future_epoch.completed.source.restart_frontier = Some(source_lineage.position(1));
+        future_epoch.completed.source.restart_observations =
+            vec![restart_commit(&source_lineage, transaction, 1)?];
+        let future_epoch = future_epoch
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("future durable transaction epoch was accepted"))?;
+        assert!(matches!(
+            future_epoch.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::DurableTransactionEpochAboveAllocatedHighWater {
+                        transaction: actual,
+                        allocated_epoch_high_water: 1,
+                    }
+                )
+            ) if *actual == transaction
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn coordinated_flush_discharges_staged_close_obligation_only_on_success()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1930).ok_or(TestError("staged close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+
+        let (mut detached, _) = empty_fake_clean_close_owner(&lineage)?;
+        let mut detached_log = FakeLog::new(lineage.clone());
+        let mut detached_store = FakeStore::new(lineage.clone());
+        let active = detached.completed.coordinator.begin()?;
+        let page = make_page(&lineage, 230, 1, 0x23)?;
+        let (active, dirty) = detached
+            .completed
+            .coordinator
+            .stage_page_write(active, page, &mut detached_log)
+            .map_err(|_| TestError("detached close stage"))?;
+        let committed = detached
+            .completed
+            .coordinator
+            .commit(active, &mut detached_log)
+            .map_err(|_| TestError("detached close commit"))?;
+        flush_committed_page(&committed, &mut detached_log, &mut detached_store, dirty)
+            .map_err(|_| TestError("detached close flush"))?;
+
+        let detached_failure = detached
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("detached flush discharged staged page"))?;
+        assert!(matches!(
+            detached_failure.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorPageStillStaged {
+                        page_number,
+                        ..
+                    }
+                )
+            ) if page_number.get() == 230
+        ));
+
+        let (mut coordinated, _) = empty_fake_clean_close_owner(&lineage)?;
+        let mut coordinated_log = FakeLog::new(lineage.clone());
+        let mut coordinated_store = FakeStore::new(lineage.clone());
+        let active = coordinated.completed.coordinator.begin()?;
+        let page = make_page(&lineage, 231, 1, 0x24)?;
+        let (active, dirty) = coordinated
+            .completed
+            .coordinator
+            .stage_page_write(active, page, &mut coordinated_log)
+            .map_err(|_| TestError("coordinated close stage"))?;
+        let committed = coordinated
+            .completed
+            .coordinator
+            .commit(active, &mut coordinated_log)
+            .map_err(|_| TestError("coordinated close commit"))?;
+        coordinated
+            .completed
+            .coordinator
+            .flush_staged_committed_page(
+                &committed,
+                &mut coordinated_log,
+                &mut coordinated_store,
+                dirty,
+            )
+            .map_err(|_| TestError("coordinated close flush"))?;
+        assert!(coordinated.completed.coordinator.staged_pages.is_empty());
+        let failure = coordinated
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("disconnected committed WAL was accepted"))?;
+        assert!(matches!(
+                failure.error(),
+                DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                    DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                        DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorCommitMissingFromDurableState {
+                            ..
+                        }
+                    )
+                )
+            ));
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_rejects_unresolved_durable_transaction_before_publication()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1940).ok_or(TestError("unresolved close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let transaction = durable_identity(1, 1)?;
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_owned_page(&lineage, transaction, 240, 1)?],
+            Vec::new(),
+        )?;
+        let owner = complete_fake_clean_close_owner(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(1)),
+                vec![restart_owned_page(&lineage, transaction, 240, 1)?],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage),
+            &baseline,
+        )?;
+        let publication_calls = owner
+            .completed
+            .checkpoint_source
+            .clean_close_publication_calls;
+
+        let failure = owner
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("unresolved durable transaction was accepted"))?;
+
+        assert!(matches!(
+            failure.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::UnresolvedDurableTransactions {
+                        count: 1
+                    }
+                )
+            )
+        ));
+        assert_eq!(
+            failure
+                ._analyzed
+                .completed
+                .checkpoint_source
+                .clean_close_publication_calls,
+            publication_calls
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_baseline_requires_current_pages_and_after_frontier_replay()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1941).ok_or(TestError("page close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let transaction = durable_identity(1, 1)?;
+        let page = PageNumber::new(241).ok_or(TestError("page close page"))?;
+        let committed_observations = vec![
+            restart_owned_page(&lineage, transaction, page.get(), 1)?,
+            restart_commit(&lineage, transaction, 2)?,
+        ];
+        let missing = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            committed_observations,
+            Vec::new(),
+        )?;
+        assert!(matches!(
+            validate_transaction_page_storage_clean_close_baseline(&missing),
+            Err(
+                DurableTransactionPageStorageCleanCloseEvidenceError::PageNotCurrent {
+                    page_number,
+                    state: TransactionPageStorageCleanClosePageState::StoreMissing,
+                }
+            ) if page_number == page
+        ));
+
+        let behind_snapshot = FakeRecoverySnapshot {
+            page_number: page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(page.get()).map_err(|_| TestError("behind close page byte"))?,
+            page_position: lineage.position(1),
+        };
+        let behind = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_raw_page(&lineage, page.get(), 1)?,
+                restart_raw_page(&lineage, page.get(), 2)?,
+            ],
+            vec![behind_snapshot],
+        )?;
+        assert!(matches!(
+            validate_transaction_page_storage_clean_close_baseline(&behind),
+            Err(
+                DurableTransactionPageStorageCleanCloseEvidenceError::PageNotCurrent {
+                    page_number,
+                    state: TransactionPageStorageCleanClosePageState::StoreBehind,
+                }
+            ) if page_number == page
+        ));
+
+        let current_snapshot = FakeRecoverySnapshot {
+            page_number: page,
+            page_version: PageVersion::new(2),
+            byte: u8::try_from(page.get()).map_err(|_| TestError("current close page byte"))?,
+            page_position: lineage.position(2),
+        };
+        let current = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_raw_page(&lineage, page.get(), 1)?,
+                restart_raw_page(&lineage, page.get(), 2)?,
+            ],
+            vec![current_snapshot],
+        )?;
+        assert!(validate_transaction_page_storage_clean_close_baseline(&current).is_ok());
+
+        let mut replay_only = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        replay_only.replay_start = DurableTransactionRestartReplayStart::AtPosition {
+            position: 1,
+            cause: DurableTransactionRestartReplayStartCause::StoreMissing { page_number: page },
+        };
+        assert!(matches!(
+            validate_transaction_page_storage_clean_close_baseline(&replay_only),
+            Err(DurableTransactionPageStorageCleanCloseEvidenceError::ReplayRequired {
+                replay_start
+            }) if replay_start.position() == Some(1)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_publication_errors_are_always_outcome_indeterminate() -> Result<(), TestError> {
+        for fault in [
+            FakeCheckpointPublicationFault::Before(FakeFault("clean close publish before")),
+            FakeCheckpointPublicationFault::After(FakeFault("clean close publish after")),
+        ] {
+            let persistent_log_id =
+                PersistentLogId::new(0x1950).ok_or(TestError("publish close persistent id"))?;
+            let lineage = LogLineage::persistent(persistent_log_id);
+            let (mut owner, _) = empty_fake_clean_close_owner(&lineage)?;
+            owner
+                .completed
+                .checkpoint_source
+                .clean_close_publication_fault = Some(fault);
+
+            let failure = owner
+                .prepare_clean_close()
+                .err()
+                .ok_or(TestError("clean-close publisher failure was accepted"))?;
+
+            assert!(failure.error().outcome_is_indeterminate());
+            assert!(matches!(
+                failure.error(),
+                DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                    DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Publication(
+                        _
+                    )
+                )
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_candidate_crash_keeps_anchored_recovery_selectable() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1951).ok_or(TestError("candidate crash persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let source = anchored_restart_source(&lineage, None, Vec::new(), &baseline, 1)?;
+        let mut owner = complete_fake_clean_close_owner(
+            source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage),
+            &baseline,
+        )?;
+        let active = owner.completed.coordinator.begin()?;
+        let transaction = active.transaction_id();
+        owner
+            .completed
+            .coordinator
+            .lifecycles
+            .insert(transaction, TransactionLifecycleStatus::Committed);
+        let _durable = install_fake_current_commit(&mut owner, transaction)?;
+        let selected_checkpoint = owner.completed.checkpoint_source.checkpoint.clone();
+        owner
+            .completed
+            .checkpoint_source
+            .clean_close_publication_fault = Some(FakeCheckpointPublicationFault::After(
+            FakeFault("crash after close candidate replace"),
+        ));
+
+        let failure = owner
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("candidate crash was reported as success"))?;
+
+        assert!(failure.error().outcome_is_indeterminate());
+        assert_eq!(
+            failure._analyzed.completed.checkpoint_source.checkpoint,
+            selected_checkpoint
+        );
+        assert!(
+            failure
+                ._analyzed
+                .completed
+                .checkpoint_source
+                .clean_close_checkpoint
+                .is_some()
+        );
+        let FailedTransactionPageStorageCleanClosePreparation { _analyzed, .. } = failure;
+        let (_, source, store, _, _, checkpoint_source) = (*_analyzed).into_parts();
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_generation_aware_restart_checkpoint_completeness(checkpoint_source);
+        assert!(matches!(
+            selection,
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_reload_absence_failure_and_mismatch_are_terminal() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1960).ok_or(TestError("reload close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+
+        let (mut absent, _) = empty_fake_clean_close_owner(&lineage)?;
+        absent
+            .completed
+            .checkpoint_source
+            .clean_close_checkpoint_override = Some(None);
+        let absent = absent
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("absent reloaded checkpoint was accepted"))?;
+        assert!(matches!(
+            absent.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::CheckpointAbsent
+            )
+        ));
+
+        let (mut unavailable, _) = empty_fake_clean_close_owner(&lineage)?;
+        unavailable
+            .completed
+            .checkpoint_source
+            .clean_close_load_fault = Some(FakeFault("clean close reload"));
+        let unavailable = unavailable
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("failed checkpoint reload was accepted"))?;
+        assert!(matches!(
+            unavailable.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::CheckpointReload(
+                    FakeFault("clean close reload")
+                )
+            )
+        ));
+
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x2960).ok_or(TestError("foreign reload persistent id"))?,
+        );
+        let foreign = fake_completeness_baseline(&foreign_lineage, None, Vec::new(), Vec::new())?;
+        let (mut mismatch, _) = empty_fake_clean_close_owner(&lineage)?;
+        mismatch
+            .completed
+            .checkpoint_source
+            .clean_close_checkpoint_override =
+            Some(Some(owned_decoded_completeness_checkpoint(&foreign)));
+        let mismatch = mismatch
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("mismatched reloaded checkpoint was accepted"))?;
+        assert!(matches!(
+            mismatch.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::ReloadedCheckpointMismatch {
+                        ..
+                    }
+                )
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_detects_current_baseline_and_metadata_toctou_after_publication()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1970).ok_or(TestError("TOCTOU close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let transaction = durable_identity(1, 1)?;
+
+        let (mut baseline_changed, _) = empty_fake_clean_close_owner(&lineage)?;
+        baseline_changed
+            .completed
+            .source
+            .restart_replacement_after_callback = Some((
+            Some(lineage.position(1)),
+            vec![restart_commit(&lineage, transaction, 1)?],
+        ));
+        let baseline_changed = baseline_changed
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("clean-close baseline TOCTOU was accepted"))?;
+        assert!(matches!(
+            baseline_changed.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::CurrentBaselineChanged { .. }
+                )
+            )
+        ));
+
+        let (mut metadata_changed, _) = empty_fake_clean_close_owner(&lineage)?;
+        metadata_changed
+            .completed
+            .source
+            .retention_source_constraint_after_observation = Some(Some(lineage.position(1)));
+        let metadata_changed = metadata_changed
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("clean-close metadata TOCTOU was accepted"))?;
+        assert!(matches!(
+            metadata_changed.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Evidence(
+                    DurableTransactionPageStorageCleanCloseEvidenceError::RetentionMetadataChanged {
+                        ..
+                    }
+                )
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_metadata_failure_stays_before_publication() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1980).ok_or(TestError("metadata close persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let (mut owner, _) = empty_fake_clean_close_owner(&lineage)?;
+        owner.completed.source.retention_metadata_error = Some(FakeFault("clean close metadata"));
+        let publication_calls = owner
+            .completed
+            .checkpoint_source
+            .clean_close_publication_calls;
+
+        let failure = owner
+            .prepare_clean_close()
+            .err()
+            .ok_or(TestError("clean-close metadata failure was accepted"))?;
+
+        assert!(!failure.error().outcome_is_indeterminate());
+        assert!(matches!(
+            failure.error(),
+            DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                DurableTransactionPageStorageCleanCloseBeforePublicationError::RetentionMetadataSource(
+                    FakeFault("clean close metadata")
+                )
+            )
+        ));
+        assert_eq!(
+            failure
+                ._analyzed
+                .completed
+                .checkpoint_source
+                .clean_close_publication_calls,
+            publication_calls
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn clean_close_portable_count_overflow_is_typed() {
+        assert!(matches!(
+            portable_transaction_page_storage_clean_close_count(
+                u128::from(u64::MAX) + 1,
+                TransactionPageStorageCleanCloseCountField::TransactionEntries,
+            ),
+            Err(
+                DurableTransactionPageStorageCleanCloseEvidenceError::PortableCountWidthExceeded {
+                    field: TransactionPageStorageCleanCloseCountField::TransactionEntries,
+                    count,
+                }
+            ) if count == u128::from(u64::MAX) + 1
+        ));
     }
 }

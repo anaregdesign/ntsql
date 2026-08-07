@@ -5,7 +5,7 @@
 - Issue: #170
 - Extends: ADR 0011, ADR 0013, ADR 0014, ADR 0034, ADR 0035, ADR 0036,
   ADR 0039, ADR 0052, ADR 0053, ADR 0058, ADR 0059
-- Extended by: ADR 0061
+- Extended by: ADR 0061, ADR 0068
 - Follows: #169
 
 ## Context

@@ -12,5 +12,8 @@ ntsql-page.workspace = true
 ntsql-transaction.workspace = true
 ntsql-wal.workspace = true
 
+[dev-dependencies]
+ntsql-recovery-model.workspace = true
+
 [lints]
 workspace = true

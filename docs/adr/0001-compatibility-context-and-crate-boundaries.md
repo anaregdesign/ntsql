@@ -5,7 +5,7 @@
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
   ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014, ADR 0015, ADR 0016,
-  ADR 0017, ADR 0018, ADR 0019, ADR 0020
+  ADR 0017, ADR 0018, ADR 0019, ADR 0020, ADR 0061
 
 ## Context
 
@@ -68,9 +68,13 @@ ntsql-page -------------> ntsql-wal
 
 ntsql-wal --------------> standard library only
 
-ntsql-storage-file -----> ntsql-page, ntsql-transaction, ntsql-wal
+ntsql-recovery-model ----> standard library only
 
+ntsql-storage-file -----> ntsql-page, ntsql-transaction, ntsql-wal
 ntsql-storage-memory ---> ntsql-page, ntsql-transaction, ntsql-wal
+
+ntsql-storage-file -. development only .-> ntsql-recovery-model
+ntsql-storage-memory -. development only .-> ntsql-recovery-model
 
 ntsql-architecture-check -------> standard library only
 ```
@@ -86,6 +90,13 @@ verification through injected ports, requires a plan for all seven dimensions,
 and returns only locally validated `ConformanceRecord` values. It does not own a
 real product oracle, cryptographic implementation, filesystem or network
 access, an ambient clock, or external fixtures.
+
+`ntsql-recovery-model` owns only the repository-authored, I/O-free bounded state
+machine and deterministic trace inputs used to verify crash/restart invariants.
+It has no engine, adapter, contract, serialization, randomness, filesystem, or
+network dependency. Memory and filesystem adapters depend on it only from their
+development targets, so concrete runners remain outside the model and production
+adapter graphs remain unchanged.
 
 `ntsql-wal` owns the I/O-free ordering invariant that a commit record is
 appended and its exact assigned position is flushed before a durable
@@ -128,12 +139,14 @@ client diagnostic, or domain policy. No domain crate may depend on it.
 
 `ntsql-architecture-check` is a build-time tool, not an engine dependency. It
 compares every workspace package's complete set of direct normal, build, and
-development dependencies with the reviewed allowlist. It rejects reverse
-edges, unregistered workspace packages, missing required edges, and unreviewed
-external dependencies. Its negative self-test proves that a
+development dependencies with separate reviewed allowlists for each dependency
+kind. A development-only edge cannot silently become a normal or build edge. It
+rejects reverse edges, unregistered workspace packages, missing required edges,
+and unreviewed external dependencies. Its negative self-test proves that a
 `ntsql-compatibility -> ntsql-contract` edge is rejected. Focused tests also
-reject extra `ntsql-page` dependencies and the reverse `ntsql-wal ->
-ntsql-page` edge.
+reject extra `ntsql-page` dependencies, the reverse `ntsql-wal -> ntsql-page`
+edge, production adapter dependencies on `ntsql-recovery-model`, and every
+model-to-adapter edge.
 
 ## Package Evolution Rules
 
@@ -160,6 +173,9 @@ catch-all package solely to avoid an explicit dependency.
   target selection at the adapter boundary.
 - `ntsql-testkit` tests use repository-authored in-memory sources and explicit
   timestamps, input identities, and normalization plans.
+- `ntsql-recovery-model` unit tests exhaust bounded repository-authored logical
+  traces without opening an adapter. Adapter development tests execute the same
+  canonical seeds and compare concrete durable observations with model state.
 - `ntsql-page` tests prove exact WAL-before-page call ordering, lineage
   rejection before either port call, and terminal store-write ambiguity.
   Compile-fail tests reject construction of the private write permit and clean

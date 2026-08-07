@@ -1188,6 +1188,62 @@ impl<const N: usize> Error for InMemoryPageStoreInventoryError<N> {
     }
 }
 
+/// Exact physical state observed when an in-memory generation-swap fault fires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InMemoryWalReclamationFaultObservation {
+    fault_point: FaultPoint,
+    source_generation: u64,
+    retained_first: Option<u64>,
+    logical_high_water: Option<u64>,
+    allocated_epoch_high_water: NonZeroU64,
+    durable_record_count: usize,
+    selected_checkpoint_anchor: Option<(u16, u128)>,
+}
+
+impl InMemoryWalReclamationFaultObservation {
+    /// Returns the exact injected boundary.
+    #[must_use]
+    pub const fn fault_point(&self) -> FaultPoint {
+        self.fault_point
+    }
+
+    /// Returns the physical generation after the fault boundary.
+    #[must_use]
+    pub const fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    /// Returns the first retained durable record after the fault boundary.
+    #[must_use]
+    pub const fn retained_first(&self) -> Option<u64> {
+        self.retained_first
+    }
+
+    /// Returns the durable logical high-water after the fault boundary.
+    #[must_use]
+    pub const fn logical_high_water(&self) -> Option<u64> {
+        self.logical_high_water
+    }
+
+    /// Returns the allocated epoch high-water after the fault boundary.
+    #[must_use]
+    pub const fn allocated_epoch_high_water(&self) -> NonZeroU64 {
+        self.allocated_epoch_high_water
+    }
+
+    /// Returns the retained durable-record count after the fault boundary.
+    #[must_use]
+    pub const fn durable_record_count(&self) -> usize {
+        self.durable_record_count
+    }
+
+    /// Returns whether an exact selected-checkpoint anchor is installed.
+    #[must_use]
+    pub const fn has_selected_checkpoint_anchor(&self) -> bool {
+        self.selected_checkpoint_anchor.is_some()
+    }
+}
+
 /// Failure to observe or apply an in-memory WAL reclamation operation.
 ///
 /// This is the adapter-specific error for
@@ -1222,7 +1278,7 @@ pub enum InMemoryWalReclamationSourceError {
     /// [`FaultPoint::BeforeGenerationSwap`] means no mutation was applied.
     /// [`FaultPoint::AfterGenerationSwap`] means the full prefix drain,
     /// generation increment, and anchor installation are complete.
-    InjectedFault(FaultPoint),
+    InjectedFault(InMemoryWalReclamationFaultObservation),
 }
 
 impl fmt::Display for InMemoryWalReclamationSourceError {
@@ -1248,8 +1304,12 @@ impl fmt::Display for InMemoryWalReclamationSourceError {
             Self::GenerationExhausted => {
                 formatter.write_str("in-memory WAL generation counter is exhausted")
             }
-            Self::InjectedFault(point) => {
-                write!(formatter, "injected WAL reclamation fault at: {point}")
+            Self::InjectedFault(observation) => {
+                write!(
+                    formatter,
+                    "injected WAL reclamation fault at: {}",
+                    observation.fault_point()
+                )
             }
         }
     }
@@ -2528,11 +2588,39 @@ impl<const N: usize> InMemoryCommitLog<N> {
         self.generation
     }
 
+    /// Returns the next logical position without consuming it.
+    #[must_use]
+    pub const fn next_logical_position(&self) -> Option<u64> {
+        self.next_position
+    }
+
     /// Returns the raw selected-checkpoint anchor stored after the last
     /// successful reclamation, or `None` when the generation is zero.
     #[must_use]
     pub const fn selected_checkpoint_anchor(&self) -> Option<(u16, u128)> {
         self.selected_checkpoint_anchor
+    }
+
+    fn reclamation_fault_observation(
+        &self,
+        fault_point: FaultPoint,
+        allocated_epoch_high_water: NonZeroU64,
+    ) -> InMemoryWalReclamationFaultObservation {
+        InMemoryWalReclamationFaultObservation {
+            fault_point,
+            source_generation: self.generation,
+            retained_first: self
+                .durable_records()
+                .next()
+                .map(|record| record.position().get()),
+            logical_high_water: self
+                .durable_logical_high_water
+                .as_ref()
+                .map(LogSequenceNumber::get),
+            allocated_epoch_high_water,
+            durable_record_count: self.durable_len,
+            selected_checkpoint_anchor: self.selected_checkpoint_anchor,
+        }
     }
 
     /// Returns every physically appended snapshot, including the volatile suffix.
@@ -3100,7 +3188,10 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for InMemo
         // Generation, records, and durable_len are unchanged when this fires.
         if self.consume_fault(FaultPoint::BeforeGenerationSwap) {
             return Err(InMemoryWalReclamationSourceError::InjectedFault(
-                FaultPoint::BeforeGenerationSwap,
+                self.reclamation_fault_observation(
+                    FaultPoint::BeforeGenerationSwap,
+                    allocated_epoch_high_water,
+                ),
             ));
         }
 
@@ -3124,7 +3215,10 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for InMemo
         // indeterminate (the physical effect is in place).
         if self.consume_fault(FaultPoint::AfterGenerationSwap) {
             return Err(InMemoryWalReclamationSourceError::InjectedFault(
-                FaultPoint::AfterGenerationSwap,
+                self.reclamation_fault_observation(
+                    FaultPoint::AfterGenerationSwap,
+                    allocated_epoch_high_water,
+                ),
             ));
         }
 
@@ -3682,6 +3776,8 @@ mod tests {
     use ntsql_wal::CommitError;
 
     use super::*;
+
+    mod recovery_model_runner;
 
     #[test]
     fn retention_ports_report_allocator_high_water_and_sorted_complete_inventory()
@@ -7105,8 +7201,17 @@ mod tests {
         assert!(Error::source(&err6).is_none());
         assert!(err6.to_string().contains("exhaust") || err6.to_string().contains("generation"));
 
-        let err6b =
-            InMemoryWalReclamationSourceError::InjectedFault(FaultPoint::BeforeGenerationSwap);
+        let err6b = InMemoryWalReclamationSourceError::InjectedFault(
+            InMemoryWalReclamationFaultObservation {
+                fault_point: FaultPoint::BeforeGenerationSwap,
+                source_generation: 0,
+                retained_first: None,
+                logical_high_water: None,
+                allocated_epoch_high_water: NonZeroU64::MIN,
+                durable_record_count: 0,
+                selected_checkpoint_anchor: None,
+            },
+        );
         assert!(Error::source(&err6b).is_none());
         let msg6b = err6b.to_string();
         assert!(
@@ -7114,8 +7219,17 @@ mod tests {
             "message: {msg6b}"
         );
 
-        let err6c =
-            InMemoryWalReclamationSourceError::InjectedFault(FaultPoint::AfterGenerationSwap);
+        let err6c = InMemoryWalReclamationSourceError::InjectedFault(
+            InMemoryWalReclamationFaultObservation {
+                fault_point: FaultPoint::AfterGenerationSwap,
+                source_generation: 1,
+                retained_first: None,
+                logical_high_water: None,
+                allocated_epoch_high_water: NonZeroU64::MIN,
+                durable_record_count: 0,
+                selected_checkpoint_anchor: Some((1, 1)),
+            },
+        );
         assert!(Error::source(&err6c).is_none());
         let msg6c = err6c.to_string();
         assert!(
@@ -7274,11 +7388,9 @@ mod tests {
                 failed.error(),
                 DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
                     DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
-                        InMemoryWalReclamationSourceError::InjectedFault(
-                            FaultPoint::BeforeGenerationSwap
-                        )
+                        InMemoryWalReclamationSourceError::InjectedFault(observation)
                     )
-                )
+                ) if observation.fault_point() == FaultPoint::BeforeGenerationSwap
             ),
             "unexpected error: {:?}",
             failed.error()
@@ -7293,11 +7405,9 @@ mod tests {
     /// source.  The domain wraps the error as
     /// `OutcomeIndeterminate(Effect(InjectedFault(AfterGenerationSwap)))`.
     ///
-    /// The `AfterGenerationSwap` error shape itself proves the generation swap
-    /// completed: had the fault fired before the mutation, the variant would be
-    /// `BeforeGenerationSwap`.  A fresh `observe_restart_wal_reclamation_source`
-    /// on the source (accessible through the failure wrapper's internal
-    /// `analyzed` field) would report generation=1 and the preserved high-water.
+    /// The `AfterGenerationSwap` error retains an immutable physical-state
+    /// observation proving that generation advancement, prefix drain, anchor
+    /// installation, and both high-water marks match the applied boundary.
     #[test]
     fn after_generation_swap_fault_reports_indeterminate_with_installed_generation()
     -> Result<(), Box<dyn Error>> {
@@ -7362,11 +7472,9 @@ mod tests {
                 failed.error(),
                 DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
                     DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
-                        InMemoryWalReclamationSourceError::InjectedFault(
-                            FaultPoint::AfterGenerationSwap
-                        )
+                        InMemoryWalReclamationSourceError::InjectedFault(observation)
                     )
-                )
+                ) if observation.fault_point() == FaultPoint::AfterGenerationSwap
             ),
             "unexpected error: {:?}",
             failed.error()

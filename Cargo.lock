@@ -43,10 +43,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntsql-recovery-model"
+version = "0.1.0"
+
+[[package]]
 name = "ntsql-storage-file"
 version = "0.1.0"
 dependencies = [
  "ntsql-page",
+ "ntsql-recovery-model",
  "ntsql-transaction",
  "ntsql-wal",
 ]
@@ -56,6 +61,7 @@ name = "ntsql-storage-memory"
 version = "0.1.0"
 dependencies = [
  "ntsql-page",
+ "ntsql-recovery-model",
  "ntsql-transaction",
  "ntsql-wal",
 ]

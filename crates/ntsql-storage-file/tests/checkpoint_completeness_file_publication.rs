@@ -391,7 +391,7 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
             .map(|transaction| transaction.epoch()),
         Some(2)
     );
-    let mut completed = restored.complete_restart()?;
+    let completed = restored.complete_restart()?;
     assert_file_composition_locked(directory.path(), &slot_path)?;
     assert_eq!(
         completed.completion_evidence().current_frontier(),
@@ -403,10 +403,36 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
             page_number: suffix_page,
         }]
     );
+    let mut retained = completed.analyze_wal_retention()?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert_eq!(
+        retained.retention_analysis().persistent_log_id(),
+        persistent_log_id
+    );
+    assert_eq!(
+        retained.retention_analysis().durable_frontier(),
+        Some(current_frontier.get())
+    );
+    assert_eq!(
+        retained.retention_analysis().allocated_epoch_high_water(),
+        3
+    );
+    assert_eq!(
+        retained
+            .retention_analysis()
+            .floor()
+            .retained_first_record(),
+        Some(1)
+    );
+    assert_eq!(retained.retention_analysis().store_page_count(), 2);
+    assert_eq!(
+        retained.retention_analysis().unresolved_transaction_count(),
+        0
+    );
 
     let live_page = PageNumber::new(163).ok_or_else(|| io::Error::other("live page is zero"))?;
     {
-        let (coordinator, log, store) = completed.parts_mut();
+        let (coordinator, log, store) = retained.parts_mut();
         let lineage = LogDurability::lineage(log).clone();
         let active = coordinator.begin()?;
         assert_eq!(active.transaction_id().epoch().get(), 3);
@@ -421,12 +447,12 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
     }
     assert_file_composition_locked(directory.path(), &slot_path)?;
     assert_eq!(
-        completed.completion_evidence().current_frontier(),
+        retained.completion_evidence().current_frontier(),
         Some(current_frontier.get())
     );
 
     let publication =
-        completed.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        retained.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
     let published_frontier = publication
         .durable_frontier()
         .ok_or_else(|| io::Error::other("completed filesystem frontier is empty"))?;
@@ -435,13 +461,22 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
     assert_eq!(publication.page_count(), 3);
     assert_file_composition_locked(directory.path(), &slot_path)?;
 
-    let (coordinator, log, store, completion_evidence, checkpoint) = completed.into_parts();
+    let (coordinator, log, store, completion_evidence, retention_analysis, checkpoint) =
+        retained.into_parts();
     assert_file_composition_locked(directory.path(), &slot_path)?;
     assert_eq!(
         completion_evidence.current_frontier(),
         Some(current_frontier.get())
     );
-    drop((coordinator, log, store, completion_evidence, checkpoint));
+    assert_eq!(retention_analysis.floor().retained_first_record(), Some(1));
+    drop((
+        coordinator,
+        log,
+        store,
+        completion_evidence,
+        retention_analysis,
+        checkpoint,
+    ));
 
     let reopened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
         directory.path().join("wal.bin"),
@@ -492,8 +527,16 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
         completed.completion_evidence().current_frontier(),
         Some(published_frontier)
     );
+    let retained = completed.analyze_wal_retention()?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert_eq!(
+        retained.retention_analysis().allocated_epoch_high_water(),
+        4
+    );
+    assert_eq!(retained.retention_analysis().store_page_count(), 3);
 
-    let (coordinator, log, store, completion_evidence, checkpoint) = completed.into_parts();
+    let (coordinator, log, store, completion_evidence, retention_analysis, checkpoint) =
+        retained.into_parts();
     assert_file_composition_locked(directory.path(), &slot_path)?;
     assert_eq!(
         completion_evidence.current_frontier(),
@@ -510,7 +553,18 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
     assert_eq!(stored_live.page_version(), PageVersion::new(3));
     assert_eq!(stored_live.bytes(), &[0x16, 0x13]);
     assert_eq!(checkpoint.persistent_log_id(), persistent_log_id);
-    drop((coordinator, log, store, completion_evidence, checkpoint));
+    assert_eq!(
+        retention_analysis.durable_frontier(),
+        Some(published_frontier)
+    );
+    drop((
+        coordinator,
+        log,
+        store,
+        completion_evidence,
+        retention_analysis,
+        checkpoint,
+    ));
 
     drop(FileCommitLog::<2>::open_transaction_page_capable(
         directory.path().join("wal.bin"),
@@ -652,7 +706,15 @@ fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_lock
         let completed = restored.complete_restart()?;
         assert_file_composition_locked(&case_path, &slot_path)?;
         assert_eq!(completed.completion_evidence().page_outcomes().len(), 1);
-        let (coordinator, log, store, completion_evidence, checkpoint) = completed.into_parts();
+        let retained = completed.analyze_wal_retention()?;
+        assert_file_composition_locked(&case_path, &slot_path)?;
+        assert_eq!(retained.retention_analysis().store_page_count(), 1);
+        assert_eq!(
+            retained.retention_analysis().allocated_epoch_high_water(),
+            2
+        );
+        let (coordinator, log, store, completion_evidence, retention_analysis, checkpoint) =
+            retained.into_parts();
         assert_file_composition_locked(&case_path, &slot_path)?;
         assert_eq!(
             completion_evidence.current_frontier(),
@@ -663,7 +725,14 @@ fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_lock
             .ok_or_else(|| io::Error::other("repaired filesystem page is missing after reopen"))?;
         assert_eq!(stored.page_version(), PageVersion::new(1));
         assert_eq!(stored.bytes(), &[0x16, index as u8]);
-        drop((coordinator, log, store, completion_evidence, checkpoint));
+        drop((
+            coordinator,
+            log,
+            store,
+            completion_evidence,
+            retention_analysis,
+            checkpoint,
+        ));
 
         let store = FilePageStore::<2>::open(&page_store_path)?;
         let stored = store

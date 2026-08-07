@@ -2565,6 +2565,23 @@ pub trait DurablePageStoreSnapshotSource<const N: usize> {
     ) -> Result<Option<StoredPageSnapshotObservation<N>>, Self::ObservationError>;
 }
 
+/// Exclusive read-only source of every current durable page-store snapshot.
+///
+/// Implementations must return one owned observation for every current page,
+/// strictly increasing by [`PageNumber`], from one stable store view. The
+/// observations are inert and grant no page-write or WAL authority.
+pub trait DurablePageStoreInventorySource<const N: usize>:
+    DurablePageStoreSnapshotSource<N>
+{
+    /// Adapter-specific failure before a complete inventory is available.
+    type InventoryError;
+
+    /// Returns the complete current durable page inventory.
+    fn durable_page_store_inventory(
+        &mut self,
+    ) -> Result<Vec<StoredPageSnapshotObservation<N>>, Self::InventoryError>;
+}
+
 /// Recovery-only page-store port with atomic source recheck and replacement.
 ///
 /// `compare_and_replace` must validate the permit against the candidate, recheck
@@ -6940,6 +6957,906 @@ where
     }
 }
 
+/// Inert reason one logical WAL record remains required after selected restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartWalRetentionRequirementCause {
+    /// The active selected checkpoint retains its exact frontier boundary.
+    SelectedCheckpointFrontier,
+    /// The selected checkpoint retains its inclusive replay lower bound.
+    SelectedReplayStart {
+        /// Evidence that established the selected replay lower bound.
+        cause: DurableTransactionRestartReplayStartCause,
+    },
+    /// One exact current page-store snapshot requires its backing page record.
+    StoredPage {
+        /// Page whose current snapshot requires the record.
+        page_number: PageNumber,
+    },
+    /// An unresolved durable transaction requires its first owned-page record.
+    UnresolvedTransaction {
+        /// Persisted unresolved transaction identity.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// Adapter format or migration metadata requires this logical record.
+    SourceConstraint,
+}
+
+/// One exact inclusive logical-record requirement in a retention analysis.
+#[derive(Debug)]
+#[must_use]
+pub struct DurableTransactionRestartWalRetentionRequirement {
+    position: LogSequenceNumber,
+    cause: DurableTransactionRestartWalRetentionRequirementCause,
+}
+
+impl DurableTransactionRestartWalRetentionRequirement {
+    /// Returns the inert numeric position of the required logical record.
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        self.position.get()
+    }
+
+    /// Returns the reason this record remains required.
+    #[must_use]
+    pub const fn cause(&self) -> DurableTransactionRestartWalRetentionRequirementCause {
+        self.cause
+    }
+}
+
+/// Opaque inclusive WAL retention floor, or an explicit no-record requirement.
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalRetentionFloor;
+///
+/// let forged = DurableTransactionRestartWalRetentionFloor {
+///     retained_first_record: None,
+/// };
+/// ```
+#[derive(Debug)]
+#[must_use]
+pub struct DurableTransactionRestartWalRetentionFloor {
+    retained_first_record: Option<LogSequenceNumber>,
+}
+
+impl DurableTransactionRestartWalRetentionFloor {
+    /// Returns the first logical record that must remain, or `None` when no
+    /// logical record in the analyzed prefix is required.
+    #[must_use]
+    pub const fn retained_first_record(&self) -> Option<u64> {
+        match &self.retained_first_record {
+            Some(position) => Some(position.get()),
+            None => None,
+        }
+    }
+}
+
+/// Immutable non-authorizing retention analysis for one completed restart.
+///
+/// The exact lineage-bound floor remains private. This value cannot become a
+/// durability, truncation, replacement, page, checkpoint, or transaction
+/// authority.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartWalRetentionAnalysis,
+///     DurableTransactionRestartWalRetentionFloor,
+/// };
+///
+/// fn cannot_forge(
+///     floor: DurableTransactionRestartWalRetentionFloor,
+/// ) -> DurableTransactionRestartWalRetentionAnalysis {
+///     DurableTransactionRestartWalRetentionAnalysis {
+///         persistent_log_id: todo!(),
+///         lineage: todo!(),
+///         durable_frontier: None,
+///         floor,
+///         allocated_epoch_high_water: todo!(),
+///         requirements: Vec::new(),
+///         store_page_count: 0,
+///         unresolved_transaction_count: 0,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalRetentionAnalysis;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_reclaim<Log: LogDurability>(
+///     log: &mut Log,
+///     analysis: &DurableTransactionRestartWalRetentionAnalysis,
+/// ) {
+///     let _ = log.flush_through(analysis);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::StoredPageSnapshotObservation;
+/// use ntsql_transaction::DurableTransactionRestartWalRetentionAnalysis;
+///
+/// fn inventory_cannot_become_analysis(
+///     inventory: Vec<StoredPageSnapshotObservation<1>>,
+/// ) -> DurableTransactionRestartWalRetentionAnalysis {
+///     inventory.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+///     DurableTransactionRestartWalRetentionAnalysis,
+/// };
+///
+/// fn cannot_publish_checkpoint<Publisher>(
+///     publisher: &mut Publisher,
+///     analysis: &DurableTransactionRestartWalRetentionAnalysis,
+/// )
+/// where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     publisher.publish_restart_checkpoint_completeness_baseline(analysis);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalRetentionAnalysis;
+///
+/// fn cannot_issue_transaction(
+///     analysis: &mut DurableTransactionRestartWalRetentionAnalysis,
+/// ) {
+///     let _ = analysis.begin();
+/// }
+/// ```
+#[derive(Debug)]
+#[must_use]
+pub struct DurableTransactionRestartWalRetentionAnalysis {
+    persistent_log_id: PersistentLogId,
+    lineage: LogLineage,
+    durable_frontier: Option<LogSequenceNumber>,
+    floor: DurableTransactionRestartWalRetentionFloor,
+    allocated_epoch_high_water: NonZeroU64,
+    requirements: Vec<DurableTransactionRestartWalRetentionRequirement>,
+    store_page_count: usize,
+    unresolved_transaction_count: usize,
+}
+
+impl DurableTransactionRestartWalRetentionAnalysis {
+    /// Returns the persistent WAL identity validated by this analysis.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the exact analyzed WAL lineage.
+    pub const fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    /// Returns the exact analyzed logical durable frontier.
+    #[must_use]
+    pub const fn durable_frontier(&self) -> Option<u64> {
+        match &self.durable_frontier {
+            Some(position) => Some(position.get()),
+            None => None,
+        }
+    }
+
+    /// Returns the opaque inclusive floor.
+    pub const fn floor(&self) -> &DurableTransactionRestartWalRetentionFloor {
+        &self.floor
+    }
+
+    /// Returns the greatest durably allocated coordinator epoch.
+    #[must_use]
+    pub const fn allocated_epoch_high_water(&self) -> u64 {
+        self.allocated_epoch_high_water.get()
+    }
+
+    /// Returns every exact requirement in deterministic derivation order.
+    pub fn requirements(&self) -> &[DurableTransactionRestartWalRetentionRequirement] {
+        &self.requirements
+    }
+
+    /// Returns the number of exact current snapshots in the complete inventory.
+    #[must_use]
+    pub const fn store_page_count(&self) -> usize {
+        self.store_page_count
+    }
+
+    /// Returns the number of unresolved transactions contributing constraints.
+    #[must_use]
+    pub const fn unresolved_transaction_count(&self) -> usize {
+        self.unresolved_transaction_count
+    }
+}
+
+/// Contradiction that prevents a completed restart from yielding a retention floor.
+#[derive(Debug)]
+pub enum DurableTransactionRestartWalRetentionEvidenceError {
+    /// Fresh logical WAL evidence no longer forms a valid complete prefix.
+    RestartAnalysis {
+        /// Exact restart-analysis evidence cause.
+        source: Box<DurableTransactionRestartAnalysisEvidenceError>,
+    },
+    /// Fresh logical WAL/coordinator evidence no longer matches completion.
+    Completion {
+        /// Exact completion-evidence contradiction.
+        source: Box<DurableTransactionRestartCheckpointCompletionEvidenceError>,
+    },
+    /// The complete inventory's declared lineage differs from the WAL.
+    StoreLineageMismatch {
+        /// Exact completed WAL lineage.
+        expected: LogLineage,
+        /// Current store lineage.
+        actual: LogLineage,
+    },
+    /// Inventory order was duplicate or non-increasing.
+    PageInventoryNotStrictlyIncreasing {
+        /// Index of the invalid inventory entry.
+        index: usize,
+        /// Earlier page number.
+        previous: PageNumber,
+        /// Duplicate or lower page number.
+        actual: PageNumber,
+    },
+    /// One inventory snapshot contradicted complete logical WAL evidence.
+    PageInventorySnapshot {
+        /// Page being reconciled.
+        page_number: PageNumber,
+        /// Exact existing completeness contradiction.
+        source: Box<DurableTransactionRestartCompletenessEvidenceError>,
+    },
+    /// A required current WAL image was absent from the complete store inventory.
+    RequiredPageSnapshotMissing {
+        /// Page missing its final required snapshot.
+        page_number: PageNumber,
+        /// Exact required logical page-record position.
+        required_position: u64,
+    },
+    /// A current stored snapshot was backed by an older image than required.
+    RequiredPageSnapshotBehind {
+        /// Page whose current snapshot remained behind.
+        page_number: PageNumber,
+        /// Stored backing position.
+        stored_position: u64,
+        /// Latest required page-record position.
+        required_position: u64,
+    },
+    /// A current stored snapshot exists although no durable image requires it.
+    UnexpectedPageSnapshotWithoutRequiredImage {
+        /// Unexpected current page.
+        page_number: PageNumber,
+        /// Logical position backing the unexpected snapshot.
+        stored_position: u64,
+    },
+    /// The union of WAL and store page numbers overflowed.
+    PageInventoryCountOverflow {
+        /// Number of logical WAL records.
+        record_count: usize,
+        /// Number of current stored snapshots.
+        store_page_count: usize,
+    },
+    /// The union page table could not reserve its conservative upper bound.
+    PageInventoryCapacityExhausted {
+        /// Requested conservative capacity.
+        capacity: usize,
+    },
+    /// Retention requirements overflowed their conservative upper bound.
+    RequirementCountOverflow,
+    /// Retention requirements could not reserve their conservative upper bound.
+    RequirementCapacityExhausted {
+        /// Requested conservative capacity.
+        capacity: usize,
+    },
+    /// A selected inclusive replay position lost its retained cause.
+    SelectedReplayCauseMissing {
+        /// Selected replay position.
+        position: u64,
+    },
+    /// An unresolved transaction lost its first owned-page position.
+    UnresolvedTransactionPositionMissing {
+        /// Persisted unresolved transaction identity.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// Retention metadata belongs to another WAL lineage.
+    MetadataLineageMismatch {
+        /// Exact completed WAL lineage.
+        expected: LogLineage,
+        /// Metadata-reported lineage.
+        actual: LogLineage,
+    },
+    /// Allocator high-water changed after completion.
+    AllocatedEpochHighWaterChanged {
+        /// Epoch of the exact coordinator restored by startup.
+        expected: u64,
+        /// Current durable allocator high-water.
+        actual: u64,
+    },
+    /// A source logical constraint belongs to another lineage.
+    ForeignSourceConstraint {
+        /// Foreign source-required position.
+        position: LogSequenceNumber,
+    },
+    /// A requirement exists although the logical prefix is empty.
+    RequirementInEmptyPrefix {
+        /// Inert numeric requested position.
+        position: u64,
+        /// Requirement category.
+        cause: DurableTransactionRestartWalRetentionRequirementCause,
+    },
+    /// A requirement lies after the exact current frontier.
+    RequirementAfterFrontier {
+        /// Inert numeric requested position.
+        position: u64,
+        /// Exact current frontier.
+        frontier: u64,
+        /// Requirement category.
+        cause: DurableTransactionRestartWalRetentionRequirementCause,
+    },
+    /// A requirement does not identify a current logical record boundary.
+    RequirementNotRecordBoundary {
+        /// Inert numeric requested position.
+        position: u64,
+        /// Requirement category.
+        cause: DurableTransactionRestartWalRetentionRequirementCause,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartWalRetentionEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RestartAnalysis { source } => {
+                write!(formatter, "fresh logical WAL analysis failed: {source}")
+            }
+            Self::Completion { source } => {
+                write!(formatter, "completed restart evidence changed: {source}")
+            }
+            Self::StoreLineageMismatch { .. } => {
+                formatter.write_str("complete page inventory belongs to another WAL lineage")
+            }
+            Self::PageInventoryNotStrictlyIncreasing {
+                index,
+                previous,
+                actual,
+            } => write!(
+                formatter,
+                "page inventory entry {index} is not strictly increasing: {} then {}",
+                previous.get(),
+                actual.get()
+            ),
+            Self::PageInventorySnapshot {
+                page_number,
+                source,
+            } => write!(
+                formatter,
+                "stored page {} contradicts logical WAL evidence: {source}",
+                page_number.get()
+            ),
+            Self::RequiredPageSnapshotMissing {
+                page_number,
+                required_position,
+            } => write!(
+                formatter,
+                "page {} is missing required snapshot at logical position {required_position}",
+                page_number.get()
+            ),
+            Self::RequiredPageSnapshotBehind {
+                page_number,
+                stored_position,
+                required_position,
+            } => write!(
+                formatter,
+                "page {} remains at position {stored_position} behind required position {required_position}",
+                page_number.get()
+            ),
+            Self::UnexpectedPageSnapshotWithoutRequiredImage {
+                page_number,
+                stored_position,
+            } => write!(
+                formatter,
+                "page {} has a current snapshot at position {stored_position} but no durable image requires it",
+                page_number.get()
+            ),
+            Self::PageInventoryCountOverflow { .. } => {
+                formatter.write_str("WAL/store page inventory count overflowed")
+            }
+            Self::PageInventoryCapacityExhausted { capacity } => write!(
+                formatter,
+                "WAL/store page inventory capacity is exhausted for {capacity} entries"
+            ),
+            Self::RequirementCountOverflow => {
+                formatter.write_str("retention requirement count overflowed")
+            }
+            Self::RequirementCapacityExhausted { capacity } => write!(
+                formatter,
+                "retention requirement capacity is exhausted for {capacity} entries"
+            ),
+            Self::SelectedReplayCauseMissing { position } => write!(
+                formatter,
+                "selected replay position {position} has no retained cause"
+            ),
+            Self::UnresolvedTransactionPositionMissing { transaction } => write!(
+                formatter,
+                "unresolved transaction {transaction} has no owned-page position"
+            ),
+            Self::MetadataLineageMismatch { .. } => {
+                formatter.write_str("retention metadata belongs to another WAL lineage")
+            }
+            Self::AllocatedEpochHighWaterChanged { expected, actual } => write!(
+                formatter,
+                "allocator epoch high-water changed from restored epoch {expected} to {actual}"
+            ),
+            Self::ForeignSourceConstraint { position } => write!(
+                formatter,
+                "source retention constraint {} belongs to another WAL lineage",
+                position.get()
+            ),
+            Self::RequirementInEmptyPrefix { position, cause } => write!(
+                formatter,
+                "{cause:?} requires logical position {position} in an empty prefix"
+            ),
+            Self::RequirementAfterFrontier {
+                position,
+                frontier,
+                cause,
+            } => write!(
+                formatter,
+                "{cause:?} requires logical position {position} after frontier {frontier}"
+            ),
+            Self::RequirementNotRecordBoundary { position, cause } => write!(
+                formatter,
+                "{cause:?} requires non-record logical position {position}"
+            ),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartWalRetentionEvidenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RestartAnalysis { source } => Some(source.as_ref()),
+            Self::Completion { source } => Some(source.as_ref()),
+            Self::PageInventorySnapshot { source, .. } => Some(source.as_ref()),
+            Self::StoreLineageMismatch { .. }
+            | Self::PageInventoryNotStrictlyIncreasing { .. }
+            | Self::RequiredPageSnapshotMissing { .. }
+            | Self::RequiredPageSnapshotBehind { .. }
+            | Self::UnexpectedPageSnapshotWithoutRequiredImage { .. }
+            | Self::PageInventoryCountOverflow { .. }
+            | Self::PageInventoryCapacityExhausted { .. }
+            | Self::RequirementCountOverflow
+            | Self::RequirementCapacityExhausted { .. }
+            | Self::SelectedReplayCauseMissing { .. }
+            | Self::UnresolvedTransactionPositionMissing { .. }
+            | Self::MetadataLineageMismatch { .. }
+            | Self::AllocatedEpochHighWaterChanged { .. }
+            | Self::ForeignSourceConstraint { .. }
+            | Self::RequirementInEmptyPrefix { .. }
+            | Self::RequirementAfterFrontier { .. }
+            | Self::RequirementNotRecordBoundary { .. } => None,
+        }
+    }
+}
+
+/// Failure while deriving WAL retention from one completed selected restart.
+#[derive(Debug)]
+pub enum DurableTransactionRestartWalRetentionAnalysisError<
+    WalSourceError,
+    StoreInventoryError,
+    MetadataSourceError,
+> {
+    /// The complete page-store inventory could not be established.
+    StoreInventory(StoreInventoryError),
+    /// WAL allocator or source-format retention metadata was unavailable.
+    MetadataSource(MetadataSourceError),
+    /// The stable logical WAL callback failed.
+    WalSource(WalSourceError),
+    /// Authoritative inputs contradicted the completed startup evidence.
+    Evidence(Box<DurableTransactionRestartWalRetentionEvidenceError>),
+}
+
+impl<WalSourceError, StoreInventoryError, MetadataSourceError> fmt::Display
+    for DurableTransactionRestartWalRetentionAnalysisError<
+        WalSourceError,
+        StoreInventoryError,
+        MetadataSourceError,
+    >
+where
+    WalSourceError: fmt::Display,
+    StoreInventoryError: fmt::Display,
+    MetadataSourceError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StoreInventory(source) => {
+                write!(formatter, "complete page-store inventory failed: {source}")
+            }
+            Self::MetadataSource(source) => {
+                write!(
+                    formatter,
+                    "WAL retention metadata observation failed: {source}"
+                )
+            }
+            Self::WalSource(source) => {
+                write!(
+                    formatter,
+                    "logical WAL retention observation failed: {source}"
+                )
+            }
+            Self::Evidence(source) => {
+                write!(formatter, "WAL retention analysis was rejected: {source}")
+            }
+        }
+    }
+}
+
+impl<WalSourceError, StoreInventoryError, MetadataSourceError> Error
+    for DurableTransactionRestartWalRetentionAnalysisError<
+        WalSourceError,
+        StoreInventoryError,
+        MetadataSourceError,
+    >
+where
+    WalSourceError: Error + 'static,
+    StoreInventoryError: Error + 'static,
+    MetadataSourceError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StoreInventory(source) => Some(source),
+            Self::MetadataSource(source) => Some(source),
+            Self::WalSource(source) => Some(source),
+            Self::Evidence(source) => Some(source.as_ref()),
+        }
+    }
+}
+
+/// Retention-analysis error specialized to one completed WAL and page store.
+pub type TransactionPageStorageRestartCheckpointWalRetentionAnalysisError<
+    Source,
+    Store,
+    const N: usize,
+> = DurableTransactionRestartWalRetentionAnalysisError<
+    <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+    <Store as DurablePageStoreInventorySource<N>>::InventoryError,
+    <Source as DurableTransactionRestartRetentionMetadataSource>::Error,
+>;
+
+/// Live completed-restart owner paired with exact non-authorizing retention evidence.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     CompletedTransactionPageStorageRestartCheckpointReplay,
+///     DurableTransactionRestartWalRetentionAnalysis,
+///     WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay,
+/// };
+///
+/// fn cannot_forge<Source, Store, CheckpointSource, const N: usize>(
+///     completed: CompletedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+///     analysis: DurableTransactionRestartWalRetentionAnalysis,
+/// ) -> WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     N,
+/// > {
+///     WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay {
+///         completed,
+///         analysis,
+///     }
+/// }
+/// ```
+#[must_use = "retention-analyzed selected restart owns all live adapters and evidence"]
+pub struct WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    completed:
+        CompletedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    analysis: DurableTransactionRestartWalRetentionAnalysis,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    /// Returns immutable selected-restart completion evidence.
+    pub const fn completion_evidence(
+        &self,
+    ) -> &TransactionPageStorageRestartCheckpointCompletionEvidence<N> {
+        self.completed.completion_evidence()
+    }
+
+    /// Returns immutable non-authorizing WAL retention evidence.
+    pub const fn retention_analysis(&self) -> &DurableTransactionRestartWalRetentionAnalysis {
+        &self.analysis
+    }
+
+    /// Borrows the exact live coordinator, WAL source, and page store.
+    #[must_use]
+    pub const fn parts(&self) -> (&TransactionCoordinator, &Source, &Store) {
+        self.completed.parts()
+    }
+
+    /// Borrows the exact live coordinator, WAL source, and page store mutably.
+    ///
+    /// A later reclamation transition must reject this analysis if live work
+    /// changes logical WAL, page inventory, or allocator metadata.
+    pub const fn parts_mut(&mut self) -> (&mut TransactionCoordinator, &mut Source, &mut Store) {
+        self.completed.parts_mut()
+    }
+
+    /// Releases all exact live owners and both immutable startup analyses.
+    pub fn into_parts(
+        self,
+    ) -> (
+        TransactionCoordinator,
+        Source,
+        Store,
+        TransactionPageStorageRestartCheckpointCompletionEvidence<N>,
+        DurableTransactionRestartWalRetentionAnalysis,
+        CheckpointSource,
+    ) {
+        let (coordinator, source, store, completion, checkpoint_source) =
+            self.completed.into_parts();
+        (
+            coordinator,
+            source,
+            store,
+            completion,
+            self.analysis,
+            checkpoint_source,
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    /// Publishes fresh current completeness through the retained checkpoint source.
+    ///
+    /// Publication does not update the retained completion or retention analyses.
+    pub fn publish_restart_checkpoint_completeness_baseline_from_current_prefix(
+        &mut self,
+    ) -> DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationResult<
+        Source::Error,
+        Store::ObservationError,
+        CheckpointSource::Error,
+    > {
+        self.completed
+            .publish_restart_checkpoint_completeness_baseline_from_current_prefix()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay")
+            .field("completion_evidence", self.completion_evidence())
+            .field("retention_analysis", &self.analysis)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Fail-closed owner retaining one completed restart and exact retention failure.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreInventorySource, DurableTransactionRestartAnalysisSource,
+///     DurableTransactionRestartRetentionMetadataSource,
+///     FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis,
+/// };
+///
+/// fn cannot_release_failed<Source, Store, CheckpointSource, const N: usize>(
+///     failed: FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>
+///         + DurableTransactionRestartRetentionMetadataSource,
+///     Store: DurablePageStoreInventorySource<N>,
+/// {
+///     let _ = failed.into_parts();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurablePageStoreInventorySource, DurableTransactionRestartAnalysisSource,
+///     DurableTransactionRestartRetentionMetadataSource,
+///     FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis,
+/// };
+///
+/// fn cannot_retry_failed<Source, Store, CheckpointSource, const N: usize>(
+///     failed: FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// )
+/// where
+///     Source: DurableTransactionRestartAnalysisSource<N>
+///         + DurableTransactionRestartRetentionMetadataSource,
+///     Store: DurablePageStoreInventorySource<N>,
+/// {
+///     let _ = failed.retry();
+/// }
+/// ```
+#[must_use = "failed retention analysis retains all completed owners until dropped"]
+pub struct FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreInventorySource<N>,
+{
+    completed: Box<
+        CompletedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    >,
+    error: TransactionPageStorageRestartCheckpointWalRetentionAnalysisError<Source, Store, N>,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreInventorySource<N>,
+{
+    /// Returns the exact source, inventory, metadata, or evidence cause.
+    #[must_use]
+    pub const fn error(
+        &self,
+    ) -> &TransactionPageStorageRestartCheckpointWalRetentionAnalysisError<Source, Store, N> {
+        &self.error
+    }
+
+    /// Returns inert aggregate restoration evidence without releasing an owner.
+    pub const fn transaction_summary(&self) -> TransactionRestartRestorationSummary {
+        self.completed.completion_evidence().transaction_summary()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreInventorySource<N>,
+    TransactionPageStorageRestartCheckpointWalRetentionAnalysisError<Source, Store, N>: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis")
+            .field(
+                "persistent_log_id",
+                &self.completed.completion_evidence().persistent_log_id(),
+            )
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreInventorySource<N>,
+    TransactionPageStorageRestartCheckpointWalRetentionAnalysisError<Source, Store, N>:
+        fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "selected-restart WAL retention analysis failed: {}",
+            self.error
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> Error
+    for FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + 'static,
+    Store: DurablePageStoreInventorySource<N> + 'static,
+    CheckpointSource: 'static,
+    TransactionPageStorageRestartCheckpointWalRetentionAnalysisError<Source, Store, N>:
+        Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    CompletedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreInventorySource<N>,
+{
+    /// Consumes one unused completed owner and derives conservative WAL retention.
+    ///
+    /// The transition writes nothing. Any failure retains every completed owner
+    /// and requires drop/reopen rather than same-owner retry.
+    pub fn analyze_wal_retention(
+        self,
+    ) -> Result<
+        WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+        FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    > {
+        analyze_completed_transaction_restart_wal_retention(self)
+    }
+}
+
 /// Fail-closed owner for a deterministic transaction-restoration rejection.
 ///
 /// There is no retry method because every retained input is immutable or the
@@ -9650,6 +10567,68 @@ pub trait DurableTransactionRestartAnalysisSource<const N: usize> {
             Option<&'evidence LogSequenceNumber>,
             &'evidence [DurableTransactionRestartObservation<N>],
         ) -> Output;
+}
+
+/// Untrusted source projection needed by restart WAL retention analysis.
+///
+/// Allocator high-water is physical persistence metadata, not a logical WAL
+/// record or frontier. The optional logical constraint is reserved for an
+/// adapter format or migration marker that requires retaining an older logical
+/// record. Construction grants no retention or reclamation authority.
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct DurableTransactionRestartRetentionMetadataObservation {
+    lineage: LogLineage,
+    allocated_epoch_high_water: NonZeroU64,
+    oldest_required_log_position: Option<LogSequenceNumber>,
+}
+
+impl DurableTransactionRestartRetentionMetadataObservation {
+    /// Creates one adapter-owned retention metadata observation.
+    pub const fn new(
+        lineage: LogLineage,
+        allocated_epoch_high_water: NonZeroU64,
+        oldest_required_log_position: Option<LogSequenceNumber>,
+    ) -> Self {
+        Self {
+            lineage,
+            allocated_epoch_high_water,
+            oldest_required_log_position,
+        }
+    }
+
+    /// Returns the lineage that owns the observed allocator state.
+    #[must_use]
+    pub const fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    /// Returns the greatest epoch durably allocated in this lineage.
+    #[must_use]
+    pub const fn allocated_epoch_high_water(&self) -> NonZeroU64 {
+        self.allocated_epoch_high_water
+    }
+
+    /// Returns an optional oldest logical record required by source metadata.
+    #[must_use]
+    pub const fn oldest_required_log_position(&self) -> Option<&LogSequenceNumber> {
+        self.oldest_required_log_position.as_ref()
+    }
+}
+
+/// Read-only WAL source for allocator and format retention metadata.
+///
+/// This trait is implemented by the same source that owns the logical WAL
+/// analysis port. Observation must not allocate an epoch, append a record,
+/// advance durability, or mutate source generation.
+pub trait DurableTransactionRestartRetentionMetadataSource {
+    /// Adapter-specific failure before authoritative metadata is available.
+    type Error;
+
+    /// Observes current durable allocator and source-format retention metadata.
+    fn observe_restart_retention_metadata(
+        &mut self,
+    ) -> Result<DurableTransactionRestartRetentionMetadataObservation, Self::Error>;
 }
 
 /// Commit classification reconstructed for one persisted transaction identity.
@@ -15778,8 +16757,17 @@ fn prepare_transaction_restart_restoration<Source, Store, CheckpointSource, cons
     >,
 ) -> Result<PreparedTransactionRestartRestoration, TransactionRestartRestorationEvidenceError> {
     let planned = &repaired.prepared.planned;
-    let selected = planned.selected.baseline.transaction_baseline();
-    let current = &planned.current_analysis;
+    prepare_transaction_restart_restoration_evidence(
+        &planned.selected.baseline,
+        &planned.current_analysis,
+    )
+}
+
+fn prepare_transaction_restart_restoration_evidence(
+    selected_baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    current: &DurableTransactionRestartAnalysis,
+) -> Result<PreparedTransactionRestartRestoration, TransactionRestartRestorationEvidenceError> {
+    let selected = selected_baseline.transaction_baseline();
     let Some(current_persistent_id) = current.lineage().persistent_id() else {
         return Err(TransactionRestartRestorationEvidenceError::CurrentPersistentLineageRequired);
     };
@@ -16165,13 +17153,28 @@ fn validate_completed_transaction_restart_evidence<
     >,
     fresh_analysis: &DurableTransactionRestartAnalysis,
 ) -> Result<(), DurableTransactionRestartCheckpointCompletionEvidenceError> {
-    let prepared =
-        prepare_transaction_restart_restoration(&restored.repaired).map_err(|source| {
+    validate_completed_transaction_restart_evidence_parts(
+        &restored.repaired.prepared.planned.selected.baseline,
+        &restored.repaired.prepared.planned.current_analysis,
+        &restored.coordinator,
+        restored.summary,
+        fresh_analysis,
+    )
+}
+
+fn validate_completed_transaction_restart_evidence_parts(
+    selected_baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    retained: &DurableTransactionRestartAnalysis,
+    coordinator: &TransactionCoordinator,
+    summary: TransactionRestartRestorationSummary,
+    fresh_analysis: &DurableTransactionRestartAnalysis,
+) -> Result<(), DurableTransactionRestartCheckpointCompletionEvidenceError> {
+    let prepared = prepare_transaction_restart_restoration_evidence(selected_baseline, retained)
+        .map_err(|source| {
             DurableTransactionRestartCheckpointCompletionEvidenceError::RestorationEvidence(
                 Box::new(source),
             )
         })?;
-    let retained = &restored.repaired.prepared.planned.current_analysis;
     if !retained.lineage().same_lineage(fresh_analysis.lineage()) {
         return Err(
             DurableTransactionRestartCheckpointCompletionEvidenceError::CurrentLineageChanged {
@@ -16220,20 +17223,20 @@ fn validate_completed_transaction_restart_evidence<
 
     if !fresh_analysis
         .lineage()
-        .same_lineage(&restored.coordinator.log_lineage)
+        .same_lineage(&coordinator.log_lineage)
     {
         return Err(
             DurableTransactionRestartCheckpointCompletionEvidenceError::CoordinatorLineageMismatch {
                 expected: fresh_analysis.lineage().clone(),
-                actual: restored.coordinator.log_lineage.clone(),
+                actual: coordinator.log_lineage.clone(),
             },
         );
     }
-    let coordinator_epoch = restored.coordinator.epoch();
-    if restored.summary.coordinator_epoch != coordinator_epoch {
+    let coordinator_epoch = coordinator.epoch();
+    if summary.coordinator_epoch != coordinator_epoch {
         return Err(
             DurableTransactionRestartCheckpointCompletionEvidenceError::CoordinatorEpochChanged {
-                expected: restored.summary.coordinator_epoch.get(),
+                expected: summary.coordinator_epoch.get(),
                 actual: coordinator_epoch.get(),
             },
         );
@@ -16254,30 +17257,25 @@ fn validate_completed_transaction_restart_evidence<
         unresolved_count: prepared.unresolved_count,
         highest_persisted_transaction: prepared.highest_persisted_transaction,
         coordinator_epoch,
-        indeterminate_allocation_attempt_count: restored
-            .summary
-            .indeterminate_allocation_attempt_count,
+        indeterminate_allocation_attempt_count: summary.indeterminate_allocation_attempt_count,
     };
-    if expected_summary != restored.summary {
+    if expected_summary != summary {
         return Err(
             DurableTransactionRestartCheckpointCompletionEvidenceError::RestorationSummaryChanged {
                 expected: expected_summary,
-                actual: restored.summary,
+                actual: summary,
             },
         );
     }
-    if restored.coordinator.next_transaction_id != Some(NonZeroU64::MIN)
-        || !restored.coordinator.lifecycles.is_empty()
-        || !restored.coordinator.staged_pages.is_empty()
+    if coordinator.next_transaction_id != Some(NonZeroU64::MIN)
+        || !coordinator.lifecycles.is_empty()
+        || !coordinator.staged_pages.is_empty()
     {
         return Err(
             DurableTransactionRestartCheckpointCompletionEvidenceError::CoordinatorStateChanged {
-                next_sequence: restored
-                    .coordinator
-                    .next_transaction_id
-                    .map(NonZeroU64::get),
-                lifecycle_count: restored.coordinator.lifecycles.len(),
-                staged_page_count: restored.coordinator.staged_pages.len(),
+                next_sequence: coordinator.next_transaction_id.map(NonZeroU64::get),
+                lifecycle_count: coordinator.lifecycles.len(),
+                staged_page_count: coordinator.staged_pages.len(),
             },
         );
     }
@@ -16586,6 +17584,490 @@ where
             transaction_summary: summary,
         },
     })
+}
+
+fn wal_retention_evidence_error<WalSourceError, StoreError, MetadataError>(
+    source: DurableTransactionRestartWalRetentionEvidenceError,
+) -> DurableTransactionRestartWalRetentionAnalysisError<WalSourceError, StoreError, MetadataError> {
+    DurableTransactionRestartWalRetentionAnalysisError::Evidence(Box::new(source))
+}
+
+fn validate_wal_retention_inventory_order<const N: usize>(
+    inventory: &[StoredPageSnapshotObservation<N>],
+) -> Result<(), DurableTransactionRestartWalRetentionEvidenceError> {
+    for (offset, window) in inventory.windows(2).enumerate() {
+        let previous = window[0].page_number();
+        let actual = window[1].page_number();
+        if actual <= previous {
+            return Err(
+                DurableTransactionRestartWalRetentionEvidenceError::PageInventoryNotStrictlyIncreasing {
+                    index: offset + 1,
+                    previous,
+                    actual,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn push_wal_retention_requirement<const N: usize>(
+    lineage: &LogLineage,
+    durable_frontier: Option<&LogSequenceNumber>,
+    observations: &[DurableTransactionRestartObservation<N>],
+    position: u64,
+    cause: DurableTransactionRestartWalRetentionRequirementCause,
+    requirements: &mut Vec<DurableTransactionRestartWalRetentionRequirement>,
+    retained_first_record: &mut Option<LogSequenceNumber>,
+) -> Result<(), DurableTransactionRestartWalRetentionEvidenceError> {
+    let Some(frontier) = durable_frontier else {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::RequirementInEmptyPrefix {
+                cause,
+                position,
+            },
+        );
+    };
+    if position > frontier.get() {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::RequirementAfterFrontier {
+                cause,
+                position,
+                frontier: frontier.get(),
+            },
+        );
+    }
+    let Ok(index) =
+        observations.binary_search_by_key(&position, |observation| observation.position().get())
+    else {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::RequirementNotRecordBoundary {
+                cause,
+                position,
+            },
+        );
+    };
+    let actual = observations[index].position().clone();
+    if !lineage.same_lineage(actual.lineage()) {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::RequirementNotRecordBoundary {
+                cause,
+                position,
+            },
+        );
+    }
+    if retained_first_record
+        .as_ref()
+        .is_none_or(|retained| actual.get() < retained.get())
+    {
+        *retained_first_record = Some(actual.clone());
+    }
+    requirements.push(DurableTransactionRestartWalRetentionRequirement {
+        position: actual,
+        cause,
+    });
+    Ok(())
+}
+
+struct CompletedTransactionRestartWalRetentionEvidenceInput<'evidence, const N: usize> {
+    coordinator: &'evidence TransactionCoordinator,
+    completion: &'evidence TransactionPageStorageRestartCheckpointCompletionEvidence<N>,
+    lineage: &'evidence LogLineage,
+    store_lineage: &'evidence LogLineage,
+    durable_frontier: Option<&'evidence LogSequenceNumber>,
+    observations: &'evidence [DurableTransactionRestartObservation<N>],
+    inventory: &'evidence [StoredPageSnapshotObservation<N>],
+    metadata: &'evidence DurableTransactionRestartRetentionMetadataObservation,
+}
+
+fn analyze_completed_transaction_restart_wal_retention_evidence<const N: usize>(
+    input: CompletedTransactionRestartWalRetentionEvidenceInput<'_, N>,
+) -> Result<
+    DurableTransactionRestartWalRetentionAnalysis,
+    DurableTransactionRestartWalRetentionEvidenceError,
+> {
+    let CompletedTransactionRestartWalRetentionEvidenceInput {
+        coordinator,
+        completion,
+        lineage,
+        store_lineage,
+        durable_frontier,
+        observations,
+        inventory,
+        metadata,
+    } = input;
+    let fresh_analysis =
+        analyze_durable_transaction_restart_evidence(lineage, durable_frontier, observations)
+            .map_err(|source| {
+                DurableTransactionRestartWalRetentionEvidenceError::RestartAnalysis {
+                    source: Box::new(source),
+                }
+            })?;
+    validate_completed_transaction_restart_evidence_parts(
+        &completion.selected_baseline,
+        &completion.current_analysis,
+        coordinator,
+        completion.transaction_summary(),
+        &fresh_analysis,
+    )
+    .map_err(
+        |source| DurableTransactionRestartWalRetentionEvidenceError::Completion {
+            source: Box::new(source),
+        },
+    )?;
+
+    if !lineage.same_lineage(store_lineage) {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::StoreLineageMismatch {
+                expected: lineage.clone(),
+                actual: store_lineage.clone(),
+            },
+        );
+    }
+    if !lineage.same_lineage(metadata.lineage()) {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::MetadataLineageMismatch {
+                expected: lineage.clone(),
+                actual: metadata.lineage().clone(),
+            },
+        );
+    }
+    if metadata.allocated_epoch_high_water().get() != coordinator.epoch().get() {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::AllocatedEpochHighWaterChanged {
+                expected: coordinator.epoch().get(),
+                actual: metadata.allocated_epoch_high_water().get(),
+            },
+        );
+    }
+    if let Some(position) = metadata.oldest_required_log_position()
+        && !lineage.same_lineage(position.lineage())
+    {
+        return Err(
+            DurableTransactionRestartWalRetentionEvidenceError::ForeignSourceConstraint {
+                position: position.clone(),
+            },
+        );
+    }
+    validate_wal_retention_inventory_order(inventory)?;
+
+    let page_number_capacity = observations.len().checked_add(inventory.len()).ok_or(
+        DurableTransactionRestartWalRetentionEvidenceError::PageInventoryCountOverflow {
+            record_count: observations.len(),
+            store_page_count: inventory.len(),
+        },
+    )?;
+    let mut page_numbers = Vec::new();
+    page_numbers
+        .try_reserve_exact(page_number_capacity)
+        .map_err(|_| {
+            DurableTransactionRestartWalRetentionEvidenceError::PageInventoryCapacityExhausted {
+                capacity: page_number_capacity,
+            }
+        })?;
+    for observation in observations {
+        match observation {
+            DurableTransactionRestartObservation::Page(observation) => {
+                page_numbers.push(observation.page_number());
+            }
+            DurableTransactionRestartObservation::TransactionPage(observation) => {
+                page_numbers.push(observation.page().page_number());
+            }
+            DurableTransactionRestartObservation::Commit(_) => {}
+        }
+    }
+    page_numbers.extend(
+        inventory
+            .iter()
+            .map(StoredPageSnapshotObservation::page_number),
+    );
+    page_numbers.sort_unstable();
+    page_numbers.dedup();
+
+    let unresolved_count = fresh_analysis
+        .transactions()
+        .iter()
+        .filter(|entry| matches!(entry.state(), DurableTransactionRestartState::Uncommitted))
+        .count();
+    let requirement_capacity = 2_usize
+        .checked_add(inventory.len())
+        .and_then(|capacity| capacity.checked_add(unresolved_count))
+        .and_then(|capacity| {
+            capacity.checked_add(usize::from(
+                metadata.oldest_required_log_position().is_some(),
+            ))
+        })
+        .ok_or(DurableTransactionRestartWalRetentionEvidenceError::RequirementCountOverflow)?;
+    let mut requirements = Vec::new();
+    requirements
+        .try_reserve_exact(requirement_capacity)
+        .map_err(|_| {
+            DurableTransactionRestartWalRetentionEvidenceError::RequirementCapacityExhausted {
+                capacity: requirement_capacity,
+            }
+        })?;
+    let mut retained_first_record = None;
+
+    if let Some(position) = completion.selected_baseline.durable_frontier() {
+        push_wal_retention_requirement(
+            lineage,
+            durable_frontier,
+            observations,
+            position,
+            DurableTransactionRestartWalRetentionRequirementCause::SelectedCheckpointFrontier,
+            &mut requirements,
+            &mut retained_first_record,
+        )?;
+    }
+    if let Some(position) = completion.selected_baseline.replay_start().position() {
+        let Some(cause) = completion.selected_baseline.replay_start().cause() else {
+            return Err(
+                DurableTransactionRestartWalRetentionEvidenceError::SelectedReplayCauseMissing {
+                    position,
+                },
+            );
+        };
+        push_wal_retention_requirement(
+            lineage,
+            durable_frontier,
+            observations,
+            position,
+            DurableTransactionRestartWalRetentionRequirementCause::SelectedReplayStart { cause },
+            &mut requirements,
+            &mut retained_first_record,
+        )?;
+    }
+
+    for page_number in page_numbers {
+        let required =
+            latest_required_restart_page_image(&fresh_analysis, page_number, observations)
+                .map_err(|source| {
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
+                        page_number,
+                        source: Box::new(source),
+                    }
+                })?;
+        let snapshot = inventory
+            .binary_search_by_key(&page_number, StoredPageSnapshotObservation::page_number)
+            .ok()
+            .map(|index| &inventory[index]);
+        match (required, snapshot) {
+            (None, None) => {}
+            (None, Some(snapshot)) => {
+                let stored_position = validate_restart_page_snapshot(
+                    lineage,
+                    &fresh_analysis,
+                    observations,
+                    page_number,
+                    snapshot,
+                )
+                .map_err(|source| {
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
+                        page_number,
+                        source: Box::new(source),
+                    }
+                })?;
+                return Err(
+                    DurableTransactionRestartWalRetentionEvidenceError::UnexpectedPageSnapshotWithoutRequiredImage {
+                        page_number,
+                        stored_position,
+                    },
+                );
+            }
+            (Some(required), None) => {
+                return Err(
+                    DurableTransactionRestartWalRetentionEvidenceError::RequiredPageSnapshotMissing {
+                        page_number,
+                        required_position: required.page_position(),
+                    },
+                );
+            }
+            (Some(required), Some(snapshot)) => {
+                let stored_position = validate_restart_page_snapshot(
+                    lineage,
+                    &fresh_analysis,
+                    observations,
+                    page_number,
+                    snapshot,
+                )
+                .map_err(|source| {
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
+                        page_number,
+                        source: Box::new(source),
+                    }
+                })?;
+                if stored_position != required.page_position() {
+                    return Err(
+                        DurableTransactionRestartWalRetentionEvidenceError::RequiredPageSnapshotBehind {
+                            page_number,
+                            stored_position,
+                            required_position: required.page_position(),
+                        },
+                    );
+                }
+                push_wal_retention_requirement(
+                    lineage,
+                    durable_frontier,
+                    observations,
+                    stored_position,
+                    DurableTransactionRestartWalRetentionRequirementCause::StoredPage {
+                        page_number,
+                    },
+                    &mut requirements,
+                    &mut retained_first_record,
+                )?;
+            }
+        }
+    }
+
+    for entry in fresh_analysis.transactions() {
+        if matches!(entry.state(), DurableTransactionRestartState::Uncommitted) {
+            let transaction = entry.transaction();
+            let Some(position) = entry
+                .first_owned_page_position()
+                .map(LogSequenceNumber::get)
+            else {
+                return Err(
+                    DurableTransactionRestartWalRetentionEvidenceError::UnresolvedTransactionPositionMissing {
+                        transaction,
+                    },
+                );
+            };
+            push_wal_retention_requirement(
+                lineage,
+                durable_frontier,
+                observations,
+                position,
+                DurableTransactionRestartWalRetentionRequirementCause::UnresolvedTransaction {
+                    transaction,
+                },
+                &mut requirements,
+                &mut retained_first_record,
+            )?;
+        }
+    }
+    if let Some(position) = metadata.oldest_required_log_position() {
+        push_wal_retention_requirement(
+            lineage,
+            durable_frontier,
+            observations,
+            position.get(),
+            DurableTransactionRestartWalRetentionRequirementCause::SourceConstraint,
+            &mut requirements,
+            &mut retained_first_record,
+        )?;
+    }
+
+    let floor = DurableTransactionRestartWalRetentionFloor {
+        retained_first_record,
+    };
+    Ok(DurableTransactionRestartWalRetentionAnalysis {
+        persistent_log_id: completion.persistent_log_id(),
+        lineage: lineage.clone(),
+        durable_frontier: durable_frontier.cloned(),
+        allocated_epoch_high_water: metadata.allocated_epoch_high_water(),
+        floor,
+        requirements,
+        store_page_count: inventory.len(),
+        unresolved_transaction_count: unresolved_count,
+    })
+}
+
+fn analyze_completed_transaction_restart_wal_retention<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+>(
+    mut completed: CompletedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+) -> Result<
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreInventorySource<N>,
+{
+    let inventory = match completed.store.durable_page_store_inventory() {
+        Ok(inventory) => inventory,
+        Err(source) => {
+            return Err(
+                FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                    completed: Box::new(completed),
+                    error: DurableTransactionRestartWalRetentionAnalysisError::StoreInventory(
+                        source,
+                    ),
+                },
+            );
+        }
+    };
+    let store_lineage = completed.store.lineage().clone();
+    let metadata = match completed.source.observe_restart_retention_metadata() {
+        Ok(metadata) => metadata,
+        Err(source) => {
+            return Err(
+                FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                    completed: Box::new(completed),
+                    error: DurableTransactionRestartWalRetentionAnalysisError::MetadataSource(
+                        source,
+                    ),
+                },
+            );
+        }
+    };
+    let lineage = completed.source.lineage().clone();
+    let analysis = completed
+        .source
+        .with_durable_transaction_restart_observations(|durable_frontier, observations| {
+            analyze_completed_transaction_restart_wal_retention_evidence(
+                CompletedTransactionRestartWalRetentionEvidenceInput {
+                    coordinator: &completed.coordinator,
+                    completion: &completed.evidence,
+                    lineage: &lineage,
+                    store_lineage: &store_lineage,
+                    durable_frontier,
+                    observations,
+                    inventory: &inventory,
+                    metadata: &metadata,
+                },
+            )
+        });
+    match analysis {
+        Ok(Ok(analysis)) => Ok(
+            WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay {
+                completed,
+                analysis,
+            },
+        ),
+        Ok(Err(source)) => Err(
+            FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                completed: Box::new(completed),
+                error: wal_retention_evidence_error(source),
+            },
+        ),
+        Err(source) => Err(
+            FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                completed: Box::new(completed),
+                error: DurableTransactionRestartWalRetentionAnalysisError::WalSource(source),
+            },
+        ),
+    }
 }
 
 fn validate_restart_checkpoint_completeness_baseline_against_current_prefix<
@@ -19838,6 +21320,10 @@ mod tests {
         restart_epoch_result_override: Option<NonZeroU64>,
         restart_epoch_lineage_override: Option<LogLineage>,
         restart_epoch_allocations: Vec<u64>,
+        retention_metadata_error: Option<FakeFault>,
+        retention_metadata_lineage_override: Option<LogLineage>,
+        retention_metadata_epoch_override: Option<NonZeroU64>,
+        retention_source_constraint: Option<LogSequenceNumber>,
     }
 
     impl FakeDurablePageRecoverySource {
@@ -19881,6 +21367,10 @@ mod tests {
                 restart_epoch_result_override: None,
                 restart_epoch_lineage_override: None,
                 restart_epoch_allocations: Vec::new(),
+                retention_metadata_error: None,
+                retention_metadata_lineage_override: None,
+                retention_metadata_epoch_override: None,
+                retention_source_constraint: None,
             }
         }
     }
@@ -19953,6 +21443,34 @@ mod tests {
                 return Err(source);
             }
             Ok(output)
+        }
+    }
+
+    impl DurableTransactionRestartRetentionMetadataSource for FakeDurablePageRecoverySource {
+        type Error = FakeFault;
+
+        fn observe_restart_retention_metadata(
+            &mut self,
+        ) -> Result<DurableTransactionRestartRetentionMetadataObservation, Self::Error> {
+            if let Some(source) = self.retention_metadata_error.take() {
+                return Err(source);
+            }
+            let allocated_epoch_high_water = match self.retention_metadata_epoch_override {
+                Some(epoch) => epoch,
+                None => self
+                    .restart_epoch_allocations
+                    .last()
+                    .copied()
+                    .and_then(NonZeroU64::new)
+                    .ok_or(FakeFault("retention metadata has no allocated epoch"))?,
+            };
+            Ok(DurableTransactionRestartRetentionMetadataObservation::new(
+                self.retention_metadata_lineage_override
+                    .clone()
+                    .unwrap_or_else(|| self.lineage.clone()),
+                allocated_epoch_high_water,
+                self.retention_source_constraint.clone(),
+            ))
         }
     }
 
@@ -20157,6 +21675,8 @@ mod tests {
         observations: RefCell<Vec<PageNumber>>,
         observation_fault_on_attempt: Option<(usize, PageNumber, FakeFault)>,
         attempts: Vec<PageNumber>,
+        inventory_error: Option<FakeFault>,
+        inventory_override: Option<Vec<FakeRecoverySnapshot>>,
     }
 
     impl FakeBatchCommittedPageRecoveryStore {
@@ -20170,6 +21690,8 @@ mod tests {
                 observations: RefCell::new(Vec::new()),
                 observation_fault_on_attempt: None,
                 attempts: Vec::new(),
+                inventory_error: None,
+                inventory_override: None,
             }
         }
 
@@ -20219,6 +21741,29 @@ mod tests {
                 return snapshot.observation().map(Some);
             }
             self.current_observation(page_number)
+        }
+    }
+
+    impl DurablePageStoreInventorySource<1> for FakeBatchCommittedPageRecoveryStore {
+        type InventoryError = FakeFault;
+
+        fn durable_page_store_inventory(
+            &mut self,
+        ) -> Result<Vec<StoredPageSnapshotObservation<1>>, Self::InventoryError> {
+            if let Some(source) = self.inventory_error.take() {
+                return Err(source);
+            }
+            let mut snapshots = self
+                .inventory_override
+                .clone()
+                .unwrap_or_else(|| self.current.clone());
+            if self.inventory_override.is_none() {
+                snapshots.sort_unstable_by_key(|snapshot| snapshot.page_number);
+            }
+            snapshots
+                .iter()
+                .map(FakeRecoverySnapshot::observation)
+                .collect()
         }
     }
 
@@ -24054,6 +25599,12 @@ mod tests {
         FakeCompletenessCheckpointSource,
         1,
     >;
+    type FakeCompletedRestartCheckpoint = CompletedTransactionPageStorageRestartCheckpointReplay<
+        FakeDurablePageRecoverySource,
+        FakeBatchCommittedPageRecoveryStore,
+        FakeCompletenessCheckpointSource,
+        1,
+    >;
 
     fn restart_analyzed_checkpoint_owner(
         lineage: &LogLineage,
@@ -25926,6 +27477,37 @@ mod tests {
                 Err(TestError("fake transaction restoration failed"))
             }
         }
+    }
+
+    fn complete_fake_restart_checkpoint(
+        source: FakeDurablePageRecoverySource,
+        store: FakeBatchCommittedPageRecoveryStore,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> Result<FakeCompletedRestartCheckpoint, TestError> {
+        restore_fake_restart_checkpoint(source, store, baseline)?
+            .complete_restart()
+            .map_err(|_| TestError("fake restart completion failed"))
+    }
+
+    fn complete_fake_raw_restart_page_positions(
+        lineage: &LogLineage,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+        page_number: PageNumber,
+        positions: &[u64],
+    ) -> Result<FakeCompletedRestartCheckpoint, TestError> {
+        let Some(frontier) = positions.last().copied() else {
+            return Err(TestError("raw restart positions are empty"));
+        };
+        let observations = positions
+            .iter()
+            .copied()
+            .map(|position| restart_raw_page(lineage, page_number.get(), position))
+            .collect::<Result<Vec<_>, _>>()?;
+        complete_fake_restart_checkpoint(
+            fake_restart_source(lineage, Some(lineage.position(frontier)), observations),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            baseline,
+        )
     }
 
     fn restore_fake_raw_restart_page(
@@ -29370,7 +30952,7 @@ mod tests {
         assert_eq!(summary.unresolved_count(), 1);
         assert_eq!(summary.coordinator_epoch().get(), 167);
 
-        let mut completed = restored
+        let completed = restored
             .complete_restart()
             .map_err(|_| TestError("selected restart completion failed"))?;
         let evidence = completed.completion_evidence();
@@ -29390,10 +30972,40 @@ mod tests {
         assert_eq!(completed.evidence.replay_observations.len(), 6);
         assert_eq!(completed.evidence.page_repairs.len(), 5);
 
-        let live = completed.parts_mut().0.begin()?;
+        let mut retained = completed
+            .analyze_wal_retention()
+            .map_err(|_| TestError("selected restart retention analysis failed"))?;
+        let analysis = retained.retention_analysis();
+        assert_eq!(analysis.persistent_log_id(), persistent_log_id);
+        assert!(analysis.lineage().same_lineage(&lineage));
+        assert_eq!(analysis.durable_frontier(), Some(7));
+        assert_eq!(analysis.allocated_epoch_high_water(), 167);
+        assert_eq!(analysis.floor().retained_first_record(), Some(1));
+        assert_eq!(analysis.store_page_count(), 4);
+        assert_eq!(analysis.unresolved_transaction_count(), 1);
+        assert_eq!(analysis.requirements().len(), 6);
+        assert_eq!(
+            analysis.requirements()[0].cause(),
+            DurableTransactionRestartWalRetentionRequirementCause::SelectedCheckpointFrontier
+        );
+        assert_eq!(
+            analysis.requirements()[5].cause(),
+            DurableTransactionRestartWalRetentionRequirementCause::UnresolvedTransaction {
+                transaction: uncommitted,
+            }
+        );
+
+        let live = retained.parts_mut().0.begin()?;
         assert_eq!(live.transaction_id().epoch().get(), 167);
         assert_eq!(live.transaction_id().sequence(), 1);
-        assert_eq!(completed.completion_evidence().current_frontier(), Some(7));
+        assert_eq!(retained.completion_evidence().current_frontier(), Some(7));
+        assert_eq!(
+            retained
+                .retention_analysis()
+                .floor()
+                .retained_first_record(),
+            Some(1)
+        );
         Ok(())
     }
 
@@ -29633,6 +31245,443 @@ mod tests {
                         lifecycle_count: 1,
                         staged_page_count: 0,
                     }
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wal_retention_analysis_preserves_empty_maximum_and_source_constraints()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1690).ok_or(TestError("retention persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+
+        let empty = complete_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?
+        .analyze_wal_retention()
+        .map_err(|_| TestError("empty retention analysis failed"))?;
+        assert_eq!(
+            empty.retention_analysis().persistent_log_id(),
+            persistent_log_id
+        );
+        assert_eq!(empty.retention_analysis().durable_frontier(), None);
+        assert_eq!(
+            empty.retention_analysis().floor().retained_first_record(),
+            None
+        );
+        assert_eq!(empty.retention_analysis().allocated_epoch_high_water(), 1);
+        assert_eq!(empty.retention_analysis().store_page_count(), 0);
+        assert!(empty.retention_analysis().requirements().is_empty());
+
+        let page_number = PageNumber::new(220).ok_or(TestError("maximum retention page"))?;
+        let mut maximum = complete_fake_raw_restart_page_positions(
+            &lineage,
+            &baseline,
+            page_number,
+            &[u64::MAX],
+        )?;
+        maximum.source.retention_source_constraint = Some(lineage.position(u64::MAX));
+        let maximum = maximum
+            .analyze_wal_retention()
+            .map_err(|_| TestError("maximum retention analysis failed"))?;
+        assert_eq!(
+            maximum.retention_analysis().durable_frontier(),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            maximum.retention_analysis().floor().retained_first_record(),
+            Some(u64::MAX)
+        );
+        assert_eq!(maximum.retention_analysis().requirements().len(), 2);
+        assert_eq!(
+            maximum.retention_analysis().requirements()[0].cause(),
+            DurableTransactionRestartWalRetentionRequirementCause::StoredPage { page_number }
+        );
+        assert_eq!(
+            maximum.retention_analysis().requirements()[1].cause(),
+            DurableTransactionRestartWalRetentionRequirementCause::SourceConstraint
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wal_retention_analysis_retains_completed_owner_on_source_and_staleness_failures()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1691).ok_or(TestError("retention failure persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let page_number = PageNumber::new(221).ok_or(TestError("retention failure page"))?;
+
+        let mut inventory_failed =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        inventory_failed.store.inventory_error = Some(FakeFault("retention inventory"));
+        let inventory_failed = inventory_failed
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("retention inventory failure was accepted"))?;
+        assert!(matches!(
+            inventory_failed.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::StoreInventory(FakeFault(
+                "retention inventory"
+            ))
+        ));
+        assert_eq!(
+            inventory_failed
+                .transaction_summary()
+                .coordinator_epoch()
+                .get(),
+            1
+        );
+
+        let mut metadata_failed =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        metadata_failed.source.retention_metadata_error = Some(FakeFault("retention metadata"));
+        let metadata_failed = metadata_failed
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("retention metadata failure was accepted"))?;
+        assert!(matches!(
+            metadata_failed.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::MetadataSource(FakeFault(
+                "retention metadata"
+            ))
+        ));
+
+        let mut wal_failed =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        wal_failed.source.restart_before_callback_error = Some(FakeFault("retention WAL"));
+        let wal_failed = wal_failed
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("retention WAL failure was accepted"))?;
+        assert!(matches!(
+            wal_failed.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::WalSource(FakeFault(
+                "retention WAL"
+            ))
+        ));
+
+        let mut allocator_stale =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        allocator_stale.source.retention_metadata_epoch_override = NonZeroU64::new(2);
+        let allocator_stale = allocator_stale
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("stale allocator metadata was accepted"))?;
+        assert!(matches!(
+            allocator_stale.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::AllocatedEpochHighWaterChanged {
+                        expected: 1,
+                        actual: 2,
+                    }
+                )
+        ));
+
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x169F).ok_or(TestError("foreign retention lineage"))?,
+        );
+        let mut store_foreign =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        store_foreign.store.lineage = foreign_lineage.clone();
+        let store_foreign = store_foreign
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("foreign inventory lineage was accepted"))?;
+        assert!(matches!(
+            store_foreign.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::StoreLineageMismatch {
+                        expected,
+                        actual,
+                    } if expected.same_lineage(&lineage)
+                        && actual.same_lineage(&foreign_lineage)
+                )
+        ));
+
+        let mut metadata_foreign =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        metadata_foreign.source.retention_metadata_lineage_override = Some(foreign_lineage.clone());
+        let metadata_foreign = metadata_foreign
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("foreign retention metadata was accepted"))?;
+        assert!(matches!(
+            metadata_foreign.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::MetadataLineageMismatch {
+                        expected,
+                        actual,
+                    } if expected.same_lineage(&lineage)
+                        && actual.same_lineage(&foreign_lineage)
+                )
+        ));
+
+        let mut source_constraint_foreign =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        source_constraint_foreign.source.retention_source_constraint =
+            Some(foreign_lineage.position(1));
+        let source_constraint_foreign = source_constraint_foreign
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("foreign source constraint was accepted"))?;
+        assert!(matches!(
+            source_constraint_foreign.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::ForeignSourceConstraint {
+                        position,
+                    } if position.lineage().same_lineage(&foreign_lineage)
+                )
+        ));
+
+        let mut coordinator_used =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        let active = coordinator_used.parts_mut().0.begin()?;
+        assert_eq!(active.transaction_id().sequence(), 1);
+        let coordinator_used = coordinator_used
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError(
+                "used coordinator retention analysis was accepted",
+            ))?;
+        assert!(matches!(
+            coordinator_used.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::Completion {
+                        source
+                    } if matches!(
+                        source.as_ref(),
+                        DurableTransactionRestartCheckpointCompletionEvidenceError::CoordinatorStateChanged {
+                            next_sequence: Some(2),
+                            lifecycle_count: 1,
+                            staged_page_count: 0,
+                        }
+                    )
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn wal_retention_analysis_rejects_incomplete_or_contradictory_page_inventory()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1692).ok_or(TestError("inventory rejection persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let page_number = PageNumber::new(222).ok_or(TestError("inventory rejection page"))?;
+
+        let mut duplicate =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        let duplicate_snapshot = duplicate.store.current[0].clone();
+        duplicate.store.inventory_override =
+            Some(vec![duplicate_snapshot.clone(), duplicate_snapshot]);
+        let duplicate = duplicate
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("duplicate page inventory was accepted"))?;
+        assert!(matches!(
+            duplicate.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventoryNotStrictlyIncreasing {
+                        index: 1,
+                        previous,
+                        actual,
+                    } if *previous == page_number && *actual == page_number
+                )
+        ));
+
+        let mut missing =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        missing.store.current.clear();
+        let missing = missing
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("missing page inventory was accepted"))?;
+        assert!(matches!(
+            missing.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::RequiredPageSnapshotMissing {
+                        page_number: actual,
+                        required_position: 1,
+                    } if *actual == page_number
+                )
+        ));
+
+        let mut behind =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1, 2])?;
+        behind.store.current[0].page_version = PageVersion::new(1);
+        behind.store.current[0].page_position = lineage.position(1);
+        let behind = behind
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("behind page inventory was accepted"))?;
+        assert!(matches!(
+            behind.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::RequiredPageSnapshotBehind {
+                        page_number: actual,
+                        stored_position: 1,
+                        required_position: 2,
+                    } if *actual == page_number
+                )
+        ));
+
+        let mut contradictory =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        contradictory.store.current[0].byte ^= 0xFF;
+        let contradictory = contradictory
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("contradictory page inventory was accepted"))?;
+        assert!(matches!(
+            contradictory.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
+                        page_number: actual,
+                        source,
+                    } if *actual == page_number
+                        && matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartCompletenessEvidenceError::SnapshotPayloadContradiction {
+                                page_number: nested,
+                                position: 1,
+                            } if *nested == page_number
+                        )
+                )
+        ));
+
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x169E).ok_or(TestError("foreign snapshot lineage"))?,
+        );
+        let mut foreign =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        foreign.store.current[0].page_position = foreign_lineage.position(1);
+        let foreign = foreign
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("foreign snapshot inventory was accepted"))?;
+        assert!(matches!(
+            foreign.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
+                        page_number: actual,
+                        source,
+                    } if *actual == page_number
+                        && matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartCompletenessEvidenceError::ForeignSnapshotLineage {
+                                page_number: nested,
+                                position,
+                            } if *nested == page_number
+                                && position.lineage().same_lineage(&foreign_lineage)
+                        )
+                )
+        ));
+
+        let store_only_page = PageNumber::new(223).ok_or(TestError("store-only inventory page"))?;
+        let mut store_only =
+            complete_fake_raw_restart_page_positions(&lineage, &baseline, page_number, &[1])?;
+        store_only.store.current.push(FakeRecoverySnapshot {
+            page_number: store_only_page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(store_only_page.get())
+                .map_err(|_| TestError("store-only page byte"))?,
+            page_position: lineage.position(1),
+        });
+        let store_only = store_only
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("store-only page inventory was accepted"))?;
+        assert!(matches!(
+            store_only.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
+                        page_number: actual,
+                        source,
+                    } if *actual == store_only_page
+                        && matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartCompletenessEvidenceError::SnapshotPositionUnbacked {
+                                page_number: nested,
+                                position: 1,
+                            } if *nested == store_only_page
+                        )
+                )
+        ));
+
+        let uncommitted = durable_identity(169, 1)?;
+        let unresolved_page = PageNumber::new(224).ok_or(TestError("unresolved inventory page"))?;
+        let mut unresolved = complete_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(1)),
+                vec![restart_owned_page(
+                    &lineage,
+                    uncommitted,
+                    unresolved_page.get(),
+                    1,
+                )?],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        unresolved.store.current.push(FakeRecoverySnapshot {
+            page_number: unresolved_page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(unresolved_page.get())
+                .map_err(|_| TestError("unresolved page byte"))?,
+            page_position: lineage.position(1),
+        });
+        let unresolved = unresolved
+            .analyze_wal_retention()
+            .err()
+            .ok_or(TestError("unresolved-backed inventory was accepted"))?;
+        assert!(matches!(
+            unresolved.error(),
+            DurableTransactionRestartWalRetentionAnalysisError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
+                        page_number: actual,
+                        source,
+                    } if *actual == unresolved_page
+                        && matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartCompletenessEvidenceError::SnapshotBackedByUncommittedTransactionPage {
+                                page_number: nested,
+                                transaction,
+                                page_position: 1,
+                            } if *nested == unresolved_page && *transaction == uncommitted
+                        )
                 )
         ));
         Ok(())

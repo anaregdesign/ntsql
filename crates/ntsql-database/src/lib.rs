@@ -6,6 +6,10 @@ use std::{
     num::{NonZeroU16, NonZeroU64, NonZeroU128},
 };
 
+use ntsql_transaction::{
+    DurablePageStoreSnapshotSource, DurableTransactionRestartAnalysisSource,
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay,
+};
 use ntsql_wal::PersistentLogId;
 
 /// Repository-owned nonzero identity for one logical database.
@@ -1428,10 +1432,343 @@ define_owned_database_state!(
     ///     }
     /// }
     /// ```
+    ///
+    /// ```compile_fail
+    /// use ntsql_database::LiveDatabase;
+    ///
+    /// fn cannot_extract_recovered_owner<Owner>(live: LiveDatabase<Owner>) -> Owner {
+    ///     let LiveDatabase { _owner, .. } = live;
+    ///     _owner
+    /// }
+    /// ```
     #[must_use = "live database ownership must be closed, abandoned, or dropped"]
     LiveDatabase,
     DatabaseLifecycleStage::Live
 );
+
+/// Adapter-owned recovery operation accepted by the database live gate.
+///
+/// Implementations consume one exact database owner and must return the
+/// private-constructible transaction completion owner produced by the approved
+/// selected-restart path. For a concrete repository adapter, Rust coherence
+/// prevents downstream crates from replacing this implementation.
+pub trait DatabaseRecoveryOwner<Input, const N: usize>: Sized {
+    /// WAL adapter retained after successful restart completion.
+    type Source: DurableTransactionRestartAnalysisSource<N>;
+    /// Page-store adapter retained after successful restart completion.
+    type Store: DurablePageStoreSnapshotSource<N>;
+    /// Completeness-checkpoint adapter retained by the completed restart.
+    type CheckpointSource;
+    /// Database-wide ownership retained beside the transaction composition.
+    type RetainedOwner;
+    /// Exact adapter recovery failure retaining every acquired owner.
+    type Failure;
+
+    /// Consumes this recovery-required owner through the approved restart path.
+    fn complete_database_recovery(
+        self,
+        input: Input,
+    ) -> DatabaseRecoveryOperationResult<Self, Input, N>;
+}
+
+/// Result of one concrete adapter's approved transaction-recovery operation.
+pub type DatabaseRecoveryOperationResult<Owner, Input, const N: usize> = Result<
+    (
+        <Owner as DatabaseRecoveryOwner<Input, N>>::RetainedOwner,
+        WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+            <Owner as DatabaseRecoveryOwner<Input, N>>::Source,
+            <Owner as DatabaseRecoveryOwner<Input, N>>::Store,
+            <Owner as DatabaseRecoveryOwner<Input, N>>::CheckpointSource,
+            N,
+        >,
+    ),
+    <Owner as DatabaseRecoveryOwner<Input, N>>::Failure,
+>;
+
+/// Exact database-wide owner paired with completed transaction recovery.
+///
+/// Construction is private to [`RecoveryRequiredDatabase::complete_recovery`].
+/// The retained transaction owner still owns its checkpoint source and
+/// non-authorizing WAL retention analysis.
+#[must_use = "recovered ownership must remain inside the live database typestate"]
+pub struct RecoveredDatabaseOwnership<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    outer_owner: OuterOwner,
+    transaction: WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    RecoveredDatabaseOwnership<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Borrows the retained database-wide owner.
+    #[must_use]
+    pub const fn outer_owner(&self) -> &OuterOwner {
+        &self.outer_owner
+    }
+
+    /// Borrows the exact completed transaction recovery owner.
+    pub const fn transaction(
+        &self,
+    ) -> &WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    > {
+        &self.transaction
+    }
+
+    /// Borrows the completed transaction owner for ordinary live work.
+    pub const fn transaction_mut(
+        &mut self,
+    ) -> &mut WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    > {
+        &mut self.transaction
+    }
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for RecoveredDatabaseOwnership<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveredDatabaseOwnership")
+            .field(
+                "persistent_log_id",
+                &self.transaction.completion_evidence().persistent_log_id(),
+            )
+            .field("outer_owner", &format_args!("<retained>"))
+            .field("transaction", &format_args!("<retained>"))
+            .finish()
+    }
+}
+
+/// Transaction completion identified a different persistent WAL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseRecoveryEvidenceMismatch {
+    expected: PersistentLogId,
+    actual: PersistentLogId,
+}
+
+impl DatabaseRecoveryEvidenceMismatch {
+    /// Returns the manifest-selected persistent WAL identity.
+    #[must_use]
+    pub const fn expected(&self) -> PersistentLogId {
+        self.expected
+    }
+
+    /// Returns the identity reported by exact transaction completion evidence.
+    #[must_use]
+    pub const fn actual(&self) -> PersistentLogId {
+        self.actual
+    }
+}
+
+impl fmt::Display for DatabaseRecoveryEvidenceMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "completed recovery persistent log ID {} does not match selected database persistent log ID {}",
+            self.actual.get(),
+            self.expected.get()
+        )
+    }
+}
+
+impl Error for DatabaseRecoveryEvidenceMismatch {}
+
+enum FailedDatabaseRecoveryState<Failure, RecoveredOwner> {
+    Operation(Failure),
+    Evidence {
+        _owner: RecoveredOwner,
+        error: DatabaseRecoveryEvidenceMismatch,
+    },
+}
+
+struct FailedDatabaseRecoveryInner<Failure, RecoveredOwner> {
+    identity: DatabaseCompositionIdentity,
+    state: FailedDatabaseRecoveryState<Failure, RecoveredOwner>,
+}
+
+/// Borrowed cause of one terminal database recovery failure.
+#[derive(Debug)]
+pub enum DatabaseRecoveryFailureCause<'failure, Failure> {
+    /// The concrete adapter recovery operation failed.
+    Operation(&'failure Failure),
+    /// Exact transaction completion evidence identified another WAL.
+    Evidence(&'failure DatabaseRecoveryEvidenceMismatch),
+}
+
+/// Terminal database recovery failure retaining every operation owner.
+///
+/// There is no retry or owner extraction. Resolution requires dropping this
+/// value, correcting any external cause, and reopening the complete database.
+#[must_use = "failed database recovery retains all ownership until dropped"]
+pub struct FailedDatabaseRecovery<
+    Failure,
+    OuterOwner,
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    inner: Box<
+        FailedDatabaseRecoveryInner<
+            Failure,
+            RecoveredDatabaseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+        >,
+    >,
+}
+
+impl<Failure, OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    FailedDatabaseRecovery<Failure, OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Returns the selected database composition retained by the failed owner.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.inner.identity
+    }
+
+    /// Returns the exact operation or evidence cause without releasing ownership.
+    #[must_use]
+    pub const fn cause(&self) -> DatabaseRecoveryFailureCause<'_, Failure> {
+        match &self.inner.state {
+            FailedDatabaseRecoveryState::Operation(failure) => {
+                DatabaseRecoveryFailureCause::Operation(failure)
+            }
+            FailedDatabaseRecoveryState::Evidence { error, .. } => {
+                DatabaseRecoveryFailureCause::Evidence(error)
+            }
+        }
+    }
+}
+
+impl<Failure, OuterOwner, Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedDatabaseRecovery<Failure, OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Failure: fmt::Debug,
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedDatabaseRecovery")
+            .field("identity", &self.identity())
+            .field("cause", &self.cause())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of the only database RecoveryRequired-to-Live transition.
+pub type DatabaseRecoveryResult<Owner, Input, const N: usize> = Result<
+    LiveDatabase<
+        RecoveredDatabaseOwnership<
+            <Owner as DatabaseRecoveryOwner<Input, N>>::RetainedOwner,
+            <Owner as DatabaseRecoveryOwner<Input, N>>::Source,
+            <Owner as DatabaseRecoveryOwner<Input, N>>::Store,
+            <Owner as DatabaseRecoveryOwner<Input, N>>::CheckpointSource,
+            N,
+        >,
+    >,
+    FailedDatabaseRecovery<
+        <Owner as DatabaseRecoveryOwner<Input, N>>::Failure,
+        <Owner as DatabaseRecoveryOwner<Input, N>>::RetainedOwner,
+        <Owner as DatabaseRecoveryOwner<Input, N>>::Source,
+        <Owner as DatabaseRecoveryOwner<Input, N>>::Store,
+        <Owner as DatabaseRecoveryOwner<Input, N>>::CheckpointSource,
+        N,
+    >,
+>;
+
+impl<Owner> RecoveryRequiredDatabase<Owner> {
+    /// Completes the exact adapter recovery operation before releasing Live.
+    ///
+    /// The adapter operation is selected by the concrete owner type rather than
+    /// a caller-supplied success closure. Its completed transaction owner is
+    /// retained and its persistent identity is cross-checked before the private
+    /// Live constructor is reached.
+    pub fn complete_recovery<Input, const N: usize>(
+        self,
+        input: Input,
+    ) -> DatabaseRecoveryResult<Owner, Input, N>
+    where
+        Owner: DatabaseRecoveryOwner<Input, N>,
+    {
+        let Self {
+            _owner: owner,
+            identity,
+        } = self;
+        let (outer_owner, transaction) = match owner.complete_database_recovery(input) {
+            Ok(recovered) => recovered,
+            Err(failure) => {
+                return Err(FailedDatabaseRecovery {
+                    inner: Box::new(FailedDatabaseRecoveryInner {
+                        identity,
+                        state: FailedDatabaseRecoveryState::Operation(failure),
+                    }),
+                });
+            }
+        };
+        let actual = transaction.completion_evidence().persistent_log_id();
+        let recovered = RecoveredDatabaseOwnership {
+            outer_owner,
+            transaction,
+        };
+        let expected = identity.persistent_log_id();
+        if actual != expected {
+            return Err(FailedDatabaseRecovery {
+                inner: Box::new(FailedDatabaseRecoveryInner {
+                    identity,
+                    state: FailedDatabaseRecoveryState::Evidence {
+                        _owner: recovered,
+                        error: DatabaseRecoveryEvidenceMismatch { expected, actual },
+                    },
+                }),
+            });
+        }
+        Ok(LiveDatabase {
+            _owner: recovered,
+            identity,
+        })
+    }
+}
+
+impl<Owner> LiveDatabase<Owner> {
+    /// Borrows the exact recovery-complete owner for inspection.
+    #[must_use]
+    pub const fn owner(&self) -> &Owner {
+        &self._owner
+    }
+
+    /// Borrows the exact recovery-complete owner for ordinary live work.
+    pub const fn owner_mut(&mut self) -> &mut Owner {
+        &mut self._owner
+    }
+}
 
 define_owned_database_state!(
     /// Live owner consumed into an orderly close attempt.

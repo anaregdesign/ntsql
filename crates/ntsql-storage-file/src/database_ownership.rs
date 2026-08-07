@@ -7,12 +7,20 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ntsql_compatibility::CompatibilityContext;
 use ntsql_database::{
     DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
     DatabaseCompositionIdentityMismatch, DatabaseFileHeaderIdentity, DatabaseFileRole, DatabaseId,
     DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
-    DatabaseStorageFormatVersion, DatabaseStorageIdentity, ManifestSelectedDatabase,
-    RecoveryRequiredDatabase, UnboundDatabase,
+    DatabaseRecoveryFailureCause, DatabaseRecoveryOwner, DatabaseStorageFormatVersion,
+    DatabaseStorageIdentity, FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase,
+    RecoveredDatabaseOwnership, RecoveryRequiredDatabase, UnboundDatabase,
+};
+use ntsql_transaction::{
+    FailedTransactionPageStorageRecoveryHandoff, TransactionCoordinator,
+    TransactionPageStorageRecoveryHandoffPhase,
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay,
+    complete_transaction_page_storage_recovery_handoff_with_observer,
 };
 use ntsql_wal::PersistentLogId;
 
@@ -1574,6 +1582,318 @@ impl<const N: usize> fmt::Debug for FileDatabaseOwnership<N> {
     }
 }
 
+/// Filesystem database/manifest locks retained after transaction recovery.
+#[must_use = "live filesystem database ownership must remain inside its database typestate"]
+pub struct RecoveredFileDatabaseOuterOwnership {
+    _manifest_file: File,
+    _database_owner_file: File,
+    manifest: DatabaseManifest,
+    layout: FileDatabaseLayout,
+    compatibility_context: CompatibilityContext,
+}
+
+impl RecoveredFileDatabaseOuterOwnership {
+    /// Returns the exact validated manifest retained under lock.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.manifest
+    }
+
+    /// Returns the trusted selected layout retained by this owner.
+    #[must_use]
+    pub const fn layout(&self) -> &FileDatabaseLayout {
+        &self.layout
+    }
+
+    /// Returns the one immutable exact-target context moved through open.
+    #[must_use]
+    pub const fn compatibility_context(&self) -> &CompatibilityContext {
+        &self.compatibility_context
+    }
+}
+
+impl fmt::Debug for RecoveredFileDatabaseOuterOwnership {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveredFileDatabaseOuterOwnership")
+            .field("manifest", &self.manifest)
+            .field("layout", &self.layout)
+            .field(
+                "compatibility_target",
+                self.compatibility_context.target_id(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Terminal filesystem recovery attempt retaining every acquired lock.
+#[must_use = "failed filesystem recovery retains all database and child locks"]
+pub struct FailedFileDatabaseRecoveryAttempt<const N: usize> {
+    _outer_owner: RecoveredFileDatabaseOuterOwnership,
+    failure: FailedTransactionPageStorageRecoveryHandoff<
+        FileCommitLog<N>,
+        FilePageStore<N>,
+        FileRestartCheckpointCompletenessBaselineSource,
+        N,
+    >,
+}
+
+impl<const N: usize> FailedFileDatabaseRecoveryAttempt<N> {
+    /// Returns the first transaction recovery phase that did not complete.
+    #[must_use]
+    pub const fn phase(&self) -> TransactionPageStorageRecoveryHandoffPhase {
+        self.failure.phase()
+    }
+}
+
+impl<const N: usize> fmt::Debug for FailedFileDatabaseRecoveryAttempt<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedFileDatabaseRecoveryAttempt")
+            .field("phase", &self.phase())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Filesystem open boundary crossed after one complete owning phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDatabaseOpenPhase {
+    /// Database-wide, manifest, WAL, page, and checkpoint validation completed.
+    CompositionValidated,
+    /// One transaction recovery handoff phase completed.
+    Recovery(TransactionPageStorageRecoveryHandoffPhase),
+    /// The database domain accepted exact completion evidence and released Live.
+    LiveReleased,
+}
+
+/// Observer input accepted only by the filesystem recovery-owner implementation.
+pub struct FileDatabaseRecoveryInput<'observer, Observer> {
+    compatibility_context: CompatibilityContext,
+    observer: &'observer mut Observer,
+}
+
+impl<const N: usize, Observer> DatabaseRecoveryOwner<FileDatabaseRecoveryInput<'_, Observer>, N>
+    for FileDatabaseOwnership<N>
+where
+    Observer: FnMut(FileDatabaseOpenPhase),
+{
+    type Source = FileCommitLog<N>;
+    type Store = FilePageStore<N>;
+    type CheckpointSource = FileRestartCheckpointCompletenessBaselineSource;
+    type RetainedOwner = RecoveredFileDatabaseOuterOwnership;
+    type Failure = FailedFileDatabaseRecoveryAttempt<N>;
+
+    fn complete_database_recovery(
+        self,
+        input: FileDatabaseRecoveryInput<'_, Observer>,
+    ) -> Result<
+        (
+            Self::RetainedOwner,
+            WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+                Self::Source,
+                Self::Store,
+                Self::CheckpointSource,
+                N,
+            >,
+        ),
+        Self::Failure,
+    > {
+        let Self {
+            composition,
+            _manifest_file,
+            _database_owner_file,
+            manifest,
+            layout,
+        } = self;
+        let FileDatabaseRecoveryInput {
+            compatibility_context,
+            observer,
+        } = input;
+        let outer_owner = RecoveredFileDatabaseOuterOwnership {
+            _manifest_file,
+            _database_owner_file,
+            manifest,
+            layout,
+            compatibility_context,
+        };
+        let selection = composition.select_restart_checkpoint_completeness();
+        match complete_transaction_page_storage_recovery_handoff_with_observer(selection, |phase| {
+            observer(FileDatabaseOpenPhase::Recovery(phase))
+        }) {
+            Ok(transaction) => Ok((outer_owner, transaction)),
+            Err(failure) => Err(FailedFileDatabaseRecoveryAttempt {
+                _outer_owner: outer_owner,
+                failure,
+            }),
+        }
+    }
+}
+
+type LiveFileDatabaseDomainOwner<const N: usize> = RecoveredDatabaseOwnership<
+    RecoveredFileDatabaseOuterOwnership,
+    FileCommitLog<N>,
+    FilePageStore<N>,
+    FileRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+type FailedFileDatabaseDomainRecovery<const N: usize> = FailedDatabaseRecovery<
+    FailedFileDatabaseRecoveryAttempt<N>,
+    RecoveredFileDatabaseOuterOwnership,
+    FileCommitLog<N>,
+    FilePageStore<N>,
+    FileRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+/// Recovery-complete filesystem database owner with one exact target context.
+#[must_use = "live filesystem database must be closed or dropped"]
+pub struct LiveFileDatabase<const N: usize> {
+    database: LiveDatabase<LiveFileDatabaseDomainOwner<N>>,
+}
+
+impl<const N: usize> LiveFileDatabase<N> {
+    /// Returns the exact selected database composition identity.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.database.identity()
+    }
+
+    /// Returns the database lifecycle stage.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        self.database.stage()
+    }
+
+    /// Returns the one immutable exact-target context moved through open.
+    #[must_use]
+    pub const fn compatibility_context(&self) -> &CompatibilityContext {
+        self.database.owner().outer_owner().compatibility_context()
+    }
+
+    /// Returns the exact manifest retained under the database-wide locks.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.database.owner().outer_owner().manifest()
+    }
+
+    /// Borrows the recovered coordinator, WAL, and page store.
+    #[must_use]
+    pub const fn transaction_parts(
+        &self,
+    ) -> (
+        &TransactionCoordinator,
+        &FileCommitLog<N>,
+        &FilePageStore<N>,
+    ) {
+        self.database.owner().transaction().parts()
+    }
+
+    /// Borrows the recovered coordinator, WAL, and page store for live work.
+    pub const fn transaction_parts_mut(
+        &mut self,
+    ) -> (
+        &mut TransactionCoordinator,
+        &mut FileCommitLog<N>,
+        &mut FilePageStore<N>,
+    ) {
+        self.database.owner_mut().transaction_mut().parts_mut()
+    }
+
+    /// Borrows the exact completion and WAL-retention handoff owner.
+    pub const fn recovery_handoff(
+        &self,
+    ) -> &WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        FileCommitLog<N>,
+        FilePageStore<N>,
+        FileRestartCheckpointCompletenessBaselineSource,
+        N,
+    > {
+        self.database.owner().transaction()
+    }
+}
+
+impl<const N: usize> fmt::Debug for LiveFileDatabase<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LiveFileDatabase")
+            .field("identity", &self.identity())
+            .field(
+                "compatibility_target",
+                self.compatibility_context().target_id(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Failure before or during fail-closed filesystem database open.
+#[must_use = "failed filesystem database open may retain every database owner"]
+pub enum FileDatabaseLiveOpenError<const N: usize> {
+    /// Database-wide ownership or structural composition validation failed.
+    Ownership(FileDatabaseOwnershipOpenError),
+    /// Transaction recovery or exact completion-evidence binding failed.
+    Recovery(FailedFileDatabaseDomainRecovery<N>),
+}
+
+impl<const N: usize> FileDatabaseLiveOpenError<N> {
+    /// Returns the transaction recovery phase for an adapter-operation failure.
+    #[must_use]
+    pub const fn recovery_phase(&self) -> Option<TransactionPageStorageRecoveryHandoffPhase> {
+        match self {
+            Self::Ownership(_) => None,
+            Self::Recovery(failure) => match failure.cause() {
+                DatabaseRecoveryFailureCause::Operation(failure) => Some(failure.phase()),
+                DatabaseRecoveryFailureCause::Evidence(_) => None,
+            },
+        }
+    }
+}
+
+impl<const N: usize> fmt::Debug for FileDatabaseLiveOpenError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ownership(error) => formatter
+                .debug_tuple("FileDatabaseLiveOpenError::Ownership")
+                .field(error)
+                .finish(),
+            Self::Recovery(error) => formatter
+                .debug_tuple("FileDatabaseLiveOpenError::Recovery")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
+impl<const N: usize> fmt::Display for FileDatabaseLiveOpenError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ownership(error) => write!(formatter, "filesystem database open failed: {error}"),
+            Self::Recovery(error) => match error.cause() {
+                DatabaseRecoveryFailureCause::Operation(failure) => write!(
+                    formatter,
+                    "filesystem database recovery failed before completing {:?}",
+                    failure.phase()
+                ),
+                DatabaseRecoveryFailureCause::Evidence(error) => {
+                    write!(
+                        formatter,
+                        "filesystem database recovery evidence failed: {error}"
+                    )
+                }
+            },
+        }
+    }
+}
+
+impl<const N: usize> Error for FileDatabaseLiveOpenError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Ownership(error) => Some(error),
+            Self::Recovery(_) => None,
+        }
+    }
+}
+
 /// Manifest-selected filesystem ownership retaining every acquired lock.
 ///
 /// This legacy-compatible wrapper deliberately withholds stable-storage binding.
@@ -1675,6 +1995,46 @@ pub fn open_recovery_required_file_database<const N: usize>(
         .selected
         .bind_observed_storage(observed_storage_identity)
         .map_err(|failure| FileDatabaseOwnershipOpenError::StorageBinding(*failure.reason()))
+}
+
+/// Opens one exact filesystem composition through recovery into Live.
+pub fn open_live_file_database<const N: usize>(
+    expected_database_id: DatabaseId,
+    layout: FileDatabaseLayout,
+    compatibility_context: CompatibilityContext,
+) -> Result<LiveFileDatabase<N>, FileDatabaseLiveOpenError<N>> {
+    open_live_file_database_with_observer(
+        expected_database_id,
+        layout,
+        compatibility_context,
+        |_| {},
+    )
+}
+
+/// Opens through recovery while reporting each completed owning phase.
+///
+/// The observer receives inert phase values only. A process-exit test may
+/// terminate after any callback without obtaining an adapter or live owner.
+pub fn open_live_file_database_with_observer<const N: usize, Observer>(
+    expected_database_id: DatabaseId,
+    layout: FileDatabaseLayout,
+    compatibility_context: CompatibilityContext,
+    mut observer: Observer,
+) -> Result<LiveFileDatabase<N>, FileDatabaseLiveOpenError<N>>
+where
+    Observer: FnMut(FileDatabaseOpenPhase),
+{
+    let recovery_required = open_recovery_required_file_database(expected_database_id, layout)
+        .map_err(FileDatabaseLiveOpenError::Ownership)?;
+    observer(FileDatabaseOpenPhase::CompositionValidated);
+    let database = recovery_required
+        .complete_recovery::<_, N>(FileDatabaseRecoveryInput {
+            compatibility_context,
+            observer: &mut observer,
+        })
+        .map_err(FileDatabaseLiveOpenError::Recovery)?;
+    observer(FileDatabaseOpenPhase::LiveReleased);
+    Ok(LiveFileDatabase { database })
 }
 
 fn acquire_file_database_ownership<const N: usize>(

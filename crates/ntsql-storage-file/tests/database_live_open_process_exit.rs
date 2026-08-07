@@ -1,9 +1,23 @@
+// This binary holds only `process_exit_after_every_open_phase_converges_on_fresh_reopen`
+// and its inert child entry point `file_live_open_process_crash_child`.
+//
+// The parent test spawns `Command::new(env::current_exe()?)` to re-exec this
+// test binary as a child process. On fork-based hosts (Linux), the child
+// temporarily inherits the parent's open file descriptions across
+// fork -> exec, including any `std::fs::File` flock locks held by libtest
+// sibling threads running concurrently in the same binary. A sibling that
+// drops and reopens a lock during that pre-exec window can observe
+// `WouldBlock` even though `O_CLOEXEC` is set, because the descriptor stays
+// open until the exec syscall actually completes. Keeping this test (and its
+// crash child) as the only tests in this binary guarantees no sibling thread
+// is ever holding a database lock when the child is spawned.
+
 use std::{
     env,
     error::Error,
-    fs::{self, OpenOptions},
-    io,
+    fs, io,
     path::{Path, PathBuf},
+    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -14,120 +28,68 @@ use ntsql_database::{
     DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
 };
 use ntsql_storage_file::{
-    FileDatabaseCreateOutcome, FileDatabaseLayout, FileDatabaseLiveOpenError,
-    FileDatabaseOpenPhase, FileDatabaseOwnershipOpenError, create_file_database,
+    FileDatabaseCreateOutcome, FileDatabaseLayout, FileDatabaseOpenPhase, create_file_database,
     open_live_file_database, open_live_file_database_with_observer,
-    open_recovery_required_file_database,
 };
 use ntsql_transaction::TransactionPageStorageRecoveryHandoffPhase;
 use ntsql_wal::PersistentLogId;
 
 #[test]
-fn fresh_open_bootstraps_checkpoint_and_retains_context_and_all_locks() -> Result<(), Box<dyn Error>>
-{
-    let database = TestDatabase::create("fresh", 1)?;
-    let mut phases = Vec::new();
-    let live = open_live_file_database_with_observer::<1, _>(
-        database.database_id,
-        database.layout.clone(),
-        compatibility_context("file-live")?,
-        |phase| phases.push(phase),
-    )?;
+fn process_exit_after_every_open_phase_converges_on_fresh_reopen() -> Result<(), Box<dyn Error>> {
+    for (index, phase) in absent_checkpoint_phases().into_iter().enumerate() {
+        let value = 10_000 + index as u128;
+        let database = TestDatabase::create("process-exit", value)?;
+        let status = Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg("file_live_open_process_crash_child")
+            .arg("--nocapture")
+            .env("NTSQL_LIVE_OPEN_CRASH_ROOT", database.directory.path())
+            .env("NTSQL_LIVE_OPEN_CRASH_VALUE", value.to_string())
+            .env("NTSQL_LIVE_OPEN_CRASH_PHASE", index.to_string())
+            .status()?;
+        assert_eq!(
+            status.code(),
+            Some(89),
+            "child did not exit after {phase:?}"
+        );
 
-    assert_eq!(live.stage(), DatabaseLifecycleStage::Live);
-    assert_eq!(live.identity(), database.manifest.composition_identity());
-    assert_eq!(
-        live.compatibility_context().target_id().as_str(),
-        "file-live"
-    );
-    assert_eq!(live.manifest(), database.manifest);
-    assert_eq!(live.transaction_parts().1.generation(), 0);
-    assert_eq!(phases, absent_checkpoint_phases());
-    assert_all_database_files_locked(&database.layout)?;
-    assert!(matches!(
-        open_recovery_required_file_database::<1>(database.database_id, database.layout.clone()),
-        Err(FileDatabaseOwnershipOpenError::Io(_))
-    ));
-
-    drop(live);
-    drop(open_recovery_required_file_database::<1>(
-        database.database_id,
-        database.layout.clone(),
-    )?);
+        let live = open_live_file_database::<1>(
+            database.database_id,
+            database.layout.clone(),
+            compatibility_context("fresh-reopen")?,
+        )?;
+        assert_eq!(live.stage(), DatabaseLifecycleStage::Live);
+        assert_eq!(live.identity(), database.manifest.composition_identity());
+        assert_eq!(live.transaction_parts().1.generation(), 0);
+    }
     Ok(())
 }
 
 #[test]
-fn selected_reopen_ignores_unpublished_candidate_without_reclaiming_wal()
--> Result<(), Box<dyn Error>> {
-    let database = TestDatabase::create("selected", 2)?;
-    let mut first = open_live_file_database::<1>(
-        database.database_id,
-        database.layout.clone(),
-        compatibility_context("first-open")?,
+fn file_live_open_process_crash_child() -> Result<(), Box<dyn Error>> {
+    let Ok(root) = env::var("NTSQL_LIVE_OPEN_CRASH_ROOT") else {
+        return Ok(());
+    };
+    let value = env::var("NTSQL_LIVE_OPEN_CRASH_VALUE")?.parse::<u128>()?;
+    let phase_index = env::var("NTSQL_LIVE_OPEN_CRASH_PHASE")?.parse::<usize>()?;
+    let exit_phase = absent_checkpoint_phases()
+        .get(phase_index)
+        .copied()
+        .ok_or_else(|| io::Error::other("live-open crash phase index is invalid"))?;
+    let database_id = nonzero_database_id(value)?;
+    let layout = layout(Path::new(&root));
+
+    let _live = open_live_file_database_with_observer::<1, _>(
+        database_id,
+        layout,
+        compatibility_context("crash-child")?,
+        |phase| {
+            if phase == exit_phase {
+                std::process::exit(89);
+            }
+        },
     )?;
-    let (coordinator, log, _) = first.transaction_parts_mut();
-    let transaction = coordinator.begin()?;
-    drop(coordinator.commit(transaction, log)?);
-    drop(first);
-    fs::write(
-        database.layout.restart_checkpoint().join("candidate"),
-        b"unpublished and invalid",
-    )?;
-
-    let mut phases = Vec::new();
-    let live = open_live_file_database_with_observer::<1, _>(
-        database.database_id,
-        database.layout.clone(),
-        compatibility_context("selected-open")?,
-        |phase| phases.push(phase),
-    )?;
-
-    assert_eq!(live.transaction_parts().1.generation(), 0);
-    assert_eq!(phases, selected_checkpoint_phases());
-    assert!(
-        database
-            .layout
-            .restart_checkpoint()
-            .join("candidate")
-            .is_file()
-    );
-    Ok(())
-}
-
-#[test]
-fn rejected_selected_checkpoint_never_falls_back_and_failure_retains_all_locks()
--> Result<(), Box<dyn Error>> {
-    let database = TestDatabase::create("rejected", 3)?;
-    drop(open_live_file_database::<1>(
-        database.database_id,
-        database.layout.clone(),
-        compatibility_context("bootstrap")?,
-    )?);
-    let current = database.layout.restart_checkpoint().join("current");
-    let mut corrupt = fs::read(&current)?;
-    corrupt.push(0);
-    fs::write(&current, corrupt)?;
-
-    let mut phases = Vec::new();
-    let error = open_live_file_database_with_observer::<1, _>(
-        database.database_id,
-        database.layout.clone(),
-        compatibility_context("rejected")?,
-        |phase| phases.push(phase),
-    )
-    .err()
-    .ok_or_else(|| io::Error::other("corrupt selected checkpoint released Live"))?;
-
-    assert!(matches!(error, FileDatabaseLiveOpenError::Recovery(_)));
-    assert_eq!(
-        error.recovery_phase(),
-        Some(TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected)
-    );
-    assert_eq!(phases, [FileDatabaseOpenPhase::CompositionValidated]);
-    assert_all_database_files_locked(&database.layout)?;
-    drop(error);
-    Ok(())
+    Err(io::Error::other("live-open crash child did not reach requested phase").into())
 }
 
 fn absent_checkpoint_phases() -> [FileDatabaseOpenPhase; 13] {
@@ -148,50 +110,14 @@ fn absent_checkpoint_phases() -> [FileDatabaseOpenPhase; 13] {
     ]
 }
 
-fn selected_checkpoint_phases() -> [FileDatabaseOpenPhase; 9] {
-    [
-        FileDatabaseOpenPhase::CompositionValidated,
-        recovery_phase(TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected),
-        recovery_phase(TransactionPageStorageRecoveryHandoffPhase::ReplayPlanned),
-        recovery_phase(TransactionPageStorageRecoveryHandoffPhase::PageRepairsPrepared),
-        recovery_phase(TransactionPageStorageRecoveryHandoffPhase::PageRepairsCompleted),
-        recovery_phase(TransactionPageStorageRecoveryHandoffPhase::TransactionStateRestored),
-        recovery_phase(TransactionPageStorageRecoveryHandoffPhase::RestartCompleted),
-        recovery_phase(TransactionPageStorageRecoveryHandoffPhase::WalRetentionAnalyzed),
-        FileDatabaseOpenPhase::LiveReleased,
-    ]
-}
-
 const fn recovery_phase(
     phase: TransactionPageStorageRecoveryHandoffPhase,
 ) -> FileDatabaseOpenPhase {
     FileDatabaseOpenPhase::Recovery(phase)
 }
 
-fn assert_all_database_files_locked(layout: &FileDatabaseLayout) -> Result<(), Box<dyn Error>> {
-    let paths = [
-        layout.database_owner().to_path_buf(),
-        layout.manifest().to_path_buf(),
-        layout.wal().to_path_buf(),
-        layout.page_store().to_path_buf(),
-        layout.restart_checkpoint().join("control"),
-    ];
-    for path in paths {
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let Err(error) = file.try_lock() else {
-            return Err(io::Error::other(format!("{} was not locked", path.display())).into());
-        };
-        assert!(
-            matches!(error, std::fs::TryLockError::WouldBlock),
-            "{} returned unexpected lock error: {error}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
 struct TestDatabase {
-    _directory: TestDirectory,
+    directory: TestDirectory,
     layout: FileDatabaseLayout,
     database_id: DatabaseId,
     manifest: DatabaseManifest,
@@ -209,7 +135,7 @@ impl TestDatabase {
         };
         drop(owner);
         Ok(Self {
-            _directory: directory,
+            directory,
             layout,
             database_id,
             manifest,
@@ -294,7 +220,7 @@ impl TestDirectory {
     fn new(tag: &str) -> Result<Self, io::Error> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let path = env::temp_dir().join(format!(
-            "ntsql-database-live-open-{tag}-{}-{}",
+            "ntsql-database-live-open-process-exit-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

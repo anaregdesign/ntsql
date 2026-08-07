@@ -883,20 +883,172 @@ impl DatabaseRequiredFeatures {
     }
 }
 
-/// Persisted lifecycle state understood by manifest format version 1.
+/// Failure to validate one inert clean-close certificate field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseCleanCloseCertificateError {
+    /// The optional durable WAL frontier was present but canonically zero.
+    DurableWalFrontierZero,
+    /// The allocated transaction-epoch high-water was zero.
+    AllocatedTransactionEpochHighWaterZero,
+    /// The selected completeness-checkpoint anchor version was zero.
+    CheckpointAnchorVersionZero,
+}
+
+impl fmt::Display for DatabaseCleanCloseCertificateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DurableWalFrontierZero => {
+                formatter.write_str("database clean-close certificate durable WAL frontier is zero")
+            }
+            Self::AllocatedTransactionEpochHighWaterZero => formatter.write_str(
+                "database clean-close certificate allocated transaction epoch high-water is zero",
+            ),
+            Self::CheckpointAnchorVersionZero => formatter
+                .write_str("database clean-close certificate checkpoint anchor version is zero"),
+        }
+    }
+}
+
+impl Error for DatabaseCleanCloseCertificateError {}
+
+/// Inert repository-owned evidence summary for one orderly database close.
 ///
-/// Later clean-close and tombstone issues must add their states together with
-/// the evidence fields and version policy that make those states meaningful.
+/// This certificate is entirely descriptive. Constructing or decoding one does
+/// not perform a close, select storage, advance a manifest, or promote any
+/// owner to live or closed authority. A later issue defines the effectful
+/// transaction close orchestration that actually produces these values and
+/// the filesystem publication that makes a clean manifest durable.
+///
+/// ```compile_fail
+/// use ntsql_database::{DatabaseCleanCloseCertificate, LiveDatabase};
+///
+/// fn cannot_promote_certificate<Owner>(
+///     certificate: DatabaseCleanCloseCertificate,
+/// ) -> LiveDatabase<Owner> {
+///     certificate.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DatabaseCleanCloseCertificate {
+    source_generation: DatabaseLifecycleGeneration,
+    durable_wal_frontier: Option<NonZeroU64>,
+    allocated_transaction_epoch_high_water: NonZeroU64,
+    checkpoint_anchor_version: NonZeroU16,
+    checkpoint_anchor_value: u128,
+    transaction_entry_count: u64,
+    page_entry_count: u64,
+}
+
+impl DatabaseCleanCloseCertificate {
+    /// Validates and constructs one inert clean-close certificate.
+    ///
+    /// `source_generation` is the exact `RecoveryRequired` generation this
+    /// evidence was produced from. `durable_wal_frontier` is optional but must
+    /// be nonzero when present; `None` is the canonical absent representation.
+    /// `allocated_transaction_epoch_high_water` and `checkpoint_anchor_version`
+    /// must be nonzero. `checkpoint_anchor_value`, `transaction_entry_count`,
+    /// and `page_entry_count` are portable counters and may be zero.
+    pub const fn new(
+        source_generation: DatabaseLifecycleGeneration,
+        durable_wal_frontier: Option<u64>,
+        allocated_transaction_epoch_high_water: u64,
+        checkpoint_anchor_version: u16,
+        checkpoint_anchor_value: u128,
+        transaction_entry_count: u64,
+        page_entry_count: u64,
+    ) -> Result<Self, DatabaseCleanCloseCertificateError> {
+        let durable_wal_frontier = match durable_wal_frontier {
+            None => None,
+            Some(value) => match NonZeroU64::new(value) {
+                Some(nonzero) => Some(nonzero),
+                None => return Err(DatabaseCleanCloseCertificateError::DurableWalFrontierZero),
+            },
+        };
+        let Some(allocated_transaction_epoch_high_water) =
+            NonZeroU64::new(allocated_transaction_epoch_high_water)
+        else {
+            return Err(DatabaseCleanCloseCertificateError::AllocatedTransactionEpochHighWaterZero);
+        };
+        let Some(checkpoint_anchor_version) = NonZeroU16::new(checkpoint_anchor_version) else {
+            return Err(DatabaseCleanCloseCertificateError::CheckpointAnchorVersionZero);
+        };
+        Ok(Self {
+            source_generation,
+            durable_wal_frontier,
+            allocated_transaction_epoch_high_water,
+            checkpoint_anchor_version,
+            checkpoint_anchor_value,
+            transaction_entry_count,
+            page_entry_count,
+        })
+    }
+
+    /// Returns the source `RecoveryRequired` generation this evidence extends.
+    #[must_use]
+    pub const fn source_generation(self) -> DatabaseLifecycleGeneration {
+        self.source_generation
+    }
+
+    /// Returns the optional durable WAL frontier, canonically absent as `None`.
+    #[must_use]
+    pub const fn durable_wal_frontier(self) -> Option<u64> {
+        match self.durable_wal_frontier {
+            Some(value) => Some(value.get()),
+            None => None,
+        }
+    }
+
+    /// Returns the nonzero allocated transaction-epoch high-water.
+    #[must_use]
+    pub const fn allocated_transaction_epoch_high_water(self) -> u64 {
+        self.allocated_transaction_epoch_high_water.get()
+    }
+
+    /// Returns the nonzero selected completeness-checkpoint anchor version.
+    #[must_use]
+    pub const fn checkpoint_anchor_version(self) -> u16 {
+        self.checkpoint_anchor_version.get()
+    }
+
+    /// Returns the selected completeness-checkpoint anchor value.
+    #[must_use]
+    pub const fn checkpoint_anchor_value(self) -> u128 {
+        self.checkpoint_anchor_value
+    }
+
+    /// Returns the portable transaction-entry count.
+    #[must_use]
+    pub const fn transaction_entry_count(self) -> u64 {
+        self.transaction_entry_count
+    }
+
+    /// Returns the portable page-entry count.
+    #[must_use]
+    pub const fn page_entry_count(self) -> u64 {
+        self.page_entry_count
+    }
+}
+
+/// Persisted lifecycle state understood by manifest format versions 1 and 2.
+///
+/// Later tombstone work must add its state together with the evidence fields
+/// and version policy that make that state meaningful.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum DatabaseManifestLifecycleState {
     /// Startup must complete the approved recovery path before live release.
     RecoveryRequired,
+    /// An orderly close published this inert certificate as durable evidence.
+    ///
+    /// This state carries no authority by itself; a later clean-open issue
+    /// must define the effectful gate that may consume it.
+    Clean(DatabaseCleanCloseCertificate),
 }
 
 impl fmt::Display for DatabaseManifestLifecycleState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RecoveryRequired => formatter.write_str("recovery required"),
+            Self::Clean(_) => formatter.write_str("clean"),
         }
     }
 }
@@ -962,7 +1114,35 @@ impl DatabaseManifest {
         self.required_features
     }
 
+    /// Constructs a `Clean` manifest bound to one exact certificate.
+    ///
+    /// `certificate.source_generation()` must be the exact predecessor of
+    /// `composition_identity`'s lifecycle generation; this is the same adjacency
+    /// rule [`DatabaseLifecycleGeneration::require_successor`] already enforces
+    /// elsewhere. This constructor selects a lifecycle state only; it performs
+    /// no filesystem publication and grants no clean-open authority.
+    pub fn clean(
+        composition_identity: DatabaseCompositionIdentity,
+        storage_formats: DatabaseStorageFormatRequirements,
+        required_features: DatabaseRequiredFeatures,
+        certificate: DatabaseCleanCloseCertificate,
+    ) -> Result<Self, DatabaseLifecycleGenerationTransitionError> {
+        certificate
+            .source_generation()
+            .require_successor(composition_identity.lifecycle_generation())?;
+        Ok(Self {
+            composition_identity,
+            lifecycle_state: DatabaseManifestLifecycleState::Clean(certificate),
+            storage_formats,
+            required_features,
+        })
+    }
+
     /// Produces the same recovery-required manifest at the exact next generation.
+    ///
+    /// This works from either lifecycle state: it only reads
+    /// `composition_identity`, `storage_formats`, and `required_features`, not
+    /// the current lifecycle state.
     pub fn next_recovery_required(self) -> Result<Self, DatabaseLifecycleGenerationExhausted> {
         Ok(Self::recovery_required(
             self.composition_identity.next_generation()?,
@@ -971,10 +1151,46 @@ impl DatabaseManifest {
         ))
     }
 
+    /// Produces the `Clean` successor manifest bound to `certificate` at the
+    /// exact next generation.
+    ///
+    /// The current manifest must be `RecoveryRequired`, and `certificate` must
+    /// report its exact current generation as the source generation. A clean
+    /// manifest cannot produce another clean successor without first publishing
+    /// a recovery-required generation.
+    pub fn next_clean(
+        self,
+        certificate: DatabaseCleanCloseCertificate,
+    ) -> Result<Self, DatabaseManifestCleanSuccessorError> {
+        if matches!(
+            self.lifecycle_state,
+            DatabaseManifestLifecycleState::Clean(_)
+        ) {
+            return Err(DatabaseManifestCleanSuccessorError::LifecycleTransition(
+                DatabaseManifestLifecycleTransitionError::CleanToClean,
+            ));
+        }
+        let next_composition_identity = self
+            .composition_identity
+            .next_generation()
+            .map_err(DatabaseManifestCleanSuccessorError::Exhausted)?;
+        Self::clean(
+            next_composition_identity,
+            self.storage_formats,
+            self.required_features,
+            certificate,
+        )
+        .map_err(DatabaseManifestCleanSuccessorError::SourceGeneration)
+    }
+
     /// Validates this manifest as the exact next generation after `previous`.
     ///
     /// This comparison is explicit because decoding one isolated frame has no
     /// prior generation against which it could detect regression.
+    /// `RecoveryRequired -> RecoveryRequired`, `RecoveryRequired -> Clean`, and
+    /// `Clean -> RecoveryRequired` are the only valid lifecycle transitions;
+    /// `Clean -> Clean` is rejected because an orderly close must always leave
+    /// a fresh recovery-required generation before it may become clean again.
     pub fn require_successor_of(
         self,
         previous: Self,
@@ -988,6 +1204,17 @@ impl DatabaseManifest {
             .lifecycle_generation()
             .require_successor(self.composition_identity.lifecycle_generation())
             .map_err(DatabaseManifestSuccessorError::LifecycleGeneration)?;
+        if matches!(
+            previous.lifecycle_state,
+            DatabaseManifestLifecycleState::Clean(_)
+        ) && matches!(
+            self.lifecycle_state,
+            DatabaseManifestLifecycleState::Clean(_)
+        ) {
+            return Err(DatabaseManifestSuccessorError::LifecycleTransition(
+                DatabaseManifestLifecycleTransitionError::CleanToClean,
+            ));
+        }
         for role in [
             DatabaseFileRole::Wal,
             DatabaseFileRole::PageStore,
@@ -1013,6 +1240,68 @@ impl DatabaseManifest {
     }
 }
 
+/// Rejection of an invalid lifecycle-state pairing between adjacent manifests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseManifestLifecycleTransitionError {
+    /// A `Clean` manifest cannot be immediately followed by another `Clean` manifest.
+    CleanToClean,
+}
+
+impl fmt::Display for DatabaseManifestLifecycleTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CleanToClean => formatter.write_str(
+                "database manifest lifecycle cannot transition from clean directly to clean",
+            ),
+        }
+    }
+}
+
+impl Error for DatabaseManifestLifecycleTransitionError {}
+
+/// Rejection of a manifest claimed as one exact `Clean` lifecycle successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseManifestCleanSuccessorError {
+    /// The retained lifecycle state cannot directly become clean.
+    LifecycleTransition(DatabaseManifestLifecycleTransitionError),
+    /// No generation exists above the retained current generation.
+    Exhausted(DatabaseLifecycleGenerationExhausted),
+    /// The certificate's source generation is not the exact predecessor of the
+    /// proposed clean generation.
+    SourceGeneration(DatabaseLifecycleGenerationTransitionError),
+}
+
+impl fmt::Display for DatabaseManifestCleanSuccessorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LifecycleTransition(source) => write!(
+                formatter,
+                "database manifest clean successor lifecycle is invalid: {source}"
+            ),
+            Self::Exhausted(source) => {
+                write!(
+                    formatter,
+                    "database manifest clean successor is invalid: {source}"
+                )
+            }
+            Self::SourceGeneration(source) => write!(
+                formatter,
+                "database manifest clean successor certificate is invalid: {source}"
+            ),
+        }
+    }
+}
+
+impl Error for DatabaseManifestCleanSuccessorError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::LifecycleTransition(source) => Some(source),
+            Self::Exhausted(source) => Some(source),
+            Self::SourceGeneration(source) => Some(source),
+        }
+    }
+}
+
 /// Rejection of a manifest claimed as one exact lifecycle successor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseManifestSuccessorError {
@@ -1020,6 +1309,8 @@ pub enum DatabaseManifestSuccessorError {
     CompositionIdentity(DatabaseCompositionIdentityMismatch),
     /// The lifecycle generation regressed, skipped, or exhausted.
     LifecycleGeneration(DatabaseLifecycleGenerationTransitionError),
+    /// The lifecycle-state pairing is not one of the allowed transitions.
+    LifecycleTransition(DatabaseManifestLifecycleTransitionError),
     /// One child persistent-format requirement changed without migration.
     StorageFormatVersion {
         /// Changed file role.
@@ -1050,6 +1341,12 @@ impl fmt::Display for DatabaseManifestSuccessorError {
                     "database manifest generation is invalid: {source}"
                 )
             }
+            Self::LifecycleTransition(source) => {
+                write!(
+                    formatter,
+                    "database manifest lifecycle is invalid: {source}"
+                )
+            }
             Self::StorageFormatVersion {
                 role,
                 expected,
@@ -1075,6 +1372,7 @@ impl Error for DatabaseManifestSuccessorError {
         match self {
             Self::CompositionIdentity(source) => Some(source),
             Self::LifecycleGeneration(source) => Some(source),
+            Self::LifecycleTransition(source) => Some(source),
             Self::StorageFormatVersion { .. } | Self::RequiredFeatures { .. } => None,
         }
     }
@@ -2232,6 +2530,230 @@ mod tests {
             Err(DatabaseLifecycleGenerationExhausted {
                 current: generation(u64::MAX)?,
             })
+        );
+        Ok(())
+    }
+
+    fn certificate(
+        source_generation: DatabaseLifecycleGeneration,
+        durable_wal_frontier: Option<u64>,
+        allocated_transaction_epoch_high_water: u64,
+        checkpoint_anchor_version: u16,
+        checkpoint_anchor_value: u128,
+        transaction_entry_count: u64,
+        page_entry_count: u64,
+    ) -> Result<DatabaseCleanCloseCertificate, DatabaseCleanCloseCertificateError> {
+        DatabaseCleanCloseCertificate::new(
+            source_generation,
+            durable_wal_frontier,
+            allocated_transaction_epoch_high_water,
+            checkpoint_anchor_version,
+            checkpoint_anchor_value,
+            transaction_entry_count,
+            page_entry_count,
+        )
+    }
+
+    #[test]
+    fn clean_close_certificate_rejects_zero_optional_frontier_and_zero_scalars()
+    -> Result<(), TestValueError> {
+        assert_eq!(
+            certificate(generation(1)?, Some(0), 5, 6, 7, 8, 9),
+            Err(DatabaseCleanCloseCertificateError::DurableWalFrontierZero)
+        );
+        assert_eq!(
+            certificate(generation(1)?, None, 0, 6, 7, 8, 9),
+            Err(DatabaseCleanCloseCertificateError::AllocatedTransactionEpochHighWaterZero)
+        );
+        assert_eq!(
+            certificate(generation(1)?, None, 5, 0, 7, 8, 9),
+            Err(DatabaseCleanCloseCertificateError::CheckpointAnchorVersionZero)
+        );
+
+        let absent_frontier = certificate(generation(1)?, None, 5, 6, 0, 0, 0)
+            .map_err(|_| TestValueError("absent-frontier certificate must construct"))?;
+        assert_eq!(absent_frontier.durable_wal_frontier(), None);
+        assert_eq!(absent_frontier.checkpoint_anchor_value(), 0);
+        assert_eq!(absent_frontier.transaction_entry_count(), 0);
+        assert_eq!(absent_frontier.page_entry_count(), 0);
+
+        let maximum = certificate(
+            generation(u64::MAX)?,
+            Some(u64::MAX),
+            u64::MAX,
+            u16::MAX,
+            u128::MAX,
+            u64::MAX,
+            u64::MAX,
+        )
+        .map_err(|_| TestValueError("maximum-field certificate must construct"))?;
+        assert_eq!(maximum.source_generation(), generation(u64::MAX)?);
+        assert_eq!(maximum.durable_wal_frontier(), Some(u64::MAX));
+        assert_eq!(maximum.allocated_transaction_epoch_high_water(), u64::MAX);
+        assert_eq!(maximum.checkpoint_anchor_version(), u16::MAX);
+        assert_eq!(maximum.checkpoint_anchor_value(), u128::MAX);
+        assert_eq!(maximum.transaction_entry_count(), u64::MAX);
+        assert_eq!(maximum.page_entry_count(), u64::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn clean_manifest_requires_exact_predecessor_source_generation() -> Result<(), TestValueError> {
+        let recovery_required = manifest(1, 2, 3, 4)?;
+        let next_identity = recovery_required
+            .composition_identity()
+            .next_generation()
+            .map_err(|_| TestValueError("test composition must advance"))?;
+
+        // Certificate source generation 2 is the exact predecessor of target generation 3.
+        let matching_certificate = certificate(generation(2)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        let clean = DatabaseManifest::clean(
+            next_identity,
+            recovery_required.storage_formats(),
+            recovery_required.required_features(),
+            matching_certificate,
+        )
+        .map_err(|_| TestValueError("exact predecessor certificate must select clean"))?;
+        assert_eq!(
+            clean.lifecycle_state(),
+            DatabaseManifestLifecycleState::Clean(matching_certificate)
+        );
+        assert_eq!(clean.composition_identity(), next_identity);
+
+        // Certificate source generation 3 equals the target generation: regression.
+        let regressed_certificate = certificate(generation(3)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        assert_eq!(
+            DatabaseManifest::clean(
+                next_identity,
+                recovery_required.storage_formats(),
+                recovery_required.required_features(),
+                regressed_certificate,
+            ),
+            Err(
+                DatabaseLifecycleGenerationTransitionError::NotStrictlyIncreasing {
+                    current: generation(3)?,
+                    proposed: generation(3)?,
+                }
+            )
+        );
+
+        // Certificate source generation 1 skips the exact predecessor (2).
+        let skipped_certificate = certificate(generation(1)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        assert_eq!(
+            DatabaseManifest::clean(
+                next_identity,
+                recovery_required.storage_formats(),
+                recovery_required.required_features(),
+                skipped_certificate,
+            ),
+            Err(DatabaseLifecycleGenerationTransitionError::Skipped {
+                expected: generation(2)?,
+                proposed: generation(3)?,
+            })
+        );
+
+        let exhausted_certificate = certificate(generation(u64::MAX)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        assert_eq!(
+            DatabaseManifest::clean(
+                recovery_required.composition_identity(),
+                recovery_required.storage_formats(),
+                recovery_required.required_features(),
+                exhausted_certificate,
+            ),
+            Err(DatabaseLifecycleGenerationTransitionError::Exhausted {
+                current: generation(u64::MAX)?,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_lifecycle_transitions_reject_only_clean_to_clean() -> Result<(), TestValueError> {
+        let generation_one = manifest(1, 1, 3, 4)?;
+        let generation_two = manifest(1, 2, 3, 4)?;
+        let certificate_for_two = certificate(generation(1)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        let clean_two = DatabaseManifest::clean(
+            generation_two.composition_identity(),
+            generation_two.storage_formats(),
+            generation_two.required_features(),
+            certificate_for_two,
+        )
+        .map_err(|_| TestValueError("clean manifest must select"))?;
+
+        // RecoveryRequired -> RecoveryRequired is allowed.
+        assert_eq!(generation_two.require_successor_of(generation_one), Ok(()));
+        // RecoveryRequired -> Clean is allowed.
+        assert_eq!(clean_two.require_successor_of(generation_one), Ok(()));
+
+        let certificate_for_three = certificate(generation(2)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        let generation_three = manifest(1, 3, 3, 4)?;
+        let clean_three = DatabaseManifest::clean(
+            generation_three.composition_identity(),
+            generation_three.storage_formats(),
+            generation_three.required_features(),
+            certificate_for_three,
+        )
+        .map_err(|_| TestValueError("clean manifest must select"))?;
+        // Clean -> RecoveryRequired is allowed.
+        assert_eq!(generation_three.require_successor_of(clean_two), Ok(()));
+        // Clean -> Clean is rejected.
+        assert_eq!(
+            clean_three.require_successor_of(clean_two),
+            Err(DatabaseManifestSuccessorError::LifecycleTransition(
+                DatabaseManifestLifecycleTransitionError::CleanToClean
+            ))
+        );
+        assert_eq!(
+            clean_two.next_clean(certificate_for_three),
+            Err(DatabaseManifestCleanSuccessorError::LifecycleTransition(
+                DatabaseManifestLifecycleTransitionError::CleanToClean
+            ))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn next_clean_advances_generation_and_binds_fresh_certificate() -> Result<(), TestValueError> {
+        let recovery_required = manifest(1, 2, 3, 4)?;
+        let certificate_for_three = certificate(generation(2)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        let clean = recovery_required
+            .next_clean(certificate_for_three)
+            .map_err(|_| TestValueError("next_clean must select with exact predecessor"))?;
+        assert_eq!(
+            clean.composition_identity().lifecycle_generation(),
+            generation(3)?
+        );
+        assert_eq!(clean.require_successor_of(recovery_required), Ok(()));
+
+        let mismatched_certificate = certificate(generation(1)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        assert_eq!(
+            recovery_required.next_clean(mismatched_certificate),
+            Err(DatabaseManifestCleanSuccessorError::SourceGeneration(
+                DatabaseLifecycleGenerationTransitionError::Skipped {
+                    expected: generation(2)?,
+                    proposed: generation(3)?,
+                }
+            ))
+        );
+
+        let exhausted = manifest(1, u64::MAX, 3, 4)?;
+        let exhausted_certificate = certificate(generation(u64::MAX)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        assert_eq!(
+            exhausted.next_clean(exhausted_certificate),
+            Err(DatabaseManifestCleanSuccessorError::Exhausted(
+                DatabaseLifecycleGenerationExhausted {
+                    current: generation(u64::MAX)?,
+                }
+            ))
         );
         Ok(())
     }

@@ -237,11 +237,44 @@ impl Error for DatabaseManifestDecodeError {
     }
 }
 
+/// Rejection of encoding a database manifest into frame version 1.
+///
+/// Version 1 supports only [`DatabaseManifestLifecycleState::RecoveryRequired`].
+/// Any later lifecycle state (currently `Clean`) must be encoded through
+/// [`crate::encode_database_manifest_v2`] instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseManifestV1UnsupportedLifecycleState {
+    /// Exact lifecycle state that frame version 1 cannot represent.
+    pub actual: DatabaseManifestLifecycleState,
+}
+
+impl fmt::Display for DatabaseManifestV1UnsupportedLifecycleState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "database manifest lifecycle state {} cannot be encoded by frame version 1",
+            self.actual
+        )
+    }
+}
+
+impl Error for DatabaseManifestV1UnsupportedLifecycleState {}
+
 /// Encodes one validated inert database manifest into the exact version-1 frame.
 ///
 /// Encoding is allocation-free and performs no publication or filesystem I/O.
-#[must_use]
-pub fn encode_database_manifest(manifest: &DatabaseManifest) -> [u8; DATABASE_MANIFEST_V1_LENGTH] {
+/// Version 1 supports only `RecoveryRequired`; a `Clean` manifest is rejected
+/// with a typed error rather than silently encoded, because frame version 1
+/// has no certificate representation.
+pub fn encode_database_manifest(
+    manifest: &DatabaseManifest,
+) -> Result<[u8; DATABASE_MANIFEST_V1_LENGTH], DatabaseManifestV1UnsupportedLifecycleState> {
+    let lifecycle_state_code = match manifest.lifecycle_state() {
+        DatabaseManifestLifecycleState::RecoveryRequired => LIFECYCLE_STATE_RECOVERY_REQUIRED,
+        actual @ DatabaseManifestLifecycleState::Clean(_) => {
+            return Err(DatabaseManifestV1UnsupportedLifecycleState { actual });
+        }
+    };
     let mut encoded = [0_u8; DATABASE_MANIFEST_V1_LENGTH];
     encoded[..8].copy_from_slice(&HEADER_MAGIC);
     super::write_u16(&mut encoded, 8, FORMAT_VERSION);
@@ -258,9 +291,7 @@ pub fn encode_database_manifest(manifest: &DatabaseManifest) -> [u8; DATABASE_MA
         LIFECYCLE_GENERATION_OFFSET,
         composition.lifecycle_generation().get(),
     );
-    encoded[LIFECYCLE_STATE_OFFSET] = match manifest.lifecycle_state() {
-        DatabaseManifestLifecycleState::RecoveryRequired => LIFECYCLE_STATE_RECOVERY_REQUIRED,
-    };
+    encoded[LIFECYCLE_STATE_OFFSET] = lifecycle_state_code;
     super::write_u128(
         &mut encoded,
         PERSISTENT_LOG_ID_OFFSET,
@@ -308,7 +339,7 @@ pub fn encode_database_manifest(manifest: &DatabaseManifest) -> [u8; DATABASE_MA
     encoded[FOOTER_MAGIC_OFFSET..CHECKSUM_OFFSET].copy_from_slice(&FOOTER_MAGIC);
     let checksum = super::checksum_v1(&encoded[..CHECKSUM_OFFSET]);
     super::write_u64(&mut encoded, CHECKSUM_OFFSET, checksum);
-    encoded
+    Ok(encoded)
 }
 
 /// Decodes and fully validates one exact version-1 database manifest frame.

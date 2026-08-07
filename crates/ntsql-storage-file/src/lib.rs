@@ -243,6 +243,7 @@ use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, Persist
 
 mod database_child_identity_codec;
 mod database_manifest_codec;
+mod database_manifest_codec_v2;
 mod database_ownership;
 mod restart_checkpoint_codec;
 mod restart_checkpoint_completeness_codec;
@@ -253,8 +254,13 @@ pub use database_child_identity_codec::{
     DatabaseChildIdentityDecodeError, DatabaseChildIdentityDecodeErrorReason,
 };
 pub use database_manifest_codec::{
-    DATABASE_MANIFEST_V1_LENGTH, DatabaseManifestDecodeError, decode_database_manifest,
+    DATABASE_MANIFEST_V1_LENGTH, DatabaseManifestDecodeError,
+    DatabaseManifestV1UnsupportedLifecycleState, decode_database_manifest,
     encode_database_manifest,
+};
+pub use database_manifest_codec_v2::{
+    DATABASE_MANIFEST_V2_LENGTH, DatabaseManifestV2DecodeError, decode_database_manifest_v2,
+    encode_database_manifest_v2,
 };
 pub use database_ownership::{
     DATABASE_OWNER_CONTROL_V1_LENGTH, DatabaseOwnerControlDecodeError, FileDatabaseCreateBoundary,

@@ -139,7 +139,7 @@ fn successor_children_bind_stable_storage_across_manifest_generations() -> Resul
     let successor = database.manifest.next_recovery_required()?;
     overwrite_synced(
         database.layout.manifest(),
-        &encode_database_manifest(&successor),
+        &encode_database_manifest(&successor)?,
     )?;
     let reopened =
         open_recovery_required_file_database::<1>(database.database_id, database.layout.clone())?;
@@ -363,7 +363,7 @@ fn owner_manifest_and_each_child_reject_foreign_identity() -> Result<(), Box<dyn
         manifest.manifest_with(database_id(800)?, manifest.persistent_log_id, [3, 1, 1])?;
     overwrite_synced(
         manifest.layout.manifest(),
-        &encode_database_manifest(&foreign_manifest),
+        &encode_database_manifest(&foreign_manifest)?,
     )?;
     assert!(matches!(
         open_file_database_ownership::<1>(manifest.database_id, manifest.layout.clone()),
@@ -471,7 +471,7 @@ fn every_child_format_requirement_is_checked_before_composition_open() -> Result
             database.manifest_with(database.database_id, database.persistent_log_id, formats)?;
         overwrite_synced(
             database.layout.manifest(),
-            &encode_database_manifest(&changed),
+            &encode_database_manifest(&changed)?,
         )?;
         assert!(matches!(
             open_file_database_ownership::<1>(database.database_id, database.layout.clone()),
@@ -783,7 +783,7 @@ impl TestDatabase {
         )?;
 
         write_synced_new(&owner_path, &encode_database_owner_control(database_id))?;
-        write_synced_new(&manifest_path, &encode_database_manifest(&manifest))?;
+        write_synced_new(&manifest_path, &encode_database_manifest(&manifest)?)?;
         drop(FileCommitLog::<1>::create_new_transaction_page_capable(
             &wal_path,
             persistent_log_id,
@@ -838,7 +838,7 @@ impl TestDatabase {
         let storage_identity = manifest.composition_identity().storage_identity();
 
         write_synced_new(&owner_path, &encode_database_owner_control(database_id))?;
-        write_synced_new(&manifest_path, &encode_database_manifest(&manifest))?;
+        write_synced_new(&manifest_path, &encode_database_manifest(&manifest)?)?;
         drop(
             FileCommitLog::<1>::create_new_database_transaction_page_capable(
                 &wal_path,

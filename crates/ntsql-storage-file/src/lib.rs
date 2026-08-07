@@ -257,10 +257,15 @@ pub use database_manifest_codec::{
     encode_database_manifest,
 };
 pub use database_ownership::{
-    DATABASE_OWNER_CONTROL_V1_LENGTH, DatabaseOwnerControlDecodeError, FileDatabaseLayout,
-    FileDatabaseLockRole, FileDatabaseOwnership, FileDatabaseOwnershipIoError,
-    FileDatabaseOwnershipIoStage, FileDatabaseOwnershipOpenError, FileDatabaseOwnershipSelection,
-    RecoveryRequiredFileDatabase, decode_database_owner_control, encode_database_owner_control,
+    DATABASE_OWNER_CONTROL_V1_LENGTH, DatabaseOwnerControlDecodeError, FileDatabaseCreateBoundary,
+    FileDatabaseCreateEntry, FileDatabaseCreateError, FileDatabaseCreateFault,
+    FileDatabaseCreateFaultTiming, FileDatabaseCreateIoError, FileDatabaseCreateIoStage,
+    FileDatabaseCreateLocation, FileDatabaseCreateManifestError,
+    FileDatabaseCreateManifestMismatch, FileDatabaseCreateNamespaceEvidence,
+    FileDatabaseCreateOutcome, FileDatabaseCreatePhase, FileDatabaseLayout, FileDatabaseLockRole,
+    FileDatabaseOwnership, FileDatabaseOwnershipIoError, FileDatabaseOwnershipIoStage,
+    FileDatabaseOwnershipOpenError, FileDatabaseOwnershipSelection, RecoveryRequiredFileDatabase,
+    create_file_database, decode_database_owner_control, encode_database_owner_control,
     open_file_database_ownership, open_recovery_required_file_database,
 };
 pub use restart_checkpoint_codec::{
@@ -2051,6 +2056,20 @@ impl<const N: usize> LockedFileCommitLogOpen<N> {
         self.log.database_file_identity
     }
 
+    pub(crate) fn is_exact_initial_database_file(&self) -> bool {
+        self.repaired_len.is_none()
+            && self.log.format == LogFormat::V5
+            && self.log.generation == 0
+            && self.log.reclaimed_retained_first.is_none()
+            && self.log.reclaimed_logical_high_water.is_none()
+            && self.log.reclaimed_allocated_epoch_high_water.is_none()
+            && self.log.selected_checkpoint_anchor.is_none()
+            && self.log.records.is_empty()
+            && self.log.durable_len == 0
+            && self.log.next_epoch == Some(NonZeroU64::MIN)
+            && self.log.next_position == Some(1)
+    }
+
     pub(crate) fn finish(mut self) -> Result<FileCommitLog<N>, FileOpenError> {
         if let Some(repaired_len) = self.repaired_len {
             self.log.file.set_len(repaired_len).map_err(|source| {
@@ -2068,6 +2087,14 @@ impl<const N: usize> LockedFileCommitLogOpen<N> {
             .seek(SeekFrom::End(0))
             .map_err(|source| FileOpenError::Io(FileIoError::new(FileIoStage::SeekEnd, source)))?;
         cleanup_reclamation_candidate(&self.log.path, &self.log.file, &self.log.parent_directory)?;
+        Ok(self.log)
+    }
+
+    pub(crate) fn finish_for_database_create(mut self) -> Result<FileCommitLog<N>, FileOpenError> {
+        self.log
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|source| FileOpenError::Io(FileIoError::new(FileIoStage::SeekEnd, source)))?;
         Ok(self.log)
     }
 }
@@ -2098,6 +2125,14 @@ impl FileCommitLog<0> {
 }
 
 impl<const N: usize> FileCommitLog<N> {
+    pub(crate) fn database_create_metadata(&self) -> io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
+
+    pub(crate) fn rebind_database_selected_path(&mut self, path: &Path) {
+        self.path = path.to_path_buf();
+    }
+
     /// Creates a new empty v2 page-capable file with one caller-supplied persistent lineage ID.
     pub fn create_new_page_capable<P>(
         path: P,
@@ -6377,6 +6412,13 @@ impl<const N: usize> LockedFilePageStoreOpen<N> {
         self.store.database_file_identity
     }
 
+    pub(crate) fn is_exact_initial_database_file(&self) -> bool {
+        self.repaired_len.is_none()
+            && self.store.format == PageStoreFormat::V2
+            && self.store.pages.is_empty()
+            && self.store.next_sequence == Some(1)
+    }
+
     pub(crate) fn finish(mut self) -> Result<FilePageStore<N>, PageStoreOpenError> {
         if let Some(repaired_len) = self.repaired_len {
             self.store.file.set_len(repaired_len).map_err(|source| {
@@ -6400,6 +6442,10 @@ impl<const N: usize> LockedFilePageStoreOpen<N> {
 }
 
 impl<const N: usize> FilePageStore<N> {
+    pub(crate) fn database_create_metadata(&self) -> io::Result<fs::Metadata> {
+        self.file.metadata()
+    }
+
     /// Creates a new empty page store file.
     pub fn create_new<P>(
         path: P,

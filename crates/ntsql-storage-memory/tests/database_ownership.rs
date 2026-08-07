@@ -6,9 +6,12 @@ use ntsql_database::{
     DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
 };
 use ntsql_storage_memory::{
-    InMemoryDatabaseFileObservation, InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole,
-    InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSlot,
-    InMemoryDatabaseOwnershipSlotError, InMemoryDatabaseOwnershipWorld,
+    InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError, InMemoryDatabaseCreateFault,
+    InMemoryDatabaseCreateFaultTiming, InMemoryDatabaseCreateManifestError,
+    InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation,
+    InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole, InMemoryDatabaseOwnershipError,
+    InMemoryDatabaseOwnershipSlot, InMemoryDatabaseOwnershipSlotError,
+    InMemoryDatabaseOwnershipWorld,
 };
 use ntsql_wal::PersistentLogId;
 
@@ -340,6 +343,325 @@ fn every_later_modeled_role_rejects_alias_with_an_earlier_object() -> Result<(),
     Ok(())
 }
 
+#[test]
+fn memory_create_is_manifest_last_and_repeated_create_is_explicit() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(100, 200)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+
+    let created = composition.create(&slot, None)?;
+    let InMemoryDatabaseCreateOutcome::Created(created) = created else {
+        return Err(io::Error::other("fresh memory create did not report Created").into());
+    };
+    assert_eq!(slot.create_phase(), InMemoryDatabaseCreatePhase::Published);
+    assert_eq!(created.stage(), DatabaseLifecycleStage::RecoveryRequired);
+    assert_eq!(
+        created.identity(),
+        composition.manifest.composition_identity()
+    );
+    assert_eq!(
+        composition.create(&slot, None).err(),
+        Some(InMemoryDatabaseCreateError::Ownership(
+            InMemoryDatabaseOwnershipError::Contended {
+                database_id: composition.database_id,
+            }
+        ))
+    );
+    drop(created);
+
+    let repeated = composition.create(&slot, None)?;
+    let InMemoryDatabaseCreateOutcome::AlreadyPublished(repeated) = repeated else {
+        return Err(
+            io::Error::other("repeated memory create did not report AlreadyPublished").into(),
+        );
+    };
+    assert_eq!(
+        repeated.identity(),
+        composition.manifest.composition_identity()
+    );
+    Ok(())
+}
+
+#[test]
+fn ordinary_memory_open_rejects_unpublished_create_evidence() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(200, 300)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    let fault = InMemoryDatabaseCreateFault::new(
+        InMemoryDatabaseCreateBoundary::ManifestCandidatePublication,
+        InMemoryDatabaseCreateFaultTiming::AfterEffect,
+    );
+    assert_eq!(
+        composition.create(&slot, Some(fault)).err(),
+        Some(InMemoryDatabaseCreateError::InjectedFault(fault))
+    );
+
+    assert_eq!(
+        composition
+            .acquire_recovery_required(&slot, composition.manifest)
+            .err(),
+        Some(InMemoryDatabaseOwnershipError::UnpublishedCreate {
+            phase: InMemoryDatabaseCreatePhase::ManifestCandidate,
+        })
+    );
+    assert!(!slot.is_owned());
+
+    let alternate_owner = world.slot(composition.database_id, object_id(999_998)?)?;
+    let alternate_files = [
+        replace_object_id(composition.files[0], object_id(999_995)?),
+        replace_object_id(composition.files[1], object_id(999_994)?),
+        replace_object_id(composition.files[2], object_id(999_993)?),
+    ];
+    assert_eq!(
+        alternate_owner
+            .try_acquire_recovery_required(
+                composition.database_id,
+                object_id(999_996)?,
+                composition.manifest,
+                &alternate_files,
+            )
+            .err(),
+        Some(InMemoryDatabaseOwnershipError::UnpublishedCreate {
+            phase: InMemoryDatabaseCreatePhase::ManifestCandidate,
+        })
+    );
+    assert_eq!(
+        composition.create(&alternate_owner, None).err(),
+        Some(InMemoryDatabaseCreateError::EvidenceConflict {
+            phase: InMemoryDatabaseCreatePhase::ManifestCandidate,
+        })
+    );
+    assert!(!alternate_owner.is_owned());
+    Ok(())
+}
+
+#[test]
+fn published_memory_open_requires_the_selected_modeled_objects() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(201, 301)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+
+    assert_eq!(
+        slot.try_acquire_recovery_required(
+            composition.database_id,
+            object_id(999_999)?,
+            composition.manifest,
+            &composition.files,
+        )
+        .err(),
+        Some(InMemoryDatabaseOwnershipError::PublishedCreateSelectionMismatch)
+    );
+    assert!(!slot.is_owned());
+
+    let alternate_owner = world.slot(composition.database_id, object_id(999_998)?)?;
+    let alternate_files = [
+        replace_object_id(composition.files[0], object_id(999_995)?),
+        replace_object_id(composition.files[1], object_id(999_994)?),
+        replace_object_id(composition.files[2], object_id(999_993)?),
+    ];
+    assert_eq!(
+        alternate_owner
+            .try_acquire_recovery_required(
+                composition.database_id,
+                object_id(999_996)?,
+                composition.manifest,
+                &alternate_files,
+            )
+            .err(),
+        Some(InMemoryDatabaseOwnershipError::PublishedCreateSelectionMismatch)
+    );
+    assert!(!alternate_owner.is_owned());
+    Ok(())
+}
+
+#[test]
+fn owner_before_effect_does_not_bind_an_absent_modeled_object() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(202, 302)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    let fault = InMemoryDatabaseCreateFault::new(
+        InMemoryDatabaseCreateBoundary::OwnerPublication,
+        InMemoryDatabaseCreateFaultTiming::BeforeEffect,
+    );
+    assert_eq!(
+        composition.create(&slot, Some(fault)).err(),
+        Some(InMemoryDatabaseCreateError::InjectedFault(fault))
+    );
+    assert_eq!(slot.create_phase(), InMemoryDatabaseCreatePhase::Absent);
+    drop(world.slot(database_id(999_999)?, composition.owner_object_id)?);
+    Ok(())
+}
+
+#[test]
+fn published_owner_identity_blocks_alternate_memory_owner_slots() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(203, 303)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    let fault = InMemoryDatabaseCreateFault::new(
+        InMemoryDatabaseCreateBoundary::OwnerPublication,
+        InMemoryDatabaseCreateFaultTiming::AfterEffect,
+    );
+    assert_eq!(
+        composition.create(&slot, Some(fault)).err(),
+        Some(InMemoryDatabaseCreateError::InjectedFault(fault))
+    );
+
+    let alternate_owner = world.slot(composition.database_id, object_id(999_992)?)?;
+    assert_eq!(
+        composition
+            .acquire_recovery_required(&alternate_owner, composition.manifest)
+            .err(),
+        Some(InMemoryDatabaseOwnershipError::UnpublishedCreate {
+            phase: InMemoryDatabaseCreatePhase::Owner,
+        })
+    );
+    assert_eq!(
+        composition.create(&alternate_owner, None).err(),
+        Some(InMemoryDatabaseCreateError::EvidenceConflict {
+            phase: InMemoryDatabaseCreatePhase::Owner,
+        })
+    );
+    assert!(!alternate_owner.is_owned());
+    Ok(())
+}
+
+#[test]
+fn every_memory_create_fault_timing_resumes_from_exact_phase() -> Result<(), Box<dyn Error>> {
+    let boundaries = [
+        InMemoryDatabaseCreateBoundary::OwnerPublication,
+        InMemoryDatabaseCreateBoundary::ManifestCandidatePublication,
+        InMemoryDatabaseCreateBoundary::WalCandidatePublication,
+        InMemoryDatabaseCreateBoundary::PageStoreCandidatePublication,
+        InMemoryDatabaseCreateBoundary::RestartCheckpointCandidatePublication,
+        InMemoryDatabaseCreateBoundary::WalPublication,
+        InMemoryDatabaseCreateBoundary::PageStorePublication,
+        InMemoryDatabaseCreateBoundary::RestartCheckpointPublication,
+        InMemoryDatabaseCreateBoundary::ManifestPublication,
+    ];
+    let timings = [
+        InMemoryDatabaseCreateFaultTiming::BeforeEffect,
+        InMemoryDatabaseCreateFaultTiming::AfterEffect,
+        InMemoryDatabaseCreateFaultTiming::OutcomeIndeterminateBeforeEffect,
+        InMemoryDatabaseCreateFaultTiming::OutcomeIndeterminateAfterEffect,
+    ];
+
+    for (boundary_index, boundary) in boundaries.into_iter().enumerate() {
+        for (timing_index, timing) in timings.into_iter().enumerate() {
+            let composition = TestComposition::new_create(
+                300 + (boundary_index * timings.len() + timing_index) as u128,
+                400 + (boundary_index * timings.len() + timing_index) as u128,
+            )?;
+            let mut world = InMemoryDatabaseOwnershipWorld::new();
+            let slot = composition.slot(&mut world)?;
+            let fault = InMemoryDatabaseCreateFault::new(boundary, timing);
+            let error = composition
+                .create(&slot, Some(fault))
+                .err()
+                .ok_or_else(|| io::Error::other("armed memory create fault did not fire"))?;
+            assert_eq!(error, InMemoryDatabaseCreateError::InjectedFault(fault));
+            assert_eq!(
+                error.is_outcome_indeterminate(),
+                timing.is_outcome_indeterminate()
+            );
+            assert_eq!(
+                slot.create_phase(),
+                expected_memory_fault_phase(boundary, timing)
+            );
+
+            let resumed = composition.create(&slot, None)?;
+            match (boundary, timing, resumed) {
+                (
+                    InMemoryDatabaseCreateBoundary::ManifestPublication,
+                    InMemoryDatabaseCreateFaultTiming::AfterEffect
+                    | InMemoryDatabaseCreateFaultTiming::OutcomeIndeterminateAfterEffect,
+                    InMemoryDatabaseCreateOutcome::AlreadyPublished(database),
+                )
+                | (_, _, InMemoryDatabaseCreateOutcome::Created(database)) => drop(database),
+                _ => return Err(io::Error::other("memory retry returned wrong outcome").into()),
+            }
+            assert_eq!(slot.create_phase(), InMemoryDatabaseCreatePhase::Published);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn memory_create_conflicts_and_invalid_inputs_do_not_normalize_evidence()
+-> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(500, 600)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    let fault = InMemoryDatabaseCreateFault::new(
+        InMemoryDatabaseCreateBoundary::ManifestCandidatePublication,
+        InMemoryDatabaseCreateFaultTiming::AfterEffect,
+    );
+    assert_eq!(
+        composition.create(&slot, Some(fault)).err(),
+        Some(InMemoryDatabaseCreateError::InjectedFault(fault))
+    );
+    let mut conflicting_files = composition.files;
+    conflicting_files[0] = replace_object_id(conflicting_files[0], object_id(999_999)?);
+    assert_eq!(
+        slot.try_create_recovery_required(
+            composition.manifest_object_id,
+            composition.manifest,
+            &conflicting_files,
+            None,
+        )
+        .err(),
+        Some(InMemoryDatabaseCreateError::EvidenceConflict {
+            phase: InMemoryDatabaseCreatePhase::ManifestCandidate,
+        })
+    );
+    assert_eq!(
+        slot.create_phase(),
+        InMemoryDatabaseCreatePhase::ManifestCandidate
+    );
+
+    let invalid = TestComposition::new_create(501, 601)?;
+    let invalid_slot = invalid.slot(&mut world)?;
+    let successor = invalid.manifest.next_recovery_required()?;
+    assert_eq!(
+        invalid_slot
+            .try_create_recovery_required(
+                invalid.manifest_object_id,
+                successor,
+                &invalid.files,
+                None,
+            )
+            .err(),
+        Some(InMemoryDatabaseCreateError::ManifestRequirement(
+            InMemoryDatabaseCreateManifestError::LifecycleGeneration { actual: 2 }
+        ))
+    );
+    assert_eq!(
+        invalid_slot.create_phase(),
+        InMemoryDatabaseCreatePhase::Absent
+    );
+
+    let aliased = replace_object_id(invalid.files[0], invalid.manifest_object_id);
+    assert!(matches!(
+        invalid_slot.try_create_recovery_required(
+            invalid.manifest_object_id,
+            invalid.manifest,
+            &[aliased, invalid.files[1], invalid.files[2]],
+            None,
+        ),
+        Err(InMemoryDatabaseCreateError::Ownership(
+            InMemoryDatabaseOwnershipError::ObjectAlias {
+                first: InMemoryDatabaseObjectRole::Manifest,
+                second: InMemoryDatabaseObjectRole::Wal,
+            }
+        ))
+    ));
+    assert_eq!(
+        invalid_slot.create_phase(),
+        InMemoryDatabaseCreatePhase::Absent
+    );
+    Ok(())
+}
+
 struct TestComposition {
     database_id: DatabaseId,
     persistent_log_id: PersistentLogId,
@@ -351,6 +673,18 @@ struct TestComposition {
 
 impl TestComposition {
     fn new(database_value: u128, persistent_value: u128) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_formats(database_value, persistent_value, [3, 1, 1])
+    }
+
+    fn new_create(database_value: u128, persistent_value: u128) -> Result<Self, Box<dyn Error>> {
+        Self::new_with_formats(database_value, persistent_value, [5, 2, 2])
+    }
+
+    fn new_with_formats(
+        database_value: u128,
+        persistent_value: u128,
+        formats: [u16; 3],
+    ) -> Result<Self, Box<dyn Error>> {
         let database_id = database_id(database_value)?;
         let persistent_log_id = persistent_log_id(persistent_value)?;
         let file_values = [
@@ -358,7 +692,6 @@ impl TestComposition {
             2_000 + database_value,
             3_000 + database_value,
         ];
-        let formats = [3, 1, 1];
         let manifest = manifest(database_id, persistent_log_id, file_values, formats)?;
         let files = [
             file_observation(
@@ -429,6 +762,70 @@ impl TestComposition {
             manifest,
             &self.files,
         )
+    }
+
+    fn create(
+        &self,
+        slot: &InMemoryDatabaseOwnershipSlot,
+        fault: Option<InMemoryDatabaseCreateFault>,
+    ) -> Result<InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreateError> {
+        slot.try_create_recovery_required(
+            self.manifest_object_id,
+            self.manifest,
+            &self.files,
+            fault,
+        )
+    }
+}
+
+const fn expected_memory_fault_phase(
+    boundary: InMemoryDatabaseCreateBoundary,
+    timing: InMemoryDatabaseCreateFaultTiming,
+) -> InMemoryDatabaseCreatePhase {
+    let after = matches!(
+        timing,
+        InMemoryDatabaseCreateFaultTiming::AfterEffect
+            | InMemoryDatabaseCreateFaultTiming::OutcomeIndeterminateAfterEffect
+    );
+    match (boundary, after) {
+        (InMemoryDatabaseCreateBoundary::OwnerPublication, false) => {
+            InMemoryDatabaseCreatePhase::Absent
+        }
+        (InMemoryDatabaseCreateBoundary::OwnerPublication, true)
+        | (InMemoryDatabaseCreateBoundary::ManifestCandidatePublication, false) => {
+            InMemoryDatabaseCreatePhase::Owner
+        }
+        (InMemoryDatabaseCreateBoundary::ManifestCandidatePublication, true)
+        | (InMemoryDatabaseCreateBoundary::WalCandidatePublication, false) => {
+            InMemoryDatabaseCreatePhase::ManifestCandidate
+        }
+        (InMemoryDatabaseCreateBoundary::WalCandidatePublication, true)
+        | (InMemoryDatabaseCreateBoundary::PageStoreCandidatePublication, false) => {
+            InMemoryDatabaseCreatePhase::WalCandidate
+        }
+        (InMemoryDatabaseCreateBoundary::PageStoreCandidatePublication, true)
+        | (InMemoryDatabaseCreateBoundary::RestartCheckpointCandidatePublication, false) => {
+            InMemoryDatabaseCreatePhase::PageStoreCandidate
+        }
+        (InMemoryDatabaseCreateBoundary::RestartCheckpointCandidatePublication, true)
+        | (InMemoryDatabaseCreateBoundary::WalPublication, false) => {
+            InMemoryDatabaseCreatePhase::RestartCheckpointCandidate
+        }
+        (InMemoryDatabaseCreateBoundary::WalPublication, true)
+        | (InMemoryDatabaseCreateBoundary::PageStorePublication, false) => {
+            InMemoryDatabaseCreatePhase::WalPublished
+        }
+        (InMemoryDatabaseCreateBoundary::PageStorePublication, true)
+        | (InMemoryDatabaseCreateBoundary::RestartCheckpointPublication, false) => {
+            InMemoryDatabaseCreatePhase::PageStorePublished
+        }
+        (InMemoryDatabaseCreateBoundary::RestartCheckpointPublication, true)
+        | (InMemoryDatabaseCreateBoundary::ManifestPublication, false) => {
+            InMemoryDatabaseCreatePhase::ChildrenPublished
+        }
+        (InMemoryDatabaseCreateBoundary::ManifestPublication, true) => {
+            InMemoryDatabaseCreatePhase::Published
+        }
     }
 }
 

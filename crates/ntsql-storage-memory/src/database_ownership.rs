@@ -105,7 +105,236 @@ impl InMemoryDatabaseFileObservation {
             format_version,
         }
     }
+}
 
+/// One durable phase in deterministic memory database creation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum InMemoryDatabaseCreatePhase {
+    /// No owner publication has occurred.
+    Absent,
+    /// Only the stable owner has been published.
+    Owner,
+    /// The manifest candidate has been published.
+    ManifestCandidate,
+    /// The WAL candidate has been published.
+    WalCandidate,
+    /// The page-store candidate has been published.
+    PageStoreCandidate,
+    /// The restart-checkpoint candidate has been published.
+    RestartCheckpointCandidate,
+    /// The WAL candidate has moved to the selected entry.
+    WalPublished,
+    /// The page-store candidate has moved to the selected entry.
+    PageStorePublished,
+    /// Every child is selected while the manifest remains a candidate.
+    ChildrenPublished,
+    /// The manifest and every child are selected.
+    Published,
+}
+
+impl fmt::Display for InMemoryDatabaseCreatePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("absent"),
+            Self::Owner => formatter.write_str("owner"),
+            Self::ManifestCandidate => formatter.write_str("manifest candidate"),
+            Self::WalCandidate => formatter.write_str("WAL candidate"),
+            Self::PageStoreCandidate => formatter.write_str("page-store candidate"),
+            Self::RestartCheckpointCandidate => formatter.write_str("restart-checkpoint candidate"),
+            Self::WalPublished => formatter.write_str("WAL published"),
+            Self::PageStorePublished => formatter.write_str("page store published"),
+            Self::ChildrenPublished => formatter.write_str("children published"),
+            Self::Published => formatter.write_str("published"),
+        }
+    }
+}
+
+/// One complete modeled effect boundary in deterministic memory creation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum InMemoryDatabaseCreateBoundary {
+    /// Stable owner publication.
+    OwnerPublication,
+    /// Manifest-candidate publication.
+    ManifestCandidatePublication,
+    /// WAL-candidate publication.
+    WalCandidatePublication,
+    /// Page-store-candidate publication.
+    PageStoreCandidatePublication,
+    /// Restart-checkpoint-candidate publication.
+    RestartCheckpointCandidatePublication,
+    /// WAL selection.
+    WalPublication,
+    /// Page-store selection.
+    PageStorePublication,
+    /// Restart-checkpoint selection.
+    RestartCheckpointPublication,
+    /// Manifest selection.
+    ManifestPublication,
+}
+
+impl fmt::Display for InMemoryDatabaseCreateBoundary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnerPublication => formatter.write_str("owner publication"),
+            Self::ManifestCandidatePublication => {
+                formatter.write_str("manifest-candidate publication")
+            }
+            Self::WalCandidatePublication => formatter.write_str("WAL-candidate publication"),
+            Self::PageStoreCandidatePublication => {
+                formatter.write_str("page-store-candidate publication")
+            }
+            Self::RestartCheckpointCandidatePublication => {
+                formatter.write_str("restart-checkpoint-candidate publication")
+            }
+            Self::WalPublication => formatter.write_str("WAL publication"),
+            Self::PageStorePublication => formatter.write_str("page-store publication"),
+            Self::RestartCheckpointPublication => {
+                formatter.write_str("restart-checkpoint publication")
+            }
+            Self::ManifestPublication => formatter.write_str("manifest publication"),
+        }
+    }
+}
+
+/// Physical state and caller certainty for one deterministic memory fault.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum InMemoryDatabaseCreateFaultTiming {
+    /// Fail definitely before installing the complete effect.
+    BeforeEffect,
+    /// Install the complete effect, then report a definite failure.
+    AfterEffect,
+    /// Keep the prior phase but make the report outcome-indeterminate.
+    OutcomeIndeterminateBeforeEffect,
+    /// Install the complete effect and make the report outcome-indeterminate.
+    OutcomeIndeterminateAfterEffect,
+}
+
+impl InMemoryDatabaseCreateFaultTiming {
+    /// Returns whether the injected report is outcome-indeterminate.
+    #[must_use]
+    pub const fn is_outcome_indeterminate(self) -> bool {
+        matches!(
+            self,
+            Self::OutcomeIndeterminateBeforeEffect | Self::OutcomeIndeterminateAfterEffect
+        )
+    }
+}
+
+impl fmt::Display for InMemoryDatabaseCreateFaultTiming {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeEffect => formatter.write_str("before effect"),
+            Self::AfterEffect => formatter.write_str("after effect"),
+            Self::OutcomeIndeterminateBeforeEffect => {
+                formatter.write_str("outcome-indeterminate before effect")
+            }
+            Self::OutcomeIndeterminateAfterEffect => {
+                formatter.write_str("outcome-indeterminate after effect")
+            }
+        }
+    }
+}
+
+/// One deterministic one-shot memory create fault.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InMemoryDatabaseCreateFault {
+    boundary: InMemoryDatabaseCreateBoundary,
+    timing: InMemoryDatabaseCreateFaultTiming,
+}
+
+impl InMemoryDatabaseCreateFault {
+    /// Selects one exact modeled boundary and timing.
+    #[must_use]
+    pub const fn new(
+        boundary: InMemoryDatabaseCreateBoundary,
+        timing: InMemoryDatabaseCreateFaultTiming,
+    ) -> Self {
+        Self { boundary, timing }
+    }
+
+    /// Returns the selected modeled boundary.
+    #[must_use]
+    pub const fn boundary(self) -> InMemoryDatabaseCreateBoundary {
+        self.boundary
+    }
+
+    /// Returns the selected physical/certainty timing.
+    #[must_use]
+    pub const fn timing(self) -> InMemoryDatabaseCreateFaultTiming {
+        self.timing
+    }
+}
+
+impl fmt::Display for InMemoryDatabaseCreateFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} {}", self.boundary, self.timing)
+    }
+}
+
+/// Initial create-manifest requirement rejected before modeled mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryDatabaseCreateManifestError {
+    /// Initial creation requires lifecycle generation one.
+    LifecycleGeneration {
+        /// Exact rejected generation.
+        actual: u64,
+    },
+    /// One child format is not the exact initial successor version.
+    StorageFormatVersion {
+        /// Rejected role.
+        role: DatabaseFileRole,
+        /// Required initial version.
+        expected: u16,
+        /// Exact supplied version.
+        actual: u16,
+    },
+    /// Initial creation supports no required feature bit.
+    RequiredFeatures {
+        /// Exact rejected feature set.
+        actual: u64,
+    },
+}
+
+impl fmt::Display for InMemoryDatabaseCreateManifestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LifecycleGeneration { actual } => write!(
+                formatter,
+                "initial database lifecycle generation must be 1, not {actual}"
+            ),
+            Self::StorageFormatVersion {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "initial {role} format must be {expected}, not {actual}"
+            ),
+            Self::RequiredFeatures { actual } => write!(
+                formatter,
+                "initial database required feature bits must be zero, not {actual:#018x}"
+            ),
+        }
+    }
+}
+
+impl Error for InMemoryDatabaseCreateManifestError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InMemoryDatabaseCreateRequest {
+    manifest_object_id: InMemoryDatabaseObjectId,
+    manifest: DatabaseManifest,
+    files: [InMemoryDatabaseFileObservation; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InMemoryDatabaseCreateRecord {
+    database_id: DatabaseId,
+    phase: InMemoryDatabaseCreatePhase,
+    request: Option<InMemoryDatabaseCreateRequest>,
+}
+
+impl InMemoryDatabaseFileObservation {
     /// Returns the modeled child role.
     #[must_use]
     pub const fn role(self) -> DatabaseFileRole {
@@ -157,6 +386,7 @@ struct InMemoryDatabaseObjectBinding {
 #[derive(Debug)]
 pub struct InMemoryDatabaseOwnershipWorld {
     states: Rc<RefCell<BTreeMap<InMemoryDatabaseObjectId, Rc<InMemoryDatabaseOwnershipState>>>>,
+    creates: Rc<RefCell<BTreeMap<InMemoryDatabaseObjectId, InMemoryDatabaseCreateRecord>>>,
 }
 
 impl InMemoryDatabaseOwnershipWorld {
@@ -165,6 +395,7 @@ impl InMemoryDatabaseOwnershipWorld {
     pub fn new() -> Self {
         Self {
             states: Rc::new(RefCell::new(BTreeMap::new())),
+            creates: Rc::new(RefCell::new(BTreeMap::new())),
         }
     }
 
@@ -189,17 +420,15 @@ impl InMemoryDatabaseOwnershipWorld {
                     requested_role: requested.role,
                 });
             }
-        } else {
-            if state.owned.get() {
-                return Err(InMemoryDatabaseOwnershipSlotError::ObjectCurrentlyOwned { object_id });
-            }
-            state.binding.set(Some(requested));
+        } else if state.owned.get() {
+            return Err(InMemoryDatabaseOwnershipSlotError::ObjectCurrentlyOwned { object_id });
         }
         Ok(InMemoryDatabaseOwnershipSlot {
             database_id,
             object_id,
             state,
             world: Rc::clone(&self.states),
+            creates: Rc::clone(&self.creates),
         })
     }
 }
@@ -284,6 +513,149 @@ pub struct InMemoryDatabaseOwnershipSlot {
     object_id: InMemoryDatabaseObjectId,
     state: Rc<InMemoryDatabaseOwnershipState>,
     world: Rc<RefCell<BTreeMap<InMemoryDatabaseObjectId, Rc<InMemoryDatabaseOwnershipState>>>>,
+    creates: Rc<RefCell<BTreeMap<InMemoryDatabaseObjectId, InMemoryDatabaseCreateRecord>>>,
+}
+
+/// Failure to create or resume one deterministic memory database composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryDatabaseCreateError {
+    /// The supplied manifest is not an exact initial create manifest.
+    ManifestRequirement(InMemoryDatabaseCreateManifestError),
+    /// Existing modeled ownership or physical evidence was rejected.
+    Ownership(InMemoryDatabaseOwnershipError),
+    /// A legal prefix belongs to another exact create request.
+    EvidenceConflict {
+        /// Durable phase whose evidence contradicted the request.
+        phase: InMemoryDatabaseCreatePhase,
+    },
+    /// Private modeled state violated the legal phase/request shape.
+    StateCorrupt {
+        /// Durable phase whose private record was invalid.
+        phase: InMemoryDatabaseCreatePhase,
+    },
+    /// A deterministic fault fired at one exact boundary.
+    InjectedFault(InMemoryDatabaseCreateFault),
+}
+
+impl InMemoryDatabaseCreateError {
+    /// Returns whether the injected report is outcome-indeterminate.
+    #[must_use]
+    pub const fn is_outcome_indeterminate(self) -> bool {
+        match self {
+            Self::InjectedFault(fault) => fault.timing().is_outcome_indeterminate(),
+            Self::ManifestRequirement(_)
+            | Self::Ownership(_)
+            | Self::EvidenceConflict { .. }
+            | Self::StateCorrupt { .. } => false,
+        }
+    }
+}
+
+impl fmt::Display for InMemoryDatabaseCreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManifestRequirement(source) => {
+                write!(formatter, "memory create manifest is invalid: {source}")
+            }
+            Self::Ownership(source) => {
+                write!(formatter, "memory create evidence is invalid: {source}")
+            }
+            Self::EvidenceConflict { phase } => {
+                write!(
+                    formatter,
+                    "memory create {phase} evidence conflicts with the request"
+                )
+            }
+            Self::StateCorrupt { phase } => {
+                write!(formatter, "memory create private {phase} state is invalid")
+            }
+            Self::InjectedFault(fault) => {
+                write!(formatter, "injected memory database create fault {fault}")
+            }
+        }
+    }
+}
+
+impl Error for InMemoryDatabaseCreateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ManifestRequirement(source) => Some(source),
+            Self::Ownership(source) => Some(source),
+            Self::EvidenceConflict { .. } | Self::StateCorrupt { .. } | Self::InjectedFault(_) => {
+                None
+            }
+        }
+    }
+}
+
+/// Successful initial memory publication or exact already-published retry.
+#[must_use = "created database ownership must remain inside its lifecycle typestate"]
+pub enum InMemoryDatabaseCreateOutcome {
+    /// This invocation completed manifest-last publication.
+    Created(RecoveryRequiredInMemoryDatabase),
+    /// The exact composition was already manifest-selected.
+    AlreadyPublished(RecoveryRequiredInMemoryDatabase),
+}
+
+impl fmt::Debug for InMemoryDatabaseCreateOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created(database) => formatter
+                .debug_tuple("Created")
+                .field(&database.identity())
+                .finish(),
+            Self::AlreadyPublished(database) => formatter
+                .debug_tuple("AlreadyPublished")
+                .field(&database.identity())
+                .finish(),
+        }
+    }
+}
+
+struct InMemoryCreateFaultController {
+    armed: Option<InMemoryDatabaseCreateFault>,
+}
+
+impl InMemoryCreateFaultController {
+    const fn new(armed: Option<InMemoryDatabaseCreateFault>) -> Self {
+        Self { armed }
+    }
+
+    fn before(
+        &mut self,
+        boundary: InMemoryDatabaseCreateBoundary,
+    ) -> Result<(), InMemoryDatabaseCreateError> {
+        if let Some(fault) = self.armed
+            && fault.boundary() == boundary
+            && matches!(
+                fault.timing(),
+                InMemoryDatabaseCreateFaultTiming::BeforeEffect
+                    | InMemoryDatabaseCreateFaultTiming::OutcomeIndeterminateBeforeEffect
+            )
+        {
+            self.armed = None;
+            return Err(InMemoryDatabaseCreateError::InjectedFault(fault));
+        }
+        Ok(())
+    }
+
+    fn after(
+        &mut self,
+        boundary: InMemoryDatabaseCreateBoundary,
+    ) -> Result<(), InMemoryDatabaseCreateError> {
+        if let Some(fault) = self.armed
+            && fault.boundary() == boundary
+            && matches!(
+                fault.timing(),
+                InMemoryDatabaseCreateFaultTiming::AfterEffect
+                    | InMemoryDatabaseCreateFaultTiming::OutcomeIndeterminateAfterEffect
+            )
+        {
+            self.armed = None;
+            return Err(InMemoryDatabaseCreateError::InjectedFault(fault));
+        }
+        Ok(())
+    }
 }
 
 impl InMemoryDatabaseOwnershipSlot {
@@ -303,6 +675,265 @@ impl InMemoryDatabaseOwnershipSlot {
     #[must_use]
     pub fn is_owned(&self) -> bool {
         self.state.owned.get()
+    }
+
+    /// Returns the durable modeled create phase for this stable owner.
+    #[must_use]
+    pub fn create_phase(&self) -> InMemoryDatabaseCreatePhase {
+        self.creates
+            .borrow()
+            .get(&self.object_id)
+            .map_or(InMemoryDatabaseCreatePhase::Absent, |record| record.phase)
+    }
+
+    /// Creates or resumes one exact deterministic successor-format composition.
+    pub fn try_create_recovery_required(
+        &self,
+        manifest_object_id: InMemoryDatabaseObjectId,
+        manifest: DatabaseManifest,
+        files: &[InMemoryDatabaseFileObservation],
+        fault: Option<InMemoryDatabaseCreateFault>,
+    ) -> Result<InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreateError> {
+        let request = prepare_memory_create_request(self, manifest_object_id, manifest, files)?;
+        let mut fault = InMemoryCreateFaultController::new(fault);
+        if let Some(record) = self.foreign_database_create_record() {
+            return Err(InMemoryDatabaseCreateError::EvidenceConflict {
+                phase: record.phase,
+            });
+        }
+        if let Some(record) = self.create_record()
+            && record.phase == InMemoryDatabaseCreatePhase::Published
+        {
+            require_memory_create_request(record, request)?;
+            let database = self
+                .try_acquire_recovery_required(
+                    self.database_id,
+                    request.manifest_object_id,
+                    request.manifest,
+                    &request.files,
+                )
+                .map_err(InMemoryDatabaseCreateError::Ownership)?;
+            return Ok(InMemoryDatabaseCreateOutcome::AlreadyPublished(database));
+        }
+
+        let mut guard = InMemoryDatabaseOwnershipGuard::new();
+        guard
+            .acquire(
+                self.object_id,
+                Rc::clone(&self.state),
+                InMemoryDatabaseObjectBinding {
+                    database_id: self.database_id,
+                    role: InMemoryDatabaseObjectRole::DatabaseOwner,
+                },
+            )
+            .map_err(InMemoryDatabaseCreateError::Ownership)?;
+
+        let mut phase = match self.create_record() {
+            Some(record) => {
+                if record.phase == InMemoryDatabaseCreatePhase::Published {
+                    require_memory_create_request(record, request)?;
+                    drop(guard);
+                    let database = self
+                        .try_acquire_recovery_required(
+                            self.database_id,
+                            request.manifest_object_id,
+                            request.manifest,
+                            &request.files,
+                        )
+                        .map_err(InMemoryDatabaseCreateError::Ownership)?;
+                    return Ok(InMemoryDatabaseCreateOutcome::AlreadyPublished(database));
+                }
+                record.phase
+            }
+            None => {
+                fault.before(InMemoryDatabaseCreateBoundary::OwnerPublication)?;
+                guard.commit_bindings();
+                self.set_create_record(InMemoryDatabaseCreatePhase::Owner, None);
+                fault.after(InMemoryDatabaseCreateBoundary::OwnerPublication)?;
+                InMemoryDatabaseCreatePhase::Owner
+            }
+        };
+
+        if phase == InMemoryDatabaseCreatePhase::Owner {
+            fault.before(InMemoryDatabaseCreateBoundary::ManifestCandidatePublication)?;
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.manifest_object_id,
+                InMemoryDatabaseObjectRole::Manifest,
+            )?;
+            guard.commit_bindings();
+            phase = InMemoryDatabaseCreatePhase::ManifestCandidate;
+            self.set_create_record(phase, Some(request));
+            fault.after(InMemoryDatabaseCreateBoundary::ManifestCandidatePublication)?;
+        } else {
+            require_memory_create_request(
+                self.create_record()
+                    .ok_or(InMemoryDatabaseCreateError::StateCorrupt { phase })?,
+                request,
+            )?;
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.manifest_object_id,
+                InMemoryDatabaseObjectRole::Manifest,
+            )?;
+        }
+
+        if phase < InMemoryDatabaseCreatePhase::WalCandidate {
+            fault.before(InMemoryDatabaseCreateBoundary::WalCandidatePublication)?;
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.files[0].object_id(),
+                InMemoryDatabaseObjectRole::Wal,
+            )?;
+            guard.commit_bindings();
+            phase = InMemoryDatabaseCreatePhase::WalCandidate;
+            self.set_create_record(phase, Some(request));
+            fault.after(InMemoryDatabaseCreateBoundary::WalCandidatePublication)?;
+        } else {
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.files[0].object_id(),
+                InMemoryDatabaseObjectRole::Wal,
+            )?;
+        }
+
+        if phase < InMemoryDatabaseCreatePhase::PageStoreCandidate {
+            fault.before(InMemoryDatabaseCreateBoundary::PageStoreCandidatePublication)?;
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.files[1].object_id(),
+                InMemoryDatabaseObjectRole::PageStore,
+            )?;
+            guard.commit_bindings();
+            phase = InMemoryDatabaseCreatePhase::PageStoreCandidate;
+            self.set_create_record(phase, Some(request));
+            fault.after(InMemoryDatabaseCreateBoundary::PageStoreCandidatePublication)?;
+        } else {
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.files[1].object_id(),
+                InMemoryDatabaseObjectRole::PageStore,
+            )?;
+        }
+
+        if phase < InMemoryDatabaseCreatePhase::RestartCheckpointCandidate {
+            fault.before(InMemoryDatabaseCreateBoundary::RestartCheckpointCandidatePublication)?;
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.files[2].object_id(),
+                InMemoryDatabaseObjectRole::RestartCheckpoint,
+            )?;
+            guard.commit_bindings();
+            phase = InMemoryDatabaseCreatePhase::RestartCheckpointCandidate;
+            self.set_create_record(phase, Some(request));
+            fault.after(InMemoryDatabaseCreateBoundary::RestartCheckpointCandidatePublication)?;
+        } else {
+            acquire_memory_create_object(
+                self,
+                &mut guard,
+                request.files[2].object_id(),
+                InMemoryDatabaseObjectRole::RestartCheckpoint,
+            )?;
+        }
+
+        if phase < InMemoryDatabaseCreatePhase::WalPublished {
+            fault.before(InMemoryDatabaseCreateBoundary::WalPublication)?;
+            phase = InMemoryDatabaseCreatePhase::WalPublished;
+            self.set_create_record(phase, Some(request));
+            fault.after(InMemoryDatabaseCreateBoundary::WalPublication)?;
+        }
+        if phase < InMemoryDatabaseCreatePhase::PageStorePublished {
+            fault.before(InMemoryDatabaseCreateBoundary::PageStorePublication)?;
+            phase = InMemoryDatabaseCreatePhase::PageStorePublished;
+            self.set_create_record(phase, Some(request));
+            fault.after(InMemoryDatabaseCreateBoundary::PageStorePublication)?;
+        }
+        if phase < InMemoryDatabaseCreatePhase::ChildrenPublished {
+            fault.before(InMemoryDatabaseCreateBoundary::RestartCheckpointPublication)?;
+            phase = InMemoryDatabaseCreatePhase::ChildrenPublished;
+            self.set_create_record(phase, Some(request));
+            fault.after(InMemoryDatabaseCreateBoundary::RestartCheckpointPublication)?;
+        }
+        fault.before(InMemoryDatabaseCreateBoundary::ManifestPublication)?;
+        phase = InMemoryDatabaseCreatePhase::Published;
+        self.set_create_record(phase, Some(request));
+        fault.after(InMemoryDatabaseCreateBoundary::ManifestPublication)?;
+
+        let acquired = finish_in_memory_database_acquisition(
+            self.database_id,
+            request.manifest_object_id,
+            request.manifest,
+            request.files,
+            guard,
+        )
+        .map_err(InMemoryDatabaseCreateError::Ownership)?;
+        let database = acquired
+            .selected
+            .bind_observed_storage(acquired.observed_storage_identity)
+            .map_err(|failure| {
+                InMemoryDatabaseCreateError::Ownership(
+                    InMemoryDatabaseOwnershipError::StorageBinding(*failure.reason()),
+                )
+            })?;
+        Ok(InMemoryDatabaseCreateOutcome::Created(database))
+    }
+
+    fn create_record(&self) -> Option<InMemoryDatabaseCreateRecord> {
+        self.creates.borrow().get(&self.object_id).copied()
+    }
+
+    fn set_create_record(
+        &self,
+        phase: InMemoryDatabaseCreatePhase,
+        request: Option<InMemoryDatabaseCreateRequest>,
+    ) {
+        self.creates.borrow_mut().insert(
+            self.object_id,
+            InMemoryDatabaseCreateRecord {
+                database_id: self.database_id,
+                phase,
+                request,
+            },
+        );
+    }
+
+    fn foreign_database_create_record(&self) -> Option<InMemoryDatabaseCreateRecord> {
+        self.creates
+            .borrow()
+            .iter()
+            .find_map(|(owner_object_id, record)| {
+                (*owner_object_id != self.object_id && record.database_id == self.database_id)
+                    .then_some(*record)
+            })
+    }
+
+    fn require_memory_create_publication(
+        &self,
+        manifest_object_id: InMemoryDatabaseObjectId,
+        files: &[InMemoryDatabaseFileObservation],
+    ) -> Result<(), InMemoryDatabaseOwnershipError> {
+        if let Some(record) = self.create_record() {
+            require_published_memory_selection(record, manifest_object_id, files)?;
+        }
+        for (owner_object_id, record) in self.creates.borrow().iter() {
+            if *owner_object_id == self.object_id || record.database_id != self.database_id {
+                continue;
+            }
+            if record.phase != InMemoryDatabaseCreatePhase::Published {
+                return Err(InMemoryDatabaseOwnershipError::UnpublishedCreate {
+                    phase: record.phase,
+                });
+            }
+            return Err(InMemoryDatabaseOwnershipError::PublishedCreateSelectionMismatch);
+        }
+        Ok(())
     }
 
     /// Acquires and validates one deterministic manifest-selected composition.
@@ -360,6 +991,7 @@ impl InMemoryDatabaseOwnershipSlot {
                 actual: self.database_id,
             });
         }
+        self.require_memory_create_publication(manifest_object_id, files)?;
         reject_object_alias(
             InMemoryDatabaseObjectRole::DatabaseOwner,
             self.object_id,
@@ -438,42 +1070,246 @@ impl InMemoryDatabaseOwnershipSlot {
         )?;
         validate_file(manifest, restart_checkpoint)?;
 
-        let ordered_files = [wal, page_store, restart_checkpoint];
-        let observed_files = [
-            DatabaseFileIdentity::new(wal.role, wal.file_id),
-            DatabaseFileIdentity::new(page_store.role, page_store.file_id),
-            DatabaseFileIdentity::new(restart_checkpoint.role, restart_checkpoint.file_id),
-        ];
-        let selected_identity = manifest.composition_identity();
-        let observed_storage_identity =
-            DatabaseStorageIdentity::new(self.database_id, wal.persistent_log_id, &observed_files)
-                .map_err(InMemoryDatabaseOwnershipError::ObservedStorageIdentity)?;
-        selected_identity
-            .storage_identity()
-            .require_exact_match(observed_storage_identity)
-            .map_err(InMemoryDatabaseOwnershipError::StorageBinding)?;
-        guard.commit_bindings();
-        let owner = InMemoryDatabaseOwnership {
-            manifest,
+        finish_in_memory_database_acquisition(
+            expected_database_id,
             manifest_object_id,
-            files: ordered_files,
-            _guard: guard,
-        };
-        let selected = match UnboundDatabase::new(owner, expected_database_id)
-            .select_manifest(selected_identity)
-        {
-            Ok(selected) => selected,
-            Err(failure) => {
-                let reason = *failure.reason();
-                drop(failure);
-                return Err(InMemoryDatabaseOwnershipError::ManifestSelection(reason));
-            }
-        };
-        Ok(AcquiredInMemoryDatabaseOwnership {
-            selected,
-            observed_storage_identity,
-        })
+            manifest,
+            [wal, page_store, restart_checkpoint],
+            guard,
+        )
     }
+}
+
+fn prepare_memory_create_request(
+    slot: &InMemoryDatabaseOwnershipSlot,
+    manifest_object_id: InMemoryDatabaseObjectId,
+    manifest: DatabaseManifest,
+    files: &[InMemoryDatabaseFileObservation],
+) -> Result<InMemoryDatabaseCreateRequest, InMemoryDatabaseCreateError> {
+    validate_memory_create_manifest(manifest)?;
+    let manifest_database_id = manifest.composition_identity().database_id();
+    if manifest_database_id != slot.database_id {
+        return Err(InMemoryDatabaseCreateError::Ownership(
+            InMemoryDatabaseOwnershipError::ManifestDatabaseIdMismatch {
+                owner: slot.database_id,
+                manifest: manifest_database_id,
+            },
+        ));
+    }
+    reject_object_alias(
+        InMemoryDatabaseObjectRole::DatabaseOwner,
+        slot.object_id,
+        InMemoryDatabaseObjectRole::Manifest,
+        manifest_object_id,
+    )
+    .map_err(InMemoryDatabaseCreateError::Ownership)?;
+    let wal = require_exact_role(files, DatabaseFileRole::Wal)
+        .map_err(InMemoryDatabaseCreateError::Ownership)?;
+    let page_store = require_exact_role(files, DatabaseFileRole::PageStore)
+        .map_err(InMemoryDatabaseCreateError::Ownership)?;
+    let restart_checkpoint = require_exact_role(files, DatabaseFileRole::RestartCheckpoint)
+        .map_err(InMemoryDatabaseCreateError::Ownership)?;
+    for file in [wal, page_store, restart_checkpoint] {
+        validate_file(manifest, file).map_err(InMemoryDatabaseCreateError::Ownership)?;
+    }
+    validate_object_against_prefix(
+        wal,
+        &[
+            (InMemoryDatabaseObjectRole::DatabaseOwner, slot.object_id),
+            (InMemoryDatabaseObjectRole::Manifest, manifest_object_id),
+        ],
+    )
+    .map_err(InMemoryDatabaseCreateError::Ownership)?;
+    validate_object_against_prefix(
+        page_store,
+        &[
+            (InMemoryDatabaseObjectRole::DatabaseOwner, slot.object_id),
+            (InMemoryDatabaseObjectRole::Manifest, manifest_object_id),
+            (InMemoryDatabaseObjectRole::Wal, wal.object_id),
+        ],
+    )
+    .map_err(InMemoryDatabaseCreateError::Ownership)?;
+    validate_object_against_prefix(
+        restart_checkpoint,
+        &[
+            (InMemoryDatabaseObjectRole::DatabaseOwner, slot.object_id),
+            (InMemoryDatabaseObjectRole::Manifest, manifest_object_id),
+            (InMemoryDatabaseObjectRole::Wal, wal.object_id),
+            (InMemoryDatabaseObjectRole::PageStore, page_store.object_id),
+        ],
+    )
+    .map_err(InMemoryDatabaseCreateError::Ownership)?;
+
+    let observed_files = [
+        DatabaseFileIdentity::new(wal.role, wal.file_id),
+        DatabaseFileIdentity::new(page_store.role, page_store.file_id),
+        DatabaseFileIdentity::new(restart_checkpoint.role, restart_checkpoint.file_id),
+    ];
+    let observed_storage_identity =
+        DatabaseStorageIdentity::new(slot.database_id, wal.persistent_log_id, &observed_files)
+            .map_err(|source| {
+                InMemoryDatabaseCreateError::Ownership(
+                    InMemoryDatabaseOwnershipError::ObservedStorageIdentity(source),
+                )
+            })?;
+    manifest
+        .composition_identity()
+        .storage_identity()
+        .require_exact_match(observed_storage_identity)
+        .map_err(|source| {
+            InMemoryDatabaseCreateError::Ownership(InMemoryDatabaseOwnershipError::StorageBinding(
+                source,
+            ))
+        })?;
+
+    Ok(InMemoryDatabaseCreateRequest {
+        manifest_object_id,
+        manifest,
+        files: [wal, page_store, restart_checkpoint],
+    })
+}
+
+fn validate_memory_create_manifest(
+    manifest: DatabaseManifest,
+) -> Result<(), InMemoryDatabaseCreateError> {
+    let generation = manifest.composition_identity().lifecycle_generation().get();
+    if generation != 1 {
+        return Err(InMemoryDatabaseCreateError::ManifestRequirement(
+            InMemoryDatabaseCreateManifestError::LifecycleGeneration { actual: generation },
+        ));
+    }
+    for (role, expected) in [
+        (DatabaseFileRole::Wal, 5_u16),
+        (DatabaseFileRole::PageStore, 2),
+        (DatabaseFileRole::RestartCheckpoint, 2),
+    ] {
+        let actual = manifest.storage_formats().version(role).get();
+        if actual != expected {
+            return Err(InMemoryDatabaseCreateError::ManifestRequirement(
+                InMemoryDatabaseCreateManifestError::StorageFormatVersion {
+                    role,
+                    expected,
+                    actual,
+                },
+            ));
+        }
+    }
+    let required_features = manifest.required_features().bits();
+    if required_features != 0 {
+        return Err(InMemoryDatabaseCreateError::ManifestRequirement(
+            InMemoryDatabaseCreateManifestError::RequiredFeatures {
+                actual: required_features,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn require_memory_create_request(
+    record: InMemoryDatabaseCreateRecord,
+    requested: InMemoryDatabaseCreateRequest,
+) -> Result<(), InMemoryDatabaseCreateError> {
+    let Some(stored) = record.request else {
+        return Err(InMemoryDatabaseCreateError::StateCorrupt {
+            phase: record.phase,
+        });
+    };
+    if stored != requested {
+        return Err(InMemoryDatabaseCreateError::EvidenceConflict {
+            phase: record.phase,
+        });
+    }
+    Ok(())
+}
+
+fn require_published_memory_selection(
+    record: InMemoryDatabaseCreateRecord,
+    manifest_object_id: InMemoryDatabaseObjectId,
+    files: &[InMemoryDatabaseFileObservation],
+) -> Result<(), InMemoryDatabaseOwnershipError> {
+    if record.phase != InMemoryDatabaseCreatePhase::Published {
+        return Err(InMemoryDatabaseOwnershipError::UnpublishedCreate {
+            phase: record.phase,
+        });
+    }
+    let stored = record
+        .request
+        .ok_or(InMemoryDatabaseOwnershipError::CreateStateCorrupt {
+            phase: record.phase,
+        })?;
+    let observed = [
+        require_exact_role(files, DatabaseFileRole::Wal)?,
+        require_exact_role(files, DatabaseFileRole::PageStore)?,
+        require_exact_role(files, DatabaseFileRole::RestartCheckpoint)?,
+    ];
+    if manifest_object_id != stored.manifest_object_id || observed != stored.files {
+        return Err(InMemoryDatabaseOwnershipError::PublishedCreateSelectionMismatch);
+    }
+    Ok(())
+}
+
+fn acquire_memory_create_object(
+    slot: &InMemoryDatabaseOwnershipSlot,
+    guard: &mut InMemoryDatabaseOwnershipGuard,
+    object_id: InMemoryDatabaseObjectId,
+    role: InMemoryDatabaseObjectRole,
+) -> Result<(), InMemoryDatabaseCreateError> {
+    guard
+        .acquire(
+            object_id,
+            resolve_world_state(&slot.world, object_id),
+            InMemoryDatabaseObjectBinding {
+                database_id: slot.database_id,
+                role,
+            },
+        )
+        .map_err(InMemoryDatabaseCreateError::Ownership)
+}
+
+fn finish_in_memory_database_acquisition(
+    expected_database_id: DatabaseId,
+    manifest_object_id: InMemoryDatabaseObjectId,
+    manifest: DatabaseManifest,
+    files: [InMemoryDatabaseFileObservation; 3],
+    guard: InMemoryDatabaseOwnershipGuard,
+) -> Result<AcquiredInMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError> {
+    let observed_files = [
+        DatabaseFileIdentity::new(files[0].role, files[0].file_id),
+        DatabaseFileIdentity::new(files[1].role, files[1].file_id),
+        DatabaseFileIdentity::new(files[2].role, files[2].file_id),
+    ];
+    let selected_identity = manifest.composition_identity();
+    let observed_storage_identity = DatabaseStorageIdentity::new(
+        expected_database_id,
+        files[0].persistent_log_id,
+        &observed_files,
+    )
+    .map_err(InMemoryDatabaseOwnershipError::ObservedStorageIdentity)?;
+    selected_identity
+        .storage_identity()
+        .require_exact_match(observed_storage_identity)
+        .map_err(InMemoryDatabaseOwnershipError::StorageBinding)?;
+    guard.commit_bindings();
+    let owner = InMemoryDatabaseOwnership {
+        manifest,
+        manifest_object_id,
+        files,
+        _guard: guard,
+    };
+    let selected = match UnboundDatabase::new(owner, expected_database_id)
+        .select_manifest(selected_identity)
+    {
+        Ok(selected) => selected,
+        Err(failure) => {
+            let reason = *failure.reason();
+            drop(failure);
+            return Err(InMemoryDatabaseOwnershipError::ManifestSelection(reason));
+        }
+    };
+    Ok(AcquiredInMemoryDatabaseOwnership {
+        selected,
+        observed_storage_identity,
+    })
 }
 
 /// Recovery-required memory ownership proven by modeled stable child identity.
@@ -691,6 +1527,18 @@ pub enum InMemoryDatabaseOwnershipError {
         /// Stable owner identity.
         actual: DatabaseId,
     },
+    /// A modeled create has not selected its final manifest yet.
+    UnpublishedCreate {
+        /// Exact durable create phase that remains unselected.
+        phase: InMemoryDatabaseCreatePhase,
+    },
+    /// A published create record lacks its exact selected-object evidence.
+    CreateStateCorrupt {
+        /// Exact durable create phase whose evidence is invalid.
+        phase: InMemoryDatabaseCreatePhase,
+    },
+    /// Supplied objects differ from the objects selected by published create.
+    PublishedCreateSelectionMismatch,
     /// Two roles reuse one modeled opened object.
     ObjectAlias {
         /// Earlier role in acquisition order.
@@ -780,6 +1628,18 @@ impl fmt::Display for InMemoryDatabaseOwnershipError {
                 actual.get(),
                 expected.get()
             ),
+            Self::UnpublishedCreate { phase } => write!(
+                formatter,
+                "modeled database create remains unpublished at {phase}"
+            ),
+            Self::CreateStateCorrupt { phase } => {
+                write!(
+                    formatter,
+                    "modeled database create {phase} state is invalid"
+                )
+            }
+            Self::PublishedCreateSelectionMismatch => formatter
+                .write_str("modeled objects differ from the published database create selection"),
             Self::ObjectAlias { first, second } => {
                 write!(formatter, "modeled database {second} aliases {first}")
             }
@@ -849,6 +1709,9 @@ impl Error for InMemoryDatabaseOwnershipError {
             | Self::ObjectContended { .. }
             | Self::ObjectBindingMismatch { .. }
             | Self::DatabaseOwnerIdMismatch { .. }
+            | Self::UnpublishedCreate { .. }
+            | Self::CreateStateCorrupt { .. }
+            | Self::PublishedCreateSelectionMismatch
             | Self::ObjectAlias { .. }
             | Self::ManifestDatabaseIdMismatch { .. }
             | Self::MissingRole { .. }

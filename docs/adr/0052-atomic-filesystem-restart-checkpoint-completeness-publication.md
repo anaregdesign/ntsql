@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #157
 - Extends: ADR 0046, ADR 0049, ADR 0051
-- Extended by: ADR 0053, ADR 0060, ADR 0061
+- Extended by: ADR 0053, ADR 0060, ADR 0061, ADR 0065
 - Follows: #155
 
 ## Context

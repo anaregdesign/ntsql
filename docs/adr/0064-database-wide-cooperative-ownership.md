@@ -5,7 +5,7 @@
 - Issue: #183
 - Extends: ADR 0001, ADR 0014, ADR 0045, ADR 0062, ADR 0063
 - Follows: #182
-- Extended by: #184
+- Extended by: ADR 0065
 
 ## Context
 

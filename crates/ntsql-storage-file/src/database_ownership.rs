@@ -1,8 +1,9 @@
 use std::{
     error::Error,
+    ffi::OsString,
     fmt,
     fs::{self, File, Metadata, OpenOptions},
-    io::{self, Read},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -16,12 +17,14 @@ use ntsql_database::{
 use ntsql_wal::PersistentLogId;
 
 use super::{
-    FileCommitLog, FileOpenError, FilePageStore, FilePageWidthError,
-    FileRestartCheckpointCompletenessBaselineSource, PageLayout, PageStoreOpenError,
-    UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint, checksum_v1,
-    decode_database_manifest, metadata_identifies_same_file, read_u16, read_u32, read_u64,
-    read_u128,
-    restart_checkpoint_file::{CONTROL_FILE_NAME, FileRestartCheckpointSlotOpenError},
+    FileCommitLog, FileCreateError, FileOpenError, FilePageStore, FilePageWidthError,
+    FileRestartCheckpointCompletenessBaselineSource, PageLayout, PageStoreCreateError,
+    PageStoreOpenError, UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint,
+    checksum_v1, decode_database_manifest, metadata_identifies_same_file, read_u16, read_u32,
+    read_u64, read_u128,
+    restart_checkpoint_file::{
+        CONTROL_FILE_NAME, FileRestartCheckpointSlotCreateError, FileRestartCheckpointSlotOpenError,
+    },
     write_u16, write_u32, write_u64, write_u128,
 };
 
@@ -287,6 +290,836 @@ impl FileDatabaseLayout {
     }
 }
 
+/// One selected, candidate, or auxiliary entry in atomic database creation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FileDatabaseCreateEntry {
+    /// Stable database-owner control.
+    DatabaseOwner,
+    /// Selected database manifest.
+    Manifest,
+    /// Unselected create manifest.
+    ManifestCandidate,
+    /// Selected WAL.
+    Wal,
+    /// Unselected create WAL.
+    WalCandidate,
+    /// Selected page store.
+    PageStore,
+    /// Unselected create page store.
+    PageStoreCandidate,
+    /// Selected restart-checkpoint slot directory.
+    RestartCheckpoint,
+    /// Unselected create restart-checkpoint slot directory.
+    RestartCheckpointCandidate,
+    /// Selected restart-checkpoint control file.
+    RestartCheckpointControl,
+    /// Unselected restart-checkpoint control file.
+    RestartCheckpointCandidateControl,
+    /// WAL reclamation candidate derived from the selected WAL.
+    WalReclamationCandidate,
+    /// WAL reclamation candidate derived from the create WAL.
+    WalCandidateReclamationCandidate,
+}
+
+impl fmt::Display for FileDatabaseCreateEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DatabaseOwner => formatter.write_str("database owner"),
+            Self::Manifest => formatter.write_str("manifest"),
+            Self::ManifestCandidate => formatter.write_str("manifest create candidate"),
+            Self::Wal => formatter.write_str("WAL"),
+            Self::WalCandidate => formatter.write_str("WAL create candidate"),
+            Self::PageStore => formatter.write_str("page store"),
+            Self::PageStoreCandidate => formatter.write_str("page-store create candidate"),
+            Self::RestartCheckpoint => formatter.write_str("restart checkpoint"),
+            Self::RestartCheckpointCandidate => {
+                formatter.write_str("restart-checkpoint create candidate")
+            }
+            Self::RestartCheckpointControl => formatter.write_str("restart-checkpoint control"),
+            Self::RestartCheckpointCandidateControl => {
+                formatter.write_str("restart-checkpoint create-candidate control")
+            }
+            Self::WalReclamationCandidate => formatter.write_str("WAL reclamation candidate"),
+            Self::WalCandidateReclamationCandidate => {
+                formatter.write_str("create-WAL reclamation candidate")
+            }
+        }
+    }
+}
+
+/// One complete durable state in the atomic create prefix.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FileDatabaseCreatePhase {
+    /// No selected or create entry exists.
+    Absent,
+    /// Only the stable owner exists.
+    Owner,
+    /// The owner and manifest candidate exist.
+    ManifestCandidate,
+    /// The manifest and WAL candidates exist.
+    WalCandidate,
+    /// The manifest, WAL, and page candidates exist.
+    PageStoreCandidate,
+    /// All four create candidates exist.
+    RestartCheckpointCandidate,
+    /// The WAL is selected and the other candidates remain.
+    WalPublished,
+    /// The WAL and page store are selected.
+    PageStorePublished,
+    /// All children are selected while the manifest remains a candidate.
+    ChildrenPublished,
+    /// The manifest and every child are selected.
+    Published,
+}
+
+impl fmt::Display for FileDatabaseCreatePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("absent"),
+            Self::Owner => formatter.write_str("owner"),
+            Self::ManifestCandidate => formatter.write_str("manifest candidate"),
+            Self::WalCandidate => formatter.write_str("WAL candidate"),
+            Self::PageStoreCandidate => formatter.write_str("page-store candidate"),
+            Self::RestartCheckpointCandidate => formatter.write_str("restart-checkpoint candidate"),
+            Self::WalPublished => formatter.write_str("WAL published"),
+            Self::PageStorePublished => formatter.write_str("page store published"),
+            Self::ChildrenPublished => formatter.write_str("children published"),
+            Self::Published => formatter.write_str("published"),
+        }
+    }
+}
+
+/// Exact durable effect boundary used by deterministic create fault tests.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FileDatabaseCreateBoundary {
+    /// Stable owner creation and parent synchronization.
+    OwnerPublication,
+    /// Manifest-candidate creation and parent synchronization.
+    ManifestCandidatePublication,
+    /// WAL-candidate creation and parent synchronization.
+    WalCandidatePublication,
+    /// Page-candidate creation and parent synchronization.
+    PageStoreCandidatePublication,
+    /// Checkpoint-candidate creation and parent synchronization.
+    RestartCheckpointCandidatePublication,
+    /// WAL rename and selected-parent synchronization.
+    WalPublication,
+    /// Page-store rename and selected-parent synchronization.
+    PageStorePublication,
+    /// Checkpoint-directory rename and selected-parent synchronization.
+    RestartCheckpointPublication,
+    /// Manifest rename and selected-parent synchronization.
+    ManifestPublication,
+}
+
+impl fmt::Display for FileDatabaseCreateBoundary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OwnerPublication => formatter.write_str("owner publication"),
+            Self::ManifestCandidatePublication => {
+                formatter.write_str("manifest-candidate publication")
+            }
+            Self::WalCandidatePublication => formatter.write_str("WAL-candidate publication"),
+            Self::PageStoreCandidatePublication => {
+                formatter.write_str("page-store-candidate publication")
+            }
+            Self::RestartCheckpointCandidatePublication => {
+                formatter.write_str("restart-checkpoint-candidate publication")
+            }
+            Self::WalPublication => formatter.write_str("WAL publication"),
+            Self::PageStorePublication => formatter.write_str("page-store publication"),
+            Self::RestartCheckpointPublication => {
+                formatter.write_str("restart-checkpoint publication")
+            }
+            Self::ManifestPublication => formatter.write_str("manifest publication"),
+        }
+    }
+}
+
+/// Physical state and caller-certainty timing of one injected create fault.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FileDatabaseCreateFaultTiming {
+    /// Fail definitely before installing the complete effect.
+    BeforeEffect,
+    /// Install the complete effect, then report a definite injected failure.
+    AfterEffect,
+    /// Leave the prior phase while making the caller treat the outcome as indeterminate.
+    OutcomeIndeterminateBeforeEffect,
+    /// Install the complete effect while making the caller treat the outcome as indeterminate.
+    OutcomeIndeterminateAfterEffect,
+}
+
+impl FileDatabaseCreateFaultTiming {
+    /// Returns whether the injected report is outcome-indeterminate.
+    #[must_use]
+    pub const fn is_outcome_indeterminate(self) -> bool {
+        matches!(
+            self,
+            Self::OutcomeIndeterminateBeforeEffect | Self::OutcomeIndeterminateAfterEffect
+        )
+    }
+}
+
+impl fmt::Display for FileDatabaseCreateFaultTiming {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BeforeEffect => formatter.write_str("before effect"),
+            Self::AfterEffect => formatter.write_str("after effect"),
+            Self::OutcomeIndeterminateBeforeEffect => {
+                formatter.write_str("outcome-indeterminate before effect")
+            }
+            Self::OutcomeIndeterminateAfterEffect => {
+                formatter.write_str("outcome-indeterminate after effect")
+            }
+        }
+    }
+}
+
+/// One deterministic one-shot fault for atomic database creation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FileDatabaseCreateFault {
+    boundary: FileDatabaseCreateBoundary,
+    timing: FileDatabaseCreateFaultTiming,
+}
+
+impl FileDatabaseCreateFault {
+    /// Selects one exact boundary and timing.
+    #[must_use]
+    pub const fn new(
+        boundary: FileDatabaseCreateBoundary,
+        timing: FileDatabaseCreateFaultTiming,
+    ) -> Self {
+        Self { boundary, timing }
+    }
+
+    /// Returns the selected durable effect boundary.
+    #[must_use]
+    pub const fn boundary(self) -> FileDatabaseCreateBoundary {
+        self.boundary
+    }
+
+    /// Returns the selected physical/certainty timing.
+    #[must_use]
+    pub const fn timing(self) -> FileDatabaseCreateFaultTiming {
+        self.timing
+    }
+}
+
+impl fmt::Display for FileDatabaseCreateFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} {}", self.boundary, self.timing)
+    }
+}
+
+/// Create-manifest prerequisite rejected before any filesystem mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDatabaseCreateManifestError {
+    /// Initial creation requires lifecycle generation one.
+    LifecycleGeneration {
+        /// Exact rejected generation.
+        actual: u64,
+    },
+    /// Initial creation requires one exact successor child format.
+    StorageFormatVersion {
+        /// Rejected child role.
+        role: DatabaseFileRole,
+        /// Required initial format.
+        expected: u16,
+        /// Exact manifest requirement.
+        actual: u16,
+    },
+    /// Initial creation supports no required feature bit.
+    RequiredFeatures {
+        /// Exact rejected feature bits.
+        actual: u64,
+    },
+}
+
+impl fmt::Display for FileDatabaseCreateManifestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LifecycleGeneration { actual } => write!(
+                formatter,
+                "initial database lifecycle generation must be 1, not {actual}"
+            ),
+            Self::StorageFormatVersion {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "initial {role} format must be {expected}, not {actual}"
+            ),
+            Self::RequiredFeatures { actual } => write!(
+                formatter,
+                "initial database required feature bits must be zero, not {actual:#018x}"
+            ),
+        }
+    }
+}
+
+impl Error for FileDatabaseCreateManifestError {}
+
+/// Candidate or selected location of one child.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FileDatabaseCreateLocation {
+    /// Fixed unselected `.create-candidate` location.
+    Candidate,
+    /// Selected final location.
+    Final,
+}
+
+impl fmt::Display for FileDatabaseCreateLocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Candidate => formatter.write_str("candidate"),
+            Self::Final => formatter.write_str("final"),
+        }
+    }
+}
+
+/// Exact presence bitmap that did not match one legal create phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileDatabaseCreateNamespaceEvidence {
+    present: u16,
+}
+
+impl FileDatabaseCreateNamespaceEvidence {
+    /// Returns whether `entry` was observed as a directory entry.
+    #[must_use]
+    pub const fn contains(self, entry: FileDatabaseCreateEntry) -> bool {
+        let bit = match entry {
+            FileDatabaseCreateEntry::DatabaseOwner => 0,
+            FileDatabaseCreateEntry::Manifest => 1,
+            FileDatabaseCreateEntry::ManifestCandidate => 2,
+            FileDatabaseCreateEntry::Wal => 3,
+            FileDatabaseCreateEntry::WalCandidate => 4,
+            FileDatabaseCreateEntry::PageStore => 5,
+            FileDatabaseCreateEntry::PageStoreCandidate => 6,
+            FileDatabaseCreateEntry::RestartCheckpoint => 7,
+            FileDatabaseCreateEntry::RestartCheckpointCandidate => 8,
+            FileDatabaseCreateEntry::RestartCheckpointControl
+            | FileDatabaseCreateEntry::RestartCheckpointCandidateControl
+            | FileDatabaseCreateEntry::WalReclamationCandidate
+            | FileDatabaseCreateEntry::WalCandidateReclamationCandidate => return false,
+        };
+        self.present & (1 << bit) != 0
+    }
+}
+
+/// Exact filesystem operation performed directly by the create coordinator.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDatabaseCreateIoStage {
+    /// Observing whether one directory entry exists.
+    ObserveEntry {
+        /// Entry being observed.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Creating one exact file.
+    CreateFile {
+        /// Entry being created.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Opening one existing file.
+    OpenFile {
+        /// Entry being opened.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Acquiring one nonblocking exclusive lock.
+    AcquireExclusiveLock {
+        /// Entry being locked.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Reading metadata from one opened object.
+    ReadMetadata {
+        /// Entry being inspected.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Reading one complete fixed header.
+    ReadHeader {
+        /// Entry being decoded.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Writing one complete fixed header.
+    WriteHeader {
+        /// Entry being initialized.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Synchronizing one initialized or reopened object.
+    SyncObject {
+        /// Entry being synchronized.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Reading a checkpoint candidate directory.
+    ReadCheckpointDirectory {
+        /// Candidate or final checkpoint location.
+        location: FileDatabaseCreateLocation,
+    },
+    /// Opening a containing parent directory.
+    OpenParentDirectory {
+        /// Entry whose parent is required.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Synchronizing a containing parent directory.
+    SyncParentDirectory {
+        /// Entry whose parent is synchronized.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Renaming one candidate to its selected path.
+    RenameCandidate {
+        /// Child or manifest being published.
+        entry: FileDatabaseCreateEntry,
+    },
+}
+
+impl fmt::Display for FileDatabaseCreateIoStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ObserveEntry { entry } => write!(formatter, "observing {entry}"),
+            Self::CreateFile { entry } => write!(formatter, "creating {entry}"),
+            Self::OpenFile { entry } => write!(formatter, "opening {entry}"),
+            Self::AcquireExclusiveLock { entry } => {
+                write!(formatter, "acquiring the {entry} exclusive lock")
+            }
+            Self::ReadMetadata { entry } => write!(formatter, "reading {entry} metadata"),
+            Self::ReadHeader { entry } => write!(formatter, "reading the {entry} header"),
+            Self::WriteHeader { entry } => write!(formatter, "writing the {entry} header"),
+            Self::SyncObject { entry } => write!(formatter, "synchronizing {entry}"),
+            Self::ReadCheckpointDirectory { location } => {
+                write!(formatter, "reading the {location} checkpoint directory")
+            }
+            Self::OpenParentDirectory { entry } => {
+                write!(formatter, "opening the {entry} parent directory")
+            }
+            Self::SyncParentDirectory { entry } => {
+                write!(formatter, "synchronizing the {entry} parent directory")
+            }
+            Self::RenameCandidate { entry } => {
+                write!(formatter, "renaming the {entry} create candidate")
+            }
+        }
+    }
+}
+
+/// Stage-preserving coordinator I/O failure.
+#[derive(Debug)]
+pub struct FileDatabaseCreateIoError {
+    stage: FileDatabaseCreateIoStage,
+    source: io::Error,
+}
+
+impl FileDatabaseCreateIoError {
+    fn new(stage: FileDatabaseCreateIoStage, source: io::Error) -> Self {
+        Self { stage, source }
+    }
+
+    /// Returns the exact failed coordinator stage.
+    #[must_use]
+    pub const fn stage(&self) -> FileDatabaseCreateIoStage {
+        self.stage
+    }
+
+    /// Returns the retained operating-system cause.
+    #[must_use]
+    pub const fn io_source(&self) -> &io::Error {
+        &self.source
+    }
+}
+
+impl fmt::Display for FileDatabaseCreateIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.stage, self.source)
+    }
+}
+
+impl Error for FileDatabaseCreateIoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Failure to create or resume one exact database composition.
+#[derive(Debug)]
+pub enum FileDatabaseCreateError {
+    /// The requested page geometry is not representable.
+    PageWidth(FilePageWidthError),
+    /// The manifest is not an exact initial create manifest.
+    ManifestRequirement(FileDatabaseCreateManifestError),
+    /// A selected path cannot derive its fixed adjacent candidate.
+    CandidatePathUnavailable {
+        /// Selected entry without a terminal file name.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Two trusted selected, candidate, or auxiliary names are identical.
+    PathCollision {
+        /// Earlier name in protocol order.
+        first: FileDatabaseCreateEntry,
+        /// Later colliding name.
+        second: FileDatabaseCreateEntry,
+    },
+    /// One exact coordinator filesystem operation failed.
+    Io(FileDatabaseCreateIoError),
+    /// Another owner retains the stable database lock.
+    OwnershipContended {
+        /// Database whose stable owner was contended.
+        database_id: DatabaseId,
+        /// Original operating-system lock error.
+        source: io::Error,
+    },
+    /// The observed top-level namespace is not one legal prefix.
+    NamespaceConflict(FileDatabaseCreateNamespaceEvidence),
+    /// A protocol entry has an unsupported filesystem object type.
+    UnexpectedObjectType {
+        /// Entry with the unsupported type.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// An unselected WAL reclamation entry exists during initial create.
+    UnexpectedAuxiliaryEntry {
+        /// Exact auxiliary entry that exists.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Two locked protocol entries resolve to the same filesystem object.
+    OpenedObjectAlias {
+        /// Earlier entry in lock order.
+        first: FileDatabaseCreateEntry,
+        /// Later aliased entry.
+        second: FileDatabaseCreateEntry,
+    },
+    /// A selected path resolved to another object between preflight and locked open.
+    OpenedObjectChanged {
+        /// Entry whose opened object changed.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// The stable owner-control frame is not exact.
+    DatabaseOwnerControl(DatabaseOwnerControlDecodeError),
+    /// The stable owner belongs to another database.
+    DatabaseOwnerIdMismatch {
+        /// Manifest-requested database identity.
+        expected: DatabaseId,
+        /// Owner-control database identity.
+        actual: DatabaseId,
+    },
+    /// A candidate manifest file has a noncanonical length.
+    ManifestFileLength {
+        /// Candidate or final location.
+        location: FileDatabaseCreateLocation,
+        /// Exact observed byte length.
+        actual: u64,
+    },
+    /// A candidate manifest is structurally invalid.
+    Manifest(super::DatabaseManifestDecodeError),
+    /// A structurally valid candidate manifest differs from the request.
+    ManifestMismatch(Box<FileDatabaseCreateManifestMismatch>),
+    /// Creating a new WAL candidate failed.
+    WalCreate(FileCreateError),
+    /// Opening an existing candidate or final WAL failed.
+    WalOpen(FileOpenError),
+    /// Creating a new page-store candidate failed.
+    PageStoreCreate(PageStoreCreateError),
+    /// Opening an existing candidate or final page store failed.
+    PageStoreOpen(PageStoreOpenError),
+    /// Creating a new checkpoint candidate failed.
+    RestartCheckpointCreate(FileRestartCheckpointSlotCreateError),
+    /// Opening an existing candidate or final checkpoint failed.
+    RestartCheckpointOpen(FileRestartCheckpointSlotOpenError),
+    /// One parsed child contradicts the requested manifest.
+    ChildValidation(FileDatabaseOwnershipOpenError),
+    /// An existing child contains more than its exact initial header.
+    NonInitialChild {
+        /// Child role.
+        role: DatabaseFileRole,
+        /// Candidate or selected location.
+        location: FileDatabaseCreateLocation,
+    },
+    /// A checkpoint slot contains an entry other than its exact control.
+    UnexpectedCheckpointEntry {
+        /// Candidate or selected location.
+        location: FileDatabaseCreateLocation,
+        /// Exact unexpected entry name.
+        actual: OsString,
+    },
+    /// An exact published namespace failed ordinary successor-only open.
+    PublishedOpen(FileDatabaseOwnershipOpenError),
+    /// A deterministic fault fired at the requested boundary.
+    InjectedFault(FileDatabaseCreateFault),
+    /// The physical child set could not form one storage identity.
+    ObservedStorageIdentity(DatabaseCompositionIdentityError),
+    /// Domain manifest selection rejected the retained owner.
+    ManifestSelection(DatabaseManifestSelectionRejection),
+    /// Domain stable-storage binding rejected the retained observations.
+    StorageBinding(DatabaseCompositionIdentityMismatch),
+}
+
+/// Exact requested and observed manifests retained by a create mismatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileDatabaseCreateManifestMismatch {
+    expected: DatabaseManifest,
+    actual: DatabaseManifest,
+}
+
+impl FileDatabaseCreateManifestMismatch {
+    /// Returns the exact manifest requested by create.
+    #[must_use]
+    pub const fn expected(&self) -> DatabaseManifest {
+        self.expected
+    }
+
+    /// Returns the exact structurally valid manifest found in storage.
+    #[must_use]
+    pub const fn actual(&self) -> DatabaseManifest {
+        self.actual
+    }
+}
+
+impl FileDatabaseCreateError {
+    /// Returns whether the caller must use a fresh resolver attempt to decide the effect.
+    #[must_use]
+    pub const fn is_outcome_indeterminate(&self) -> bool {
+        match self {
+            Self::InjectedFault(fault) => fault.timing().is_outcome_indeterminate(),
+            Self::Io(_) | Self::OwnershipContended { .. } => true,
+            Self::WalCreate(source) => matches!(source, FileCreateError::Io(_)),
+            Self::WalOpen(source) => matches!(source, FileOpenError::Io(_)),
+            Self::PageStoreCreate(source) => matches!(source, PageStoreCreateError::Io(_)),
+            Self::PageStoreOpen(source) => matches!(source, PageStoreOpenError::Io(_)),
+            Self::RestartCheckpointCreate(source) => {
+                matches!(source, FileRestartCheckpointSlotCreateError::Io(_))
+            }
+            Self::RestartCheckpointOpen(source) => {
+                matches!(source, FileRestartCheckpointSlotOpenError::Io(_))
+            }
+            Self::ChildValidation(source) | Self::PublishedOpen(source) => {
+                ownership_open_is_outcome_indeterminate(source)
+            }
+            Self::PageWidth(_)
+            | Self::ManifestRequirement(_)
+            | Self::CandidatePathUnavailable { .. }
+            | Self::PathCollision { .. }
+            | Self::NamespaceConflict(_)
+            | Self::UnexpectedObjectType { .. }
+            | Self::UnexpectedAuxiliaryEntry { .. }
+            | Self::OpenedObjectAlias { .. }
+            | Self::OpenedObjectChanged { .. }
+            | Self::DatabaseOwnerControl(_)
+            | Self::DatabaseOwnerIdMismatch { .. }
+            | Self::ManifestFileLength { .. }
+            | Self::Manifest(_)
+            | Self::ManifestMismatch { .. }
+            | Self::NonInitialChild { .. }
+            | Self::UnexpectedCheckpointEntry { .. }
+            | Self::ObservedStorageIdentity(_)
+            | Self::ManifestSelection(_)
+            | Self::StorageBinding(_) => false,
+        }
+    }
+}
+
+const fn ownership_open_is_outcome_indeterminate(source: &FileDatabaseOwnershipOpenError) -> bool {
+    match source {
+        FileDatabaseOwnershipOpenError::Io(_) => true,
+        FileDatabaseOwnershipOpenError::WalOpen(source) => {
+            matches!(source, FileOpenError::Io(_))
+        }
+        FileDatabaseOwnershipOpenError::PageStoreOpen(source) => {
+            matches!(source, PageStoreOpenError::Io(_))
+        }
+        FileDatabaseOwnershipOpenError::RestartCheckpointOpen(source) => {
+            matches!(source, FileRestartCheckpointSlotOpenError::Io(_))
+        }
+        FileDatabaseOwnershipOpenError::PageWidth(_)
+        | FileDatabaseOwnershipOpenError::DatabaseOwnerControlFileLength { .. }
+        | FileDatabaseOwnershipOpenError::DatabaseOwnerControl(_)
+        | FileDatabaseOwnershipOpenError::DatabaseOwnerIdMismatch { .. }
+        | FileDatabaseOwnershipOpenError::OpenedObjectAlias { .. }
+        | FileDatabaseOwnershipOpenError::OpenedObjectChanged { .. }
+        | FileDatabaseOwnershipOpenError::WalReclamationCandidateCollision { .. }
+        | FileDatabaseOwnershipOpenError::ManifestFileLength { .. }
+        | FileDatabaseOwnershipOpenError::Manifest(_)
+        | FileDatabaseOwnershipOpenError::ManifestDatabaseIdMismatch { .. }
+        | FileDatabaseOwnershipOpenError::StorageFormatVersionMismatch { .. }
+        | FileDatabaseOwnershipOpenError::PersistentLogIdMismatch { .. }
+        | FileDatabaseOwnershipOpenError::ChildDatabaseIdMismatch { .. }
+        | FileDatabaseOwnershipOpenError::ChildFileRoleMismatch { .. }
+        | FileDatabaseOwnershipOpenError::ChildFileIdMismatch { .. }
+        | FileDatabaseOwnershipOpenError::StableStorageIdentityUnavailable { .. }
+        | FileDatabaseOwnershipOpenError::ObservedStorageIdentity(_)
+        | FileDatabaseOwnershipOpenError::StorageBinding(_)
+        | FileDatabaseOwnershipOpenError::ManifestSelection(_) => false,
+    }
+}
+
+impl fmt::Display for FileDatabaseCreateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PageWidth(source) => {
+                write!(formatter, "database page width is invalid: {source}")
+            }
+            Self::ManifestRequirement(source) => {
+                write!(formatter, "database create manifest is invalid: {source}")
+            }
+            Self::CandidatePathUnavailable { entry } => {
+                write!(formatter, "{entry} has no file name for a create candidate")
+            }
+            Self::PathCollision { first, second } => {
+                write!(
+                    formatter,
+                    "database create {second} path collides with {first}"
+                )
+            }
+            Self::Io(source) => source.fmt(formatter),
+            Self::OwnershipContended {
+                database_id,
+                source,
+            } => write!(
+                formatter,
+                "database {} is already owned: {source}",
+                database_id.get()
+            ),
+            Self::NamespaceConflict(evidence) => write!(
+                formatter,
+                "database create namespace does not match a legal prefix: {:#05x}",
+                evidence.present
+            ),
+            Self::UnexpectedObjectType { entry } => {
+                write!(
+                    formatter,
+                    "database create {entry} has an unsupported object type"
+                )
+            }
+            Self::UnexpectedAuxiliaryEntry { entry } => {
+                write!(formatter, "database create found unexpected {entry}")
+            }
+            Self::OpenedObjectAlias { first, second } => {
+                write!(formatter, "database create {second} aliases {first}")
+            }
+            Self::OpenedObjectChanged { entry } => {
+                write!(
+                    formatter,
+                    "database create {entry} changed before locked open"
+                )
+            }
+            Self::DatabaseOwnerControl(source) => {
+                write!(formatter, "database owner control is invalid: {source}")
+            }
+            Self::DatabaseOwnerIdMismatch { expected, actual } => write!(
+                formatter,
+                "database owner identity {} does not match create identity {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::ManifestFileLength { location, actual } => write!(
+                formatter,
+                "{location} manifest length {actual} is not {}",
+                super::DATABASE_MANIFEST_V1_LENGTH
+            ),
+            Self::Manifest(source) => write!(formatter, "manifest candidate is invalid: {source}"),
+            Self::ManifestMismatch(_) => {
+                formatter.write_str("manifest candidate does not match the requested manifest")
+            }
+            Self::WalCreate(source) => write!(formatter, "creating WAL candidate failed: {source}"),
+            Self::WalOpen(source) => write!(formatter, "opening create WAL failed: {source}"),
+            Self::PageStoreCreate(source) => {
+                write!(formatter, "creating page-store candidate failed: {source}")
+            }
+            Self::PageStoreOpen(source) => {
+                write!(formatter, "opening create page store failed: {source}")
+            }
+            Self::RestartCheckpointCreate(source) => {
+                write!(formatter, "creating checkpoint candidate failed: {source}")
+            }
+            Self::RestartCheckpointOpen(source) => {
+                write!(formatter, "opening create checkpoint failed: {source}")
+            }
+            Self::ChildValidation(source) => {
+                write!(formatter, "create child validation failed: {source}")
+            }
+            Self::NonInitialChild { role, location } => {
+                write!(formatter, "{location} {role} is not an exact initial child")
+            }
+            Self::UnexpectedCheckpointEntry { location, actual } => write!(
+                formatter,
+                "{location} checkpoint contains unexpected entry {actual:?}"
+            ),
+            Self::PublishedOpen(source) => {
+                write!(formatter, "opening the published database failed: {source}")
+            }
+            Self::InjectedFault(fault) => {
+                write!(formatter, "injected database create fault {fault}")
+            }
+            Self::ObservedStorageIdentity(source) => {
+                write!(formatter, "created storage identity is invalid: {source}")
+            }
+            Self::ManifestSelection(source) => {
+                write!(formatter, "created manifest selection failed: {source}")
+            }
+            Self::StorageBinding(source) => {
+                write!(formatter, "created storage binding failed: {source}")
+            }
+        }
+    }
+}
+
+impl Error for FileDatabaseCreateError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PageWidth(source) => Some(source),
+            Self::ManifestRequirement(source) => Some(source),
+            Self::Io(source) => Some(source),
+            Self::OwnershipContended { source, .. } => Some(source),
+            Self::DatabaseOwnerControl(source) => Some(source),
+            Self::Manifest(source) => Some(source),
+            Self::WalCreate(source) => Some(source),
+            Self::WalOpen(source) => Some(source),
+            Self::PageStoreCreate(source) => Some(source),
+            Self::PageStoreOpen(source) => Some(source),
+            Self::RestartCheckpointCreate(source) => Some(source),
+            Self::RestartCheckpointOpen(source) => Some(source),
+            Self::ChildValidation(source) => Some(source),
+            Self::PublishedOpen(source) => Some(source),
+            Self::ObservedStorageIdentity(source) => Some(source),
+            Self::ManifestSelection(source) => Some(source),
+            Self::StorageBinding(source) => Some(source),
+            Self::CandidatePathUnavailable { .. }
+            | Self::PathCollision { .. }
+            | Self::NamespaceConflict(_)
+            | Self::UnexpectedObjectType { .. }
+            | Self::UnexpectedAuxiliaryEntry { .. }
+            | Self::OpenedObjectAlias { .. }
+            | Self::OpenedObjectChanged { .. }
+            | Self::DatabaseOwnerIdMismatch { .. }
+            | Self::ManifestFileLength { .. }
+            | Self::ManifestMismatch(_)
+            | Self::NonInitialChild { .. }
+            | Self::UnexpectedCheckpointEntry { .. }
+            | Self::InjectedFault(_) => None,
+        }
+    }
+}
+
+/// Successful initial publication or exact already-published retry.
+#[must_use = "created database ownership must remain inside its lifecycle typestate"]
+pub enum FileDatabaseCreateOutcome<const N: usize> {
+    /// This invocation completed manifest-last publication.
+    Created(RecoveryRequiredFileDatabase<N>),
+    /// The exact composition was already manifest-selected before this invocation.
+    AlreadyPublished(RecoveryRequiredFileDatabase<N>),
+}
+
+impl<const N: usize> fmt::Debug for FileDatabaseCreateOutcome<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Created(database) => formatter
+                .debug_tuple("Created")
+                .field(&database.identity())
+                .finish(),
+            Self::AlreadyPublished(database) => formatter
+                .debug_tuple("AlreadyPublished")
+                .field(&database.identity())
+                .finish(),
+        }
+    }
+}
+
 /// Stable acquisition order labels for database-wide cooperative ownership.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum FileDatabaseLockRole {
@@ -339,6 +1172,21 @@ pub enum FileDatabaseOwnershipIoStage {
         /// Role of the opened file.
         role: FileDatabaseLockRole,
     },
+    /// Synchronizing one selected file before exposing ownership.
+    SyncFile {
+        /// Role of the selected file.
+        role: FileDatabaseLockRole,
+    },
+    /// Opening the selected file's parent directory.
+    OpenParentDirectory {
+        /// Role of the selected file.
+        role: FileDatabaseLockRole,
+    },
+    /// Synchronizing the selected file's parent directory.
+    SyncParentDirectory {
+        /// Role of the selected file.
+        role: FileDatabaseLockRole,
+    },
 }
 
 impl fmt::Display for FileDatabaseOwnershipIoStage {
@@ -356,6 +1204,15 @@ impl fmt::Display for FileDatabaseOwnershipIoStage {
             }
             Self::ReadHeader { role } => {
                 write!(formatter, "reading database {role} header")
+            }
+            Self::SyncFile { role } => {
+                write!(formatter, "synchronizing database {role} file")
+            }
+            Self::OpenParentDirectory { role } => {
+                write!(formatter, "opening database {role} parent directory")
+            }
+            Self::SyncParentDirectory { role } => {
+                write!(formatter, "synchronizing database {role} parent directory")
             }
         }
     }
@@ -1038,6 +1895,7 @@ fn acquire_file_database_ownership<const N: usize>(
     {
         return Err(FileDatabaseOwnershipOpenError::StableStorageIdentityUnavailable { role });
     }
+    sync_selected_manifest_publication(&manifest_file, layout.manifest())?;
 
     let log = pending_log
         .finish()
@@ -1103,6 +1961,41 @@ fn open_file(
         )
     })?;
     Ok((file, metadata))
+}
+
+fn sync_selected_manifest_publication(
+    manifest_file: &File,
+    manifest_path: &Path,
+) -> Result<(), FileDatabaseOwnershipIoError> {
+    let role = FileDatabaseLockRole::Manifest;
+    manifest_file.sync_all().map_err(|source| {
+        FileDatabaseOwnershipIoError::new(FileDatabaseOwnershipIoStage::SyncFile { role }, source)
+    })?;
+    let parent = match manifest_path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => {
+            return Err(FileDatabaseOwnershipIoError::new(
+                FileDatabaseOwnershipIoStage::OpenParentDirectory { role },
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "database manifest path has no parent directory",
+                ),
+            ));
+        }
+    };
+    let directory = File::open(parent).map_err(|source| {
+        FileDatabaseOwnershipIoError::new(
+            FileDatabaseOwnershipIoStage::OpenParentDirectory { role },
+            source,
+        )
+    })?;
+    directory.sync_all().map_err(|source| {
+        FileDatabaseOwnershipIoError::new(
+            FileDatabaseOwnershipIoStage::SyncParentDirectory { role },
+            source,
+        )
+    })
 }
 
 fn lock_file(file: &File, role: FileDatabaseLockRole) -> Result<(), FileDatabaseOwnershipIoError> {
@@ -1287,4 +2180,1530 @@ fn require_same_opened_object(
     let _ = (role, probed, locked);
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct FileDatabaseCreatePaths {
+    manifest_candidate: PathBuf,
+    wal_candidate: PathBuf,
+    page_store_candidate: PathBuf,
+    restart_checkpoint_candidate: PathBuf,
+    restart_checkpoint_control: PathBuf,
+    restart_checkpoint_candidate_control: PathBuf,
+    wal_reclamation_candidate: PathBuf,
+    wal_candidate_reclamation_candidate: PathBuf,
+}
+
+impl FileDatabaseCreatePaths {
+    fn derive(layout: &FileDatabaseLayout) -> Result<Self, FileDatabaseCreateError> {
+        let manifest_candidate =
+            create_candidate_path(layout.manifest(), FileDatabaseCreateEntry::Manifest)?;
+        let wal_candidate = create_candidate_path(layout.wal(), FileDatabaseCreateEntry::Wal)?;
+        let page_store_candidate =
+            create_candidate_path(layout.page_store(), FileDatabaseCreateEntry::PageStore)?;
+        let restart_checkpoint_candidate = create_candidate_path(
+            layout.restart_checkpoint(),
+            FileDatabaseCreateEntry::RestartCheckpoint,
+        )?;
+        let wal_reclamation_candidate = super::reclamation_candidate_path(layout.wal()).ok_or(
+            FileDatabaseCreateError::CandidatePathUnavailable {
+                entry: FileDatabaseCreateEntry::WalReclamationCandidate,
+            },
+        )?;
+        let wal_candidate_reclamation_candidate = super::reclamation_candidate_path(&wal_candidate)
+            .ok_or(FileDatabaseCreateError::CandidatePathUnavailable {
+                entry: FileDatabaseCreateEntry::WalCandidateReclamationCandidate,
+            })?;
+        let paths = Self {
+            restart_checkpoint_control: layout.restart_checkpoint().join(CONTROL_FILE_NAME),
+            restart_checkpoint_candidate_control: restart_checkpoint_candidate
+                .join(CONTROL_FILE_NAME),
+            manifest_candidate,
+            wal_candidate,
+            page_store_candidate,
+            restart_checkpoint_candidate,
+            wal_reclamation_candidate,
+            wal_candidate_reclamation_candidate,
+        };
+        paths.reject_lexical_collisions(layout)?;
+        Ok(paths)
+    }
+
+    fn reject_lexical_collisions(
+        &self,
+        layout: &FileDatabaseLayout,
+    ) -> Result<(), FileDatabaseCreateError> {
+        let paths = [
+            (
+                FileDatabaseCreateEntry::DatabaseOwner,
+                layout.database_owner(),
+            ),
+            (FileDatabaseCreateEntry::Manifest, layout.manifest()),
+            (
+                FileDatabaseCreateEntry::ManifestCandidate,
+                self.manifest_candidate.as_path(),
+            ),
+            (FileDatabaseCreateEntry::Wal, layout.wal()),
+            (
+                FileDatabaseCreateEntry::WalCandidate,
+                self.wal_candidate.as_path(),
+            ),
+            (FileDatabaseCreateEntry::PageStore, layout.page_store()),
+            (
+                FileDatabaseCreateEntry::PageStoreCandidate,
+                self.page_store_candidate.as_path(),
+            ),
+            (
+                FileDatabaseCreateEntry::RestartCheckpoint,
+                layout.restart_checkpoint(),
+            ),
+            (
+                FileDatabaseCreateEntry::RestartCheckpointCandidate,
+                self.restart_checkpoint_candidate.as_path(),
+            ),
+            (
+                FileDatabaseCreateEntry::RestartCheckpointControl,
+                self.restart_checkpoint_control.as_path(),
+            ),
+            (
+                FileDatabaseCreateEntry::RestartCheckpointCandidateControl,
+                self.restart_checkpoint_candidate_control.as_path(),
+            ),
+            (
+                FileDatabaseCreateEntry::WalReclamationCandidate,
+                self.wal_reclamation_candidate.as_path(),
+            ),
+            (
+                FileDatabaseCreateEntry::WalCandidateReclamationCandidate,
+                self.wal_candidate_reclamation_candidate.as_path(),
+            ),
+        ];
+        for (index, (second_entry, second_path)) in paths.iter().enumerate() {
+            for (first_entry, first_path) in &paths[..index] {
+                if first_path == second_path {
+                    return Err(FileDatabaseCreateError::PathCollision {
+                        first: *first_entry,
+                        second: *second_entry,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn create_candidate_path(
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+) -> Result<PathBuf, FileDatabaseCreateError> {
+    let file_name = path
+        .file_name()
+        .ok_or(FileDatabaseCreateError::CandidatePathUnavailable { entry })?;
+    let mut candidate_name = OsString::from(file_name);
+    candidate_name.push(".create-candidate");
+    Ok(path.with_file_name(candidate_name))
+}
+
+#[derive(Clone, Copy)]
+struct CreateNamespaceObservation {
+    evidence: FileDatabaseCreateNamespaceEvidence,
+}
+
+impl CreateNamespaceObservation {
+    fn observe(
+        layout: &FileDatabaseLayout,
+        paths: &FileDatabaseCreatePaths,
+    ) -> Result<Self, FileDatabaseCreateError> {
+        let entries = [
+            (
+                FileDatabaseCreateEntry::DatabaseOwner,
+                layout.database_owner(),
+            ),
+            (FileDatabaseCreateEntry::Manifest, layout.manifest()),
+            (
+                FileDatabaseCreateEntry::ManifestCandidate,
+                paths.manifest_candidate.as_path(),
+            ),
+            (FileDatabaseCreateEntry::Wal, layout.wal()),
+            (
+                FileDatabaseCreateEntry::WalCandidate,
+                paths.wal_candidate.as_path(),
+            ),
+            (FileDatabaseCreateEntry::PageStore, layout.page_store()),
+            (
+                FileDatabaseCreateEntry::PageStoreCandidate,
+                paths.page_store_candidate.as_path(),
+            ),
+            (
+                FileDatabaseCreateEntry::RestartCheckpoint,
+                layout.restart_checkpoint(),
+            ),
+            (
+                FileDatabaseCreateEntry::RestartCheckpointCandidate,
+                paths.restart_checkpoint_candidate.as_path(),
+            ),
+        ];
+        let mut present = 0_u16;
+        for (bit, (entry, path)) in entries.into_iter().enumerate() {
+            if create_entry_exists(path, entry)? {
+                present |= 1 << bit;
+            }
+        }
+        Ok(Self {
+            evidence: FileDatabaseCreateNamespaceEvidence { present },
+        })
+    }
+
+    const fn phase(self) -> Option<FileDatabaseCreatePhase> {
+        match self.evidence.present {
+            0b000_000_000 => Some(FileDatabaseCreatePhase::Absent),
+            0b000_000_001 => Some(FileDatabaseCreatePhase::Owner),
+            0b000_000_101 => Some(FileDatabaseCreatePhase::ManifestCandidate),
+            0b000_010_101 => Some(FileDatabaseCreatePhase::WalCandidate),
+            0b001_010_101 => Some(FileDatabaseCreatePhase::PageStoreCandidate),
+            0b101_010_101 => Some(FileDatabaseCreatePhase::RestartCheckpointCandidate),
+            0b101_001_101 => Some(FileDatabaseCreatePhase::WalPublished),
+            0b100_101_101 => Some(FileDatabaseCreatePhase::PageStorePublished),
+            0b010_101_101 => Some(FileDatabaseCreatePhase::ChildrenPublished),
+            0b010_101_011 => Some(FileDatabaseCreatePhase::Published),
+            _ => None,
+        }
+    }
+}
+
+fn create_entry_exists(
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+) -> Result<bool, FileDatabaseCreateError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ObserveEntry { entry },
+            source,
+        ))),
+    }
+}
+
+fn require_create_object_type(
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+    directory: bool,
+) -> Result<(), FileDatabaseCreateError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata { entry },
+            source,
+        ))
+    })?;
+    let expected = if directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    if !expected {
+        return Err(FileDatabaseCreateError::UnexpectedObjectType { entry });
+    }
+    Ok(())
+}
+
+fn validate_create_namespace_types(
+    observation: CreateNamespaceObservation,
+    layout: &FileDatabaseLayout,
+    paths: &FileDatabaseCreatePaths,
+) -> Result<(), FileDatabaseCreateError> {
+    for (entry, path, directory) in [
+        (
+            FileDatabaseCreateEntry::DatabaseOwner,
+            layout.database_owner(),
+            false,
+        ),
+        (FileDatabaseCreateEntry::Manifest, layout.manifest(), false),
+        (
+            FileDatabaseCreateEntry::ManifestCandidate,
+            paths.manifest_candidate.as_path(),
+            false,
+        ),
+        (FileDatabaseCreateEntry::Wal, layout.wal(), false),
+        (
+            FileDatabaseCreateEntry::WalCandidate,
+            paths.wal_candidate.as_path(),
+            false,
+        ),
+        (
+            FileDatabaseCreateEntry::PageStore,
+            layout.page_store(),
+            false,
+        ),
+        (
+            FileDatabaseCreateEntry::PageStoreCandidate,
+            paths.page_store_candidate.as_path(),
+            false,
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpoint,
+            layout.restart_checkpoint(),
+            true,
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpointCandidate,
+            paths.restart_checkpoint_candidate.as_path(),
+            true,
+        ),
+    ] {
+        if observation.evidence.contains(entry) {
+            require_create_object_type(path, entry, directory)?;
+        }
+    }
+    Ok(())
+}
+
+struct CreateFaultController {
+    armed: Option<FileDatabaseCreateFault>,
+}
+
+impl CreateFaultController {
+    const fn new(armed: Option<FileDatabaseCreateFault>) -> Self {
+        Self { armed }
+    }
+
+    fn before(
+        &mut self,
+        boundary: FileDatabaseCreateBoundary,
+    ) -> Result<(), FileDatabaseCreateError> {
+        if let Some(fault) = self.armed
+            && fault.boundary() == boundary
+            && matches!(
+                fault.timing(),
+                FileDatabaseCreateFaultTiming::BeforeEffect
+                    | FileDatabaseCreateFaultTiming::OutcomeIndeterminateBeforeEffect
+            )
+        {
+            self.armed = None;
+            return Err(FileDatabaseCreateError::InjectedFault(fault));
+        }
+        Ok(())
+    }
+
+    fn after(
+        &mut self,
+        boundary: FileDatabaseCreateBoundary,
+    ) -> Result<(), FileDatabaseCreateError> {
+        if let Some(fault) = self.armed
+            && fault.boundary() == boundary
+            && matches!(
+                fault.timing(),
+                FileDatabaseCreateFaultTiming::AfterEffect
+                    | FileDatabaseCreateFaultTiming::OutcomeIndeterminateAfterEffect
+            )
+        {
+            self.armed = None;
+            return Err(FileDatabaseCreateError::InjectedFault(fault));
+        }
+        Ok(())
+    }
+}
+
+/// Creates or resumes one exact successor-format database composition.
+///
+/// Candidate objects are written and synchronized before child-first,
+/// manifest-last publication. The returned owner retains all five protocol
+/// locks and has crossed only the recovery-required domain boundary.
+pub fn create_file_database<const N: usize>(
+    manifest: DatabaseManifest,
+    layout: FileDatabaseLayout,
+    fault: Option<FileDatabaseCreateFault>,
+) -> Result<FileDatabaseCreateOutcome<N>, FileDatabaseCreateError> {
+    validate_create_manifest(manifest)?;
+    PageLayout::for_const::<N>().map_err(FileDatabaseCreateError::PageWidth)?;
+    let paths = FileDatabaseCreatePaths::derive(&layout)?;
+    let mut fault = CreateFaultController::new(fault);
+
+    let initial = CreateNamespaceObservation::observe(&layout, &paths)?;
+    let initial_phase = initial
+        .phase()
+        .ok_or(FileDatabaseCreateError::NamespaceConflict(initial.evidence))?;
+    validate_create_namespace_types(initial, &layout, &paths)?;
+    require_absent_auxiliary_entries(&paths)?;
+
+    let (mut owner_file, owner_metadata) = match initial_phase {
+        FileDatabaseCreatePhase::Absent => {
+            fault.before(FileDatabaseCreateBoundary::OwnerPublication)?;
+            let created = create_locked_header(
+                layout.database_owner(),
+                FileDatabaseCreateEntry::DatabaseOwner,
+                &encode_database_owner_control(manifest.composition_identity().database_id()),
+                Some(manifest.composition_identity().database_id()),
+            )?;
+            fault.after(FileDatabaseCreateBoundary::OwnerPublication)?;
+            created
+        }
+        _ => open_locked_create_file(
+            layout.database_owner(),
+            FileDatabaseCreateEntry::DatabaseOwner,
+            Some(manifest.composition_identity().database_id()),
+        )?,
+    };
+    let owner_id = read_create_owner(&mut owner_file)?;
+    let expected_database_id = manifest.composition_identity().database_id();
+    if owner_id != expected_database_id {
+        return Err(FileDatabaseCreateError::DatabaseOwnerIdMismatch {
+            expected: expected_database_id,
+            actual: owner_id,
+        });
+    }
+    sync_create_file_and_parent(
+        &owner_file,
+        layout.database_owner(),
+        FileDatabaseCreateEntry::DatabaseOwner,
+    )?;
+
+    let locked_observation = CreateNamespaceObservation::observe(&layout, &paths)?;
+    let phase = locked_observation
+        .phase()
+        .ok_or(FileDatabaseCreateError::NamespaceConflict(
+            locked_observation.evidence,
+        ))?;
+    validate_create_namespace_types(locked_observation, &layout, &paths)?;
+    require_absent_auxiliary_entries(&paths)?;
+    if phase == FileDatabaseCreatePhase::Published {
+        return open_already_published(manifest, layout, owner_file, owner_metadata);
+    }
+    if phase == FileDatabaseCreatePhase::Absent {
+        return Err(FileDatabaseCreateError::NamespaceConflict(
+            locked_observation.evidence,
+        ));
+    }
+
+    let manifest_probe_metadata = if phase == FileDatabaseCreatePhase::Owner {
+        None
+    } else {
+        let metadata = preflight_create_metadata(
+            &paths.manifest_candidate,
+            FileDatabaseCreateEntry::ManifestCandidate,
+        )?;
+        reject_create_alias(
+            FileDatabaseCreateEntry::DatabaseOwner,
+            &owner_metadata,
+            FileDatabaseCreateEntry::ManifestCandidate,
+            &metadata,
+        )?;
+        Some(metadata)
+    };
+    let (mut manifest_file, manifest_metadata) = if phase == FileDatabaseCreatePhase::Owner {
+        fault.before(FileDatabaseCreateBoundary::ManifestCandidatePublication)?;
+        let created = create_locked_header(
+            &paths.manifest_candidate,
+            FileDatabaseCreateEntry::ManifestCandidate,
+            &super::encode_database_manifest(&manifest),
+            None,
+        )?;
+        fault.after(FileDatabaseCreateBoundary::ManifestCandidatePublication)?;
+        created
+    } else {
+        open_locked_create_file(
+            &paths.manifest_candidate,
+            FileDatabaseCreateEntry::ManifestCandidate,
+            None,
+        )?
+    };
+    if let Some(probed) = &manifest_probe_metadata {
+        require_same_create_object(
+            FileDatabaseCreateEntry::ManifestCandidate,
+            probed,
+            &manifest_metadata,
+        )?;
+    }
+    reject_create_alias(
+        FileDatabaseCreateEntry::DatabaseOwner,
+        &owner_metadata,
+        FileDatabaseCreateEntry::ManifestCandidate,
+        &manifest_metadata,
+    )?;
+    let observed_manifest =
+        read_create_manifest(&mut manifest_file, FileDatabaseCreateLocation::Candidate)?;
+    if observed_manifest != manifest {
+        return Err(FileDatabaseCreateError::ManifestMismatch(Box::new(
+            FileDatabaseCreateManifestMismatch {
+                expected: manifest,
+                actual: observed_manifest,
+            },
+        )));
+    }
+    sync_create_file_and_parent(
+        &manifest_file,
+        &paths.manifest_candidate,
+        FileDatabaseCreateEntry::ManifestCandidate,
+    )?;
+
+    let wal_location = if phase < FileDatabaseCreatePhase::WalPublished {
+        FileDatabaseCreateLocation::Candidate
+    } else {
+        FileDatabaseCreateLocation::Final
+    };
+    let wal_path = if wal_location == FileDatabaseCreateLocation::Candidate {
+        paths.wal_candidate.as_path()
+    } else {
+        layout.wal()
+    };
+    let wal_probe_metadata = if phase < FileDatabaseCreatePhase::WalCandidate {
+        None
+    } else {
+        let metadata = preflight_create_metadata(
+            wal_path,
+            create_child_entry(DatabaseFileRole::Wal, wal_location),
+        )?;
+        reject_create_alias_prefix(
+            create_child_entry(DatabaseFileRole::Wal, wal_location),
+            &metadata,
+            &[
+                (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+                (
+                    FileDatabaseCreateEntry::ManifestCandidate,
+                    &manifest_metadata,
+                ),
+            ],
+        )?;
+        Some(metadata)
+    };
+    let mut wal = if phase < FileDatabaseCreatePhase::WalCandidate {
+        fault.before(FileDatabaseCreateBoundary::WalCandidatePublication)?;
+        let created = FileCommitLog::<N>::create_new_database_transaction_page_capable(
+            &paths.wal_candidate,
+            manifest.composition_identity().storage_identity(),
+        )
+        .map_err(FileDatabaseCreateError::WalCreate)?;
+        fault.after(FileDatabaseCreateBoundary::WalCandidatePublication)?;
+        created
+    } else if let Some(probed) = &wal_probe_metadata {
+        open_exact_initial_create_wal(wal_path, manifest, wal_location, probed)?
+    } else {
+        return Err(FileDatabaseCreateError::NamespaceConflict(
+            locked_observation.evidence,
+        ));
+    };
+    validate_child_observation(
+        manifest,
+        ChildObservation {
+            role: DatabaseFileRole::Wal,
+            format_version: 5,
+            persistent_log_id: wal.persistent_id(),
+            database_file_identity: wal.database_file_identity(),
+        },
+    )
+    .map_err(FileDatabaseCreateError::ChildValidation)?;
+    let wal_metadata = wal.database_create_metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata {
+                entry: create_child_entry(DatabaseFileRole::Wal, wal_location),
+            },
+            source,
+        ))
+    })?;
+    if let Some(probed) = &wal_probe_metadata {
+        require_same_create_object(
+            create_child_entry(DatabaseFileRole::Wal, wal_location),
+            probed,
+            &wal_metadata,
+        )?;
+    }
+    reject_create_alias_prefix(
+        create_child_entry(DatabaseFileRole::Wal, wal_location),
+        &wal_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (
+                FileDatabaseCreateEntry::ManifestCandidate,
+                &manifest_metadata,
+            ),
+        ],
+    )?;
+
+    let page_location = if phase < FileDatabaseCreatePhase::PageStorePublished {
+        FileDatabaseCreateLocation::Candidate
+    } else {
+        FileDatabaseCreateLocation::Final
+    };
+    let page_store_path = if page_location == FileDatabaseCreateLocation::Candidate {
+        paths.page_store_candidate.as_path()
+    } else {
+        layout.page_store()
+    };
+    let page_probe_metadata = if phase < FileDatabaseCreatePhase::PageStoreCandidate {
+        None
+    } else {
+        let metadata = preflight_create_metadata(
+            page_store_path,
+            create_child_entry(DatabaseFileRole::PageStore, page_location),
+        )?;
+        reject_create_alias_prefix(
+            create_child_entry(DatabaseFileRole::PageStore, page_location),
+            &metadata,
+            &[
+                (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+                (
+                    FileDatabaseCreateEntry::ManifestCandidate,
+                    &manifest_metadata,
+                ),
+                (
+                    create_child_entry(DatabaseFileRole::Wal, wal_location),
+                    &wal_metadata,
+                ),
+            ],
+        )?;
+        Some(metadata)
+    };
+    let page_store = if phase < FileDatabaseCreatePhase::PageStoreCandidate {
+        fault.before(FileDatabaseCreateBoundary::PageStoreCandidatePublication)?;
+        let created = FilePageStore::<N>::create_new_database(
+            &paths.page_store_candidate,
+            manifest.composition_identity().storage_identity(),
+        )
+        .map_err(FileDatabaseCreateError::PageStoreCreate)?;
+        fault.after(FileDatabaseCreateBoundary::PageStoreCandidatePublication)?;
+        created
+    } else {
+        open_exact_initial_create_page_store(page_store_path, manifest, page_location)?
+    };
+    validate_child_observation(
+        manifest,
+        ChildObservation {
+            role: DatabaseFileRole::PageStore,
+            format_version: 2,
+            persistent_log_id: page_store.persistent_id(),
+            database_file_identity: page_store.database_file_identity(),
+        },
+    )
+    .map_err(FileDatabaseCreateError::ChildValidation)?;
+    let page_metadata = page_store.database_create_metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata {
+                entry: create_child_entry(DatabaseFileRole::PageStore, page_location),
+            },
+            source,
+        ))
+    })?;
+    if let Some(probed) = &page_probe_metadata {
+        require_same_create_object(
+            create_child_entry(DatabaseFileRole::PageStore, page_location),
+            probed,
+            &page_metadata,
+        )?;
+    }
+    reject_create_alias_prefix(
+        create_child_entry(DatabaseFileRole::PageStore, page_location),
+        &page_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (
+                FileDatabaseCreateEntry::ManifestCandidate,
+                &manifest_metadata,
+            ),
+            (
+                create_child_entry(DatabaseFileRole::Wal, wal_location),
+                &wal_metadata,
+            ),
+        ],
+    )?;
+
+    let checkpoint_location = if phase < FileDatabaseCreatePhase::ChildrenPublished {
+        FileDatabaseCreateLocation::Candidate
+    } else {
+        FileDatabaseCreateLocation::Final
+    };
+    let checkpoint_path = if checkpoint_location == FileDatabaseCreateLocation::Candidate {
+        paths.restart_checkpoint_candidate.as_path()
+    } else {
+        layout.restart_checkpoint()
+    };
+    let checkpoint_control_path = checkpoint_path.join(CONTROL_FILE_NAME);
+    let checkpoint_probe_metadata = if phase < FileDatabaseCreatePhase::RestartCheckpointCandidate {
+        None
+    } else {
+        let metadata = preflight_create_metadata(
+            &checkpoint_control_path,
+            create_child_entry(DatabaseFileRole::RestartCheckpoint, checkpoint_location),
+        )?;
+        reject_create_alias_prefix(
+            create_child_entry(DatabaseFileRole::RestartCheckpoint, checkpoint_location),
+            &metadata,
+            &[
+                (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+                (
+                    FileDatabaseCreateEntry::ManifestCandidate,
+                    &manifest_metadata,
+                ),
+                (
+                    create_child_entry(DatabaseFileRole::Wal, wal_location),
+                    &wal_metadata,
+                ),
+                (
+                    create_child_entry(DatabaseFileRole::PageStore, page_location),
+                    &page_metadata,
+                ),
+            ],
+        )?;
+        Some(metadata)
+    };
+    let mut checkpoint = if phase < FileDatabaseCreatePhase::RestartCheckpointCandidate {
+        fault.before(FileDatabaseCreateBoundary::RestartCheckpointCandidatePublication)?;
+        let created = FileRestartCheckpointCompletenessBaselineSource::create_new_database(
+            &paths.restart_checkpoint_candidate,
+            manifest.composition_identity().storage_identity(),
+        )
+        .map_err(FileDatabaseCreateError::RestartCheckpointCreate)?;
+        fault.after(FileDatabaseCreateBoundary::RestartCheckpointCandidatePublication)?;
+        created
+    } else {
+        FileRestartCheckpointCompletenessBaselineSource::open(checkpoint_path)
+            .map_err(FileDatabaseCreateError::RestartCheckpointOpen)?
+    };
+    validate_exact_initial_checkpoint(&checkpoint, checkpoint_location)?;
+    checkpoint.sync_for_database_create().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::SyncObject {
+                entry: create_child_entry(DatabaseFileRole::RestartCheckpoint, checkpoint_location),
+            },
+            source,
+        ))
+    })?;
+    validate_child_observation(
+        manifest,
+        ChildObservation {
+            role: DatabaseFileRole::RestartCheckpoint,
+            format_version: checkpoint.control_format_version(),
+            persistent_log_id: checkpoint.persistent_log_id(),
+            database_file_identity: checkpoint.database_file_identity(),
+        },
+    )
+    .map_err(FileDatabaseCreateError::ChildValidation)?;
+    let checkpoint_metadata = checkpoint.control_metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata {
+                entry: create_child_entry(DatabaseFileRole::RestartCheckpoint, checkpoint_location),
+            },
+            source,
+        ))
+    })?;
+    if let Some(probed) = &checkpoint_probe_metadata {
+        require_same_create_object(
+            create_child_entry(DatabaseFileRole::RestartCheckpoint, checkpoint_location),
+            probed,
+            &checkpoint_metadata,
+        )?;
+    }
+    reject_create_alias_prefix(
+        create_child_entry(DatabaseFileRole::RestartCheckpoint, checkpoint_location),
+        &checkpoint_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (
+                FileDatabaseCreateEntry::ManifestCandidate,
+                &manifest_metadata,
+            ),
+            (
+                create_child_entry(DatabaseFileRole::Wal, wal_location),
+                &wal_metadata,
+            ),
+            (
+                create_child_entry(DatabaseFileRole::PageStore, page_location),
+                &page_metadata,
+            ),
+        ],
+    )?;
+
+    if phase < FileDatabaseCreatePhase::WalPublished {
+        fault.before(FileDatabaseCreateBoundary::WalPublication)?;
+        publish_create_candidate(
+            &paths.wal_candidate,
+            layout.wal(),
+            FileDatabaseCreateEntry::Wal,
+        )?;
+        wal.rebind_database_selected_path(layout.wal());
+        fault.after(FileDatabaseCreateBoundary::WalPublication)?;
+    }
+    if phase < FileDatabaseCreatePhase::PageStorePublished {
+        fault.before(FileDatabaseCreateBoundary::PageStorePublication)?;
+        publish_create_candidate(
+            &paths.page_store_candidate,
+            layout.page_store(),
+            FileDatabaseCreateEntry::PageStore,
+        )?;
+        fault.after(FileDatabaseCreateBoundary::PageStorePublication)?;
+    }
+    if phase < FileDatabaseCreatePhase::ChildrenPublished {
+        fault.before(FileDatabaseCreateBoundary::RestartCheckpointPublication)?;
+        publish_create_candidate(
+            &paths.restart_checkpoint_candidate,
+            layout.restart_checkpoint(),
+            FileDatabaseCreateEntry::RestartCheckpoint,
+        )?;
+        checkpoint.rebind_database_selected_slot(layout.restart_checkpoint());
+        fault.after(FileDatabaseCreateBoundary::RestartCheckpointPublication)?;
+    }
+    fault.before(FileDatabaseCreateBoundary::ManifestPublication)?;
+    publish_create_candidate(
+        &paths.manifest_candidate,
+        layout.manifest(),
+        FileDatabaseCreateEntry::Manifest,
+    )?;
+    fault.after(FileDatabaseCreateBoundary::ManifestPublication)?;
+
+    let database = bind_created_file_database(
+        manifest,
+        layout,
+        owner_file,
+        manifest_file,
+        wal,
+        page_store,
+        checkpoint,
+    )?;
+    Ok(FileDatabaseCreateOutcome::Created(database))
+}
+
+fn validate_create_manifest(manifest: DatabaseManifest) -> Result<(), FileDatabaseCreateError> {
+    let generation = manifest.composition_identity().lifecycle_generation().get();
+    if generation != 1 {
+        return Err(FileDatabaseCreateError::ManifestRequirement(
+            FileDatabaseCreateManifestError::LifecycleGeneration { actual: generation },
+        ));
+    }
+    for (role, expected) in [
+        (DatabaseFileRole::Wal, 5_u16),
+        (DatabaseFileRole::PageStore, 2),
+        (DatabaseFileRole::RestartCheckpoint, 2),
+    ] {
+        let actual = manifest.storage_formats().version(role).get();
+        if actual != expected {
+            return Err(FileDatabaseCreateError::ManifestRequirement(
+                FileDatabaseCreateManifestError::StorageFormatVersion {
+                    role,
+                    expected,
+                    actual,
+                },
+            ));
+        }
+    }
+    let required_features = manifest.required_features().bits();
+    if required_features != 0 {
+        return Err(FileDatabaseCreateError::ManifestRequirement(
+            FileDatabaseCreateManifestError::RequiredFeatures {
+                actual: required_features,
+            },
+        ));
+    }
+    Ok(())
+}
+
+fn open_already_published<const N: usize>(
+    manifest: DatabaseManifest,
+    layout: FileDatabaseLayout,
+    owner_file: File,
+    owner_metadata: Metadata,
+) -> Result<FileDatabaseCreateOutcome<N>, FileDatabaseCreateError> {
+    let manifest_probe_metadata =
+        preflight_create_metadata(layout.manifest(), FileDatabaseCreateEntry::Manifest)?;
+    reject_create_alias(
+        FileDatabaseCreateEntry::DatabaseOwner,
+        &owner_metadata,
+        FileDatabaseCreateEntry::Manifest,
+        &manifest_probe_metadata,
+    )?;
+    let (mut manifest_file, manifest_metadata) =
+        open_locked_create_file(layout.manifest(), FileDatabaseCreateEntry::Manifest, None)?;
+    require_same_create_object(
+        FileDatabaseCreateEntry::Manifest,
+        &manifest_probe_metadata,
+        &manifest_metadata,
+    )?;
+    reject_create_alias(
+        FileDatabaseCreateEntry::DatabaseOwner,
+        &owner_metadata,
+        FileDatabaseCreateEntry::Manifest,
+        &manifest_metadata,
+    )?;
+    let observed_manifest =
+        read_create_manifest(&mut manifest_file, FileDatabaseCreateLocation::Final)?;
+    if observed_manifest != manifest {
+        return Err(FileDatabaseCreateError::ManifestMismatch(Box::new(
+            FileDatabaseCreateManifestMismatch {
+                expected: manifest,
+                actual: observed_manifest,
+            },
+        )));
+    }
+    let wal_probe_metadata = preflight_create_metadata(layout.wal(), FileDatabaseCreateEntry::Wal)?;
+    reject_create_alias_prefix(
+        FileDatabaseCreateEntry::Wal,
+        &wal_probe_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (FileDatabaseCreateEntry::Manifest, &manifest_metadata),
+        ],
+    )?;
+    let wal = open_exact_initial_create_wal(
+        layout.wal(),
+        manifest,
+        FileDatabaseCreateLocation::Final,
+        &wal_probe_metadata,
+    )?;
+    let wal_metadata = wal.database_create_metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata {
+                entry: FileDatabaseCreateEntry::Wal,
+            },
+            source,
+        ))
+    })?;
+    require_same_create_object(
+        FileDatabaseCreateEntry::Wal,
+        &wal_probe_metadata,
+        &wal_metadata,
+    )?;
+    reject_create_alias_prefix(
+        FileDatabaseCreateEntry::Wal,
+        &wal_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (FileDatabaseCreateEntry::Manifest, &manifest_metadata),
+        ],
+    )?;
+
+    let page_probe_metadata =
+        preflight_create_metadata(layout.page_store(), FileDatabaseCreateEntry::PageStore)?;
+    reject_create_alias_prefix(
+        FileDatabaseCreateEntry::PageStore,
+        &page_probe_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (FileDatabaseCreateEntry::Manifest, &manifest_metadata),
+            (FileDatabaseCreateEntry::Wal, &wal_metadata),
+        ],
+    )?;
+    let page_store = open_exact_initial_create_page_store(
+        layout.page_store(),
+        manifest,
+        FileDatabaseCreateLocation::Final,
+    )?;
+    let page_metadata = page_store.database_create_metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata {
+                entry: FileDatabaseCreateEntry::PageStore,
+            },
+            source,
+        ))
+    })?;
+    require_same_create_object(
+        FileDatabaseCreateEntry::PageStore,
+        &page_probe_metadata,
+        &page_metadata,
+    )?;
+    reject_create_alias_prefix(
+        FileDatabaseCreateEntry::PageStore,
+        &page_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (FileDatabaseCreateEntry::Manifest, &manifest_metadata),
+            (FileDatabaseCreateEntry::Wal, &wal_metadata),
+        ],
+    )?;
+
+    let checkpoint_control_path = layout.restart_checkpoint().join(CONTROL_FILE_NAME);
+    let checkpoint_probe_metadata = preflight_create_metadata(
+        &checkpoint_control_path,
+        FileDatabaseCreateEntry::RestartCheckpoint,
+    )?;
+    reject_create_alias_prefix(
+        FileDatabaseCreateEntry::RestartCheckpoint,
+        &checkpoint_probe_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (FileDatabaseCreateEntry::Manifest, &manifest_metadata),
+            (FileDatabaseCreateEntry::Wal, &wal_metadata),
+            (FileDatabaseCreateEntry::PageStore, &page_metadata),
+        ],
+    )?;
+    let checkpoint =
+        FileRestartCheckpointCompletenessBaselineSource::open(layout.restart_checkpoint())
+            .map_err(FileDatabaseCreateError::RestartCheckpointOpen)?;
+    validate_exact_initial_checkpoint(&checkpoint, FileDatabaseCreateLocation::Final)?;
+    checkpoint.sync_for_database_create().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::SyncObject {
+                entry: FileDatabaseCreateEntry::RestartCheckpoint,
+            },
+            source,
+        ))
+    })?;
+    validate_child_observation(
+        manifest,
+        ChildObservation {
+            role: DatabaseFileRole::RestartCheckpoint,
+            format_version: checkpoint.control_format_version(),
+            persistent_log_id: checkpoint.persistent_log_id(),
+            database_file_identity: checkpoint.database_file_identity(),
+        },
+    )
+    .map_err(FileDatabaseCreateError::ChildValidation)?;
+    let checkpoint_metadata = checkpoint.control_metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata {
+                entry: FileDatabaseCreateEntry::RestartCheckpoint,
+            },
+            source,
+        ))
+    })?;
+    require_same_create_object(
+        FileDatabaseCreateEntry::RestartCheckpoint,
+        &checkpoint_probe_metadata,
+        &checkpoint_metadata,
+    )?;
+    reject_create_alias_prefix(
+        FileDatabaseCreateEntry::RestartCheckpoint,
+        &checkpoint_metadata,
+        &[
+            (FileDatabaseCreateEntry::DatabaseOwner, &owner_metadata),
+            (FileDatabaseCreateEntry::Manifest, &manifest_metadata),
+            (FileDatabaseCreateEntry::Wal, &wal_metadata),
+            (FileDatabaseCreateEntry::PageStore, &page_metadata),
+        ],
+    )?;
+    sync_create_file_and_parent(
+        &manifest_file,
+        layout.manifest(),
+        FileDatabaseCreateEntry::Manifest,
+    )?;
+
+    let database = bind_created_file_database(
+        manifest,
+        layout,
+        owner_file,
+        manifest_file,
+        wal,
+        page_store,
+        checkpoint,
+    )?;
+    Ok(FileDatabaseCreateOutcome::AlreadyPublished(database))
+}
+
+fn create_locked_header(
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+    bytes: &[u8],
+    contended_database_id: Option<DatabaseId>,
+) -> Result<(File, Metadata), FileDatabaseCreateError> {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|source| {
+            FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+                FileDatabaseCreateIoStage::CreateFile { entry },
+                source,
+            ))
+        })?;
+    lock_create_file(&file, entry, contended_database_id)?;
+    file.write_all(bytes).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::WriteHeader { entry },
+            source,
+        ))
+    })?;
+    file.sync_all().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::SyncObject { entry },
+            source,
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata { entry },
+            source,
+        ))
+    })?;
+    sync_create_parent(path, entry)?;
+    Ok((file, metadata))
+}
+
+fn open_locked_create_file(
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+    contended_database_id: Option<DatabaseId>,
+) -> Result<(File, Metadata), FileDatabaseCreateError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|source| {
+            FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+                FileDatabaseCreateIoStage::OpenFile { entry },
+                source,
+            ))
+        })?;
+    lock_create_file(&file, entry, contended_database_id)?;
+    let metadata = file.metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata { entry },
+            source,
+        ))
+    })?;
+    Ok((file, metadata))
+}
+
+fn lock_create_file(
+    file: &File,
+    entry: FileDatabaseCreateEntry,
+    contended_database_id: Option<DatabaseId>,
+) -> Result<(), FileDatabaseCreateError> {
+    if let Err(source) = file.try_lock() {
+        let source: io::Error = source.into();
+        if let Some(database_id) = contended_database_id {
+            return Err(FileDatabaseCreateError::OwnershipContended {
+                database_id,
+                source,
+            });
+        }
+        return Err(FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::AcquireExclusiveLock { entry },
+            source,
+        )));
+    }
+    Ok(())
+}
+
+fn read_create_owner(file: &mut File) -> Result<DatabaseId, FileDatabaseCreateError> {
+    let actual = file.metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata {
+                entry: FileDatabaseCreateEntry::DatabaseOwner,
+            },
+            source,
+        ))
+    })?;
+    if actual.len() != DATABASE_OWNER_CONTROL_V1_LENGTH as u64 {
+        return Err(FileDatabaseCreateError::DatabaseOwnerControl(
+            if actual.len() < DATABASE_OWNER_CONTROL_V1_LENGTH as u64 {
+                DatabaseOwnerControlDecodeError::Truncated {
+                    actual: usize::try_from(actual.len()).map_or(usize::MAX, |length| length),
+                }
+            } else {
+                DatabaseOwnerControlDecodeError::TrailingBytes {
+                    actual: usize::try_from(actual.len()).map_or(usize::MAX, |length| length),
+                }
+            },
+        ));
+    }
+    let mut bytes = [0_u8; DATABASE_OWNER_CONTROL_V1_LENGTH];
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadHeader {
+                entry: FileDatabaseCreateEntry::DatabaseOwner,
+            },
+            source,
+        ))
+    })?;
+    file.read_exact(&mut bytes).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadHeader {
+                entry: FileDatabaseCreateEntry::DatabaseOwner,
+            },
+            source,
+        ))
+    })?;
+    decode_database_owner_control(&bytes).map_err(FileDatabaseCreateError::DatabaseOwnerControl)
+}
+
+fn read_create_manifest(
+    file: &mut File,
+    location: FileDatabaseCreateLocation,
+) -> Result<DatabaseManifest, FileDatabaseCreateError> {
+    let entry = match location {
+        FileDatabaseCreateLocation::Candidate => FileDatabaseCreateEntry::ManifestCandidate,
+        FileDatabaseCreateLocation::Final => FileDatabaseCreateEntry::Manifest,
+    };
+    let actual = file.metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata { entry },
+            source,
+        ))
+    })?;
+    if actual.len() != super::DATABASE_MANIFEST_V1_LENGTH as u64 {
+        return Err(FileDatabaseCreateError::ManifestFileLength {
+            location,
+            actual: actual.len(),
+        });
+    }
+    let mut bytes = [0_u8; super::DATABASE_MANIFEST_V1_LENGTH];
+    file.seek(SeekFrom::Start(0)).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadHeader { entry },
+            source,
+        ))
+    })?;
+    file.read_exact(&mut bytes).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadHeader { entry },
+            source,
+        ))
+    })?;
+    decode_database_manifest(&bytes).map_err(FileDatabaseCreateError::Manifest)
+}
+
+fn sync_create_file_and_parent(
+    file: &File,
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+) -> Result<(), FileDatabaseCreateError> {
+    file.sync_all().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::SyncObject { entry },
+            source,
+        ))
+    })?;
+    sync_create_parent(path, entry)
+}
+
+fn sync_create_parent(
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+) -> Result<(), FileDatabaseCreateError> {
+    let parent = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => {
+            return Err(FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+                FileDatabaseCreateIoStage::OpenParentDirectory { entry },
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "database create path has no parent directory",
+                ),
+            )));
+        }
+    };
+    let directory = File::open(parent).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::OpenParentDirectory { entry },
+            source,
+        ))
+    })?;
+    directory.sync_all().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::SyncParentDirectory { entry },
+            source,
+        ))
+    })
+}
+
+fn require_absent_auxiliary_entries(
+    paths: &FileDatabaseCreatePaths,
+) -> Result<(), FileDatabaseCreateError> {
+    for (entry, path) in [
+        (
+            FileDatabaseCreateEntry::WalReclamationCandidate,
+            paths.wal_reclamation_candidate.as_path(),
+        ),
+        (
+            FileDatabaseCreateEntry::WalCandidateReclamationCandidate,
+            paths.wal_candidate_reclamation_candidate.as_path(),
+        ),
+    ] {
+        if create_entry_exists(path, entry)? {
+            return Err(FileDatabaseCreateError::UnexpectedAuxiliaryEntry { entry });
+        }
+    }
+    Ok(())
+}
+
+fn open_exact_initial_create_wal<const N: usize>(
+    path: &Path,
+    manifest: DatabaseManifest,
+    location: FileDatabaseCreateLocation,
+    probed_metadata: &Metadata,
+) -> Result<FileCommitLog<N>, FileDatabaseCreateError> {
+    let pending = FileCommitLog::<N>::inspect_transaction_page_capable(path)
+        .map_err(FileDatabaseCreateError::WalOpen)?;
+    let entry = create_child_entry(DatabaseFileRole::Wal, location);
+    let locked_metadata = pending.metadata().map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata { entry },
+            source,
+        ))
+    })?;
+    require_same_create_object(entry, probed_metadata, &locked_metadata)?;
+    validate_child_observation(
+        manifest,
+        ChildObservation {
+            role: DatabaseFileRole::Wal,
+            format_version: pending.physical_format_version(),
+            persistent_log_id: pending.persistent_id(),
+            database_file_identity: pending.database_file_identity(),
+        },
+    )
+    .map_err(FileDatabaseCreateError::ChildValidation)?;
+    if !pending.is_exact_initial_database_file() {
+        return Err(FileDatabaseCreateError::NonInitialChild {
+            role: DatabaseFileRole::Wal,
+            location,
+        });
+    }
+    let wal = pending
+        .finish_for_database_create()
+        .map_err(FileDatabaseCreateError::WalOpen)?;
+    sync_create_parent(path, entry)?;
+    Ok(wal)
+}
+
+fn open_exact_initial_create_page_store<const N: usize>(
+    path: &Path,
+    manifest: DatabaseManifest,
+    location: FileDatabaseCreateLocation,
+) -> Result<FilePageStore<N>, FileDatabaseCreateError> {
+    let pending =
+        FilePageStore::<N>::inspect(path).map_err(FileDatabaseCreateError::PageStoreOpen)?;
+    validate_child_observation(
+        manifest,
+        ChildObservation {
+            role: DatabaseFileRole::PageStore,
+            format_version: pending.physical_format_version(),
+            persistent_log_id: pending.persistent_id(),
+            database_file_identity: pending.database_file_identity(),
+        },
+    )
+    .map_err(FileDatabaseCreateError::ChildValidation)?;
+    if !pending.is_exact_initial_database_file() {
+        return Err(FileDatabaseCreateError::NonInitialChild {
+            role: DatabaseFileRole::PageStore,
+            location,
+        });
+    }
+    let store = pending
+        .finish()
+        .map_err(FileDatabaseCreateError::PageStoreOpen)?;
+    sync_create_parent(
+        path,
+        create_child_entry(DatabaseFileRole::PageStore, location),
+    )?;
+    Ok(store)
+}
+
+fn validate_exact_initial_checkpoint(
+    checkpoint: &FileRestartCheckpointCompletenessBaselineSource,
+    location: FileDatabaseCreateLocation,
+) -> Result<(), FileDatabaseCreateError> {
+    let slot = checkpoint.slot_directory();
+    let control_path = slot.join(CONTROL_FILE_NAME);
+    require_create_object_type(
+        slot,
+        create_child_entry(DatabaseFileRole::RestartCheckpoint, location),
+        true,
+    )?;
+    require_create_object_type(
+        &control_path,
+        match location {
+            FileDatabaseCreateLocation::Candidate => {
+                FileDatabaseCreateEntry::RestartCheckpointCandidateControl
+            }
+            FileDatabaseCreateLocation::Final => FileDatabaseCreateEntry::RestartCheckpointControl,
+        },
+        false,
+    )?;
+    let entries = fs::read_dir(slot).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadCheckpointDirectory { location },
+            source,
+        ))
+    })?;
+    let mut control_seen = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+                FileDatabaseCreateIoStage::ReadCheckpointDirectory { location },
+                source,
+            ))
+        })?;
+        let name = entry.file_name();
+        if name == CONTROL_FILE_NAME {
+            if control_seen {
+                return Err(FileDatabaseCreateError::UnexpectedCheckpointEntry {
+                    location,
+                    actual: name,
+                });
+            }
+            control_seen = true;
+        } else {
+            return Err(FileDatabaseCreateError::UnexpectedCheckpointEntry {
+                location,
+                actual: name,
+            });
+        }
+    }
+    if !control_seen {
+        return Err(FileDatabaseCreateError::UnexpectedCheckpointEntry {
+            location,
+            actual: OsString::from("<missing control>"),
+        });
+    }
+    Ok(())
+}
+
+const fn create_child_entry(
+    role: DatabaseFileRole,
+    location: FileDatabaseCreateLocation,
+) -> FileDatabaseCreateEntry {
+    match (role, location) {
+        (DatabaseFileRole::Wal, FileDatabaseCreateLocation::Candidate) => {
+            FileDatabaseCreateEntry::WalCandidate
+        }
+        (DatabaseFileRole::Wal, FileDatabaseCreateLocation::Final) => FileDatabaseCreateEntry::Wal,
+        (DatabaseFileRole::PageStore, FileDatabaseCreateLocation::Candidate) => {
+            FileDatabaseCreateEntry::PageStoreCandidate
+        }
+        (DatabaseFileRole::PageStore, FileDatabaseCreateLocation::Final) => {
+            FileDatabaseCreateEntry::PageStore
+        }
+        (DatabaseFileRole::RestartCheckpoint, FileDatabaseCreateLocation::Candidate) => {
+            FileDatabaseCreateEntry::RestartCheckpointCandidate
+        }
+        (DatabaseFileRole::RestartCheckpoint, FileDatabaseCreateLocation::Final) => {
+            FileDatabaseCreateEntry::RestartCheckpoint
+        }
+    }
+}
+
+fn reject_create_alias(
+    first: FileDatabaseCreateEntry,
+    first_metadata: &Metadata,
+    second: FileDatabaseCreateEntry,
+    second_metadata: &Metadata,
+) -> Result<(), FileDatabaseCreateError> {
+    if metadata_identifies_same_file(first_metadata, second_metadata) {
+        return Err(FileDatabaseCreateError::OpenedObjectAlias { first, second });
+    }
+    Ok(())
+}
+
+fn reject_create_alias_prefix(
+    second: FileDatabaseCreateEntry,
+    second_metadata: &Metadata,
+    prefix: &[(FileDatabaseCreateEntry, &Metadata)],
+) -> Result<(), FileDatabaseCreateError> {
+    for (first, first_metadata) in prefix {
+        reject_create_alias(*first, first_metadata, second, second_metadata)?;
+    }
+    Ok(())
+}
+
+fn preflight_create_metadata(
+    path: &Path,
+    entry: FileDatabaseCreateEntry,
+) -> Result<Metadata, FileDatabaseCreateError> {
+    fs::metadata(path).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::ReadMetadata { entry },
+            source,
+        ))
+    })
+}
+
+fn require_same_create_object(
+    entry: FileDatabaseCreateEntry,
+    probed: &Metadata,
+    locked: &Metadata,
+) -> Result<(), FileDatabaseCreateError> {
+    #[cfg(unix)]
+    if !metadata_identifies_same_file(probed, locked) {
+        return Err(FileDatabaseCreateError::OpenedObjectChanged { entry });
+    }
+
+    #[cfg(not(unix))]
+    let _ = (entry, probed, locked);
+
+    Ok(())
+}
+
+fn publish_create_candidate(
+    candidate: &Path,
+    selected: &Path,
+    entry: FileDatabaseCreateEntry,
+) -> Result<(), FileDatabaseCreateError> {
+    if create_entry_exists(selected, entry)? {
+        return Err(FileDatabaseCreateError::NamespaceConflict(
+            FileDatabaseCreateNamespaceEvidence { present: 0 },
+        ));
+    }
+    fs::rename(candidate, selected).map_err(|source| {
+        FileDatabaseCreateError::Io(FileDatabaseCreateIoError::new(
+            FileDatabaseCreateIoStage::RenameCandidate { entry },
+            source,
+        ))
+    })?;
+    sync_create_parent(selected, entry)
+}
+
+fn bind_created_file_database<const N: usize>(
+    manifest: DatabaseManifest,
+    layout: FileDatabaseLayout,
+    database_owner_file: File,
+    manifest_file: File,
+    wal: FileCommitLog<N>,
+    page_store: FilePageStore<N>,
+    checkpoint: FileRestartCheckpointCompletenessBaselineSource,
+) -> Result<RecoveryRequiredFileDatabase<N>, FileDatabaseCreateError> {
+    let wal_identity =
+        wal.database_file_identity()
+            .ok_or(FileDatabaseCreateError::NonInitialChild {
+                role: DatabaseFileRole::Wal,
+                location: FileDatabaseCreateLocation::Final,
+            })?;
+    let page_identity =
+        page_store
+            .database_file_identity()
+            .ok_or(FileDatabaseCreateError::NonInitialChild {
+                role: DatabaseFileRole::PageStore,
+                location: FileDatabaseCreateLocation::Final,
+            })?;
+    let checkpoint_identity =
+        checkpoint
+            .database_file_identity()
+            .ok_or(FileDatabaseCreateError::NonInitialChild {
+                role: DatabaseFileRole::RestartCheckpoint,
+                location: FileDatabaseCreateLocation::Final,
+            })?;
+    let observed_files = [
+        wal_identity.file(),
+        page_identity.file(),
+        checkpoint_identity.file(),
+    ];
+    let observed_storage_identity = DatabaseStorageIdentity::new(
+        wal_identity.database_id(),
+        wal.persistent_id(),
+        &observed_files,
+    )
+    .map_err(FileDatabaseCreateError::ObservedStorageIdentity)?;
+    let composition =
+        UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint::from_locked_parts(
+            wal, page_store, checkpoint,
+        );
+    let selected_identity = manifest.composition_identity();
+    let owner = FileDatabaseOwnership {
+        composition,
+        _manifest_file: manifest_file,
+        _database_owner_file: database_owner_file,
+        manifest,
+        layout,
+    };
+    let selected = match UnboundDatabase::new(owner, selected_identity.database_id())
+        .select_manifest(selected_identity)
+    {
+        Ok(selected) => selected,
+        Err(failure) => {
+            let reason = *failure.reason();
+            drop(failure);
+            return Err(FileDatabaseCreateError::ManifestSelection(reason));
+        }
+    };
+    selected
+        .bind_observed_storage(observed_storage_identity)
+        .map_err(|failure| FileDatabaseCreateError::StorageBinding(*failure.reason()))
 }

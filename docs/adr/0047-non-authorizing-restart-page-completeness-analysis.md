@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #146
 - Extends: ADR 0032, ADR 0034, ADR 0037, ADR 0046
-- Extended by: ADR 0048, ADR 0050, ADR 0054
+- Extended by: ADR 0048, ADR 0050, ADR 0054, ADR 0055
 
 ## Context
 
@@ -302,7 +302,8 @@ ntsql can now derive one coherent, deterministic transaction table, WAL-backed
 page-completeness table, and exact replay lower bound from a single stable
 durable-prefix window without granting write or recovery authority.
 
-The result is intentionally transient. The next checkpoint slice must define a
-versioned codec and publication contract for these additional fields before
-startup can consume them, and a later reviewed recovery boundary must still
-execute replay and establish any WAL-retention or reclamation authority.
+The result is intentionally non-authorizing. ADR 0055 later reuses its required
+image and physical-order rules to prepare private selected-replay repair
+decisions, but still performs no write. A separately reviewed recovery boundary
+must execute repair or replay and establish any WAL-retention or reclamation
+authority.

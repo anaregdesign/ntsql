@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #161
 - Extends: ADR 0034, ADR 0037, ADR 0047, ADR 0048, ADR 0050, ADR 0053
+- Extended by: ADR 0055
 - Follows: #159
 
 ## Context
@@ -107,8 +108,9 @@ The two validations intentionally have different scopes:
 
 A valid suffix cannot change selected-prefix equality merely by existing. A
 malformed suffix must still reject planning through the exact ADR 0034 evidence
-cause. Suffix pages are not reconciled with the store in this decision; that is a
-future replay/repair responsibility.
+cause. Suffix pages are not reconciled with the store in this decision. ADR 0055 adds
+the separately reviewed read-only reconciliation and repair-preparation
+transition.
 
 Revalidation may succeed during ADR 0053 selection and differ during planning
 only if the generic source or store changes between callbacks despite remaining
@@ -351,7 +353,7 @@ This ADR does not:
 - mutate the page store, WAL, checkpoint slot, or selected baseline during
   planning;
 - restore transaction coordinator or runtime transaction state;
-- define the consuming repair successor or final live-owner construction;
+- execute the ADR 0055 prepared repairs or construct the final live owner;
 - add replay streaming, spilling, indexing, batching, or a memory limit;
 - enumerate or reconcile store-only pages or suffix page snapshots;
 - add checkpoint invalidation, quarantine, republish, generations, or fallback
@@ -369,6 +371,7 @@ startup adapter. A malformed suffix is no longer hidden by valid checkpoint
 selection, and later work can consume exact full-image evidence without
 reprojecting the WAL.
 
-The plan remains private and non-authorizing. Separately reviewed work is still
-required to repair checkpoint-classified pages, restore transaction runtime
+The plan remains private and non-authorizing. ADR 0055 consumes it into exact
+read-only page-repair decisions without reprojecting the WAL. Separately reviewed
+work is still required to execute those repairs, restore transaction runtime
 state, establish a live storage owner, choose retention, and reclaim WAL.

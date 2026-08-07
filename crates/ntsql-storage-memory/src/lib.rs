@@ -2871,7 +2871,8 @@ mod tests {
         DurableTransactionRestartRequiredPageImage, DurableTransactionRestartState,
         OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
         RestartAnalyzedTransactionPageStorage, TransactionCoordinator, TransactionLifecycleStatus,
-        TransactionPageStorageRestartCheckpointCompletenessSelection, TransactionResolutionFailure,
+        TransactionPageStorageRestartCheckpointCompletenessSelection,
+        TransactionPageStorageRestartCheckpointRepairPreparation, TransactionResolutionFailure,
         UnrecoveredTransactionPageStorage, flush_committed_page,
         recover_committed_transaction_pages,
     };
@@ -5220,7 +5221,25 @@ mod tests {
         assert_eq!(planned.replay_record_count(), 3);
         assert_eq!(planned.current_transaction_count(), 3);
 
-        let analyzed = planned.decline_replay_plan().recover()?.analyze_restart()?;
+        let preparation = planned.prepare_page_repairs();
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            preparation
+        else {
+            return Err(io::Error::other("memory replay page repair preparation failed").into());
+        };
+        assert_eq!(prepared.persistent_log_id(), persistent_log_id);
+        assert_eq!(prepared.checkpoint_frontier(), Some(checkpoint_frontier));
+        assert_eq!(prepared.current_frontier(), Some(current_frontier.get()));
+        assert_eq!(prepared.page_count(), 2);
+        assert_eq!(prepared.no_required_image_count(), 1);
+        assert_eq!(prepared.unchanged_checkpoint_current_count(), 0);
+        assert_eq!(prepared.already_current_count(), 0);
+        assert_eq!(prepared.repair_candidate_count(), 1);
+
+        let analyzed = prepared
+            .decline_page_repairs()
+            .recover()?
+            .analyze_restart()?;
         assert!(analyzed.recovery_report().pages().iter().any(|page| {
             matches!(
                 page,

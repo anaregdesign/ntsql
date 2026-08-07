@@ -5601,6 +5601,85 @@ mod tests {
             Some(2)
         );
         assert_eq!(summary.indeterminate_allocation_attempt_count(), 0);
+
+        let mut completed = restored.complete_restart()?;
+        assert_eq!(
+            completed.completion_evidence().checkpoint_frontier(),
+            Some(checkpoint_frontier)
+        );
+        assert_eq!(
+            completed.completion_evidence().current_frontier(),
+            Some(current_frontier.get())
+        );
+        assert_eq!(
+            completed
+                .completion_evidence()
+                .transaction_summary()
+                .coordinator_epoch()
+                .get(),
+            3
+        );
+        assert_eq!(completed.completion_evidence().page_outcomes().len(), 2);
+
+        let live_page_number =
+            PageNumber::new(223).ok_or_else(|| io::Error::other("live page number is zero"))?;
+        {
+            let (coordinator, log, store) = completed.parts_mut();
+            let live_page = UnloggedPage::new(
+                PageAddress::new(LogDurability::lineage(log), live_page_number),
+                PageVersion::new(1),
+                PageImage::new([0x23])?,
+            );
+            let live = coordinator.begin()?;
+            assert_eq!(live.transaction_id().epoch().get(), 3);
+            assert_eq!(live.transaction_id().sequence(), 1);
+            let (live, live_dirty) = coordinator.stage_page_write(live, live_page, log)?;
+            let live = coordinator.commit(live, log)?;
+            flush_committed_page(&live, log, store, live_dirty)?;
+        }
+        assert_eq!(
+            completed.completion_evidence().current_frontier(),
+            Some(current_frontier.get())
+        );
+        assert_eq!(completed.completion_evidence().page_outcomes().len(), 2);
+        assert_eq!(
+            completed
+                .parts()
+                .2
+                .page(live_page_number)
+                .ok_or_else(|| io::Error::other("live page was not flushed"))?
+                .bytes(),
+            &[0x23]
+        );
+
+        let publication =
+            completed.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let published_frontier = publication
+            .durable_frontier()
+            .ok_or_else(|| io::Error::other("published completion frontier is empty"))?;
+        assert!(published_frontier > current_frontier.get());
+        assert_eq!(publication.transaction_count(), 4);
+        assert_eq!(publication.page_count(), 4);
+
+        let (coordinator, log, store, completion_evidence, checkpoint) = completed.into_parts();
+        assert_eq!(
+            completion_evidence.current_frontier(),
+            Some(current_frontier.get())
+        );
+        drop(coordinator);
+
+        let restarted = UnrecoveredTransactionPageStorage::new(log.restart(), store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(restarted) =
+            restarted
+        else {
+            return Err(io::Error::other(
+                "published memory completion checkpoint was not selected after restart",
+            )
+            .into());
+        };
+        assert_eq!(restarted.durable_frontier(), Some(published_frontier));
+
         Ok(())
     }
 

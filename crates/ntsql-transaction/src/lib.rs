@@ -34,6 +34,83 @@ pub trait TransactionEpochSource {
     fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error>;
 }
 
+/// Persistence-owned epoch allocation used only while completing restart.
+///
+/// The source must return an epoch strictly greater than
+/// `persisted_epoch_high_water` in the same lineage, or one explicit deterministic
+/// rejection. A source error may occur after the allocation became durable, so
+/// callers must retain ownership and treat that result as indeterminate.
+pub trait TransactionRestartCoordinatorEpochSource {
+    /// Source-specific failure whose physical allocation outcome may be unknown.
+    type Error;
+
+    /// Allocates one fresh coordinator epoch above every retained persisted epoch.
+    fn allocate_restart_transaction_epoch(
+        &mut self,
+        persisted_epoch_high_water: Option<NonZeroU64>,
+    ) -> Result<
+        (NonZeroU64, LogLineage),
+        TransactionRestartCoordinatorEpochAllocationError<Self::Error>,
+    >;
+}
+
+/// Result-shape failure from restart-only coordinator epoch allocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionRestartCoordinatorEpochAllocationError<SourceError> {
+    /// The source failed and may already have consumed or persisted an epoch.
+    Source(SourceError),
+    /// No epoch remains strictly above the retained persisted high-water mark.
+    IdentitySpaceExhausted {
+        /// Highest persisted epoch, absent only for an empty transaction table.
+        persisted_epoch_high_water: Option<u64>,
+    },
+    /// The source's next epoch did not advance beyond retained durable evidence.
+    PersistedEpochHighWaterNotAdvanced {
+        /// Highest epoch represented by the selected or complete-current evidence.
+        persisted_epoch_high_water: u64,
+        /// Stale next epoch reported by the source.
+        next_epoch: u64,
+    },
+}
+
+impl<SourceError> fmt::Display for TransactionRestartCoordinatorEpochAllocationError<SourceError>
+where
+    SourceError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(source) => write!(formatter, "restart epoch allocation failed: {source}"),
+            Self::IdentitySpaceExhausted {
+                persisted_epoch_high_water,
+            } => write!(
+                formatter,
+                "transaction epoch space is exhausted above persisted high-water {:?}",
+                persisted_epoch_high_water
+            ),
+            Self::PersistedEpochHighWaterNotAdvanced {
+                persisted_epoch_high_water,
+                next_epoch,
+            } => write!(
+                formatter,
+                "next transaction epoch {next_epoch} does not advance beyond persisted high-water {persisted_epoch_high_water}"
+            ),
+        }
+    }
+}
+
+impl<SourceError> Error for TransactionRestartCoordinatorEpochAllocationError<SourceError>
+where
+    SourceError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Source(source) => Some(source),
+            Self::IdentitySpaceExhausted { .. }
+            | Self::PersistedEpochHighWaterNotAdvanced { .. } => None,
+        }
+    }
+}
+
 /// Authoritative lookup of one transaction identity in a durable log view.
 ///
 /// Implementations must return [`DurableCommitLookup::Absent`] only after
@@ -5641,6 +5718,823 @@ impl<Source, Store, CheckpointSource, const N: usize>
     #[must_use]
     pub fn page_outcomes(&self) -> &[TransactionRestartCheckpointPageRepairOutcome] {
         &self.page_outcomes
+    }
+}
+
+/// Inert summary of the transaction state retained by one restored restart owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct TransactionRestartRestorationSummary {
+    transaction_count: usize,
+    committed_count: usize,
+    unresolved_count: usize,
+    highest_persisted_transaction: Option<DurableTransactionIdentityObservation>,
+    coordinator_epoch: TransactionEpoch,
+    indeterminate_allocation_attempt_count: usize,
+}
+
+impl TransactionRestartRestorationSummary {
+    /// Returns the number of exact complete-current transaction entries retained.
+    #[must_use]
+    pub const fn transaction_count(self) -> usize {
+        self.transaction_count
+    }
+
+    /// Returns the number of entries with one exact durable commit position.
+    #[must_use]
+    pub const fn committed_count(self) -> usize {
+        self.committed_count
+    }
+
+    /// Returns the number of unresolved entries retained for later reviewed work.
+    #[must_use]
+    pub const fn unresolved_count(self) -> usize {
+        self.unresolved_count
+    }
+
+    /// Returns the greatest persisted identity represented by retained evidence.
+    #[must_use]
+    pub const fn highest_persisted_transaction(
+        self,
+    ) -> Option<DurableTransactionIdentityObservation> {
+        self.highest_persisted_transaction
+    }
+
+    /// Returns the fresh private coordinator epoch allocated above retained evidence.
+    #[must_use]
+    pub const fn coordinator_epoch(self) -> TransactionEpoch {
+        self.coordinator_epoch
+    }
+
+    /// Returns earlier allocation calls whose physical result remained unknown.
+    #[must_use]
+    pub const fn indeterminate_allocation_attempt_count(self) -> usize {
+        self.indeterminate_allocation_attempt_count
+    }
+}
+
+/// Contradictory selected-checkpoint and complete-current transaction evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TransactionRestartRestorationEvidenceError {
+    /// The complete-current analysis no longer has a persistent lineage identity.
+    CurrentPersistentLineageRequired,
+    /// Selected and complete-current evidence name different persistent lineages.
+    PersistentLineageMismatch {
+        /// Persistent identity retained by the selected checkpoint.
+        selected: PersistentLogId,
+        /// Persistent identity retained by complete-current analysis.
+        current: PersistentLogId,
+    },
+    /// A nonempty selected frontier has no complete-current durable frontier.
+    CurrentFrontierMissing {
+        /// Selected checkpoint frontier.
+        selected_frontier: u64,
+    },
+    /// The selected checkpoint frontier is after the complete-current frontier.
+    SelectedFrontierAfterCurrent {
+        /// Selected checkpoint frontier.
+        selected_frontier: u64,
+        /// Complete-current frontier.
+        current_frontier: u64,
+    },
+    /// An empty selected prefix retained an impossible transaction entry.
+    TransactionInEmptySelectedPrefix {
+        /// Unexpected selected transaction.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// A selected transaction is absent from complete-current analysis.
+    SelectedTransactionMissing {
+        /// Missing transaction.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// A complete-current transaction begins inside the selected prefix but is absent there.
+    CurrentTransactionMissingFromSelectedPrefix {
+        /// Missing selected-prefix transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// First complete-current position for that identity.
+        first_position: u64,
+    },
+    /// A selected transaction's first owned-page position changed.
+    FirstOwnedPagePositionMismatch {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Selected first owned-page position.
+        selected: Option<u64>,
+        /// Complete-current first owned-page position.
+        current: Option<u64>,
+    },
+    /// An unresolved selected transaction's aggregate page evidence is not a suffix extension.
+    SelectedUnresolvedOwnedPageEvidenceContradiction {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Selected checkpoint frontier.
+        selected_frontier: u64,
+        /// Selected last owned-page position.
+        selected_last_position: Option<u64>,
+        /// Complete-current last owned-page position.
+        current_last_position: Option<u64>,
+        /// Selected durable owned-page count.
+        selected_record_count: u64,
+        /// Complete-current durable owned-page count.
+        current_record_count: u64,
+    },
+    /// An unresolved selected transaction lost durable owned-page records.
+    OwnedPageRecordCountRegressed {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Selected durable owned-page count.
+        selected: u64,
+        /// Complete-current durable owned-page count.
+        current: u64,
+    },
+    /// A terminal selected committed entry changed in the complete-current table.
+    SelectedCommittedTransactionChanged {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Selected commit position.
+        selected_commit_position: u64,
+        /// Complete-current commit position, absent when it became unresolved.
+        current_commit_position: Option<u64>,
+    },
+    /// A selected unresolved entry was already committed inside its selected prefix.
+    SelectedUnresolvedTransactionCommittedInsidePrefix {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Selected checkpoint frontier.
+        selected_frontier: u64,
+        /// Complete-current commit position at or before that frontier.
+        commit_position: u64,
+    },
+    /// One selected transaction field lies beyond the selected frontier.
+    SelectedTransactionPositionAfterFrontier {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Selected checkpoint frontier.
+        selected_frontier: u64,
+        /// Out-of-range selected position.
+        position: u64,
+    },
+    /// A complete-current entry has no page or commit position.
+    CurrentTransactionHasNoRecordPosition {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// A platform-width page count cannot be represented in checkpoint-width evidence.
+    CurrentOwnedPageCountWidthExceeded {
+        /// Contradictory transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Complete-current platform-width count.
+        record_count: usize,
+    },
+    /// Restoration summary counters cannot represent another retained entry.
+    SummaryCountExhausted,
+}
+
+impl fmt::Display for TransactionRestartRestorationEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CurrentPersistentLineageRequired => formatter
+                .write_str("complete-current transaction evidence requires persistent lineage"),
+            Self::PersistentLineageMismatch { .. } => {
+                formatter.write_str("selected and complete-current transaction lineages differ")
+            }
+            Self::CurrentFrontierMissing { selected_frontier } => write!(
+                formatter,
+                "selected transaction frontier {selected_frontier} has no complete-current frontier"
+            ),
+            Self::SelectedFrontierAfterCurrent {
+                selected_frontier,
+                current_frontier,
+            } => write!(
+                formatter,
+                "selected transaction frontier {selected_frontier} is after complete-current frontier {current_frontier}"
+            ),
+            Self::TransactionInEmptySelectedPrefix { transaction } => write!(
+                formatter,
+                "empty selected transaction prefix contains {transaction}"
+            ),
+            Self::SelectedTransactionMissing { transaction } => write!(
+                formatter,
+                "selected transaction {transaction} is absent from complete-current evidence"
+            ),
+            Self::CurrentTransactionMissingFromSelectedPrefix {
+                transaction,
+                first_position,
+            } => write!(
+                formatter,
+                "complete-current transaction {transaction} begins at {first_position} inside the selected prefix but is absent there"
+            ),
+            Self::FirstOwnedPagePositionMismatch { transaction, .. } => write!(
+                formatter,
+                "selected transaction {transaction} changed its first owned-page position"
+            ),
+            Self::SelectedUnresolvedOwnedPageEvidenceContradiction { transaction, .. } => write!(
+                formatter,
+                "selected unresolved transaction {transaction} has page evidence that is not a post-frontier suffix extension"
+            ),
+            Self::OwnedPageRecordCountRegressed { transaction, .. } => write!(
+                formatter,
+                "selected transaction {transaction} lost durable owned-page records"
+            ),
+            Self::SelectedCommittedTransactionChanged { transaction, .. } => write!(
+                formatter,
+                "selected committed transaction {transaction} changed in complete-current evidence"
+            ),
+            Self::SelectedUnresolvedTransactionCommittedInsidePrefix { transaction, .. } => write!(
+                formatter,
+                "selected unresolved transaction {transaction} is committed inside the selected prefix"
+            ),
+            Self::SelectedTransactionPositionAfterFrontier {
+                transaction,
+                position,
+                ..
+            } => write!(
+                formatter,
+                "selected transaction {transaction} retains position {position} after its checkpoint frontier"
+            ),
+            Self::CurrentTransactionHasNoRecordPosition { transaction } => write!(
+                formatter,
+                "complete-current transaction {transaction} has no durable record position"
+            ),
+            Self::CurrentOwnedPageCountWidthExceeded {
+                transaction,
+                record_count,
+            } => write!(
+                formatter,
+                "complete-current transaction {transaction} owned-page count {record_count} exceeds checkpoint width"
+            ),
+            Self::SummaryCountExhausted => {
+                formatter.write_str("transaction restoration summary count is exhausted")
+            }
+        }
+    }
+}
+
+impl Error for TransactionRestartRestorationEvidenceError {}
+
+/// Deterministic rejection that cannot change within the retained startup attempt.
+#[derive(Clone, Debug)]
+pub enum TransactionRestartRestorationRejection {
+    /// Selected and complete-current transaction evidence is contradictory.
+    Evidence(Box<TransactionRestartRestorationEvidenceError>),
+    /// No numeric epoch remains above retained persisted evidence.
+    IdentitySpaceExhausted {
+        /// Highest persisted epoch, absent only for an empty transaction table.
+        persisted_epoch_high_water: Option<u64>,
+    },
+    /// The adapter reported that its next epoch is stale.
+    PersistedEpochHighWaterNotAdvanced {
+        /// Highest retained persisted epoch.
+        persisted_epoch_high_water: u64,
+        /// Stale adapter epoch.
+        next_epoch: u64,
+    },
+    /// A successful source result still failed the domain's defensive high-water check.
+    AllocatedEpochNotAbovePersistedHighWater {
+        /// Highest retained persisted epoch.
+        persisted_epoch_high_water: u64,
+        /// Invalid allocated epoch.
+        allocated_epoch: u64,
+    },
+    /// A successful source result paired the new epoch with another lineage.
+    AllocatedEpochLineageMismatch {
+        /// Complete-current transaction lineage.
+        expected: LogLineage,
+        /// Lineage paired with the allocated epoch.
+        actual: LogLineage,
+        /// Allocated but intentionally unreleased epoch.
+        allocated_epoch: u64,
+    },
+    /// Another indeterminate allocation attempt cannot be counted exactly.
+    AllocationAttemptCountExhausted,
+}
+
+impl fmt::Display for TransactionRestartRestorationRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Evidence(source) => write!(
+                formatter,
+                "transaction restoration evidence is contradictory: {source}"
+            ),
+            Self::IdentitySpaceExhausted {
+                persisted_epoch_high_water,
+            } => write!(
+                formatter,
+                "transaction identity space is exhausted above persisted epoch {:?}",
+                persisted_epoch_high_water
+            ),
+            Self::PersistedEpochHighWaterNotAdvanced {
+                persisted_epoch_high_water,
+                next_epoch,
+            } => write!(
+                formatter,
+                "next transaction epoch {next_epoch} does not advance beyond persisted epoch {persisted_epoch_high_water}"
+            ),
+            Self::AllocatedEpochNotAbovePersistedHighWater {
+                persisted_epoch_high_water,
+                allocated_epoch,
+            } => write!(
+                formatter,
+                "allocated transaction epoch {allocated_epoch} does not advance beyond persisted epoch {persisted_epoch_high_water}"
+            ),
+            Self::AllocatedEpochLineageMismatch {
+                allocated_epoch, ..
+            } => write!(
+                formatter,
+                "allocated transaction epoch {allocated_epoch} belongs to another lineage"
+            ),
+            Self::AllocationAttemptCountExhausted => formatter
+                .write_str("indeterminate transaction epoch allocation attempt count is exhausted"),
+        }
+    }
+}
+
+impl Error for TransactionRestartRestorationRejection {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Evidence(source) => Some(source.as_ref()),
+            Self::IdentitySpaceExhausted { .. }
+            | Self::PersistedEpochHighWaterNotAdvanced { .. }
+            | Self::AllocatedEpochNotAbovePersistedHighWater { .. }
+            | Self::AllocatedEpochLineageMismatch { .. }
+            | Self::AllocationAttemptCountExhausted => None,
+        }
+    }
+}
+
+/// Successful non-live owner after transaction state and a fresh coordinator exist.
+///
+/// Exact persisted entries remain private inside the retained repaired owner.
+/// The coordinator is also private, so no active token or ordinary mutation
+/// authority can escape before the final startup transition.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     ActiveTransaction, RestoredTransactionPageStorageRestartCheckpointReplay,
+/// };
+///
+/// fn cannot_extract_active<Source, Store, CheckpointSource, const N: usize>(
+///     restored: RestoredTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> ActiveTransaction {
+///     restored.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::RestoredTransactionPageStorageRestartCheckpointReplay;
+///
+/// fn cannot_activate_coordinator<Source, Store, CheckpointSource, const N: usize>(
+///     mut restored: RestoredTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = restored.coordinator_mut().begin();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     RepairedTransactionPageStorageRestartCheckpointReplay,
+///     RestoredTransactionPageStorageRestartCheckpointReplay, TransactionCoordinator,
+///     TransactionRestartRestorationSummary,
+/// };
+///
+/// fn cannot_forge<Source, Store, CheckpointSource, const N: usize>(
+///     repaired: RepairedTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+///     coordinator: TransactionCoordinator,
+///     summary: TransactionRestartRestorationSummary,
+/// ) -> RestoredTransactionPageStorageRestartCheckpointReplay<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     N,
+/// > {
+///     RestoredTransactionPageStorageRestartCheckpointReplay {
+///         repaired,
+///         coordinator,
+///         summary,
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::RestoredTransactionPageStorageRestartCheckpointReplay;
+///
+/// fn cannot_extract_adapters<Source, Store, CheckpointSource, const N: usize>(
+///     restored: RestoredTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) -> (Source, Store, CheckpointSource) {
+///     restored.into_parts()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::RestoredTransactionPageStorageRestartCheckpointReplay;
+///
+/// fn cannot_publish_checkpoint<Source, Store, CheckpointSource, const N: usize>(
+///     restored: &mut RestoredTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = restored.publish_restart_checkpoint_completeness_baseline_from_current_prefix();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::RestoredTransactionPageStorageRestartCheckpointReplay;
+/// use ntsql_wal::LogDurability;
+///
+/// fn cannot_reclaim_wal<
+///     Log: LogDurability,
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     log: &mut Log,
+///     restored: &RestoredTransactionPageStorageRestartCheckpointReplay<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = log.flush_through(restored);
+/// }
+/// ```
+#[must_use = "restored restart state must be retained for final startup validation"]
+pub struct RestoredTransactionPageStorageRestartCheckpointReplay<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    repaired:
+        RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    coordinator: TransactionCoordinator,
+    summary: TransactionRestartRestorationSummary,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RestoredTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+{
+    /// Returns the persistent identity shared by all retained restart resources.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.repaired.persistent_log_id()
+    }
+
+    /// Returns the selected checkpoint frontier.
+    #[must_use]
+    pub const fn checkpoint_frontier(&self) -> Option<u64> {
+        self.repaired.checkpoint_frontier()
+    }
+
+    /// Returns the complete-current durable frontier.
+    #[must_use]
+    pub fn current_frontier(&self) -> Option<u64> {
+        self.repaired.current_frontier()
+    }
+
+    /// Returns inert aggregate restoration evidence.
+    pub const fn transaction_summary(&self) -> TransactionRestartRestorationSummary {
+        TransactionRestartRestorationSummary {
+            coordinator_epoch: self.coordinator.epoch(),
+            ..self.summary
+        }
+    }
+
+    /// Returns the already completed ordered page-repair outcomes.
+    #[must_use]
+    pub fn page_outcomes(&self) -> &[TransactionRestartCheckpointPageRepairOutcome] {
+        self.repaired.page_outcomes()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for RestoredTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestoredTransactionPageStorageRestartCheckpointReplay")
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("checkpoint_frontier", &self.checkpoint_frontier())
+            .field("current_frontier", &self.current_frontier())
+            .field("summary", &self.summary)
+            .field("page_outcome_count", &self.page_outcomes().len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Fail-closed owner for a deterministic transaction-restoration rejection.
+///
+/// There is no retry method because every retained input is immutable or the
+/// source violated the restart allocation contract. The owner must be dropped
+/// and the complete startup composition reopened.
+///
+/// ```compile_fail
+/// use ntsql_transaction::RejectedTransactionPageStorageRestartCheckpointRestoration;
+///
+/// fn cannot_retry_deterministic_rejection<
+///     Source,
+///     Store,
+///     CheckpointSource,
+///     const N: usize,
+/// >(
+///     rejected: RejectedTransactionPageStorageRestartCheckpointRestoration<
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _ = rejected.retry();
+/// }
+/// ```
+#[must_use = "rejected restoration must be retained for diagnosis or dropped before reopen"]
+pub struct RejectedTransactionPageStorageRestartCheckpointRestoration<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> {
+    repaired:
+        RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    cause: TransactionRestartRestorationRejection,
+    indeterminate_allocation_attempt_count: usize,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RejectedTransactionPageStorageRestartCheckpointRestoration<Source, Store, CheckpointSource, N>
+{
+    /// Returns the exact deterministic rejection.
+    #[must_use]
+    pub const fn cause(&self) -> &TransactionRestartRestorationRejection {
+        &self.cause
+    }
+
+    /// Returns earlier allocation calls whose physical result remained unknown.
+    #[must_use]
+    pub const fn indeterminate_allocation_attempt_count(&self) -> usize {
+        self.indeterminate_allocation_attempt_count
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for RejectedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RejectedTransactionPageStorageRestartCheckpointRestoration")
+            .field("persistent_log_id", &self.repaired.persistent_log_id())
+            .field("cause", &self.cause)
+            .field(
+                "indeterminate_allocation_attempt_count",
+                &self.indeterminate_allocation_attempt_count,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
+    for RejectedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction restoration was rejected: {}",
+            self.cause
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> Error
+    for RejectedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// Owning state after a source-specific epoch allocation failure.
+///
+/// The generic domain cannot know whether the epoch was durably consumed. Retry
+/// therefore restarts the complete allocation boundary, preserves cumulative
+/// indeterminacy, and accepts only a newly returned epoch above the same immutable
+/// high-water mark.
+#[must_use = "failed restoration must be retained, retried, or dropped before reopen"]
+pub struct FailedTransactionPageStorageRestartCheckpointRestoration<
+    Source,
+    Store,
+    CheckpointSource,
+    EpochSourceError,
+    const N: usize,
+> {
+    repaired:
+        RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    cause: EpochSourceError,
+    indeterminate_allocation_attempt_count: usize,
+}
+
+impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize>
+    FailedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        EpochSourceError,
+        N,
+    >
+{
+    /// Returns the exact source-specific allocation failure.
+    #[must_use]
+    pub const fn cause(&self) -> &EpochSourceError {
+        &self.cause
+    }
+
+    /// Returns allocation calls whose physical result remains unknown.
+    #[must_use]
+    pub const fn indeterminate_allocation_attempt_count(&self) -> usize {
+        self.indeterminate_allocation_attempt_count
+    }
+}
+
+impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize>
+    FailedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        EpochSourceError,
+        N,
+    >
+where
+    Source: TransactionRestartCoordinatorEpochSource<Error = EpochSourceError>,
+{
+    /// Retries only the source-dependent epoch allocation boundary.
+    pub fn retry(
+        self,
+    ) -> TransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        EpochSourceError,
+        N,
+    > {
+        restore_transaction_restart_state(
+            self.repaired,
+            self.indeterminate_allocation_attempt_count,
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        EpochSourceError,
+        N,
+    >
+where
+    EpochSourceError: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRestartCheckpointRestoration")
+            .field("persistent_log_id", &self.repaired.persistent_log_id())
+            .field("cause", &self.cause)
+            .field(
+                "indeterminate_allocation_attempt_count",
+                &self.indeterminate_allocation_attempt_count,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize> fmt::Display
+    for FailedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        EpochSourceError,
+        N,
+    >
+where
+    EpochSourceError: fmt::Display,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "transaction restart coordinator epoch allocation failed: {}",
+            self.cause
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize> Error
+    for FailedTransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        EpochSourceError,
+        N,
+    >
+where
+    EpochSourceError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// Owning outcome of restoring transaction state after all page repairs succeed.
+#[must_use = "transaction restoration outcome must be handled or dropped"]
+pub enum TransactionPageStorageRestartCheckpointRestoration<
+    Source,
+    Store,
+    CheckpointSource,
+    EpochSourceError,
+    const N: usize,
+> {
+    /// Transaction entries and one fresh private coordinator are retained.
+    Restored(
+        RestoredTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    ),
+    /// Immutable evidence or deterministic allocator state rejected restoration.
+    Rejected(
+        RejectedTransactionPageStorageRestartCheckpointRestoration<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    ),
+    /// Source-specific allocation failure may be retried without adapter escape.
+    Failed(
+        FailedTransactionPageStorageRestartCheckpointRestoration<
+            Source,
+            Store,
+            CheckpointSource,
+            EpochSourceError,
+            N,
+        >,
+    ),
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: TransactionRestartCoordinatorEpochSource,
+{
+    /// Consumes repaired storage into recovery-owned transaction state.
+    ///
+    /// Retained evidence is validated before epoch allocation. A successful
+    /// allocation is defensively checked for strict high-water and lineage
+    /// agreement before a fresh coordinator is constructed privately.
+    pub fn restore_transaction_state(
+        self,
+    ) -> TransactionPageStorageRestartCheckpointRestoration<
+        Source,
+        Store,
+        CheckpointSource,
+        Source::Error,
+        N,
+    > {
+        restore_transaction_restart_state(self, 0)
     }
 }
 
@@ -14089,6 +14983,430 @@ where
     }
 }
 
+struct PreparedTransactionRestartRestoration {
+    lineage: LogLineage,
+    transaction_count: usize,
+    committed_count: usize,
+    unresolved_count: usize,
+    highest_persisted_transaction: Option<DurableTransactionIdentityObservation>,
+}
+
+fn validate_selected_transaction_positions(
+    transaction: DurableTransactionIdentityObservation,
+    selected_frontier: Option<u64>,
+    positions: impl IntoIterator<Item = Option<u64>>,
+) -> Result<(), TransactionRestartRestorationEvidenceError> {
+    for position in positions.into_iter().flatten() {
+        let Some(frontier) = selected_frontier else {
+            return Err(
+                TransactionRestartRestorationEvidenceError::TransactionInEmptySelectedPrefix {
+                    transaction,
+                },
+            );
+        };
+        if position > frontier {
+            return Err(
+                TransactionRestartRestorationEvidenceError::SelectedTransactionPositionAfterFrontier {
+                    transaction,
+                    selected_frontier: frontier,
+                    position,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn current_transaction_first_position(entry: &DurableTransactionRestartEntry) -> Option<u64> {
+    match (
+        entry
+            .first_owned_page_position()
+            .map(LogSequenceNumber::get),
+        entry.state().commit_position().map(LogSequenceNumber::get),
+    ) {
+        (Some(page), Some(commit)) => Some(page.min(commit)),
+        (Some(page), None) => Some(page),
+        (None, Some(commit)) => Some(commit),
+        (None, None) => None,
+    }
+}
+
+fn prepare_transaction_restart_restoration<Source, Store, CheckpointSource, const N: usize>(
+    repaired: &RepairedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+) -> Result<PreparedTransactionRestartRestoration, TransactionRestartRestorationEvidenceError> {
+    let planned = &repaired.prepared.planned;
+    let selected = planned.selected.baseline.transaction_baseline();
+    let current = &planned.current_analysis;
+    let Some(current_persistent_id) = current.lineage().persistent_id() else {
+        return Err(TransactionRestartRestorationEvidenceError::CurrentPersistentLineageRequired);
+    };
+    if selected.persistent_log_id() != current_persistent_id {
+        return Err(
+            TransactionRestartRestorationEvidenceError::PersistentLineageMismatch {
+                selected: selected.persistent_log_id(),
+                current: current_persistent_id,
+            },
+        );
+    }
+
+    let selected_frontier = selected.durable_frontier();
+    let current_frontier = current.durable_frontier().map(LogSequenceNumber::get);
+    match (selected_frontier, current_frontier) {
+        (Some(selected_frontier), None) => {
+            return Err(
+                TransactionRestartRestorationEvidenceError::CurrentFrontierMissing {
+                    selected_frontier,
+                },
+            );
+        }
+        (Some(selected_frontier), Some(current_frontier))
+            if selected_frontier > current_frontier =>
+        {
+            return Err(
+                TransactionRestartRestorationEvidenceError::SelectedFrontierAfterCurrent {
+                    selected_frontier,
+                    current_frontier,
+                },
+            );
+        }
+        (None, _) | (Some(_), Some(_)) => {}
+    }
+
+    let mut highest_persisted_transaction: Option<DurableTransactionIdentityObservation> = None;
+    for selected_entry in selected.transactions() {
+        let transaction = selected_entry.transaction();
+        highest_persisted_transaction = Some(
+            highest_persisted_transaction.map_or(transaction, |highest| highest.max(transaction)),
+        );
+        validate_selected_transaction_positions(
+            transaction,
+            selected_frontier,
+            [
+                selected_entry.first_owned_page_position(),
+                selected_entry.last_owned_page_position(),
+                selected_entry.state().commit_position(),
+            ],
+        )?;
+
+        let Ok(current_index) = current
+            .transactions()
+            .binary_search_by_key(&transaction, DurableTransactionRestartEntry::transaction)
+        else {
+            return Err(
+                TransactionRestartRestorationEvidenceError::SelectedTransactionMissing {
+                    transaction,
+                },
+            );
+        };
+        let current_entry = &current.transactions()[current_index];
+        let current_first = current_entry
+            .first_owned_page_position()
+            .map(LogSequenceNumber::get);
+        if selected_entry.first_owned_page_position() != current_first {
+            return Err(
+                TransactionRestartRestorationEvidenceError::FirstOwnedPagePositionMismatch {
+                    transaction,
+                    selected: selected_entry.first_owned_page_position(),
+                    current: current_first,
+                },
+            );
+        }
+        let current_last = current_entry
+            .last_owned_page_position()
+            .map(LogSequenceNumber::get);
+        let current_count =
+            u64::try_from(current_entry.owned_page_record_count()).map_err(|_| {
+                TransactionRestartRestorationEvidenceError::CurrentOwnedPageCountWidthExceeded {
+                    transaction,
+                    record_count: current_entry.owned_page_record_count(),
+                }
+            })?;
+        match selected_entry.state() {
+            DurableTransactionRestartCheckpointBaselineState::Committed { commit_position } => {
+                if selected_entry.last_owned_page_position() != current_last
+                    || selected_entry.owned_page_record_count() != current_count
+                    || current_entry
+                        .state()
+                        .commit_position()
+                        .map(LogSequenceNumber::get)
+                        != Some(commit_position)
+                {
+                    return Err(
+                        TransactionRestartRestorationEvidenceError::SelectedCommittedTransactionChanged {
+                            transaction,
+                            selected_commit_position: commit_position,
+                            current_commit_position: current_entry
+                                .state()
+                                .commit_position()
+                                .map(LogSequenceNumber::get),
+                        },
+                    );
+                }
+            }
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted => {
+                let selected_last = selected_entry.last_owned_page_position();
+                let selected_count = selected_entry.owned_page_record_count();
+                if current_count < selected_count {
+                    return Err(
+                        TransactionRestartRestorationEvidenceError::OwnedPageRecordCountRegressed {
+                            transaction,
+                            selected: selected_count,
+                            current: current_count,
+                        },
+                    );
+                }
+                let Some(selected_frontier) = selected_frontier else {
+                    return Err(
+                        TransactionRestartRestorationEvidenceError::TransactionInEmptySelectedPrefix {
+                            transaction,
+                        },
+                    );
+                };
+                let exact_unchanged_page_evidence =
+                    current_count == selected_count && current_last == selected_last;
+                let post_frontier_page_growth = current_count > selected_count
+                    && current_last.is_some_and(|position| position > selected_frontier);
+                if !exact_unchanged_page_evidence && !post_frontier_page_growth {
+                    return Err(
+                        TransactionRestartRestorationEvidenceError::SelectedUnresolvedOwnedPageEvidenceContradiction {
+                            transaction,
+                            selected_frontier,
+                            selected_last_position: selected_last,
+                            current_last_position: current_last,
+                            selected_record_count: selected_count,
+                            current_record_count: current_count,
+                        },
+                    );
+                }
+                if let Some(commit_position) = current_entry
+                    .state()
+                    .commit_position()
+                    .map(LogSequenceNumber::get)
+                    && commit_position <= selected_frontier
+                {
+                    return Err(
+                        TransactionRestartRestorationEvidenceError::SelectedUnresolvedTransactionCommittedInsidePrefix {
+                            transaction,
+                            selected_frontier,
+                            commit_position,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let mut committed_count = 0_usize;
+    let mut unresolved_count = 0_usize;
+    for current_entry in current.transactions() {
+        let transaction = current_entry.transaction();
+        highest_persisted_transaction = Some(
+            highest_persisted_transaction.map_or(transaction, |highest| highest.max(transaction)),
+        );
+        match current_entry.state() {
+            DurableTransactionRestartState::Committed { .. } => {
+                committed_count = committed_count
+                    .checked_add(1)
+                    .ok_or(TransactionRestartRestorationEvidenceError::SummaryCountExhausted)?;
+            }
+            DurableTransactionRestartState::Uncommitted => {
+                unresolved_count = unresolved_count
+                    .checked_add(1)
+                    .ok_or(TransactionRestartRestorationEvidenceError::SummaryCountExhausted)?;
+            }
+        }
+
+        let first_position = current_transaction_first_position(current_entry).ok_or(
+            TransactionRestartRestorationEvidenceError::CurrentTransactionHasNoRecordPosition {
+                transaction,
+            },
+        )?;
+        if selected_frontier.is_some_and(|frontier| first_position <= frontier)
+            && selected
+                .transactions()
+                .binary_search_by_key(
+                    &transaction,
+                    DurableTransactionRestartCheckpointBaselineEntry::transaction,
+                )
+                .is_err()
+        {
+            return Err(
+                TransactionRestartRestorationEvidenceError::CurrentTransactionMissingFromSelectedPrefix {
+                    transaction,
+                    first_position,
+                },
+            );
+        }
+    }
+
+    let transaction_count = committed_count
+        .checked_add(unresolved_count)
+        .ok_or(TransactionRestartRestorationEvidenceError::SummaryCountExhausted)?;
+    Ok(PreparedTransactionRestartRestoration {
+        lineage: current.lineage().clone(),
+        transaction_count,
+        committed_count,
+        unresolved_count,
+        highest_persisted_transaction,
+    })
+}
+
+fn rejected_transaction_restart_restoration<Source, Store, CheckpointSource, const N: usize>(
+    repaired: RepairedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    cause: TransactionRestartRestorationRejection,
+    indeterminate_allocation_attempt_count: usize,
+) -> TransactionPageStorageRestartCheckpointRestoration<
+    Source,
+    Store,
+    CheckpointSource,
+    <Source as TransactionRestartCoordinatorEpochSource>::Error,
+    N,
+>
+where
+    Source: TransactionRestartCoordinatorEpochSource,
+{
+    TransactionPageStorageRestartCheckpointRestoration::Rejected(
+        RejectedTransactionPageStorageRestartCheckpointRestoration {
+            repaired,
+            cause,
+            indeterminate_allocation_attempt_count,
+        },
+    )
+}
+
+fn restore_transaction_restart_state<Source, Store, CheckpointSource, const N: usize>(
+    mut repaired: RepairedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    indeterminate_allocation_attempt_count: usize,
+) -> TransactionPageStorageRestartCheckpointRestoration<
+    Source,
+    Store,
+    CheckpointSource,
+    Source::Error,
+    N,
+>
+where
+    Source: TransactionRestartCoordinatorEpochSource,
+{
+    let prepared = match prepare_transaction_restart_restoration(&repaired) {
+        Ok(prepared) => prepared,
+        Err(source) => {
+            return rejected_transaction_restart_restoration(
+                repaired,
+                TransactionRestartRestorationRejection::Evidence(Box::new(source)),
+                indeterminate_allocation_attempt_count,
+            );
+        }
+    };
+    let epoch_high_water = prepared
+        .highest_persisted_transaction
+        .map(|transaction| transaction.epoch);
+    let Some(next_indeterminate_allocation_attempt_count) =
+        indeterminate_allocation_attempt_count.checked_add(1)
+    else {
+        return rejected_transaction_restart_restoration(
+            repaired,
+            TransactionRestartRestorationRejection::AllocationAttemptCountExhausted,
+            indeterminate_allocation_attempt_count,
+        );
+    };
+    let source = &mut repaired.prepared.planned.selected.storage.source;
+    let (epoch, lineage) = match source.allocate_restart_transaction_epoch(epoch_high_water) {
+        Ok(allocation) => allocation,
+        Err(TransactionRestartCoordinatorEpochAllocationError::Source(source)) => {
+            return TransactionPageStorageRestartCheckpointRestoration::Failed(
+                FailedTransactionPageStorageRestartCheckpointRestoration {
+                    repaired,
+                    cause: source,
+                    indeterminate_allocation_attempt_count:
+                        next_indeterminate_allocation_attempt_count,
+                },
+            );
+        }
+        Err(TransactionRestartCoordinatorEpochAllocationError::IdentitySpaceExhausted {
+            persisted_epoch_high_water,
+        }) => {
+            return rejected_transaction_restart_restoration(
+                repaired,
+                TransactionRestartRestorationRejection::IdentitySpaceExhausted {
+                    persisted_epoch_high_water,
+                },
+                indeterminate_allocation_attempt_count,
+            );
+        }
+        Err(
+            TransactionRestartCoordinatorEpochAllocationError::PersistedEpochHighWaterNotAdvanced {
+                persisted_epoch_high_water,
+                next_epoch,
+            },
+        ) => {
+            return rejected_transaction_restart_restoration(
+                repaired,
+                TransactionRestartRestorationRejection::PersistedEpochHighWaterNotAdvanced {
+                    persisted_epoch_high_water,
+                    next_epoch,
+                },
+                indeterminate_allocation_attempt_count,
+            );
+        }
+    };
+
+    if let Some(high_water) = epoch_high_water
+        && epoch <= high_water
+    {
+        return rejected_transaction_restart_restoration(
+            repaired,
+            TransactionRestartRestorationRejection::AllocatedEpochNotAbovePersistedHighWater {
+                persisted_epoch_high_water: high_water.get(),
+                allocated_epoch: epoch.get(),
+            },
+            indeterminate_allocation_attempt_count,
+        );
+    }
+    if !prepared.lineage.same_lineage(&lineage) {
+        return rejected_transaction_restart_restoration(
+            repaired,
+            TransactionRestartRestorationRejection::AllocatedEpochLineageMismatch {
+                expected: prepared.lineage,
+                actual: lineage,
+                allocated_epoch: epoch.get(),
+            },
+            indeterminate_allocation_attempt_count,
+        );
+    }
+
+    let coordinator = TransactionCoordinator::from_allocated_epoch(epoch, lineage);
+    let summary = TransactionRestartRestorationSummary {
+        transaction_count: prepared.transaction_count,
+        committed_count: prepared.committed_count,
+        unresolved_count: prepared.unresolved_count,
+        highest_persisted_transaction: prepared.highest_persisted_transaction,
+        coordinator_epoch: coordinator.epoch(),
+        indeterminate_allocation_attempt_count,
+    };
+    TransactionPageStorageRestartCheckpointRestoration::Restored(
+        RestoredTransactionPageStorageRestartCheckpointReplay {
+            repaired,
+            coordinator,
+            summary,
+        },
+    )
+}
+
 fn validate_restart_checkpoint_completeness_baseline_against_current_prefix<
     Source,
     Store,
@@ -15328,14 +16646,18 @@ impl TransactionCoordinator {
         Source: TransactionEpochSource + ?Sized,
     {
         let (epoch, log_lineage) = source.allocate_transaction_epoch()?;
-        Ok(Self {
+        Ok(Self::from_allocated_epoch(epoch, log_lineage))
+    }
+
+    fn from_allocated_epoch(epoch: NonZeroU64, log_lineage: LogLineage) -> Self {
+        Self {
             epoch: TransactionEpoch(epoch),
             identity: Arc::new(()),
             log_lineage,
             next_transaction_id: Some(NonZeroU64::MIN),
             lifecycles: BTreeMap::new(),
             staged_pages: BTreeSet::new(),
-        })
+        }
     }
 
     /// Returns this coordinator's persistence-lineage epoch.
@@ -17329,6 +18651,12 @@ mod tests {
         )>,
         restart_callbacks: usize,
         restart_events: Option<Rc<RefCell<Vec<&'static str>>>>,
+        restart_next_epoch: Option<NonZeroU64>,
+        restart_epoch_before_error: Option<FakeFault>,
+        restart_epoch_after_error: Option<FakeFault>,
+        restart_epoch_result_override: Option<NonZeroU64>,
+        restart_epoch_lineage_override: Option<LogLineage>,
+        restart_epoch_allocations: Vec<u64>,
     }
 
     impl FakeDurablePageRecoverySource {
@@ -17366,6 +18694,12 @@ mod tests {
                 restart_replacement_after_callback: None,
                 restart_callbacks: 0,
                 restart_events: None,
+                restart_next_epoch: Some(NonZeroU64::MIN),
+                restart_epoch_before_error: None,
+                restart_epoch_after_error: None,
+                restart_epoch_result_override: None,
+                restart_epoch_lineage_override: None,
+                restart_epoch_allocations: Vec::new(),
             }
         }
     }
@@ -17438,6 +18772,54 @@ mod tests {
                 return Err(source);
             }
             Ok(output)
+        }
+    }
+
+    impl TransactionRestartCoordinatorEpochSource for FakeDurablePageRecoverySource {
+        type Error = FakeFault;
+
+        fn allocate_restart_transaction_epoch(
+            &mut self,
+            persisted_epoch_high_water: Option<NonZeroU64>,
+        ) -> Result<
+            (NonZeroU64, LogLineage),
+            TransactionRestartCoordinatorEpochAllocationError<Self::Error>,
+        > {
+            let Some(epoch) = self.restart_next_epoch else {
+                return Err(
+                    TransactionRestartCoordinatorEpochAllocationError::IdentitySpaceExhausted {
+                        persisted_epoch_high_water: persisted_epoch_high_water.map(NonZeroU64::get),
+                    },
+                );
+            };
+            if let Some(high_water) = persisted_epoch_high_water
+                && epoch <= high_water
+            {
+                return Err(
+                    TransactionRestartCoordinatorEpochAllocationError::PersistedEpochHighWaterNotAdvanced {
+                        persisted_epoch_high_water: high_water.get(),
+                        next_epoch: epoch.get(),
+                    },
+                );
+            }
+            if let Some(source) = self.restart_epoch_before_error.take() {
+                return Err(TransactionRestartCoordinatorEpochAllocationError::Source(
+                    source,
+                ));
+            }
+            self.restart_epoch_allocations.push(epoch.get());
+            self.restart_next_epoch = epoch.get().checked_add(1).and_then(NonZeroU64::new);
+            if let Some(source) = self.restart_epoch_after_error.take() {
+                return Err(TransactionRestartCoordinatorEpochAllocationError::Source(
+                    source,
+                ));
+            }
+            Ok((
+                self.restart_epoch_result_override.take().unwrap_or(epoch),
+                self.restart_epoch_lineage_override
+                    .clone()
+                    .unwrap_or_else(|| self.lineage.clone()),
+            ))
         }
     }
 
@@ -21478,6 +22860,13 @@ mod tests {
         1,
     >;
 
+    type FakeRepairedRestartCheckpoint = RepairedTransactionPageStorageRestartCheckpointReplay<
+        FakeDurablePageRecoverySource,
+        FakeBatchCommittedPageRecoveryStore,
+        FakeCompletenessCheckpointSource,
+        1,
+    >;
+
     fn restart_analyzed_checkpoint_owner(
         lineage: &LogLineage,
         durable_frontier: Option<LogSequenceNumber>,
@@ -23242,10 +24631,25 @@ mod tests {
         durable_frontier: Option<LogSequenceNumber>,
         observations: Vec<DurableTransactionRestartObservation<1>>,
     ) -> FakeDurablePageRecoverySource {
+        let highest_epoch = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                DurableTransactionRestartObservation::Page(_) => None,
+                DurableTransactionRestartObservation::TransactionPage(observation) => {
+                    Some(observation.owner().epoch())
+                }
+                DurableTransactionRestartObservation::Commit(observation) => {
+                    Some(observation.transaction().epoch())
+                }
+            })
+            .max();
         let mut source =
             FakeDurablePageRecoverySource::new(lineage.clone(), Vec::new(), Vec::new(), Vec::new());
         source.restart_frontier = durable_frontier;
         source.restart_observations = observations;
+        source.restart_next_epoch = highest_epoch.map_or(Some(NonZeroU64::MIN), |epoch| {
+            epoch.checked_add(1).and_then(NonZeroU64::new)
+        });
         source
     }
 
@@ -23299,6 +24703,23 @@ mod tests {
             }
             TransactionPageStorageRestartCheckpointRepairPreparation::Failed(_) => {
                 Err(TestError("fake repair preparation failed"))
+            }
+        }
+    }
+
+    fn repair_fake_restart_checkpoint(
+        source: FakeDurablePageRecoverySource,
+        store: FakeBatchCommittedPageRecoveryStore,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> Result<FakeRepairedRestartCheckpoint, TestError> {
+        match prepare_fake_restart_checkpoint_page_repairs(source, store, baseline)?
+            .execute_page_repairs()
+        {
+            TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) => {
+                Ok(repaired)
+            }
+            TransactionPageStorageRestartCheckpointPageRepairExecution::Failed(_) => {
+                Err(TestError("fake repair execution failed"))
             }
         }
     }
@@ -26952,6 +28373,623 @@ mod tests {
         assert_eq!(
             repaired.prepared.planned.selected.storage.store.attempts,
             [first, second]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn repaired_restart_restores_empty_committed_unresolved_and_mixed_transaction_state()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1670).ok_or(TestError("restoration persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let empty_baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let empty = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(mut empty) =
+            empty.restore_transaction_state()
+        else {
+            return Err(TestError("empty transaction restoration failed"));
+        };
+        assert_eq!(
+            empty.transaction_summary(),
+            TransactionRestartRestorationSummary {
+                transaction_count: 0,
+                committed_count: 0,
+                unresolved_count: 0,
+                highest_persisted_transaction: None,
+                coordinator_epoch: TransactionEpoch(NonZeroU64::MIN),
+                indeterminate_allocation_attempt_count: 0,
+            }
+        );
+        let first = empty.coordinator.begin()?;
+        assert_eq!(first.transaction_id().epoch().get(), 1);
+        assert_eq!(first.transaction_id().sequence(), 1);
+
+        let committed_only = durable_identity(3, 1)?;
+        let committed_stream = vec![restart_commit(&lineage, committed_only, 1)?];
+        let committed = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(1)), committed_stream),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(committed) =
+            committed.restore_transaction_state()
+        else {
+            return Err(TestError("committed-only transaction restoration failed"));
+        };
+        let summary = committed.transaction_summary();
+        assert_eq!(summary.transaction_count(), 1);
+        assert_eq!(summary.committed_count(), 1);
+        assert_eq!(summary.unresolved_count(), 0);
+        assert_eq!(
+            summary.highest_persisted_transaction(),
+            Some(committed_only)
+        );
+        assert_eq!(summary.coordinator_epoch().get(), 4);
+        let committed_entry = &committed
+            .repaired
+            .prepared
+            .planned
+            .current_analysis
+            .transactions()[0];
+        assert_eq!(committed_entry.first_owned_page_position(), None);
+        assert_eq!(committed_entry.last_owned_page_position(), None);
+        assert_eq!(committed_entry.owned_page_record_count(), 0);
+        assert_eq!(
+            committed_entry
+                .state()
+                .commit_position()
+                .map(LogSequenceNumber::get),
+            Some(1)
+        );
+
+        let unresolved_only = durable_identity(5, 1)?;
+        let unresolved_page =
+            PageNumber::new(209).ok_or(TestError("unresolved restoration page"))?;
+        let unresolved_stream = vec![restart_owned_page(
+            &lineage,
+            unresolved_only,
+            unresolved_page.get(),
+            1,
+        )?];
+        let unresolved = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(1)), unresolved_stream),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(unresolved) =
+            unresolved.restore_transaction_state()
+        else {
+            return Err(TestError("unresolved-only transaction restoration failed"));
+        };
+        let summary = unresolved.transaction_summary();
+        assert_eq!(summary.transaction_count(), 1);
+        assert_eq!(summary.committed_count(), 0);
+        assert_eq!(summary.unresolved_count(), 1);
+        assert_eq!(summary.coordinator_epoch().get(), 6);
+
+        let checkpoint_unresolved = durable_identity(6, 1)?;
+        let current_unresolved = durable_identity(7, 2)?;
+        let checkpoint_page = PageNumber::new(210).ok_or(TestError("mixed checkpoint page"))?;
+        let unresolved_first =
+            PageNumber::new(211).ok_or(TestError("mixed unresolved first page"))?;
+        let unresolved_last =
+            PageNumber::new(212).ok_or(TestError("mixed unresolved last page"))?;
+        let mixed_baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_owned_page(
+                &lineage,
+                checkpoint_unresolved,
+                checkpoint_page.get(),
+                1,
+            )?],
+            Vec::new(),
+        )?;
+        let mixed_stream = vec![
+            restart_owned_page(&lineage, checkpoint_unresolved, checkpoint_page.get(), 1)?,
+            restart_owned_page(&lineage, checkpoint_unresolved, checkpoint_page.get(), 2)?,
+            restart_commit(&lineage, checkpoint_unresolved, 3)?,
+            restart_owned_page(&lineage, current_unresolved, unresolved_first.get(), 4)?,
+            restart_owned_page(&lineage, current_unresolved, unresolved_last.get(), 5)?,
+        ];
+        let mixed = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(5)), mixed_stream),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &mixed_baseline,
+        )?;
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(mut mixed) =
+            mixed.restore_transaction_state()
+        else {
+            return Err(TestError("mixed transaction restoration failed"));
+        };
+        let summary = mixed.transaction_summary();
+        assert_eq!(summary.transaction_count(), 2);
+        assert_eq!(summary.committed_count(), 1);
+        assert_eq!(summary.unresolved_count(), 1);
+        assert_eq!(
+            summary.highest_persisted_transaction(),
+            Some(current_unresolved)
+        );
+        assert_eq!(summary.coordinator_epoch().get(), 8);
+        let entries = mixed
+            .repaired
+            .prepared
+            .planned
+            .current_analysis
+            .transactions();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0]
+                .state()
+                .commit_position()
+                .map(LogSequenceNumber::get),
+            Some(3)
+        );
+        assert_eq!(
+            entries[0]
+                .first_owned_page_position()
+                .map(LogSequenceNumber::get),
+            Some(1)
+        );
+        assert_eq!(
+            entries[0]
+                .last_owned_page_position()
+                .map(LogSequenceNumber::get),
+            Some(2)
+        );
+        assert_eq!(entries[0].owned_page_record_count(), 2);
+        assert_eq!(
+            entries[1]
+                .first_owned_page_position()
+                .map(LogSequenceNumber::get),
+            Some(4)
+        );
+        assert_eq!(
+            entries[1]
+                .last_owned_page_position()
+                .map(LogSequenceNumber::get),
+            Some(5)
+        );
+        assert_eq!(entries[1].owned_page_record_count(), 2);
+        assert_eq!(
+            entries[1].state(),
+            &DurableTransactionRestartState::Uncommitted
+        );
+        let fresh = mixed.coordinator.begin()?;
+        assert_eq!(fresh.transaction_id().epoch().get(), 8);
+        assert_eq!(fresh.transaction_id().sequence(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_restoration_rejects_unresolved_page_changes_inside_selected_prefix()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1675).ok_or(TestError("prefix change persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let transaction = durable_identity(8, 1)?;
+        let owned_page = PageNumber::new(215).ok_or(TestError("prefix owned page"))?;
+        let raw_page = PageNumber::new(216).ok_or(TestError("prefix raw page"))?;
+        let observations = || -> Result<Vec<DurableTransactionRestartObservation<1>>, TestError> {
+            Ok(vec![
+                restart_owned_page(&lineage, transaction, owned_page.get(), 1)?,
+                restart_raw_page(&lineage, raw_page.get(), 5)?,
+            ])
+        };
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(5)),
+            observations()?,
+            Vec::new(),
+        )?;
+
+        let mut growth = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(5)), observations()?),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let growth_entry = &mut growth.prepared.planned.current_analysis.transactions[0];
+        growth_entry.last_owned_page_position = Some(lineage.position(3));
+        growth_entry.owned_page_record_count = 2;
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(growth) =
+            growth.restore_transaction_state()
+        else {
+            return Err(TestError(
+                "inside-prefix unresolved page growth was accepted",
+            ));
+        };
+        assert!(matches!(
+            growth.cause(),
+            TransactionRestartRestorationRejection::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    TransactionRestartRestorationEvidenceError::SelectedUnresolvedOwnedPageEvidenceContradiction {
+                        transaction: actual,
+                        selected_frontier: 5,
+                        selected_last_position: Some(1),
+                        current_last_position: Some(3),
+                        selected_record_count: 1,
+                        current_record_count: 2,
+                    } if *actual == transaction
+                )
+        ));
+        assert!(
+            growth
+                .repaired
+                .prepared
+                .planned
+                .selected
+                .storage
+                .source
+                .restart_epoch_allocations
+                .is_empty()
+        );
+
+        let mut moved_without_growth = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(5)), observations()?),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        moved_without_growth
+            .prepared
+            .planned
+            .current_analysis
+            .transactions[0]
+            .last_owned_page_position = Some(lineage.position(3));
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(moved_without_growth) =
+            moved_without_growth.restore_transaction_state()
+        else {
+            return Err(TestError(
+                "inside-prefix unresolved last-page movement was accepted",
+            ));
+        };
+        assert!(matches!(
+            moved_without_growth.cause(),
+            TransactionRestartRestorationRejection::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    TransactionRestartRestorationEvidenceError::SelectedUnresolvedOwnedPageEvidenceContradiction {
+                        transaction: actual,
+                        selected_frontier: 5,
+                        selected_last_position: Some(1),
+                        current_last_position: Some(3),
+                        selected_record_count: 1,
+                        current_record_count: 1,
+                    } if *actual == transaction
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_restoration_rejects_contradictions_stale_high_water_and_exhaustion()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1671).ok_or(TestError("rejection persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let transaction = durable_identity(9, 1)?;
+        let page_number = PageNumber::new(213).ok_or(TestError("rejection page"))?;
+        let stream = vec![restart_owned_page(
+            &lineage,
+            transaction,
+            page_number.get(),
+            1,
+        )?];
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_owned_page(
+                &lineage,
+                transaction,
+                page_number.get(),
+                1,
+            )?],
+            Vec::new(),
+        )?;
+
+        let mut contradictory = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, Some(lineage.position(1)), stream),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        contradictory
+            .prepared
+            .planned
+            .current_analysis
+            .transactions
+            .clear();
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(rejected) =
+            contradictory.restore_transaction_state()
+        else {
+            return Err(TestError("contradictory restoration was accepted"));
+        };
+        assert!(matches!(
+            rejected.cause(),
+            TransactionRestartRestorationRejection::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    TransactionRestartRestorationEvidenceError::SelectedTransactionMissing {
+                        transaction: actual,
+                    } if *actual == transaction
+                )
+        ));
+        assert_eq!(rejected.indeterminate_allocation_attempt_count(), 0);
+        assert!(
+            rejected
+                .repaired
+                .prepared
+                .planned
+                .selected
+                .storage
+                .source
+                .restart_epoch_allocations
+                .is_empty()
+        );
+
+        let empty_baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let mut stale = repair_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(1)),
+                vec![restart_owned_page(
+                    &lineage,
+                    transaction,
+                    page_number.get(),
+                    1,
+                )?],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        stale
+            .prepared
+            .planned
+            .selected
+            .storage
+            .source
+            .restart_next_epoch = NonZeroU64::new(transaction.epoch());
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(stale) =
+            stale.restore_transaction_state()
+        else {
+            return Err(TestError("stale restoration epoch was accepted"));
+        };
+        assert!(matches!(
+            stale.cause(),
+            TransactionRestartRestorationRejection::PersistedEpochHighWaterNotAdvanced {
+                persisted_epoch_high_water: 9,
+                next_epoch: 9,
+            }
+        ));
+
+        let mut dishonest = repair_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(1)),
+                vec![restart_owned_page(
+                    &lineage,
+                    transaction,
+                    page_number.get(),
+                    1,
+                )?],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        dishonest
+            .prepared
+            .planned
+            .selected
+            .storage
+            .source
+            .restart_epoch_result_override = NonZeroU64::new(transaction.epoch());
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(dishonest) =
+            dishonest.restore_transaction_state()
+        else {
+            return Err(TestError("dishonest allocated epoch was accepted"));
+        };
+        assert!(matches!(
+            dishonest.cause(),
+            TransactionRestartRestorationRejection::AllocatedEpochNotAbovePersistedHighWater {
+                persisted_epoch_high_water: 9,
+                allocated_epoch: 9,
+            }
+        ));
+
+        let mut foreign = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x167f).ok_or(TestError("foreign restoration lineage"))?,
+        );
+        foreign
+            .prepared
+            .planned
+            .selected
+            .storage
+            .source
+            .restart_epoch_lineage_override = Some(foreign_lineage.clone());
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(foreign) =
+            foreign.restore_transaction_state()
+        else {
+            return Err(TestError("foreign allocated epoch lineage was accepted"));
+        };
+        assert!(matches!(
+            foreign.cause(),
+            TransactionRestartRestorationRejection::AllocatedEpochLineageMismatch {
+                expected,
+                actual,
+                allocated_epoch: 1,
+            } if expected.same_lineage(&lineage) && actual.same_lineage(&foreign_lineage)
+        ));
+
+        let maximum = durable_identity(u64::MAX, 1)?;
+        let maximum_page = PageNumber::new(214).ok_or(TestError("maximum epoch page"))?;
+        let exhausted = repair_fake_restart_checkpoint(
+            fake_restart_source(
+                &lineage,
+                Some(lineage.position(1)),
+                vec![restart_owned_page(
+                    &lineage,
+                    maximum,
+                    maximum_page.get(),
+                    1,
+                )?],
+            ),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &empty_baseline,
+        )?;
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(exhausted) =
+            exhausted.restore_transaction_state()
+        else {
+            return Err(TestError("maximum transaction epoch was accepted"));
+        };
+        assert!(matches!(
+            exhausted.cause(),
+            TransactionRestartRestorationRejection::IdentitySpaceExhausted {
+                persisted_epoch_high_water: Some(u64::MAX),
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transaction_restoration_retries_only_indeterminate_epoch_allocation() -> Result<(), TestError>
+    {
+        let persistent_log_id =
+            PersistentLogId::new(0x1672).ok_or(TestError("retry persistent log id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+
+        let mut before = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        before
+            .prepared
+            .planned
+            .selected
+            .storage
+            .source
+            .restart_epoch_before_error = Some(FakeFault("before restart epoch"));
+        let TransactionPageStorageRestartCheckpointRestoration::Failed(failed) =
+            before.restore_transaction_state()
+        else {
+            return Err(TestError("before-allocation fault did not fail"));
+        };
+        assert_eq!(failed.cause(), &FakeFault("before restart epoch"));
+        assert_eq!(failed.indeterminate_allocation_attempt_count(), 1);
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(before) = failed.retry()
+        else {
+            return Err(TestError("before-allocation restoration retry failed"));
+        };
+        assert_eq!(before.transaction_summary().coordinator_epoch().get(), 1);
+        assert_eq!(
+            before
+                .transaction_summary()
+                .indeterminate_allocation_attempt_count(),
+            1
+        );
+        assert_eq!(
+            before
+                .repaired
+                .prepared
+                .planned
+                .selected
+                .storage
+                .source
+                .restart_epoch_allocations,
+            [1]
+        );
+
+        let mut after = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        after
+            .prepared
+            .planned
+            .selected
+            .storage
+            .source
+            .restart_epoch_after_error = Some(FakeFault("after restart epoch"));
+        let TransactionPageStorageRestartCheckpointRestoration::Failed(failed) =
+            after.restore_transaction_state()
+        else {
+            return Err(TestError("after-allocation fault did not fail"));
+        };
+        assert_eq!(failed.cause(), &FakeFault("after restart epoch"));
+        assert_eq!(failed.indeterminate_allocation_attempt_count(), 1);
+        assert_eq!(
+            failed
+                .repaired
+                .prepared
+                .planned
+                .selected
+                .storage
+                .source
+                .restart_epoch_allocations,
+            [1]
+        );
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(after) = failed.retry()
+        else {
+            return Err(TestError("after-allocation restoration retry failed"));
+        };
+        assert_eq!(after.transaction_summary().coordinator_epoch().get(), 2);
+        assert_eq!(
+            after
+                .transaction_summary()
+                .indeterminate_allocation_attempt_count(),
+            1
+        );
+        assert_eq!(
+            after
+                .repaired
+                .prepared
+                .planned
+                .selected
+                .storage
+                .source
+                .restart_epoch_allocations,
+            [1, 2]
+        );
+
+        let exhausted_count = repair_fake_restart_checkpoint(
+            fake_restart_source(&lineage, None, Vec::new()),
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(exhausted_count) =
+            restore_transaction_restart_state(exhausted_count, usize::MAX)
+        else {
+            return Err(TestError("exhausted allocation attempt count was accepted"));
+        };
+        assert!(matches!(
+            exhausted_count.cause(),
+            TransactionRestartRestorationRejection::AllocationAttemptCountExhausted
+        ));
+        assert_eq!(
+            exhausted_count.indeterminate_allocation_attempt_count(),
+            usize::MAX
+        );
+        assert!(
+            exhausted_count
+                .repaired
+                .prepared
+                .planned
+                .selected
+                .storage
+                .source
+                .restart_epoch_allocations
+                .is_empty()
         );
         Ok(())
     }

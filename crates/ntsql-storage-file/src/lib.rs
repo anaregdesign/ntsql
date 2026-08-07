@@ -183,6 +183,7 @@ use ntsql_transaction::{
     TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
     TransactionPageWriteRecord, TransactionRecoverySource,
     TransactionRestartCheckpointPageRepairStore, TransactionRestartCheckpointPageRepairWritePermit,
+    TransactionRestartCoordinatorEpochAllocationError, TransactionRestartCoordinatorEpochSource,
     UnrecoveredTransactionPageStorage, compare_committed_transaction_page_recovery_candidate,
     compare_transaction_restart_checkpoint_page_repair_candidate,
 };
@@ -1975,12 +1976,10 @@ impl<const N: usize> FileCommitLog<N> {
             Ok(position)
         }
     }
-}
 
-impl<const N: usize> TransactionEpochSource for FileCommitLog<N> {
-    type Error = FileTransactionEpochError;
-
-    fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error> {
+    fn allocate_transaction_epoch_frame(
+        &mut self,
+    ) -> Result<(NonZeroU64, LogLineage), FileTransactionEpochError> {
         if self.poisoned {
             return Err(FileTransactionEpochError::PoisonedWriter);
         }
@@ -1994,6 +1993,55 @@ impl<const N: usize> TransactionEpochSource for FileCommitLog<N> {
             .map_err(FileTransactionEpochError::Io)?;
         self.next_epoch = epoch.get().checked_add(1).and_then(NonZeroU64::new);
         Ok((epoch, self.lineage.clone()))
+    }
+}
+
+impl<const N: usize> TransactionEpochSource for FileCommitLog<N> {
+    type Error = FileTransactionEpochError;
+
+    fn allocate_transaction_epoch(&mut self) -> Result<(NonZeroU64, LogLineage), Self::Error> {
+        self.allocate_transaction_epoch_frame()
+    }
+}
+
+impl<const N: usize> TransactionRestartCoordinatorEpochSource for FileCommitLog<N> {
+    type Error = FileTransactionEpochError;
+
+    fn allocate_restart_transaction_epoch(
+        &mut self,
+        persisted_epoch_high_water: Option<NonZeroU64>,
+    ) -> Result<
+        (NonZeroU64, LogLineage),
+        TransactionRestartCoordinatorEpochAllocationError<Self::Error>,
+    > {
+        let Some(next_epoch) = self.next_epoch else {
+            return Err(
+                TransactionRestartCoordinatorEpochAllocationError::IdentitySpaceExhausted {
+                    persisted_epoch_high_water: persisted_epoch_high_water.map(NonZeroU64::get),
+                },
+            );
+        };
+        if let Some(high_water) = persisted_epoch_high_water
+            && next_epoch <= high_water
+        {
+            return Err(
+                TransactionRestartCoordinatorEpochAllocationError::PersistedEpochHighWaterNotAdvanced {
+                    persisted_epoch_high_water: high_water.get(),
+                    next_epoch: next_epoch.get(),
+                },
+            );
+        }
+        self.allocate_transaction_epoch_frame()
+            .map_err(|source| match source {
+                FileTransactionEpochError::EpochSpaceExhausted => {
+                    TransactionRestartCoordinatorEpochAllocationError::IdentitySpaceExhausted {
+                        persisted_epoch_high_water: persisted_epoch_high_water.map(NonZeroU64::get),
+                    }
+                }
+                FileTransactionEpochError::Io(_) | FileTransactionEpochError::PoisonedWriter => {
+                    TransactionRestartCoordinatorEpochAllocationError::Source(source)
+                }
+            })
     }
 }
 
@@ -6731,6 +6779,51 @@ mod tests {
                 source: FileCommitLogError::PositionSpaceExhausted,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn restart_epoch_high_water_is_checked_and_persisted_across_file_reopen()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("restart-epoch-high-water")?;
+        let path = directory.path().join("commit-log.bin");
+        let mut log = FileCommitLog::create_new(&path, persistent_id(167)?)?;
+        for expected in 1_u64..=4 {
+            let coordinator = TransactionCoordinator::open(&mut log)?;
+            assert_eq!(coordinator.epoch().get(), expected);
+        }
+        let high_water = NonZeroU64::new(4)
+            .ok_or_else(|| io::Error::other("restart epoch high-water is zero"))?;
+        let (first, _) = log.allocate_restart_transaction_epoch(Some(high_water))?;
+        assert_eq!(first.get(), 5);
+        drop(log);
+
+        let mut reopened = FileCommitLog::open(&path)?;
+        let (second, _) = reopened.allocate_restart_transaction_epoch(Some(first))?;
+        assert_eq!(second.get(), 6);
+        let bytes_before_rejection = fs::read(&path)?;
+        reopened.next_epoch = Some(second);
+        assert!(matches!(
+            reopened.allocate_restart_transaction_epoch(Some(second)),
+            Err(
+                TransactionRestartCoordinatorEpochAllocationError::PersistedEpochHighWaterNotAdvanced {
+                    persisted_epoch_high_water: 6,
+                    next_epoch: 6,
+                }
+            )
+        ));
+        assert_eq!(fs::read(&path)?, bytes_before_rejection);
+
+        reopened.next_epoch = None;
+        assert!(matches!(
+            reopened.allocate_restart_transaction_epoch(Some(NonZeroU64::MAX)),
+            Err(
+                TransactionRestartCoordinatorEpochAllocationError::IdentitySpaceExhausted {
+                    persisted_epoch_high_water: Some(u64::MAX),
+                }
+            )
+        ));
+        assert_eq!(fs::read(&path)?, bytes_before_rejection);
         Ok(())
     }
 

@@ -33,6 +33,7 @@ use ntsql_transaction::{
     TransactionCoordinator, TransactionPageStorageRestartCheckpointCompletenessSelection,
     TransactionPageStorageRestartCheckpointPageRepairExecution,
     TransactionPageStorageRestartCheckpointRepairPreparation,
+    TransactionPageStorageRestartCheckpointRestoration,
     TransactionRestartCheckpointPageRepairFailureCause,
     TransactionRestartCheckpointPageRepairOutcome, UnrecoveredTransactionPageStorage,
     flush_committed_page,
@@ -373,7 +374,72 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
         }]
     );
     assert_ne!(fs::read(&page_store_path)?, page_store_before_preparation);
-    drop(repaired);
+    let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+        repaired.restore_transaction_state()
+    else {
+        return Err(io::Error::other("filesystem transaction restoration failed").into());
+    };
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let first_restoration = restored.transaction_summary();
+    assert_eq!(first_restoration.transaction_count(), 2);
+    assert_eq!(first_restoration.committed_count(), 2);
+    assert_eq!(first_restoration.unresolved_count(), 0);
+    assert_eq!(first_restoration.coordinator_epoch().get(), 3);
+    assert_eq!(
+        first_restoration
+            .highest_persisted_transaction()
+            .map(|transaction| transaction.epoch()),
+        Some(2)
+    );
+    drop(restored);
+
+    let reopened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        directory.path().join("wal.bin"),
+        &page_store_path,
+        &slot_path,
+    )?;
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let selection = reopened.select_restart_checkpoint_completeness();
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        selection
+    else {
+        return Err(io::Error::other("reopened repair checkpoint was not selected").into());
+    };
+    let planned = selected.plan_replay_window()?;
+    assert_eq!(planned.current_frontier(), Some(current_frontier.get()));
+    let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+        planned.prepare_page_repairs()
+    else {
+        return Err(io::Error::other("reopened repair preparation failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+        prepared.execute_page_repairs()
+    else {
+        return Err(io::Error::other("reopened repair execution failed").into());
+    };
+    assert_eq!(
+        repaired.page_outcomes(),
+        [
+            TransactionRestartCheckpointPageRepairOutcome::AlreadyCurrent {
+                page_number: suffix_page,
+            }
+        ]
+    );
+    let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+        repaired.restore_transaction_state()
+    else {
+        return Err(io::Error::other("reopened transaction restoration failed").into());
+    };
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let second_restoration = restored.transaction_summary();
+    assert_eq!(second_restoration.transaction_count(), 2);
+    assert_eq!(second_restoration.committed_count(), 2);
+    assert_eq!(second_restoration.unresolved_count(), 0);
+    assert_eq!(second_restoration.coordinator_epoch().get(), 4);
+    assert!(
+        second_restoration.coordinator_epoch().get() > first_restoration.coordinator_epoch().get()
+    );
+    drop(restored);
 
     let log = FileCommitLog::<2>::open_transaction_page_capable(directory.path().join("wal.bin"))?;
     let store = FilePageStore::<2>::open(&page_store_path)?;

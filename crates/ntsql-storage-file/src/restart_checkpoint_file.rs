@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ntsql_database::{DatabaseFileHeaderIdentity, DatabaseStorageIdentity};
 use ntsql_transaction::{
     DurableTransactionRestartCheckpointBaseline,
     DurableTransactionRestartCheckpointBaselinePublicationPermit,
@@ -16,10 +17,10 @@ use ntsql_transaction::{
 use ntsql_wal::PersistentLogId;
 
 use super::{
-    FileCommitLog, FileOpenError, FilePageStore, PageStoreOpenError,
-    RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError, checksum_v1,
-    decode_restart_checkpoint_baseline, encode_restart_checkpoint_baseline, read_u16, read_u32,
-    read_u64, read_u128, write_u16, write_u32, write_u64, write_u128,
+    DatabaseChildIdentityDecodeErrorReason, FileCommitLog, FileOpenError, FilePageStore,
+    PageStoreOpenError, RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,
+    checksum_v1, decode_restart_checkpoint_baseline, encode_restart_checkpoint_baseline, read_u16,
+    read_u32, read_u64, read_u128, write_u16, write_u32, write_u64, write_u128,
 };
 
 pub(crate) const CONTROL_FILE_NAME: &str = "control";
@@ -31,6 +32,11 @@ pub(crate) const CONTROL_HEADER_LENGTH: usize = 64;
 const CONTROL_HEADER_LENGTH_U16: u16 = 64;
 const CONTROL_RESERVED_START: usize = 32;
 const CONTROL_CHECKSUM_OFFSET: usize = 56;
+pub(crate) const CONTROL_FORMAT_VERSION_V2: u16 = 2;
+const CONTROL_HEADER_V2_LENGTH: usize = 128;
+const CONTROL_HEADER_V2_LENGTH_U16: u16 = 128;
+const CONTROL_HEADER_V2_IDENTITY_OFFSET: usize = 64;
+const CONTROL_HEADER_V2_CHECKSUM_OFFSET: usize = 120;
 
 /// Exact filesystem operation that reported a checkpoint-slot failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,6 +235,11 @@ pub enum FileRestartCheckpointSlotFormatErrorReason {
         /// Exact decoded header length.
         actual: u16,
     },
+    /// The encoded V2 header length was not its exact fixed width.
+    HeaderV2Length {
+        /// Exact decoded header length.
+        actual: u16,
+    },
     /// Reserved header flags were nonzero.
     HeaderFlags {
         /// Exact decoded flags.
@@ -243,6 +254,8 @@ pub enum FileRestartCheckpointSlotFormatErrorReason {
         /// Exact nonzero byte.
         actual: u8,
     },
+    /// The stable database-file identity extension was malformed.
+    HeaderDatabaseChildIdentity(DatabaseChildIdentityDecodeErrorReason),
     /// The complete protected control header checksum did not match.
     HeaderChecksum {
         /// Checksum calculated from bytes before the checksum field.
@@ -268,6 +281,12 @@ impl fmt::Display for FileRestartCheckpointSlotFormatErrorReason {
             Self::HeaderLength { actual } => {
                 write!(formatter, "control header length {actual} is invalid")
             }
+            Self::HeaderV2Length { actual } => {
+                write!(
+                    formatter,
+                    "control V2 header length {actual} is not {CONTROL_HEADER_V2_LENGTH}"
+                )
+            }
             Self::HeaderFlags { actual } => {
                 write!(formatter, "control header flags {actual:#010x} are invalid")
             }
@@ -278,6 +297,7 @@ impl fmt::Display for FileRestartCheckpointSlotFormatErrorReason {
                 formatter,
                 "control header reserved byte at offset {offset} is nonzero: {actual:#04x}"
             ),
+            Self::HeaderDatabaseChildIdentity(source) => source.fmt(formatter),
             Self::HeaderChecksum { expected, actual } => write!(
                 formatter,
                 "control header checksum mismatch: expected {expected:#018x}, found {actual:#018x}"
@@ -655,6 +675,8 @@ pub struct FileRestartCheckpointBaselineSource {
     _control_file: File,
     directory: File,
     persistent_log_id: PersistentLogId,
+    control_format_version: u16,
+    database_file_identity: Option<DatabaseFileHeaderIdentity>,
     armed_publication_fault: Option<FileRestartCheckpointBaselinePublicationFaultPoint>,
 }
 
@@ -679,6 +701,8 @@ impl FileRestartCheckpointBaselineSource {
             _control_file: control_file,
             directory,
             persistent_log_id,
+            control_format_version: CONTROL_FORMAT_VERSION,
+            database_file_identity: None,
             armed_publication_fault: None,
         })
     }
@@ -689,14 +713,16 @@ impl FileRestartCheckpointBaselineSource {
         P: AsRef<Path>,
     {
         let slot_directory = slot_directory.as_ref().to_path_buf();
-        let (control_file, directory, persistent_log_id) =
+        let (control_file, directory, metadata) =
             open_locked_control_slot(&slot_directory, CONTROL_MAGIC)?;
 
         Ok(Self {
             slot_directory,
             _control_file: control_file,
             directory,
-            persistent_log_id,
+            persistent_log_id: metadata.persistent_log_id(),
+            control_format_version: metadata.format_version(),
+            database_file_identity: metadata.database_file_identity(),
             armed_publication_fault: None,
         })
     }
@@ -705,6 +731,18 @@ impl FileRestartCheckpointBaselineSource {
     #[must_use]
     pub const fn persistent_log_id(&self) -> PersistentLogId {
         self.persistent_log_id
+    }
+
+    /// Returns the physically parsed control format version.
+    #[must_use]
+    pub const fn control_format_version(&self) -> u16 {
+        self.control_format_version
+    }
+
+    /// Returns stable database-file identity when the control uses V2.
+    #[must_use]
+    pub const fn database_file_identity(&self) -> Option<DatabaseFileHeaderIdentity> {
+        self.database_file_identity
     }
 
     /// Returns the caller-selected slot directory.
@@ -1088,6 +1126,150 @@ pub(crate) fn parse_slot_control_header(
     Ok(persistent_log_id)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SlotControlMetadata {
+    persistent_log_id: PersistentLogId,
+    format_version: u16,
+    database_file_identity: Option<DatabaseFileHeaderIdentity>,
+}
+
+impl SlotControlMetadata {
+    pub(crate) const fn persistent_log_id(self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    pub(crate) const fn format_version(self) -> u16 {
+        self.format_version
+    }
+
+    pub(crate) const fn database_file_identity(self) -> Option<DatabaseFileHeaderIdentity> {
+        self.database_file_identity
+    }
+}
+
+pub(crate) fn build_slot_control_header_v2(
+    magic: [u8; 8],
+    persistent_log_id: PersistentLogId,
+    database_file_identity: DatabaseFileHeaderIdentity,
+) -> [u8; CONTROL_HEADER_V2_LENGTH] {
+    let mut header = [0_u8; CONTROL_HEADER_V2_LENGTH];
+    header[..8].copy_from_slice(&magic);
+    write_u16(&mut header, 8, CONTROL_FORMAT_VERSION_V2);
+    write_u16(&mut header, 10, CONTROL_HEADER_V2_LENGTH_U16);
+    write_u128(&mut header, 16, persistent_log_id.get());
+    let identity = super::database_child_identity_codec::encode_database_child_identity(
+        database_file_identity,
+    );
+    header[CONTROL_HEADER_V2_IDENTITY_OFFSET..CONTROL_HEADER_V2_IDENTITY_OFFSET + identity.len()]
+        .copy_from_slice(&identity);
+    let checksum = checksum_v1(&header[..CONTROL_HEADER_V2_CHECKSUM_OFFSET]);
+    write_u64(&mut header, CONTROL_HEADER_V2_CHECKSUM_OFFSET, checksum);
+    header
+}
+
+pub(crate) fn parse_slot_control_header_v2(
+    magic: [u8; 8],
+    header: &[u8; CONTROL_HEADER_V2_LENGTH],
+) -> Result<SlotControlMetadata, FileRestartCheckpointSlotFormatError> {
+    if header[..8] != magic {
+        let mut actual = [0_u8; 8];
+        actual.copy_from_slice(&header[..8]);
+        return Err(FileRestartCheckpointSlotFormatError::new(
+            0,
+            FileRestartCheckpointSlotFormatErrorReason::HeaderMagic { actual },
+        ));
+    }
+    let version = read_u16(header, 8);
+    if version != CONTROL_FORMAT_VERSION_V2 {
+        return Err(FileRestartCheckpointSlotFormatError::new(
+            8,
+            FileRestartCheckpointSlotFormatErrorReason::HeaderVersion { actual: version },
+        ));
+    }
+    let header_length = read_u16(header, 10);
+    if header_length != CONTROL_HEADER_V2_LENGTH_U16 {
+        return Err(FileRestartCheckpointSlotFormatError::new(
+            10,
+            FileRestartCheckpointSlotFormatErrorReason::HeaderV2Length {
+                actual: header_length,
+            },
+        ));
+    }
+    let flags = read_u32(header, 12);
+    if flags != 0 {
+        return Err(FileRestartCheckpointSlotFormatError::new(
+            12,
+            FileRestartCheckpointSlotFormatErrorReason::HeaderFlags { actual: flags },
+        ));
+    }
+    let persistent_log_id = PersistentLogId::new(read_u128(header, 16)).ok_or_else(|| {
+        FileRestartCheckpointSlotFormatError::new(
+            16,
+            FileRestartCheckpointSlotFormatErrorReason::PersistentLogIdZero,
+        )
+    })?;
+    if let Some((relative_offset, actual)) = header
+        [CONTROL_RESERVED_START..CONTROL_HEADER_V2_IDENTITY_OFFSET]
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, byte)| *byte != 0)
+    {
+        let offset = CONTROL_RESERVED_START + relative_offset;
+        return Err(FileRestartCheckpointSlotFormatError::new(
+            offset as u64,
+            FileRestartCheckpointSlotFormatErrorReason::ReservedByteNonZero { offset, actual },
+        ));
+    }
+    let mut identity_bytes =
+        [0_u8; super::database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH];
+    identity_bytes.copy_from_slice(
+        &header[CONTROL_HEADER_V2_IDENTITY_OFFSET
+            ..CONTROL_HEADER_V2_IDENTITY_OFFSET
+                + super::database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH],
+    );
+    let database_file_identity =
+        super::database_child_identity_codec::decode_database_child_identity(&identity_bytes)
+            .map_err(|source| {
+                FileRestartCheckpointSlotFormatError::new(
+                    (CONTROL_HEADER_V2_IDENTITY_OFFSET + source.offset()) as u64,
+                    FileRestartCheckpointSlotFormatErrorReason::HeaderDatabaseChildIdentity(
+                        source.reason(),
+                    ),
+                )
+            })?;
+    let identity_end = CONTROL_HEADER_V2_IDENTITY_OFFSET
+        + super::database_child_identity_codec::DATABASE_CHILD_IDENTITY_V1_LENGTH;
+    if let Some((relative_offset, actual)) = header[identity_end..CONTROL_HEADER_V2_CHECKSUM_OFFSET]
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, byte)| *byte != 0)
+    {
+        let offset = identity_end + relative_offset;
+        return Err(FileRestartCheckpointSlotFormatError::new(
+            offset as u64,
+            FileRestartCheckpointSlotFormatErrorReason::ReservedByteNonZero { offset, actual },
+        ));
+    }
+    let actual_checksum = read_u64(header, CONTROL_HEADER_V2_CHECKSUM_OFFSET);
+    let expected_checksum = checksum_v1(&header[..CONTROL_HEADER_V2_CHECKSUM_OFFSET]);
+    if actual_checksum != expected_checksum {
+        return Err(FileRestartCheckpointSlotFormatError::new(
+            CONTROL_HEADER_V2_CHECKSUM_OFFSET as u64,
+            FileRestartCheckpointSlotFormatErrorReason::HeaderChecksum {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            },
+        ));
+    }
+    Ok(SlotControlMetadata {
+        persistent_log_id,
+        format_version: CONTROL_FORMAT_VERSION_V2,
+        database_file_identity: Some(database_file_identity),
+    })
+}
+
 /// Creates, locks, writes, and synchronizes one new lineaged control slot.
 ///
 /// The exclusive control lock is acquired before the header is written or
@@ -1098,6 +1280,36 @@ pub(crate) fn create_locked_control_slot(
     slot_directory: &Path,
     magic: [u8; 8],
     persistent_log_id: PersistentLogId,
+) -> Result<(File, File), FileRestartCheckpointSlotCreateError> {
+    let header = build_slot_control_header(magic, persistent_log_id);
+    create_locked_control_slot_with_header(slot_directory, &header)
+}
+
+pub(crate) fn create_locked_database_control_slot(
+    slot_directory: &Path,
+    magic: [u8; 8],
+    storage_identity: DatabaseStorageIdentity,
+) -> Result<(File, File, SlotControlMetadata), FileRestartCheckpointSlotCreateError> {
+    let persistent_log_id = storage_identity.persistent_log_id();
+    let database_file_identity =
+        storage_identity.file_header_identity(ntsql_database::DatabaseFileRole::RestartCheckpoint);
+    let header = build_slot_control_header_v2(magic, persistent_log_id, database_file_identity);
+    let (control_file, directory) =
+        create_locked_control_slot_with_header(slot_directory, &header)?;
+    Ok((
+        control_file,
+        directory,
+        SlotControlMetadata {
+            persistent_log_id,
+            format_version: CONTROL_FORMAT_VERSION_V2,
+            database_file_identity: Some(database_file_identity),
+        },
+    ))
+}
+
+fn create_locked_control_slot_with_header(
+    slot_directory: &Path,
+    header: &[u8],
 ) -> Result<(File, File), FileRestartCheckpointSlotCreateError> {
     let control_path = slot_directory.join(CONTROL_FILE_NAME);
 
@@ -1125,8 +1337,7 @@ pub(crate) fn create_locked_control_slot(
         ))
     })?;
 
-    let header = build_slot_control_header(magic, persistent_log_id);
-    control_file.write_all(&header).map_err(|source| {
+    control_file.write_all(header).map_err(|source| {
         FileRestartCheckpointSlotCreateError::Io(FileRestartCheckpointSlotIoError::new(
             FileRestartCheckpointSlotIoStage::WriteControlHeader,
             source,
@@ -1162,7 +1373,7 @@ pub(crate) fn create_locked_control_slot(
 pub(crate) fn open_locked_control_slot(
     slot_directory: &Path,
     magic: [u8; 8],
-) -> Result<(File, File, PersistentLogId), FileRestartCheckpointSlotOpenError> {
+) -> Result<(File, File, SlotControlMetadata), FileRestartCheckpointSlotOpenError> {
     let control_path = slot_directory.join(CONTROL_FILE_NAME);
     let mut control_file = OpenOptions::new()
         .read(true)
@@ -1190,7 +1401,9 @@ pub(crate) fn open_locked_control_slot(
             ))
         })?
         .len();
-    if control_length != CONTROL_HEADER_LENGTH as u64 {
+    if control_length != CONTROL_HEADER_LENGTH as u64
+        && control_length != CONTROL_HEADER_V2_LENGTH as u64
+    {
         return Err(FileRestartCheckpointSlotOpenError::Format(
             FileRestartCheckpointSlotFormatError::new(
                 0,
@@ -1208,15 +1421,35 @@ pub(crate) fn open_locked_control_slot(
             source,
         ))
     })?;
-    let persistent_log_id = parse_slot_control_header(magic, &header)
-        .map_err(FileRestartCheckpointSlotOpenError::Format)?;
+    let metadata = if control_length == CONTROL_HEADER_V2_LENGTH as u64 {
+        let mut header_v2 = [0_u8; CONTROL_HEADER_V2_LENGTH];
+        header_v2[..CONTROL_HEADER_LENGTH].copy_from_slice(&header);
+        control_file
+            .read_exact(&mut header_v2[CONTROL_HEADER_LENGTH..])
+            .map_err(|source| {
+                FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
+                    FileRestartCheckpointSlotIoStage::ReadControlHeader,
+                    source,
+                ))
+            })?;
+        parse_slot_control_header_v2(magic, &header_v2)
+            .map_err(FileRestartCheckpointSlotOpenError::Format)?
+    } else {
+        let persistent_log_id = parse_slot_control_header(magic, &header)
+            .map_err(FileRestartCheckpointSlotOpenError::Format)?;
+        SlotControlMetadata {
+            persistent_log_id,
+            format_version: CONTROL_FORMAT_VERSION,
+            database_file_identity: None,
+        }
+    };
     let directory = File::open(slot_directory).map_err(|source| {
         FileRestartCheckpointSlotOpenError::Io(FileRestartCheckpointSlotIoError::new(
             FileRestartCheckpointSlotIoStage::OpenSlotDirectory,
             source,
         ))
     })?;
-    Ok((control_file, directory, persistent_log_id))
+    Ok((control_file, directory, metadata))
 }
 
 /// Reads the complete optional selected `current` value of one slot.

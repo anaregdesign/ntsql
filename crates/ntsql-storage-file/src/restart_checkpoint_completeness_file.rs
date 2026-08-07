@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ntsql_database::{DatabaseFileHeaderIdentity, DatabaseStorageIdentity};
 use ntsql_transaction::{
     DurableTransactionRestartCheckpointCompletenessBaseline,
     DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit,
@@ -26,8 +27,8 @@ use super::{
     restart_checkpoint_file::{
         FileRestartCheckpointSlotCreateError, FileRestartCheckpointSlotIoError,
         FileRestartCheckpointSlotOpenError, SlotCurrentReadError, SlotPublicationError,
-        SlotPublicationStep, create_locked_control_slot, open_locked_control_slot,
-        publish_slot_current_bytes, read_current_slot_bytes,
+        SlotPublicationStep, create_locked_control_slot, create_locked_database_control_slot,
+        open_locked_control_slot, publish_slot_current_bytes, read_current_slot_bytes,
     },
 };
 
@@ -435,6 +436,8 @@ pub struct FileRestartCheckpointCompletenessBaselineSource {
     _control_file: File,
     directory: File,
     persistent_log_id: PersistentLogId,
+    control_format_version: u16,
+    database_file_identity: Option<DatabaseFileHeaderIdentity>,
     armed_publication_fault: Option<FileRestartCheckpointCompletenessBaselinePublicationFaultPoint>,
 }
 
@@ -462,6 +465,33 @@ impl FileRestartCheckpointCompletenessBaselineSource {
             _control_file: control_file,
             directory,
             persistent_log_id,
+            control_format_version: super::restart_checkpoint_file::CONTROL_FORMAT_VERSION,
+            database_file_identity: None,
+            armed_publication_fault: None,
+        })
+    }
+
+    /// Creates and locks one empty V2 completeness slot with stable database identity.
+    pub fn create_new_database<P>(
+        slot_directory: P,
+        storage_identity: DatabaseStorageIdentity,
+    ) -> Result<Self, FileRestartCheckpointSlotCreateError>
+    where
+        P: AsRef<Path>,
+    {
+        let slot_directory = slot_directory.as_ref().to_path_buf();
+        let (control_file, directory, metadata) = create_locked_database_control_slot(
+            &slot_directory,
+            COMPLETENESS_CONTROL_MAGIC,
+            storage_identity,
+        )?;
+        Ok(Self {
+            slot_directory,
+            _control_file: control_file,
+            directory,
+            persistent_log_id: metadata.persistent_log_id(),
+            control_format_version: metadata.format_version(),
+            database_file_identity: metadata.database_file_identity(),
             armed_publication_fault: None,
         })
     }
@@ -475,14 +505,16 @@ impl FileRestartCheckpointCompletenessBaselineSource {
         P: AsRef<Path>,
     {
         let slot_directory = slot_directory.as_ref().to_path_buf();
-        let (control_file, directory, persistent_log_id) =
+        let (control_file, directory, metadata) =
             open_locked_control_slot(&slot_directory, COMPLETENESS_CONTROL_MAGIC)?;
 
         Ok(Self {
             slot_directory,
             _control_file: control_file,
             directory,
-            persistent_log_id,
+            persistent_log_id: metadata.persistent_log_id(),
+            control_format_version: metadata.format_version(),
+            database_file_identity: metadata.database_file_identity(),
             armed_publication_fault: None,
         })
     }
@@ -491,6 +523,18 @@ impl FileRestartCheckpointCompletenessBaselineSource {
     #[must_use]
     pub const fn persistent_log_id(&self) -> PersistentLogId {
         self.persistent_log_id
+    }
+
+    /// Returns the physically parsed completeness-control format version.
+    #[must_use]
+    pub const fn control_format_version(&self) -> u16 {
+        self.control_format_version
+    }
+
+    /// Returns stable database-file identity when the control uses V2.
+    #[must_use]
+    pub const fn database_file_identity(&self) -> Option<DatabaseFileHeaderIdentity> {
+        self.database_file_identity
     }
 
     pub(crate) fn control_metadata(&self) -> io::Result<std::fs::Metadata> {
@@ -808,10 +852,16 @@ where
 mod tests {
     use std::io;
 
+    use ntsql_database::{DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole, DatabaseId};
+
     use super::{
-        super::restart_checkpoint_file::{build_slot_control_header, parse_slot_control_header},
+        super::restart_checkpoint_file::{
+            build_slot_control_header, build_slot_control_header_v2, parse_slot_control_header,
+            parse_slot_control_header_v2,
+        },
         *,
     };
+    use crate::{checksum_v1, write_u64};
 
     #[test]
     fn completeness_control_header_has_exact_independent_golden_bytes() -> Result<(), io::Error> {
@@ -832,6 +882,50 @@ mod tests {
             parse_slot_control_header(COMPLETENESS_CONTROL_MAGIC, &header),
             Ok(persistent_log_id)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn completeness_control_v2_has_exact_database_identity_golden_bytes()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)
+            .ok_or_else(|| io::Error::other("test persistent log ID is zero"))?;
+        let database_id = DatabaseId::new(0x1112_1314_1516_1718_191a_1b1c_1d1e_1f20)
+            .ok_or_else(|| io::Error::other("test database ID is zero"))?;
+        let file_id = DatabaseFileId::new(0x2122_2324_2526_2728_292a_2b2c_2d2e_2f30)
+            .ok_or_else(|| io::Error::other("test file ID is zero"))?;
+        let identity = DatabaseFileHeaderIdentity::new(
+            database_id,
+            DatabaseFileIdentity::new(DatabaseFileRole::RestartCheckpoint, file_id),
+        );
+        let header =
+            build_slot_control_header_v2(COMPLETENESS_CONTROL_MAGIC, persistent_log_id, identity);
+        let mut expected = [0_u8; 128];
+        expected[..8].copy_from_slice(b"NTSQCMS1");
+        expected[8..12].copy_from_slice(&[0, 2, 0, 128]);
+        expected[16..32].copy_from_slice(&persistent_log_id.get().to_be_bytes());
+        expected[64..112].copy_from_slice(&[
+            0x4e, 0x54, 0x53, 0x51, 0x43, 0x46, 0x49, 0x31, 0x00, 0x01, 0x00, 0x30, 0x03, 0x00,
+            0x00, 0x00, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a,
+            0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+        ]);
+        expected[120..128].copy_from_slice(&0x4e80_b59f_985a_57a3_u64.to_be_bytes());
+        assert_eq!(header, expected);
+
+        let metadata = parse_slot_control_header_v2(COMPLETENESS_CONTROL_MAGIC, &header)?;
+        assert_eq!(metadata.persistent_log_id(), persistent_log_id);
+        assert_eq!(metadata.format_version(), 2);
+        assert_eq!(metadata.database_file_identity(), Some(identity));
+
+        let mut reserved = header;
+        reserved[112] = 1;
+        let checksum = checksum_v1(&reserved[..120]);
+        write_u64(&mut reserved, 120, checksum);
+        assert!(parse_slot_control_header_v2(COMPLETENESS_CONTROL_MAGIC, &reserved).is_err());
+        let mut bad_checksum = header;
+        bad_checksum[120] ^= 1;
+        assert!(parse_slot_control_header_v2(COMPLETENESS_CONTROL_MAGIC, &bad_checksum).is_err());
         Ok(())
     }
 

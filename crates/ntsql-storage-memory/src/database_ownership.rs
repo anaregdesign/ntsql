@@ -11,7 +11,8 @@ use ntsql_database::{
     DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
     DatabaseCompositionIdentityMismatch, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
     DatabaseId, DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
-    DatabaseStorageFormatVersion, ManifestSelectedDatabase, UnboundDatabase,
+    DatabaseStorageFormatVersion, DatabaseStorageIdentity, ManifestSelectedDatabase,
+    RecoveryRequiredDatabase, UnboundDatabase,
 };
 use ntsql_wal::PersistentLogId;
 
@@ -315,6 +316,34 @@ impl InMemoryDatabaseOwnershipSlot {
         manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
     ) -> Result<InMemoryDatabaseOwnershipSelection, InMemoryDatabaseOwnershipError> {
+        let acquired = self.acquire(expected_database_id, manifest_object_id, manifest, files)?;
+        Ok(InMemoryDatabaseOwnershipSelection {
+            selected: acquired.selected,
+        })
+    }
+
+    /// Acquires exact stable storage and crosses the recovery-required boundary.
+    pub fn try_acquire_recovery_required(
+        &self,
+        expected_database_id: DatabaseId,
+        manifest_object_id: InMemoryDatabaseObjectId,
+        manifest: DatabaseManifest,
+        files: &[InMemoryDatabaseFileObservation],
+    ) -> Result<RecoveryRequiredInMemoryDatabase, InMemoryDatabaseOwnershipError> {
+        let acquired = self.acquire(expected_database_id, manifest_object_id, manifest, files)?;
+        acquired
+            .selected
+            .bind_observed_storage(acquired.observed_storage_identity)
+            .map_err(|failure| InMemoryDatabaseOwnershipError::StorageBinding(*failure.reason()))
+    }
+
+    fn acquire(
+        &self,
+        expected_database_id: DatabaseId,
+        manifest_object_id: InMemoryDatabaseObjectId,
+        manifest: DatabaseManifest,
+        files: &[InMemoryDatabaseFileObservation],
+    ) -> Result<AcquiredInMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError> {
         let mut guard = InMemoryDatabaseOwnershipGuard::new();
         guard.acquire(
             self.object_id,
@@ -416,16 +445,13 @@ impl InMemoryDatabaseOwnershipSlot {
             DatabaseFileIdentity::new(restart_checkpoint.role, restart_checkpoint.file_id),
         ];
         let selected_identity = manifest.composition_identity();
-        let observed_identity = DatabaseCompositionIdentity::new(
-            self.database_id,
-            selected_identity.lifecycle_generation(),
-            wal.persistent_log_id,
-            &observed_files,
-        )
-        .map_err(InMemoryDatabaseOwnershipError::ObservedComposition)?;
+        let observed_storage_identity =
+            DatabaseStorageIdentity::new(self.database_id, wal.persistent_log_id, &observed_files)
+                .map_err(InMemoryDatabaseOwnershipError::ObservedStorageIdentity)?;
         selected_identity
-            .require_exact_match(observed_identity)
-            .map_err(InMemoryDatabaseOwnershipError::CompositionBinding)?;
+            .storage_identity()
+            .require_exact_match(observed_storage_identity)
+            .map_err(InMemoryDatabaseOwnershipError::StorageBinding)?;
         guard.commit_bindings();
         let owner = InMemoryDatabaseOwnership {
             manifest,
@@ -443,8 +469,19 @@ impl InMemoryDatabaseOwnershipSlot {
                 return Err(InMemoryDatabaseOwnershipError::ManifestSelection(reason));
             }
         };
-        Ok(InMemoryDatabaseOwnershipSelection { selected })
+        Ok(AcquiredInMemoryDatabaseOwnership {
+            selected,
+            observed_storage_identity,
+        })
     }
+}
+
+/// Recovery-required memory ownership proven by modeled stable child identity.
+pub type RecoveryRequiredInMemoryDatabase = RecoveryRequiredDatabase<InMemoryDatabaseOwnership>;
+
+struct AcquiredInMemoryDatabaseOwnership {
+    selected: ManifestSelectedDatabase<InMemoryDatabaseOwnership>,
+    observed_storage_identity: DatabaseStorageIdentity,
 }
 
 /// Complete deterministic memory ownership retained inside lifecycle typestate.
@@ -587,8 +624,8 @@ const fn object_role_index(role: InMemoryDatabaseObjectRole) -> usize {
 /// use ntsql_storage_memory::InMemoryDatabaseOwnershipSelection;
 ///
 /// fn cannot_claim_exact(selected: InMemoryDatabaseOwnershipSelection) {
-///     let observed = selected.identity();
-///     selected.bind_exact_composition(observed);
+///     let observed = selected.identity().storage_identity();
+///     selected.bind_observed_storage(observed);
 /// }
 /// ```
 #[must_use = "selected memory ownership must remain retained or be dropped"]
@@ -706,11 +743,11 @@ pub enum InMemoryDatabaseOwnershipError {
         actual: PersistentLogId,
     },
     /// The complete observed identity set is internally invalid.
-    ObservedComposition(DatabaseCompositionIdentityError),
+    ObservedStorageIdentity(DatabaseCompositionIdentityError),
     /// The domain manifest-selection gate rejected the modeled owner.
     ManifestSelection(DatabaseManifestSelectionRejection),
     /// Exact comparison rejected the modeled observations.
-    CompositionBinding(DatabaseCompositionIdentityMismatch),
+    StorageBinding(DatabaseCompositionIdentityMismatch),
 }
 
 impl fmt::Display for InMemoryDatabaseOwnershipError {
@@ -786,7 +823,7 @@ impl fmt::Display for InMemoryDatabaseOwnershipError {
                 actual.get(),
                 expected.get()
             ),
-            Self::ObservedComposition(source) => {
+            Self::ObservedStorageIdentity(source) => {
                 write!(
                     formatter,
                     "modeled database composition is invalid: {source}"
@@ -795,8 +832,8 @@ impl fmt::Display for InMemoryDatabaseOwnershipError {
             Self::ManifestSelection(source) => {
                 write!(formatter, "modeled manifest selection failed: {source}")
             }
-            Self::CompositionBinding(source) => {
-                write!(formatter, "modeled composition binding failed: {source}")
+            Self::StorageBinding(source) => {
+                write!(formatter, "modeled storage binding failed: {source}")
             }
         }
     }
@@ -805,9 +842,9 @@ impl fmt::Display for InMemoryDatabaseOwnershipError {
 impl Error for InMemoryDatabaseOwnershipError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::ObservedComposition(source) => Some(source),
+            Self::ObservedStorageIdentity(source) => Some(source),
             Self::ManifestSelection(source) => Some(source),
-            Self::CompositionBinding(source) => Some(source),
+            Self::StorageBinding(source) => Some(source),
             Self::Contended { .. }
             | Self::ObjectContended { .. }
             | Self::ObjectBindingMismatch { .. }

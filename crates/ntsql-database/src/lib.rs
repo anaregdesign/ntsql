@@ -256,6 +256,36 @@ impl DatabaseFileIdentity {
     }
 }
 
+/// Stable identity persisted by one repository-owned database child header.
+///
+/// Lifecycle generation is deliberately absent. It is a manifest publication
+/// coordinate and may advance while this child identity remains unchanged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseFileHeaderIdentity {
+    database_id: DatabaseId,
+    file: DatabaseFileIdentity,
+}
+
+impl DatabaseFileHeaderIdentity {
+    /// Binds one stable database identity to one exact child role and file ID.
+    #[must_use]
+    pub const fn new(database_id: DatabaseId, file: DatabaseFileIdentity) -> Self {
+        Self { database_id, file }
+    }
+
+    /// Returns the logical database identity persisted by the child header.
+    #[must_use]
+    pub const fn database_id(self) -> DatabaseId {
+        self.database_id
+    }
+
+    /// Returns the exact role-bound file identity persisted by the child header.
+    #[must_use]
+    pub const fn file(self) -> DatabaseFileIdentity {
+        self.file
+    }
+}
+
 /// Invalid set of role-bound identities for one database composition.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseCompositionIdentityError {
@@ -315,6 +345,118 @@ impl fmt::Display for DatabaseCompositionIdentityError {
 
 impl Error for DatabaseCompositionIdentityError {}
 
+/// Validated stable identity of one database storage composition.
+///
+/// This value is the exact cross-file observation an adapter can reconstruct
+/// from successor child headers and their existing persistent WAL identities.
+/// It intentionally excludes the manifest-only lifecycle generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseStorageIdentity {
+    database_id: DatabaseId,
+    persistent_log_id: PersistentLogId,
+    wal_file_id: DatabaseFileId,
+    page_store_file_id: DatabaseFileId,
+    restart_checkpoint_file_id: DatabaseFileId,
+}
+
+impl DatabaseStorageIdentity {
+    /// Validates exactly one globally distinct identity for every required role.
+    pub fn new(
+        database_id: DatabaseId,
+        persistent_log_id: PersistentLogId,
+        files: &[DatabaseFileIdentity],
+    ) -> Result<Self, DatabaseCompositionIdentityError> {
+        let (wal_file_id, page_store_file_id, restart_checkpoint_file_id) =
+            validate_database_files(files)?;
+        Ok(Self {
+            database_id,
+            persistent_log_id,
+            wal_file_id,
+            page_store_file_id,
+            restart_checkpoint_file_id,
+        })
+    }
+
+    /// Returns the logical database identity.
+    #[must_use]
+    pub const fn database_id(self) -> DatabaseId {
+        self.database_id
+    }
+
+    /// Returns the persistent WAL lineage identity.
+    #[must_use]
+    pub const fn persistent_log_id(self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the file identity assigned to `role`.
+    #[must_use]
+    pub const fn file_id(self, role: DatabaseFileRole) -> DatabaseFileId {
+        match role {
+            DatabaseFileRole::Wal => self.wal_file_id,
+            DatabaseFileRole::PageStore => self.page_store_file_id,
+            DatabaseFileRole::RestartCheckpoint => self.restart_checkpoint_file_id,
+        }
+    }
+
+    /// Returns all role identities in stable role order.
+    #[must_use]
+    pub const fn ordered_files(self) -> [DatabaseFileIdentity; 3] {
+        [
+            DatabaseFileIdentity::new(DatabaseFileRole::Wal, self.wal_file_id),
+            DatabaseFileIdentity::new(DatabaseFileRole::PageStore, self.page_store_file_id),
+            DatabaseFileIdentity::new(
+                DatabaseFileRole::RestartCheckpoint,
+                self.restart_checkpoint_file_id,
+            ),
+        ]
+    }
+
+    /// Returns the exact stable identity one child header must persist.
+    #[must_use]
+    pub const fn file_header_identity(self, role: DatabaseFileRole) -> DatabaseFileHeaderIdentity {
+        DatabaseFileHeaderIdentity::new(
+            self.database_id,
+            DatabaseFileIdentity::new(role, self.file_id(role)),
+        )
+    }
+
+    /// Compares every physically observable storage identity in stable order.
+    pub fn require_exact_match(
+        self,
+        actual: Self,
+    ) -> Result<(), DatabaseCompositionIdentityMismatch> {
+        if self.database_id != actual.database_id {
+            return Err(DatabaseCompositionIdentityMismatch::DatabaseId {
+                expected: self.database_id,
+                actual: actual.database_id,
+            });
+        }
+        for role in [
+            DatabaseFileRole::Wal,
+            DatabaseFileRole::PageStore,
+            DatabaseFileRole::RestartCheckpoint,
+        ] {
+            let expected = self.file_id(role);
+            let actual = actual.file_id(role);
+            if expected != actual {
+                return Err(DatabaseCompositionIdentityMismatch::FileId {
+                    role,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        if self.persistent_log_id != actual.persistent_log_id {
+            return Err(DatabaseCompositionIdentityMismatch::PersistentLogId {
+                expected: self.persistent_log_id,
+                actual: actual.persistent_log_id,
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Validated inert identity of one exact database storage composition.
 ///
 /// This value contains no paths, handles, locks, decoded bytes, or lifecycle
@@ -338,71 +480,15 @@ impl DatabaseCompositionIdentity {
         persistent_log_id: PersistentLogId,
         files: &[DatabaseFileIdentity],
     ) -> Result<Self, DatabaseCompositionIdentityError> {
-        let mut wal_file_id = None;
-        let mut page_store_file_id = None;
-        let mut restart_checkpoint_file_id = None;
-
-        for file in files {
-            let slot = match file.role {
-                DatabaseFileRole::Wal => &mut wal_file_id,
-                DatabaseFileRole::PageStore => &mut page_store_file_id,
-                DatabaseFileRole::RestartCheckpoint => &mut restart_checkpoint_file_id,
-            };
-            if let Some(first_file_id) = *slot {
-                return Err(DatabaseCompositionIdentityError::DuplicateRole {
-                    role: file.role,
-                    first_file_id,
-                    duplicate_file_id: file.file_id,
-                });
-            }
-            *slot = Some(file.file_id);
-        }
-
-        let Some(wal_file_id) = wal_file_id else {
-            return Err(DatabaseCompositionIdentityError::MissingRole {
-                role: DatabaseFileRole::Wal,
-            });
-        };
-        let Some(page_store_file_id) = page_store_file_id else {
-            return Err(DatabaseCompositionIdentityError::MissingRole {
-                role: DatabaseFileRole::PageStore,
-            });
-        };
-        let Some(restart_checkpoint_file_id) = restart_checkpoint_file_id else {
-            return Err(DatabaseCompositionIdentityError::MissingRole {
-                role: DatabaseFileRole::RestartCheckpoint,
-            });
-        };
-
-        if wal_file_id == page_store_file_id {
-            return Err(DatabaseCompositionIdentityError::DuplicateFileIdentity {
-                file_id: wal_file_id,
-                first_role: DatabaseFileRole::Wal,
-                second_role: DatabaseFileRole::PageStore,
-            });
-        }
-        if wal_file_id == restart_checkpoint_file_id {
-            return Err(DatabaseCompositionIdentityError::DuplicateFileIdentity {
-                file_id: wal_file_id,
-                first_role: DatabaseFileRole::Wal,
-                second_role: DatabaseFileRole::RestartCheckpoint,
-            });
-        }
-        if page_store_file_id == restart_checkpoint_file_id {
-            return Err(DatabaseCompositionIdentityError::DuplicateFileIdentity {
-                file_id: page_store_file_id,
-                first_role: DatabaseFileRole::PageStore,
-                second_role: DatabaseFileRole::RestartCheckpoint,
-            });
-        }
+        let storage_identity = DatabaseStorageIdentity::new(database_id, persistent_log_id, files)?;
 
         Ok(Self {
             database_id,
             lifecycle_generation,
             persistent_log_id,
-            wal_file_id,
-            page_store_file_id,
-            restart_checkpoint_file_id,
+            wal_file_id: storage_identity.wal_file_id,
+            page_store_file_id: storage_identity.page_store_file_id,
+            restart_checkpoint_file_id: storage_identity.restart_checkpoint_file_id,
         })
     }
 
@@ -447,6 +533,24 @@ impl DatabaseCompositionIdentity {
         ]
     }
 
+    /// Returns the stable storage identity independently observable from children.
+    #[must_use]
+    pub const fn storage_identity(self) -> DatabaseStorageIdentity {
+        DatabaseStorageIdentity {
+            database_id: self.database_id,
+            persistent_log_id: self.persistent_log_id,
+            wal_file_id: self.wal_file_id,
+            page_store_file_id: self.page_store_file_id,
+            restart_checkpoint_file_id: self.restart_checkpoint_file_id,
+        }
+    }
+
+    /// Returns the stable identity one child header must persist.
+    #[must_use]
+    pub const fn file_header_identity(self, role: DatabaseFileRole) -> DatabaseFileHeaderIdentity {
+        self.storage_identity().file_header_identity(role)
+    }
+
     /// Produces the same composition at the exact next lifecycle generation.
     pub fn next_generation(self) -> Result<Self, DatabaseLifecycleGenerationExhausted> {
         Ok(Self {
@@ -475,34 +579,8 @@ impl DatabaseCompositionIdentity {
         self,
         actual: Self,
     ) -> Result<(), DatabaseCompositionIdentityMismatch> {
-        if self.database_id != actual.database_id {
-            return Err(DatabaseCompositionIdentityMismatch::DatabaseId {
-                expected: self.database_id,
-                actual: actual.database_id,
-            });
-        }
-        for role in [
-            DatabaseFileRole::Wal,
-            DatabaseFileRole::PageStore,
-            DatabaseFileRole::RestartCheckpoint,
-        ] {
-            let expected = self.file_id(role);
-            let actual = actual.file_id(role);
-            if expected != actual {
-                return Err(DatabaseCompositionIdentityMismatch::FileId {
-                    role,
-                    expected,
-                    actual,
-                });
-            }
-        }
-        if self.persistent_log_id != actual.persistent_log_id {
-            return Err(DatabaseCompositionIdentityMismatch::PersistentLogId {
-                expected: self.persistent_log_id,
-                actual: actual.persistent_log_id,
-            });
-        }
-        Ok(())
+        self.storage_identity()
+            .require_exact_match(actual.storage_identity())
     }
 
     /// Compares every identity in stable field order.
@@ -545,6 +623,70 @@ impl DatabaseCompositionIdentity {
         }
         Ok(())
     }
+}
+
+fn validate_database_files(
+    files: &[DatabaseFileIdentity],
+) -> Result<(DatabaseFileId, DatabaseFileId, DatabaseFileId), DatabaseCompositionIdentityError> {
+    let mut wal_file_id = None;
+    let mut page_store_file_id = None;
+    let mut restart_checkpoint_file_id = None;
+
+    for file in files {
+        let slot = match file.role {
+            DatabaseFileRole::Wal => &mut wal_file_id,
+            DatabaseFileRole::PageStore => &mut page_store_file_id,
+            DatabaseFileRole::RestartCheckpoint => &mut restart_checkpoint_file_id,
+        };
+        if let Some(first_file_id) = *slot {
+            return Err(DatabaseCompositionIdentityError::DuplicateRole {
+                role: file.role,
+                first_file_id,
+                duplicate_file_id: file.file_id,
+            });
+        }
+        *slot = Some(file.file_id);
+    }
+
+    let Some(wal_file_id) = wal_file_id else {
+        return Err(DatabaseCompositionIdentityError::MissingRole {
+            role: DatabaseFileRole::Wal,
+        });
+    };
+    let Some(page_store_file_id) = page_store_file_id else {
+        return Err(DatabaseCompositionIdentityError::MissingRole {
+            role: DatabaseFileRole::PageStore,
+        });
+    };
+    let Some(restart_checkpoint_file_id) = restart_checkpoint_file_id else {
+        return Err(DatabaseCompositionIdentityError::MissingRole {
+            role: DatabaseFileRole::RestartCheckpoint,
+        });
+    };
+
+    if wal_file_id == page_store_file_id {
+        return Err(DatabaseCompositionIdentityError::DuplicateFileIdentity {
+            file_id: wal_file_id,
+            first_role: DatabaseFileRole::Wal,
+            second_role: DatabaseFileRole::PageStore,
+        });
+    }
+    if wal_file_id == restart_checkpoint_file_id {
+        return Err(DatabaseCompositionIdentityError::DuplicateFileIdentity {
+            file_id: wal_file_id,
+            first_role: DatabaseFileRole::Wal,
+            second_role: DatabaseFileRole::RestartCheckpoint,
+        });
+    }
+    if page_store_file_id == restart_checkpoint_file_id {
+        return Err(DatabaseCompositionIdentityError::DuplicateFileIdentity {
+            file_id: page_store_file_id,
+            first_role: DatabaseFileRole::PageStore,
+            second_role: DatabaseFileRole::RestartCheckpoint,
+        });
+    }
+
+    Ok((wal_file_id, page_store_file_id, restart_checkpoint_file_id))
 }
 
 /// First exact contradiction between selected and observed composition identity.
@@ -1133,13 +1275,20 @@ impl<Owner> ManifestSelectedDatabase<Owner> {
         DatabaseLifecycleStage::ManifestSelected
     }
 
-    /// Binds this owner only when opened storage reports the exact composition.
-    pub fn bind_exact_composition(
+    /// Binds this owner only when child storage reports its exact stable identity.
+    ///
+    /// Lifecycle generation remains the selected manifest's publication
+    /// coordinate and is not synthesized into the child observation.
+    pub fn bind_observed_storage(
         self,
-        observed_identity: DatabaseCompositionIdentity,
-    ) -> Result<RecoveryRequiredDatabase<Owner>, Box<DatabaseCompositionBindingError<Owner>>> {
-        if let Err(reason) = self.identity.require_exact_match(observed_identity) {
-            return Err(Box::new(DatabaseCompositionBindingError {
+        observed_identity: DatabaseStorageIdentity,
+    ) -> Result<RecoveryRequiredDatabase<Owner>, Box<DatabaseStorageBindingError<Owner>>> {
+        if let Err(reason) = self
+            .identity
+            .storage_identity()
+            .require_exact_match(observed_identity)
+        {
+            return Err(Box::new(DatabaseStorageBindingError {
                 database: self,
                 observed_identity,
                 reason,
@@ -1161,16 +1310,16 @@ impl<Owner> fmt::Debug for ManifestSelectedDatabase<Owner> {
     }
 }
 
-/// Failed exact-composition binding retaining selected ownership and evidence.
-#[must_use = "failed composition binding retains the selected database owner"]
-pub struct DatabaseCompositionBindingError<Owner> {
+/// Failed storage-identity binding retaining selected ownership and evidence.
+#[must_use = "failed storage binding retains the selected database owner"]
+pub struct DatabaseStorageBindingError<Owner> {
     database: ManifestSelectedDatabase<Owner>,
-    observed_identity: DatabaseCompositionIdentity,
+    observed_identity: DatabaseStorageIdentity,
     reason: DatabaseCompositionIdentityMismatch,
 }
 
-impl<Owner> DatabaseCompositionBindingError<Owner> {
-    /// Returns the first exact identity contradiction.
+impl<Owner> DatabaseStorageBindingError<Owner> {
+    /// Returns the first stable storage contradiction.
     #[must_use]
     pub const fn reason(&self) -> &DatabaseCompositionIdentityMismatch {
         &self.reason
@@ -1178,37 +1327,37 @@ impl<Owner> DatabaseCompositionBindingError<Owner> {
 
     /// Returns the rejected observed composition identity.
     #[must_use]
-    pub const fn observed_identity(&self) -> DatabaseCompositionIdentity {
+    pub const fn observed_identity(&self) -> DatabaseStorageIdentity {
         self.observed_identity
     }
 
     /// Releases the retained selected owner and observed inert identity together.
-    pub fn into_parts(self) -> (ManifestSelectedDatabase<Owner>, DatabaseCompositionIdentity) {
+    pub fn into_parts(self) -> (ManifestSelectedDatabase<Owner>, DatabaseStorageIdentity) {
         (self.database, self.observed_identity)
     }
 }
 
-impl<Owner> fmt::Debug for DatabaseCompositionBindingError<Owner> {
+impl<Owner> fmt::Debug for DatabaseStorageBindingError<Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DatabaseCompositionBindingError")
+            .debug_struct("DatabaseStorageBindingError")
             .field("observed_identity", &self.observed_identity)
             .field("reason", &self.reason)
             .finish_non_exhaustive()
     }
 }
 
-impl<Owner> fmt::Display for DatabaseCompositionBindingError<Owner> {
+impl<Owner> fmt::Display for DatabaseStorageBindingError<Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "database composition binding failed: {}",
+            "database storage binding failed: {}",
             self.reason
         )
     }
 }
 
-impl<Owner> Error for DatabaseCompositionBindingError<Owner> {}
+impl<Owner> Error for DatabaseStorageBindingError<Owner> {}
 
 macro_rules! define_owned_database_state {
     ($(#[$attribute:meta])* $name:ident, $stage:expr) => {
@@ -1775,8 +1924,8 @@ mod tests {
             .map_err(|_| TestValueError("exact manifest must select"))?;
         assert_eq!(selected.stage(), DatabaseLifecycleStage::ManifestSelected);
 
-        let foreign_wal = composition(1, 2, 9, 4, 5, 6)?;
-        let binding_error = match selected.bind_exact_composition(foreign_wal) {
+        let foreign_wal = composition(1, 9, 9, 4, 5, 6)?.storage_identity();
+        let binding_error = match selected.bind_observed_storage(foreign_wal) {
             Ok(_) => return Err(TestValueError("foreign composition must be rejected")),
             Err(error) => error,
         };
@@ -1792,8 +1941,8 @@ mod tests {
         assert_eq!(rejected, foreign_wal);
 
         let recovery_required = selected
-            .bind_exact_composition(expected)
-            .map_err(|_| TestValueError("exact composition must bind"))?;
+            .bind_observed_storage(expected.storage_identity())
+            .map_err(|_| TestValueError("exact storage must bind"))?;
         assert_eq!(
             recovery_required.stage(),
             DatabaseLifecycleStage::RecoveryRequired

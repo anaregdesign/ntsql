@@ -5,6 +5,7 @@
 - Issue: #183
 - Extends: ADR 0001, ADR 0014, ADR 0045, ADR 0062, ADR 0063
 - Follows: #182
+- Extended by: #184
 
 ## Context
 
@@ -147,12 +148,12 @@ On every failure, ordinary ownership destruction releases the latest child and
 all earlier retained locks. The successful value has no explicit unlock path;
 dropping its lifecycle typestate releases the complete set.
 
-## Current File-Identity Boundary
+## Legacy and Successor File-Identity Boundaries
 
-The existing WAL, page-store, and completeness-control formats persist their
-shared `PersistentLogId` and role-specific format magic, but they do not yet
-persist `DatabaseId`, `DatabaseFileId`, or `DatabaseLifecycleGeneration`.
-Consequently, this gate can physically establish:
+The legacy WAL V3/V4, page-store V1, and completeness-control V1 formats persist
+their shared `PersistentLogId` and role-specific format magic, but they do not
+persist `DatabaseId` or `DatabaseFileId`. The legacy-compatible
+`open_file_database_ownership` gate can therefore physically establish:
 
 - the stable owner-control database ID;
 - the manifest database ID and logical role-to-file-ID association;
@@ -160,19 +161,31 @@ Consequently, this gate can physically establish:
 - each role's repository-owned format; and
 - one shared persistent WAL identity.
 
-The manifest file IDs remain logical selected-role identities at this boundary;
-they are not independently re-read from current child headers. A same-role
+The manifest file IDs remain logical selected-role identities at that boundary;
+they are not independently re-read from legacy child headers. A same-role
 substitute with the same physical format and persistent WAL ID is therefore not
-distinguishable solely by issue #183. For that reason, the adapter does not copy
-manifest fields into an alleged observation and does not invoke ADR 0062's
-exact-composition transition. Content-level staleness is validated by the
-approved recovery scan in issue #185.
+distinguishable solely through legacy formats. The legacy-compatible gate does
+not copy manifest fields into alleged observations and returns only
+manifest-selected authority.
 
-Issue #184 must introduce reviewed successor child formats that persist the
-database ID, exact role, database file ID, and lifecycle-generation policy while
-creating the composition. It must update this opener to compare those physical
-observations before publication or recovery. Existing format versions may not be
-silently reinterpreted to contain those fields.
+Issue #184 adds WAL V5, page-store V2, and completeness-control V2. Each persists
+one checksummed child extension containing the stable `DatabaseId`, exact
+`DatabaseFileRole`, and `DatabaseFileId`. The extension excludes lifecycle
+generation. Generation belongs only to the replaceable manifest and may advance
+on clean-close or other adjacent manifest publication without rewriting all
+children. WAL reclamation has its own independent WAL generation and preserves
+the stable child extension.
+
+`open_recovery_required_file_database` accepts only those successor versions. It
+parses the physical version and child identity from each locked adapter, checks
+database ID, exact role, file ID, required format, persistent WAL ID, and complete
+stable-storage identity, then consumes the retained manifest-selected owner into
+`RecoveryRequiredDatabase`. A legacy or mixed composition remains openable only
+through the weaker manifest-selected gate. Existing format versions are never
+reinterpreted to contain successor fields.
+
+Content-level staleness, replay correctness, and the recovery-to-live transition
+remain owned by issue #185.
 
 ## Filesystem Assumptions
 
@@ -209,12 +222,11 @@ its database and role while the five guards remain held.
 Synthetic opened-object IDs model owner/manifest/child alias detection without
 pretending to be operating-system descriptors. File observations validate the
 exact role set, logical file IDs, required formats, and persistent WAL identity
-in the same stable order. Success returns a private
-`InMemoryDatabaseOwnershipSelection` around manifest-selected ownership,
-retaining the guard and all observations for later lifecycle model comparison.
-Although memory observations already contain every logical file ID, this gate
-withholds exact-composition authority to match the filesystem boundary that
-issue #184 must complete.
+in the same stable order. The legacy-compatible operation returns a private
+`InMemoryDatabaseOwnershipSelection` around manifest-selected ownership.
+`try_acquire_recovery_required` additionally binds the complete stable-storage
+observation and returns recovery-required authority while retaining all guards.
+Adjacent manifest generations accept the same unchanged child observations.
 
 The memory adapter models the stronger identity evidence that issue #184 must
 persist in filesystem child headers. It does not emulate paths, inodes, advisory
@@ -247,7 +259,8 @@ error number, diagnostic, MDF/NDF/LDF/BAK format, or compatibility claim.
   earlier lock and permit immediate reopen.
 - A late foreign checkpoint leaves earlier incomplete WAL/page tails and a WAL
   reclamation candidate byte-for-byte untouched.
-- Owner, manifest, and every child reject foreign available identity evidence.
+- Owner, manifest, and every successor child reject foreign physical database,
+  role, and file identity evidence.
 - Every manifest-required child format is checked in stable role order.
 - Missing and reversed layout roles fail without fallback.
 - On Unix, all ten later-to-earlier hard-link alias pairs are rejected from
@@ -255,7 +268,13 @@ error number, diagnostic, MDF/NDF/LDF/BAK format, or compatibility claim.
 - The derived WAL reclamation candidate cannot lexically select or hard-link
   alias any of the five database lock targets.
 - Success retains all five lock targets until the database typestate is dropped,
-  exposes only manifest-selected stage, and permits repeated open after drop.
+  exposes only the stage justified by the selected opener, and permits repeated
+  open after drop.
+- Successor-only exact open reaches recovery-required authority; legacy or mixed
+  formats cannot claim that transition.
+- WAL V5 reclamation remains V5, advances only its independent WAL generation,
+  and preserves the exact stable child identity under the complete header
+  checksum.
 - Memory tests cover world-stable identity and role binding, contention/release
   across distinct owner slots sharing a child, owner/manifest identity, missing
   and duplicate roles, reversed file IDs, every foreign lineage/format, and all
@@ -266,7 +285,7 @@ error number, diagnostic, MDF/NDF/LDF/BAK format, or compatibility claim.
 This ADR does not:
 
 - create, replace, synchronize, publish, migrate, or repair a manifest;
-- allocate or persist child database/file identities in existing headers;
+- reinterpret legacy headers as if they persisted child database/file identities;
 - define or execute database crash recovery or live release;
 - add clean/unclean close evidence or a tombstone/removal protocol;
 - define waiting, lock stealing, mandatory locking, or distributed ownership;
@@ -281,6 +300,7 @@ without a reopen gap or pre-validation repair. Atomic create can build and
 publish that exact topology; open/recovery can later consume it without
 recreating authority from paths or decoded values.
 
-The deliberate limitation is that current child formats do not physically carry
-all manifest identity fields. Issue #184 owns that successor-format decision,
-and issue #185 owns content-level recovery validation before live authority.
+Legacy child formats deliberately remain weaker than the successor formats.
+Issue #184's successor headers close the stable-identity gap without making
+manifest generation immutable in children; issue #185 still owns content-level
+recovery validation before live authority.

@@ -7,9 +7,11 @@ use std::{
 };
 
 use ntsql_database::{
-    DatabaseCompositionIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleStage,
-    DatabaseManifest, DatabaseManifestSelectionRejection, DatabaseStorageFormatVersion,
-    ManifestSelectedDatabase, UnboundDatabase,
+    DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
+    DatabaseCompositionIdentityMismatch, DatabaseFileHeaderIdentity, DatabaseFileRole, DatabaseId,
+    DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
+    DatabaseStorageFormatVersion, DatabaseStorageIdentity, ManifestSelectedDatabase,
+    RecoveryRequiredDatabase, UnboundDatabase,
 };
 use ntsql_wal::PersistentLogId;
 
@@ -19,9 +21,7 @@ use super::{
     UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint, checksum_v1,
     decode_database_manifest, metadata_identifies_same_file, read_u16, read_u32, read_u64,
     read_u128,
-    restart_checkpoint_file::{
-        CONTROL_FILE_NAME, CONTROL_FORMAT_VERSION, FileRestartCheckpointSlotOpenError,
-    },
+    restart_checkpoint_file::{CONTROL_FILE_NAME, FileRestartCheckpointSlotOpenError},
     write_u16, write_u32, write_u64, write_u128,
 };
 
@@ -475,6 +475,40 @@ pub enum FileDatabaseOwnershipOpenError {
         /// Exact observed child identity.
         actual: PersistentLogId,
     },
+    /// A successor child header belongs to another logical database.
+    ChildDatabaseIdMismatch {
+        /// Child role being opened.
+        role: DatabaseFileRole,
+        /// Manifest-selected database identity.
+        expected: DatabaseId,
+        /// Physically decoded database identity.
+        actual: DatabaseId,
+    },
+    /// A successor child header identifies a different role.
+    ChildFileRoleMismatch {
+        /// Role selected by the database layout.
+        expected: DatabaseFileRole,
+        /// Role physically decoded from the child header.
+        actual: DatabaseFileRole,
+    },
+    /// A successor child header identifies another file.
+    ChildFileIdMismatch {
+        /// Child role being opened.
+        role: DatabaseFileRole,
+        /// Manifest-selected file identity.
+        expected: ntsql_database::DatabaseFileId,
+        /// Physically decoded file identity.
+        actual: ntsql_database::DatabaseFileId,
+    },
+    /// A legacy child lacks the stable physical identity needed for binding.
+    StableStorageIdentityUnavailable {
+        /// First role without successor identity in stable order.
+        role: DatabaseFileRole,
+    },
+    /// The physically observed role set is internally invalid.
+    ObservedStorageIdentity(DatabaseCompositionIdentityError),
+    /// The domain storage-binding gate rejected physical evidence.
+    StorageBinding(DatabaseCompositionIdentityMismatch),
     /// The domain manifest-selection gate rejected the locked owner.
     ManifestSelection(DatabaseManifestSelectionRejection),
 }
@@ -553,6 +587,43 @@ impl fmt::Display for FileDatabaseOwnershipOpenError {
                 actual.get(),
                 expected.get()
             ),
+            Self::ChildDatabaseIdMismatch {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "database {role} header database identity {} does not match manifest identity {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::ChildFileRoleMismatch { expected, actual } => write!(
+                formatter,
+                "database child header role {actual} does not match selected {expected}"
+            ),
+            Self::ChildFileIdMismatch {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "database {role} header file identity {} does not match manifest identity {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::StableStorageIdentityUnavailable { role } => write!(
+                formatter,
+                "database {role} uses a legacy header without stable storage identity"
+            ),
+            Self::ObservedStorageIdentity(source) => {
+                write!(
+                    formatter,
+                    "observed database storage identity is invalid: {source}"
+                )
+            }
+            Self::StorageBinding(source) => {
+                write!(formatter, "database storage binding failed: {source}")
+            }
             Self::ManifestSelection(source) => {
                 write!(
                     formatter,
@@ -574,6 +645,8 @@ impl Error for FileDatabaseOwnershipOpenError {
             Self::PageStoreOpen(source) => Some(source),
             Self::RestartCheckpointOpen(source) => Some(source),
             Self::ManifestSelection(source) => Some(source),
+            Self::ObservedStorageIdentity(source) => Some(source),
+            Self::StorageBinding(source) => Some(source),
             Self::DatabaseOwnerControlFileLength { .. }
             | Self::DatabaseOwnerIdMismatch { .. }
             | Self::OpenedObjectAlias { .. }
@@ -582,7 +655,11 @@ impl Error for FileDatabaseOwnershipOpenError {
             | Self::ManifestFileLength { .. }
             | Self::ManifestDatabaseIdMismatch { .. }
             | Self::StorageFormatVersionMismatch { .. }
-            | Self::PersistentLogIdMismatch { .. } => None,
+            | Self::PersistentLogIdMismatch { .. }
+            | Self::ChildDatabaseIdMismatch { .. }
+            | Self::ChildFileRoleMismatch { .. }
+            | Self::ChildFileIdMismatch { .. }
+            | Self::StableStorageIdentityUnavailable { .. } => None,
         }
     }
 }
@@ -642,15 +719,16 @@ impl<const N: usize> fmt::Debug for FileDatabaseOwnership<N> {
 
 /// Manifest-selected filesystem ownership retaining every acquired lock.
 ///
-/// Current child formats do not persist every manifest identity field, so this
-/// adapter deliberately withholds ADR 0062's exact-composition transition.
+/// This legacy-compatible wrapper deliberately withholds stable-storage binding.
+/// The successor-only opener performs that gate before returning a distinct
+/// recovery-required type.
 ///
 /// ```compile_fail
 /// use ntsql_storage_file::FileDatabaseOwnershipSelection;
 ///
 /// fn cannot_claim_exact<const N: usize>(selected: FileDatabaseOwnershipSelection<N>) {
-///     let observed = selected.identity();
-///     selected.bind_exact_composition(observed);
+///     let observed = selected.identity().storage_identity();
+///     selected.bind_observed_storage(observed);
 /// }
 /// ```
 #[must_use = "selected filesystem ownership must remain retained or be dropped"]
@@ -681,6 +759,21 @@ impl<const N: usize> fmt::Debug for FileDatabaseOwnershipSelection<N> {
     }
 }
 
+/// Recovery-required filesystem ownership proven by stable physical child identity.
+pub type RecoveryRequiredFileDatabase<const N: usize> =
+    RecoveryRequiredDatabase<FileDatabaseOwnership<N>>;
+
+struct AcquiredFileDatabaseOwnership<const N: usize> {
+    selected: ManifestSelectedDatabase<FileDatabaseOwnership<N>>,
+    stable_storage_observation: StableStorageObservation,
+}
+
+#[derive(Clone, Copy)]
+enum StableStorageObservation {
+    Complete(DatabaseStorageIdentity),
+    Missing(DatabaseFileRole),
+}
+
 /// Acquires one database lock set and validates all currently physical evidence.
 ///
 /// Acquisition is nonblocking and ordered:
@@ -700,6 +793,38 @@ pub fn open_file_database_ownership<const N: usize>(
     expected_database_id: DatabaseId,
     layout: FileDatabaseLayout,
 ) -> Result<FileDatabaseOwnershipSelection<N>, FileDatabaseOwnershipOpenError> {
+    let acquired = acquire_file_database_ownership(expected_database_id, layout, false)?;
+    Ok(FileDatabaseOwnershipSelection {
+        selected: acquired.selected,
+    })
+}
+
+/// Opens only successor children that physically prove the selected storage identity.
+///
+/// Legacy child formats remain openable through [`open_file_database_ownership`]
+/// but cannot cross this recovery-required authority boundary.
+pub fn open_recovery_required_file_database<const N: usize>(
+    expected_database_id: DatabaseId,
+    layout: FileDatabaseLayout,
+) -> Result<RecoveryRequiredFileDatabase<N>, FileDatabaseOwnershipOpenError> {
+    let acquired = acquire_file_database_ownership(expected_database_id, layout, true)?;
+    let observed_storage_identity = match acquired.stable_storage_observation {
+        StableStorageObservation::Complete(identity) => identity,
+        StableStorageObservation::Missing(role) => {
+            return Err(FileDatabaseOwnershipOpenError::StableStorageIdentityUnavailable { role });
+        }
+    };
+    acquired
+        .selected
+        .bind_observed_storage(observed_storage_identity)
+        .map_err(|failure| FileDatabaseOwnershipOpenError::StorageBinding(*failure.reason()))
+}
+
+fn acquire_file_database_ownership<const N: usize>(
+    expected_database_id: DatabaseId,
+    layout: FileDatabaseLayout,
+    require_stable_storage: bool,
+) -> Result<AcquiredFileDatabaseOwnership<N>, FileDatabaseOwnershipOpenError> {
     PageLayout::for_const::<N>().map_err(FileDatabaseOwnershipOpenError::PageWidth)?;
 
     let (mut database_owner_file, database_owner_metadata) =
@@ -834,8 +959,11 @@ pub fn open_file_database_ownership<const N: usize>(
             role: DatabaseFileRole::Wal,
             format_version: pending_log.physical_format_version(),
             persistent_log_id: pending_log.persistent_id(),
+            database_file_identity: pending_log.database_file_identity(),
         },
     )?;
+    let wal_database_file_identity = pending_log.database_file_identity();
+    let observed_persistent_log_id = pending_log.persistent_id();
 
     let pending_store = FilePageStore::<N>::inspect(layout.page_store())
         .map_err(FileDatabaseOwnershipOpenError::PageStoreOpen)?;
@@ -855,10 +983,12 @@ pub fn open_file_database_ownership<const N: usize>(
         manifest,
         ChildObservation {
             role: DatabaseFileRole::PageStore,
-            format_version: super::PAGE_STORE_FORMAT_VERSION,
+            format_version: pending_store.physical_format_version(),
             persistent_log_id: pending_store.persistent_id(),
+            database_file_identity: pending_store.database_file_identity(),
         },
     )?;
+    let page_store_database_file_identity = pending_store.database_file_identity();
 
     let checkpoint =
         FileRestartCheckpointCompletenessBaselineSource::open(layout.restart_checkpoint())
@@ -879,10 +1009,35 @@ pub fn open_file_database_ownership<const N: usize>(
         manifest,
         ChildObservation {
             role: DatabaseFileRole::RestartCheckpoint,
-            format_version: CONTROL_FORMAT_VERSION,
+            format_version: checkpoint.control_format_version(),
             persistent_log_id: checkpoint.persistent_log_id(),
+            database_file_identity: checkpoint.database_file_identity(),
         },
     )?;
+    let restart_checkpoint_database_file_identity = checkpoint.database_file_identity();
+    let stable_storage_observation = match (
+        wal_database_file_identity,
+        page_store_database_file_identity,
+        restart_checkpoint_database_file_identity,
+    ) {
+        (Some(wal), Some(page_store), Some(restart_checkpoint)) => {
+            let files = [wal.file(), page_store.file(), restart_checkpoint.file()];
+            let observed =
+                DatabaseStorageIdentity::new(wal.database_id(), observed_persistent_log_id, &files)
+                    .map_err(FileDatabaseOwnershipOpenError::ObservedStorageIdentity)?;
+            StableStorageObservation::Complete(observed)
+        }
+        (None, _, _) => StableStorageObservation::Missing(DatabaseFileRole::Wal),
+        (Some(_), None, _) => StableStorageObservation::Missing(DatabaseFileRole::PageStore),
+        (Some(_), Some(_), None) => {
+            StableStorageObservation::Missing(DatabaseFileRole::RestartCheckpoint)
+        }
+    };
+    if require_stable_storage
+        && let StableStorageObservation::Missing(role) = stable_storage_observation
+    {
+        return Err(FileDatabaseOwnershipOpenError::StableStorageIdentityUnavailable { role });
+    }
 
     let log = pending_log
         .finish()
@@ -913,7 +1068,10 @@ pub fn open_file_database_ownership<const N: usize>(
             return Err(FileDatabaseOwnershipOpenError::ManifestSelection(reason));
         }
     };
-    Ok(FileDatabaseOwnershipSelection { selected })
+    Ok(AcquiredFileDatabaseOwnership {
+        selected,
+        stable_storage_observation,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -921,6 +1079,7 @@ struct ChildObservation {
     role: DatabaseFileRole,
     format_version: u16,
     persistent_log_id: PersistentLogId,
+    database_file_identity: Option<DatabaseFileHeaderIdentity>,
 }
 
 fn open_file(
@@ -1029,6 +1188,31 @@ fn validate_child_observation(
             expected,
             actual: observation.persistent_log_id,
         });
+    }
+    if let Some(actual) = observation.database_file_identity {
+        let expected = manifest
+            .composition_identity()
+            .file_header_identity(observation.role);
+        if actual.database_id() != expected.database_id() {
+            return Err(FileDatabaseOwnershipOpenError::ChildDatabaseIdMismatch {
+                role: observation.role,
+                expected: expected.database_id(),
+                actual: actual.database_id(),
+            });
+        }
+        if actual.file().role() != expected.file().role() {
+            return Err(FileDatabaseOwnershipOpenError::ChildFileRoleMismatch {
+                expected: expected.file().role(),
+                actual: actual.file().role(),
+            });
+        }
+        if actual.file().file_id() != expected.file().file_id() {
+            return Err(FileDatabaseOwnershipOpenError::ChildFileIdMismatch {
+                role: observation.role,
+                expected: expected.file().file_id(),
+                actual: actual.file().file_id(),
+            });
+        }
     }
     Ok(())
 }

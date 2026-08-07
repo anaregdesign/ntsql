@@ -8,6 +8,9 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use ntsql_database::{
+    DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole, DatabaseId, DatabaseStorageIdentity,
+};
 use ntsql_page::{
     PageAddress, PageImage, PageLog, PageNumber, PageVersion, StoredPageSnapshotObservation,
     UnloggedPage,
@@ -917,6 +920,91 @@ fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Resul
     assert_eq!(
         reopened.durable_position().map(|position| position.get()),
         Some(4)
+    );
+    Ok(())
+}
+
+#[test]
+fn wal_v5_reclamation_preserves_stable_database_identity() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("wal-v5-reclamation-identity")?;
+    let persistent_log_id = persistent_log_id(17002)?;
+    let storage_identity = database_storage_identity(persistent_log_id)?;
+    let wal_path = directory.path().join("wal.bin");
+    let page_store_path = directory.path().join("pages.bin");
+    let slot_path = directory.path().join("completeness");
+    let mut owner = analyzed_database_owner(directory.path(), persistent_log_id, storage_identity)?;
+
+    assert_eq!(append_committed_transaction(&mut owner)?, 1);
+    append_committed_page(&mut owner, 171, 1, [0x17, 0x02])?;
+    let mut checkpoint = FileRestartCheckpointCompletenessBaselineSource::create_new_database(
+        &slot_path,
+        storage_identity,
+    )?;
+    let _receipt = owner
+        .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut checkpoint)?;
+    drop((owner, checkpoint));
+
+    let opened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        &wal_path,
+        &page_store_path,
+        &slot_path,
+    )?;
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        opened.select_restart_checkpoint_completeness()
+    else {
+        return Err(io::Error::other("V5 reclamation checkpoint was not selected").into());
+    };
+    let planned = selected.plan_replay_window()?;
+    let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+        planned.prepare_page_repairs()
+    else {
+        return Err(io::Error::other("V5 reclamation preparation failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+        prepared.execute_page_repairs()
+    else {
+        return Err(io::Error::other("V5 reclamation page execution failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+        repaired.restore_transaction_state()
+    else {
+        return Err(io::Error::other("V5 reclamation restoration failed").into());
+    };
+    let reclaimed = restored
+        .complete_restart()?
+        .analyze_wal_retention()?
+        .reclaim_wal_prefix()
+        .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    let receipt = reclaimed.reclamation_receipt();
+    assert_eq!(receipt.source_physical_format_version(), 5);
+    assert_eq!(receipt.replacement_physical_format_version(), 5);
+    assert_eq!(receipt.old_generation(), 0);
+    assert_eq!(receipt.new_generation(), 1);
+    let (coordinator, log, store, evidence) = reclaimed.into_parts();
+    assert_eq!(log.physical_format_version(), 5);
+    assert_eq!(
+        log.database_file_identity(),
+        Some(storage_identity.file_header_identity(DatabaseFileRole::Wal))
+    );
+    assert_eq!(store.physical_format_version(), 2);
+    assert_eq!(
+        store.database_file_identity(),
+        Some(storage_identity.file_header_identity(DatabaseFileRole::PageStore))
+    );
+    drop((coordinator, log, store, evidence));
+
+    let log = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    assert_eq!(log.physical_format_version(), 5);
+    assert_eq!(
+        log.database_file_identity(),
+        Some(storage_identity.file_header_identity(DatabaseFileRole::Wal))
+    );
+    drop(log);
+    let checkpoint = FileRestartCheckpointCompletenessBaselineSource::open(&slot_path)?;
+    assert_eq!(checkpoint.control_format_version(), 2);
+    assert_eq!(
+        checkpoint.database_file_identity(),
+        Some(storage_identity.file_header_identity(DatabaseFileRole::RestartCheckpoint))
     );
     Ok(())
 }
@@ -2407,6 +2495,54 @@ fn analyzed_owner(
     Ok(UnrecoveredTransactionPageStorage::new(log, store)
         .recover()?
         .analyze_restart()?)
+}
+
+fn analyzed_database_owner(
+    directory: &Path,
+    persistent_log_id: PersistentLogId,
+    storage_identity: DatabaseStorageIdentity,
+) -> Result<FileOwner, Box<dyn Error>> {
+    let log = FileCommitLog::<2>::create_new_database_transaction_page_capable(
+        directory.join("wal.bin"),
+        storage_identity,
+    )?;
+    let store =
+        FilePageStore::<2>::create_new_database(directory.join("pages.bin"), storage_identity)?;
+    if log.persistent_id() != persistent_log_id || store.persistent_id() != persistent_log_id {
+        return Err(io::Error::other("database child persistent log ID changed").into());
+    }
+    Ok(UnrecoveredTransactionPageStorage::new(log, store)
+        .recover()?
+        .analyze_restart()?)
+}
+
+fn database_storage_identity(
+    persistent_log_id: PersistentLogId,
+) -> Result<DatabaseStorageIdentity, Box<dyn Error>> {
+    let database_id =
+        DatabaseId::new(17_002).ok_or_else(|| io::Error::other("test database ID is zero"))?;
+    let files = [
+        DatabaseFileIdentity::new(
+            DatabaseFileRole::Wal,
+            DatabaseFileId::new(27_002)
+                .ok_or_else(|| io::Error::other("test WAL file ID is zero"))?,
+        ),
+        DatabaseFileIdentity::new(
+            DatabaseFileRole::PageStore,
+            DatabaseFileId::new(37_002)
+                .ok_or_else(|| io::Error::other("test page file ID is zero"))?,
+        ),
+        DatabaseFileIdentity::new(
+            DatabaseFileRole::RestartCheckpoint,
+            DatabaseFileId::new(47_002)
+                .ok_or_else(|| io::Error::other("test checkpoint file ID is zero"))?,
+        ),
+    ];
+    Ok(DatabaseStorageIdentity::new(
+        database_id,
+        persistent_log_id,
+        &files,
+    )?)
 }
 
 fn append_committed_page(

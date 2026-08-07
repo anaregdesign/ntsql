@@ -18,6 +18,7 @@ use ntsql_storage_file::{
     FileRestartCheckpointCompletenessBaselineSource, FileRestartCheckpointSlotIoStage,
     PageStoreIoStage, PageStoreOpenError, decode_database_owner_control, encode_database_manifest,
     encode_database_owner_control, open_file_database_ownership,
+    open_recovery_required_file_database,
 };
 use ntsql_wal::PersistentLogId;
 
@@ -121,6 +122,120 @@ fn successful_open_retains_every_lock_until_owner_drop() -> Result<(), Box<dyn E
         database.database_id,
         database.layout.clone(),
     )?);
+    Ok(())
+}
+
+#[test]
+fn successor_children_bind_stable_storage_across_manifest_generations() -> Result<(), Box<dyn Error>>
+{
+    let database = TestDatabase::new_successor("successor", 500, 600)?;
+    let opened =
+        open_recovery_required_file_database::<1>(database.database_id, database.layout.clone())?;
+    assert_eq!(opened.identity(), database.manifest.composition_identity());
+    assert_eq!(opened.stage(), DatabaseLifecycleStage::RecoveryRequired);
+    assert_all_locks_held(&database.layout)?;
+    drop(opened);
+
+    let successor = database.manifest.next_recovery_required()?;
+    overwrite_synced(
+        database.layout.manifest(),
+        &encode_database_manifest(&successor),
+    )?;
+    let reopened =
+        open_recovery_required_file_database::<1>(database.database_id, database.layout.clone())?;
+    assert_eq!(reopened.identity(), successor.composition_identity());
+    assert_eq!(
+        reopened.identity().storage_identity(),
+        database.manifest.composition_identity().storage_identity()
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_children_cannot_claim_stable_storage_binding() -> Result<(), Box<dyn Error>> {
+    let database = TestDatabase::new("legacy-binding", 501, 601)?;
+    append_synced(database.layout.wal(), &[0xaa])?;
+    append_synced(database.layout.page_store(), &[0xbb])?;
+    let wal_before = fs::read(database.layout.wal())?;
+    let page_store_before = fs::read(database.layout.page_store())?;
+    assert!(matches!(
+        open_recovery_required_file_database::<1>(database.database_id, database.layout.clone(),),
+        Err(
+            FileDatabaseOwnershipOpenError::StableStorageIdentityUnavailable {
+                role: DatabaseFileRole::Wal,
+            }
+        )
+    ));
+    assert_eq!(fs::read(database.layout.wal())?, wal_before);
+    assert_eq!(fs::read(database.layout.page_store())?, page_store_before);
+    drop(open_file_database_ownership::<1>(
+        database.database_id,
+        database.layout.clone(),
+    )?);
+    Ok(())
+}
+
+#[test]
+fn every_successor_child_identity_field_is_physically_checked() -> Result<(), Box<dyn Error>> {
+    for (index, role) in [
+        DatabaseFileRole::Wal,
+        DatabaseFileRole::PageStore,
+        DatabaseFileRole::RestartCheckpoint,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let database = TestDatabase::new_successor("child-database-id", 510 + index as u128, 610)?;
+        mutate_child_identity(
+            &database.layout,
+            role,
+            ChildIdentityMutation::DatabaseId(9_000 + index as u128),
+        )?;
+        assert!(matches!(
+            open_recovery_required_file_database::<1>(
+                database.database_id,
+                database.layout.clone(),
+            ),
+            Err(FileDatabaseOwnershipOpenError::ChildDatabaseIdMismatch {
+                role: actual,
+                ..
+            }) if actual == role
+        ));
+
+        let database = TestDatabase::new_successor("child-file-id", 520 + index as u128, 620)?;
+        mutate_child_identity(
+            &database.layout,
+            role,
+            ChildIdentityMutation::FileId(10_000 + index as u128),
+        )?;
+        assert!(matches!(
+            open_recovery_required_file_database::<1>(
+                database.database_id,
+                database.layout.clone(),
+            ),
+            Err(FileDatabaseOwnershipOpenError::ChildFileIdMismatch {
+                role: actual,
+                ..
+            }) if actual == role
+        ));
+
+        let database = TestDatabase::new_successor("child-role", 530 + index as u128, 630)?;
+        mutate_child_identity(
+            &database.layout,
+            role,
+            ChildIdentityMutation::Role(next_role(role)),
+        )?;
+        assert!(matches!(
+            open_recovery_required_file_database::<1>(
+                database.database_id,
+                database.layout.clone(),
+            ),
+            Err(FileDatabaseOwnershipOpenError::ChildFileRoleMismatch {
+                expected,
+                actual,
+            }) if expected == role && actual == next_role(role)
+        ));
+    }
     Ok(())
 }
 
@@ -697,6 +812,65 @@ impl TestDatabase {
         })
     }
 
+    fn new_successor(
+        tag: &str,
+        database_value: u128,
+        persistent_value: u128,
+    ) -> Result<Self, Box<dyn Error>> {
+        let directory = TestDirectory::new(tag)?;
+        let database_id = database_id(database_value)?;
+        let persistent_log_id = persistent_log_id(persistent_value)?;
+        let owner_path = directory.path().join("owner");
+        let manifest_path = directory.path().join("manifest");
+        let wal_path = directory.path().join("wal");
+        let page_store_path = directory.path().join("pages");
+        let checkpoint_path = directory.path().join("checkpoint");
+        let manifest = manifest(
+            database_id,
+            persistent_log_id,
+            [
+                1_000 + database_value,
+                2_000 + database_value,
+                3_000 + database_value,
+            ],
+            [5, 2, 2],
+        )?;
+        let storage_identity = manifest.composition_identity().storage_identity();
+
+        write_synced_new(&owner_path, &encode_database_owner_control(database_id))?;
+        write_synced_new(&manifest_path, &encode_database_manifest(&manifest))?;
+        drop(
+            FileCommitLog::<1>::create_new_database_transaction_page_capable(
+                &wal_path,
+                storage_identity,
+            )?,
+        );
+        drop(FilePageStore::<1>::create_new_database(
+            &page_store_path,
+            storage_identity,
+        )?);
+        drop(
+            FileRestartCheckpointCompletenessBaselineSource::create_new_database(
+                &checkpoint_path,
+                storage_identity,
+            )?,
+        );
+
+        Ok(Self {
+            directory,
+            layout: FileDatabaseLayout::new(
+                owner_path,
+                manifest_path,
+                wal_path,
+                page_store_path,
+                checkpoint_path,
+            ),
+            database_id,
+            persistent_log_id,
+            manifest,
+        })
+    }
+
     fn manifest_with(
         &self,
         database_id: DatabaseId,
@@ -714,6 +888,58 @@ impl TestDatabase {
             ],
             formats,
         )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ChildIdentityMutation {
+    DatabaseId(u128),
+    Role(DatabaseFileRole),
+    FileId(u128),
+}
+
+fn mutate_child_identity(
+    layout: &FileDatabaseLayout,
+    role: DatabaseFileRole,
+    mutation: ChildIdentityMutation,
+) -> Result<(), io::Error> {
+    let (path, identity_offset, checksum_offset) = match role {
+        DatabaseFileRole::Wal => (layout.wal().to_path_buf(), 128, 184),
+        DatabaseFileRole::PageStore => (layout.page_store().to_path_buf(), 64, 120),
+        DatabaseFileRole::RestartCheckpoint => {
+            (layout.restart_checkpoint().join("control"), 64, 120)
+        }
+    };
+    let mut bytes = fs::read(&path)?;
+    match mutation {
+        ChildIdentityMutation::DatabaseId(value) => {
+            bytes[identity_offset + 16..identity_offset + 32].copy_from_slice(&value.to_be_bytes());
+        }
+        ChildIdentityMutation::Role(role) => {
+            bytes[identity_offset + 12] = role_code(role);
+        }
+        ChildIdentityMutation::FileId(value) => {
+            bytes[identity_offset + 32..identity_offset + 48].copy_from_slice(&value.to_be_bytes());
+        }
+    }
+    let checksum = checksum(&bytes[..checksum_offset]);
+    bytes[checksum_offset..checksum_offset + 8].copy_from_slice(&checksum.to_be_bytes());
+    overwrite_synced(&path, &bytes)
+}
+
+const fn next_role(role: DatabaseFileRole) -> DatabaseFileRole {
+    match role {
+        DatabaseFileRole::Wal => DatabaseFileRole::PageStore,
+        DatabaseFileRole::PageStore => DatabaseFileRole::RestartCheckpoint,
+        DatabaseFileRole::RestartCheckpoint => DatabaseFileRole::Wal,
+    }
+}
+
+const fn role_code(role: DatabaseFileRole) -> u8 {
+    match role {
+        DatabaseFileRole::Wal => 1,
+        DatabaseFileRole::PageStore => 2,
+        DatabaseFileRole::RestartCheckpoint => 3,
     }
 }
 

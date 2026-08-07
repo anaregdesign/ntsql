@@ -173,16 +173,18 @@ use ntsql_transaction::{
     CommittedTransactionPageRecoveryWritePermit, DurableCommitLookup,
     DurableCommittedTransactionPageRecoveryCandidate,
     DurableCommittedTransactionPageRecoveryComparison,
-    DurableCommittedTransactionPageRecoveryComparisonError, DurableTransactionCommitObservation,
-    DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
-    DurableTransactionPageObservationBytesError,
+    DurableCommittedTransactionPageRecoveryComparisonError, DurablePageStoreInventorySource,
+    DurableTransactionCommitObservation, DurableTransactionCommitObservationFieldsError,
+    DurableTransactionPageObservation, DurableTransactionPageObservationBytesError,
     DurableTransactionRestartCheckpointPageRepairCandidate,
     DurableTransactionRestartCheckpointPageRepairComparison,
     DurableTransactionRestartCheckpointPageRepairComparisonError,
     DurableTransactionRestartCheckpointPageRepairTargetKind, DurableTransactionRestartObservation,
-    TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
-    TransactionPageWriteRecord, TransactionRecoverySource,
-    TransactionRestartCheckpointPageRepairStore, TransactionRestartCheckpointPageRepairWritePermit,
+    DurableTransactionRestartRetentionMetadataObservation,
+    DurableTransactionRestartRetentionMetadataSource, TransactionCommitRecord,
+    TransactionEpochSource, TransactionId, TransactionPageLog, TransactionPageWriteRecord,
+    TransactionRecoverySource, TransactionRestartCheckpointPageRepairStore,
+    TransactionRestartCheckpointPageRepairWritePermit,
     TransactionRestartCoordinatorEpochAllocationError, TransactionRestartCoordinatorEpochSource,
     UnrecoveredTransactionPageStorage, compare_committed_transaction_page_recovery_candidate,
     compare_transaction_restart_checkpoint_page_repair_candidate,
@@ -1143,6 +1145,30 @@ impl<const N: usize> Error for FileTransactionRestartAnalysisSourceError<N> {
         }
     }
 }
+
+/// Failure to observe filesystem physical restart-allocation metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileTransactionRestartRetentionMetadataSourceError {
+    /// An uncertain prior WAL write requires reopen before metadata observation.
+    PoisonedWriter,
+    /// No restart or transaction epoch has yet been durably allocated.
+    NoAllocatedEpoch,
+}
+
+impl fmt::Display for FileTransactionRestartRetentionMetadataSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoisonedWriter => formatter.write_str(
+                "commit-log writer is poisoned; reopen the file before retention metadata observation",
+            ),
+            Self::NoAllocatedEpoch => {
+                formatter.write_str("no filesystem transaction epoch has been allocated")
+            }
+        }
+    }
+}
+
+impl Error for FileTransactionRestartRetentionMetadataSourceError {}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct StoredTransactionIdentity {
@@ -2272,6 +2298,28 @@ impl<const N: usize> ntsql_transaction::DurableTransactionRestartAnalysisSource<
         }
 
         Ok(operation(durable_frontier.as_ref(), &observations))
+    }
+}
+
+impl<const N: usize> DurableTransactionRestartRetentionMetadataSource for FileCommitLog<N> {
+    type Error = FileTransactionRestartRetentionMetadataSourceError;
+
+    fn observe_restart_retention_metadata(
+        &mut self,
+    ) -> Result<DurableTransactionRestartRetentionMetadataObservation, Self::Error> {
+        if self.poisoned {
+            return Err(FileTransactionRestartRetentionMetadataSourceError::PoisonedWriter);
+        }
+        let allocated_epoch_high_water = match self.next_epoch {
+            Some(next_epoch) => NonZeroU64::new(next_epoch.get().saturating_sub(1))
+                .ok_or(FileTransactionRestartRetentionMetadataSourceError::NoAllocatedEpoch)?,
+            None => NonZeroU64::MAX,
+        };
+        Ok(DurableTransactionRestartRetentionMetadataObservation::new(
+            self.lineage.clone(),
+            allocated_epoch_high_water,
+            None,
+        ))
     }
 }
 
@@ -4004,6 +4052,56 @@ impl<const N: usize> Error for FileCommittedPageRecoveryObservationError<N> {
     }
 }
 
+/// Failure to project every current filesystem page-store snapshot.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FilePageStoreInventoryError<const N: usize> {
+    /// An uncertain prior write requires reopen before complete inventory.
+    PoisonedWriter,
+    /// The complete owned inventory could not reserve its exact page bound.
+    CapacityExhausted {
+        /// Number of current snapshots requiring projection.
+        page_count: usize,
+    },
+    /// One current snapshot could not become adapter-neutral evidence.
+    Projection {
+        /// Page whose projection failed.
+        page_number: PageNumber,
+        /// Exact projection cause.
+        source: Box<PageRecoveryObservationBytesError<N>>,
+    },
+}
+
+impl<const N: usize> fmt::Display for FilePageStoreInventoryError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoisonedWriter => formatter.write_str(
+                "page-store writer is poisoned; reopen the file before complete inventory",
+            ),
+            Self::CapacityExhausted { page_count } => write!(
+                formatter,
+                "filesystem page inventory capacity is exhausted for {page_count} pages"
+            ),
+            Self::Projection {
+                page_number,
+                source,
+            } => write!(
+                formatter,
+                "filesystem page {} inventory projection failed: {source}",
+                page_number.get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for FilePageStoreInventoryError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Projection { source, .. } => Some(source.as_ref()),
+            Self::PoisonedWriter | Self::CapacityExhausted { .. } => None,
+        }
+    }
+}
+
 /// Failure during the filesystem page-store's atomic recovery replacement.
 #[derive(Debug, Eq, PartialEq)]
 pub enum FileCommittedPageRecoveryStoreError<const N: usize> {
@@ -4727,6 +4825,33 @@ impl<const N: usize> ntsql_transaction::DurablePageStoreSnapshotSource<N> for Fi
             .map_err(|source| {
                 FileCommittedPageRecoveryObservationError::Projection(Box::new(source))
             })
+    }
+}
+
+impl<const N: usize> DurablePageStoreInventorySource<N> for FilePageStore<N> {
+    type InventoryError = FilePageStoreInventoryError<N>;
+
+    fn durable_page_store_inventory(
+        &mut self,
+    ) -> Result<Vec<StoredPageSnapshotObservation<N>>, Self::InventoryError> {
+        if self.poisoned {
+            return Err(FilePageStoreInventoryError::PoisonedWriter);
+        }
+        let page_count = self.pages.len();
+        let mut inventory = Vec::new();
+        inventory
+            .try_reserve_exact(page_count)
+            .map_err(|_| FilePageStoreInventoryError::CapacityExhausted { page_count })?;
+        for page in &self.pages {
+            inventory.push(page.page_recovery_observation().map_err(|source| {
+                FilePageStoreInventoryError::Projection {
+                    page_number: page.page_number(),
+                    source: Box::new(source),
+                }
+            })?);
+        }
+        inventory.sort_unstable_by_key(StoredPageSnapshotObservation::page_number);
+        Ok(inventory)
     }
 }
 
@@ -9003,6 +9128,78 @@ mod tests {
         let coordinator = TransactionCoordinator::open(&mut log)?;
         drop(coordinator);
         drop(log);
+        Ok(())
+    }
+
+    #[test]
+    fn retention_ports_report_physical_high_water_sort_inventory_and_reject_poison()
+    -> Result<(), Box<dyn Error>> {
+        let directory = TestDirectory::new("retention-ports")?;
+        let persistent_id = persistent_id(409)?;
+        let log_path = directory.path().join("wal.bin");
+        let store_path = directory.path().join("pages.bin");
+        let mut log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&log_path, persistent_id)?;
+        assert!(matches!(
+            log.observe_restart_retention_metadata(),
+            Err(FileTransactionRestartRetentionMetadataSourceError::NoAllocatedEpoch)
+        ));
+        let coordinator = TransactionCoordinator::open(&mut log)?;
+        assert_eq!(coordinator.epoch().get(), 1);
+        let metadata = log.observe_restart_retention_metadata()?;
+        assert_eq!(metadata.allocated_epoch_high_water(), NonZeroU64::MIN);
+        assert!(metadata.lineage().same_lineage(log.lineage()));
+        assert_eq!(metadata.oldest_required_log_position(), None);
+        log.next_epoch = Some(NonZeroU64::MAX);
+        let (allocated, _) = log.allocate_transaction_epoch()?;
+        assert_eq!(allocated, NonZeroU64::MAX);
+        assert_eq!(
+            log.observe_restart_retention_metadata()?
+                .allocated_epoch_high_water(),
+            NonZeroU64::MAX
+        );
+
+        let first = page_number(1)?;
+        let second = page_number(2)?;
+        let lineage = log.lineage().clone();
+        let mut store = FilePageStore::<2>::create_new(&store_path, persistent_id)?;
+        store.pages = vec![
+            FileStoredPage {
+                page_number: second,
+                page_version: PageVersion::new(2),
+                bytes: [2, 2],
+                required_position: lineage.position(2),
+                store_sequence: 2,
+            },
+            FileStoredPage {
+                page_number: first,
+                page_version: PageVersion::new(1),
+                bytes: [1, 1],
+                required_position: lineage.position(1),
+                store_sequence: 1,
+            },
+        ];
+        let inventory = store.durable_page_store_inventory()?;
+        assert_eq!(
+            inventory
+                .iter()
+                .map(StoredPageSnapshotObservation::page_number)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(store.pages()[0].page_number(), second);
+        assert_eq!(store.pages()[1].page_number(), first);
+
+        store.poisoned = true;
+        assert!(matches!(
+            store.durable_page_store_inventory(),
+            Err(FilePageStoreInventoryError::PoisonedWriter)
+        ));
+        log.poisoned = true;
+        assert!(matches!(
+            log.observe_restart_retention_metadata(),
+            Err(FileTransactionRestartRetentionMetadataSourceError::PoisonedWriter)
+        ));
         Ok(())
     }
 

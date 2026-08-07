@@ -10,11 +10,11 @@ use ntsql_transaction::{
     CommittedTransactionPageRecoveryStore, CommittedTransactionPageRecoveryWritePermit,
     DurableCommitLookup, DurableCommittedTransactionPageRecoveryCandidate,
     DurableCommittedTransactionPageRecoveryComparison,
-    DurableCommittedTransactionPageRecoveryComparisonError, DurableTransactionCommitObservation,
-    DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
-    DurableTransactionPageObservationBytesError, DurableTransactionPageRecoveryInventory,
-    DurableTransactionPageRecoverySource, DurableTransactionRestartAnalysisSource,
-    DurableTransactionRestartCheckpointBaseline,
+    DurableCommittedTransactionPageRecoveryComparisonError, DurablePageStoreInventorySource,
+    DurableTransactionCommitObservation, DurableTransactionCommitObservationFieldsError,
+    DurableTransactionPageObservation, DurableTransactionPageObservationBytesError,
+    DurableTransactionPageRecoveryInventory, DurableTransactionPageRecoverySource,
+    DurableTransactionRestartAnalysisSource, DurableTransactionRestartCheckpointBaseline,
     DurableTransactionRestartCheckpointBaselineEntryObservation,
     DurableTransactionRestartCheckpointBaselinePublicationPermit,
     DurableTransactionRestartCheckpointBaselinePublisher,
@@ -38,6 +38,8 @@ use ntsql_transaction::{
     DurableTransactionRestartPageEntry, DurableTransactionRestartPageState,
     DurableTransactionRestartReplayStart, DurableTransactionRestartReplayStartCause,
     DurableTransactionRestartRequiredPageImage,
+    DurableTransactionRestartRetentionMetadataObservation,
+    DurableTransactionRestartRetentionMetadataSource,
     OwnedDurableTransactionRestartCheckpointBaselineObservation,
     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
     TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
@@ -1091,6 +1093,70 @@ impl<const N: usize> Error for InMemoryTransactionRestartAnalysisSourceError<N> 
         }
     }
 }
+
+/// Failure to project every current in-memory page-store snapshot.
+#[derive(Debug, Eq, PartialEq)]
+pub enum InMemoryPageStoreInventoryError<const N: usize> {
+    /// The complete owned inventory could not reserve its exact page bound.
+    CapacityExhausted {
+        /// Number of current snapshots requiring projection.
+        page_count: usize,
+    },
+    /// One current snapshot could not become adapter-neutral evidence.
+    Projection {
+        /// Page whose projection failed.
+        page_number: PageNumber,
+        /// Exact projection cause.
+        source: Box<PageRecoveryObservationBytesError<N>>,
+    },
+}
+
+impl<const N: usize> fmt::Display for InMemoryPageStoreInventoryError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityExhausted { page_count } => write!(
+                formatter,
+                "in-memory page inventory capacity is exhausted for {page_count} pages"
+            ),
+            Self::Projection {
+                page_number,
+                source,
+            } => write!(
+                formatter,
+                "in-memory page {} inventory projection failed: {source}",
+                page_number.get()
+            ),
+        }
+    }
+}
+
+impl<const N: usize> Error for InMemoryPageStoreInventoryError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Projection { source, .. } => Some(source.as_ref()),
+            Self::CapacityExhausted { .. } => None,
+        }
+    }
+}
+
+/// Failure to observe in-memory physical restart-allocation metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryTransactionRestartRetentionMetadataSourceError {
+    /// No restart or transaction epoch has yet been allocated.
+    NoAllocatedEpoch,
+}
+
+impl fmt::Display for InMemoryTransactionRestartRetentionMetadataSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoAllocatedEpoch => {
+                formatter.write_str("no in-memory transaction epoch has been allocated")
+            }
+        }
+    }
+}
+
+impl Error for InMemoryTransactionRestartRetentionMetadataSourceError {}
 
 /// One-shot failure boundary for the next checkpoint baseline load.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2674,6 +2740,25 @@ impl<const N: usize> DurableTransactionRestartAnalysisSource<N> for InMemoryComm
     }
 }
 
+impl<const N: usize> DurableTransactionRestartRetentionMetadataSource for InMemoryCommitLog<N> {
+    type Error = InMemoryTransactionRestartRetentionMetadataSourceError;
+
+    fn observe_restart_retention_metadata(
+        &mut self,
+    ) -> Result<DurableTransactionRestartRetentionMetadataObservation, Self::Error> {
+        let allocated_epoch_high_water = match self.next_epoch {
+            Some(next_epoch) => NonZeroU64::new(next_epoch.get().saturating_sub(1))
+                .ok_or(InMemoryTransactionRestartRetentionMetadataSourceError::NoAllocatedEpoch)?,
+            None => NonZeroU64::MAX,
+        };
+        Ok(DurableTransactionRestartRetentionMetadataObservation::new(
+            self.lineage.clone(),
+            allocated_epoch_high_water,
+            None,
+        ))
+    }
+}
+
 impl<const N: usize> LogDurability for InMemoryCommitLog<N> {
     type Error = InMemoryCommitLogError;
 
@@ -2912,6 +2997,30 @@ impl<const N: usize> ntsql_transaction::DurablePageStoreSnapshotSource<N> for In
         self.page(page_number)
             .map(InMemoryStoredPage::page_recovery_observation)
             .transpose()
+    }
+}
+
+impl<const N: usize> DurablePageStoreInventorySource<N> for InMemoryPageStore<N> {
+    type InventoryError = InMemoryPageStoreInventoryError<N>;
+
+    fn durable_page_store_inventory(
+        &mut self,
+    ) -> Result<Vec<StoredPageSnapshotObservation<N>>, Self::InventoryError> {
+        let page_count = self.pages.len();
+        let mut inventory = Vec::new();
+        inventory
+            .try_reserve_exact(page_count)
+            .map_err(|_| InMemoryPageStoreInventoryError::CapacityExhausted { page_count })?;
+        for page in &self.pages {
+            inventory.push(page.page_recovery_observation().map_err(|source| {
+                InMemoryPageStoreInventoryError::Projection {
+                    page_number: page.page_number(),
+                    source: Box::new(source),
+                }
+            })?);
+        }
+        inventory.sort_unstable_by_key(StoredPageSnapshotObservation::page_number);
+        Ok(inventory)
     }
 }
 
@@ -3177,6 +3286,63 @@ mod tests {
     use ntsql_wal::CommitError;
 
     use super::*;
+
+    #[test]
+    fn retention_ports_report_allocator_high_water_and_sorted_complete_inventory()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x1693)
+            .ok_or_else(|| io::Error::other("retention port persistent id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id);
+        assert!(matches!(
+            log.observe_restart_retention_metadata(),
+            Err(InMemoryTransactionRestartRetentionMetadataSourceError::NoAllocatedEpoch)
+        ));
+        let (allocated, lineage) = log.allocate_transaction_epoch()?;
+        assert_eq!(allocated, NonZeroU64::MIN);
+        let metadata = log.observe_restart_retention_metadata()?;
+        assert!(metadata.lineage().same_lineage(&lineage));
+        assert_eq!(metadata.allocated_epoch_high_water(), NonZeroU64::MIN);
+        assert_eq!(metadata.oldest_required_log_position(), None);
+        log.next_epoch = Some(NonZeroU64::MAX);
+        let (allocated, _) = log.allocate_transaction_epoch()?;
+        assert_eq!(allocated, NonZeroU64::MAX);
+        assert_eq!(
+            log.observe_restart_retention_metadata()?
+                .allocated_epoch_high_water(),
+            NonZeroU64::MAX
+        );
+
+        let first =
+            PageNumber::new(1).ok_or_else(|| io::Error::other("first inventory page is zero"))?;
+        let second =
+            PageNumber::new(2).ok_or_else(|| io::Error::other("second inventory page is zero"))?;
+        let mut store = InMemoryPageStore::<1>::with_lineage(lineage.clone());
+        store.pages = vec![
+            InMemoryStoredPage {
+                page_number: second,
+                page_version: PageVersion::new(2),
+                bytes: [2],
+                required_position: lineage.position(2),
+            },
+            InMemoryStoredPage {
+                page_number: first,
+                page_version: PageVersion::new(1),
+                bytes: [1],
+                required_position: lineage.position(1),
+            },
+        ];
+        let inventory = store.durable_page_store_inventory()?;
+        assert_eq!(
+            inventory
+                .iter()
+                .map(StoredPageSnapshotObservation::page_number)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(store.pages()[0].page_number(), second);
+        assert_eq!(store.pages()[1].page_number(), first);
+        Ok(())
+    }
 
     fn checkpoint_publication_owner(
         persistent_log_id: PersistentLogId,
@@ -5602,7 +5768,7 @@ mod tests {
         );
         assert_eq!(summary.indeterminate_allocation_attempt_count(), 0);
 
-        let mut completed = restored.complete_restart()?;
+        let completed = restored.complete_restart()?;
         assert_eq!(
             completed.completion_evidence().checkpoint_frontier(),
             Some(checkpoint_frontier)
@@ -5620,11 +5786,36 @@ mod tests {
             3
         );
         assert_eq!(completed.completion_evidence().page_outcomes().len(), 2);
+        let mut retained = completed.analyze_wal_retention()?;
+        assert_eq!(
+            retained.retention_analysis().persistent_log_id(),
+            persistent_log_id
+        );
+        assert_eq!(
+            retained.retention_analysis().durable_frontier(),
+            Some(current_frontier.get())
+        );
+        assert_eq!(
+            retained.retention_analysis().allocated_epoch_high_water(),
+            3
+        );
+        assert_eq!(
+            retained
+                .retention_analysis()
+                .floor()
+                .retained_first_record(),
+            Some(1)
+        );
+        assert_eq!(retained.retention_analysis().store_page_count(), 2);
+        assert_eq!(
+            retained.retention_analysis().unresolved_transaction_count(),
+            1
+        );
 
         let live_page_number =
             PageNumber::new(223).ok_or_else(|| io::Error::other("live page number is zero"))?;
         {
-            let (coordinator, log, store) = completed.parts_mut();
+            let (coordinator, log, store) = retained.parts_mut();
             let live_page = UnloggedPage::new(
                 PageAddress::new(LogDurability::lineage(log), live_page_number),
                 PageVersion::new(1),
@@ -5638,12 +5829,12 @@ mod tests {
             flush_committed_page(&live, log, store, live_dirty)?;
         }
         assert_eq!(
-            completed.completion_evidence().current_frontier(),
+            retained.completion_evidence().current_frontier(),
             Some(current_frontier.get())
         );
-        assert_eq!(completed.completion_evidence().page_outcomes().len(), 2);
+        assert_eq!(retained.completion_evidence().page_outcomes().len(), 2);
         assert_eq!(
-            completed
+            retained
                 .parts()
                 .2
                 .page(live_page_number)
@@ -5651,9 +5842,16 @@ mod tests {
                 .bytes(),
             &[0x23]
         );
+        assert_eq!(
+            retained
+                .retention_analysis()
+                .floor()
+                .retained_first_record(),
+            Some(1)
+        );
 
         let publication =
-            completed.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+            retained.publish_restart_checkpoint_completeness_baseline_from_current_prefix()?;
         let published_frontier = publication
             .durable_frontier()
             .ok_or_else(|| io::Error::other("published completion frontier is empty"))?;
@@ -5661,11 +5859,13 @@ mod tests {
         assert_eq!(publication.transaction_count(), 4);
         assert_eq!(publication.page_count(), 4);
 
-        let (coordinator, log, store, completion_evidence, checkpoint) = completed.into_parts();
+        let (coordinator, log, store, completion_evidence, retention_analysis, checkpoint) =
+            retained.into_parts();
         assert_eq!(
             completion_evidence.current_frontier(),
             Some(current_frontier.get())
         );
+        assert_eq!(retention_analysis.floor().retained_first_record(), Some(1));
         drop(coordinator);
 
         let restarted = UnrecoveredTransactionPageStorage::new(log.restart(), store)

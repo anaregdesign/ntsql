@@ -4,7 +4,7 @@
 - Date: 2026-08-06
 - Issue: #92
 - Extends: ADR 0001, ADR 0006, ADR 0007, ADR 0015, ADR 0016, ADR 0019
-- Extended by: ADR 0021, ADR 0022, ADR 0023
+- Extended by: ADR 0021, ADR 0022, ADR 0023, ADR 0068
 
 ## Context
 

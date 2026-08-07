@@ -417,7 +417,7 @@ fn foreign_manifest_candidate_is_preserved_and_rejected() -> Result<(), Box<dyn 
     let foreign = manifest(database.database_id, 90_000)?;
     overwrite_synced(
         &manifest_candidate,
-        &ntsql_storage_file::encode_database_manifest(&foreign),
+        &ntsql_storage_file::encode_database_manifest(&foreign)?,
     )?;
     let before = fs::read(&manifest_candidate)?;
 

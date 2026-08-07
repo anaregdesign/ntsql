@@ -34,7 +34,7 @@ const CHECKSUM_MIX: u64 = 0x4348_4543_4b53_554d;
 #[test]
 fn recovery_required_manifest_has_exact_version_one_golden_bytes() -> Result<(), Box<dyn Error>> {
     let manifest = golden_manifest()?;
-    let encoded = encode_database_manifest(&manifest);
+    let encoded = encode_database_manifest(&manifest)?;
     let expected = [
         0x4e, 0x54, 0x53, 0x51, 0x44, 0x42, 0x4d, 0x31, 0x00, 0x01, 0x00, 0xa0, 0x00, 0x00, 0x00,
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
@@ -50,14 +50,14 @@ fn recovery_required_manifest_has_exact_version_one_golden_bytes() -> Result<(),
     ];
 
     assert_eq!(encoded, expected);
-    assert_eq!(encode_database_manifest(&manifest), expected);
+    assert_eq!(encode_database_manifest(&manifest)?, expected);
     assert_eq!(decode_database_manifest(&expected)?, manifest);
     Ok(())
 }
 
 #[test]
 fn every_prefix_is_truncated_and_one_extra_byte_is_trailing() -> Result<(), Box<dyn Error>> {
-    let encoded = encode_database_manifest(&golden_manifest()?);
+    let encoded = encode_database_manifest(&golden_manifest()?)?;
     for actual_length in 0..DATABASE_MANIFEST_V1_LENGTH {
         assert_eq!(
             decode_database_manifest(&encoded[..actual_length]),
@@ -82,7 +82,7 @@ fn every_prefix_is_truncated_and_one_extra_byte_is_trailing() -> Result<(), Box<
 
 #[test]
 fn envelope_fields_and_checksum_fail_distinctly() -> Result<(), Box<dyn Error>> {
-    let encoded = encode_database_manifest(&golden_manifest()?);
+    let encoded = encode_database_manifest(&golden_manifest()?)?;
 
     let mut wrong_magic = encoded;
     wrong_magic[0] = 0;
@@ -139,7 +139,7 @@ fn envelope_fields_and_checksum_fail_distinctly() -> Result<(), Box<dyn Error>> 
 
 #[test]
 fn every_reserved_byte_is_rejected_after_checksum_validation() -> Result<(), Box<dyn Error>> {
-    let encoded = encode_database_manifest(&golden_manifest()?);
+    let encoded = encode_database_manifest(&golden_manifest()?)?;
     for range in [41..48, 118..120, 128..144] {
         assert_reserved_range(&encoded, range)?;
     }
@@ -148,7 +148,7 @@ fn every_reserved_byte_is_rejected_after_checksum_validation() -> Result<(), Box
 
 #[test]
 fn zero_and_unsupported_scalar_fields_fail_closed() -> Result<(), Box<dyn Error>> {
-    let encoded = encode_database_manifest(&golden_manifest()?);
+    let encoded = encode_database_manifest(&golden_manifest()?)?;
 
     let mut zero_database = encoded;
     zero_database[DATABASE_ID_OFFSET..DATABASE_ID_OFFSET + 16].fill(0);
@@ -188,7 +188,7 @@ fn zero_and_unsupported_scalar_fields_fail_closed() -> Result<(), Box<dyn Error>
 
 #[test]
 fn each_file_role_rejects_zero_and_cross_role_identity_reuse() -> Result<(), Box<dyn Error>> {
-    let encoded = encode_database_manifest(&golden_manifest()?);
+    let encoded = encode_database_manifest(&golden_manifest()?)?;
     for (role, offset) in [
         (DatabaseFileRole::Wal, WAL_FILE_ID_OFFSET),
         (DatabaseFileRole::PageStore, PAGE_STORE_FILE_ID_OFFSET),
@@ -245,7 +245,7 @@ fn each_file_role_rejects_zero_and_cross_role_identity_reuse() -> Result<(), Box
 
 #[test]
 fn format_versions_and_required_features_are_validated() -> Result<(), Box<dyn Error>> {
-    let encoded = encode_database_manifest(&golden_manifest()?);
+    let encoded = encode_database_manifest(&golden_manifest()?)?;
     for (role, offset) in [
         (DatabaseFileRole::Wal, WAL_FORMAT_VERSION_OFFSET),
         (
@@ -296,7 +296,7 @@ fn maximum_nonzero_fields_round_trip_without_host_width_dependence() -> Result<(
         page_store_format_version: u16::MAX,
         restart_checkpoint_format_version: u16::MAX,
     })?;
-    let encoded = encode_database_manifest(&manifest);
+    let encoded = encode_database_manifest(&manifest)?;
     assert_eq!(decode_database_manifest(&encoded)?, manifest);
     Ok(())
 }
@@ -319,7 +319,7 @@ fn decoded_generation_regression_is_rejected_against_exact_previous_manifest()
         lifecycle_generation: 1,
         ..TestManifestFields::from_manifest(previous)
     })?;
-    let decoded = decode_database_manifest(&encode_database_manifest(&regressed))?;
+    let decoded = decode_database_manifest(&encode_database_manifest(&regressed)?)?;
     assert_eq!(
         decoded.require_successor_of(previous),
         Err(DatabaseManifestSuccessorError::LifecycleGeneration(

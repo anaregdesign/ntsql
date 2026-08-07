@@ -814,6 +814,8 @@ pub enum FileDatabaseCreateError {
         /// Exact observed byte length.
         actual: u64,
     },
+    /// The requested manifest cannot be encoded by frame version 1.
+    ManifestEncode(super::DatabaseManifestV1UnsupportedLifecycleState),
     /// A candidate manifest is structurally invalid.
     Manifest(super::DatabaseManifestDecodeError),
     /// A structurally valid candidate manifest differs from the request.
@@ -912,6 +914,7 @@ impl FileDatabaseCreateError {
             | Self::DatabaseOwnerIdMismatch { .. }
             | Self::ManifestFileLength { .. }
             | Self::Manifest(_)
+            | Self::ManifestEncode(_)
             | Self::ManifestMismatch { .. }
             | Self::NonInitialChild { .. }
             | Self::UnexpectedCheckpointEntry { .. }
@@ -1020,6 +1023,9 @@ impl fmt::Display for FileDatabaseCreateError {
                 "{location} manifest length {actual} is not {}",
                 super::DATABASE_MANIFEST_V1_LENGTH
             ),
+            Self::ManifestEncode(source) => {
+                write!(formatter, "create manifest cannot be encoded: {source}")
+            }
             Self::Manifest(source) => write!(formatter, "manifest candidate is invalid: {source}"),
             Self::ManifestMismatch(_) => {
                 formatter.write_str("manifest candidate does not match the requested manifest")
@@ -1076,6 +1082,7 @@ impl Error for FileDatabaseCreateError {
             Self::OwnershipContended { source, .. } => Some(source),
             Self::DatabaseOwnerControl(source) => Some(source),
             Self::Manifest(source) => Some(source),
+            Self::ManifestEncode(source) => Some(source),
             Self::WalCreate(source) => Some(source),
             Self::WalOpen(source) => Some(source),
             Self::PageStoreCreate(source) => Some(source),
@@ -2952,10 +2959,12 @@ pub fn create_file_database<const N: usize>(
     };
     let (mut manifest_file, manifest_metadata) = if phase == FileDatabaseCreatePhase::Owner {
         fault.before(FileDatabaseCreateBoundary::ManifestCandidatePublication)?;
+        let encoded_manifest = super::encode_database_manifest(&manifest)
+            .map_err(FileDatabaseCreateError::ManifestEncode)?;
         let created = create_locked_header(
             &paths.manifest_candidate,
             FileDatabaseCreateEntry::ManifestCandidate,
-            &super::encode_database_manifest(&manifest),
+            &encoded_manifest,
             None,
         )?;
         fault.after(FileDatabaseCreateBoundary::ManifestCandidatePublication)?;

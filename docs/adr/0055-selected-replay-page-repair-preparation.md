@@ -4,6 +4,7 @@
 - Date: 2026-08-06
 - Issue: #163
 - Extends: ADR 0033, ADR 0037, ADR 0047, ADR 0053, ADR 0054
+- Extended by: ADR 0056
 - Follows: #161
 
 ## Context
@@ -370,8 +371,7 @@ page-number-ordered, fully owned source/target repair decisions without another
 WAL projection or any persistent effect. Every preparation failure can still
 destroy the plan and enter unchanged complete recovery safely.
 
-The prepared owner remains private and non-authorizing. Separately reviewed work
-must introduce a one-attempt repair permit and atomic compare-and-replace port
-with explicit indeterminate-write semantics before any candidate can mutate the
-page store. Transaction restoration, final live ownership, retention, and WAL
-reclamation remain later boundaries.
+The prepared owner remains private and non-authorizing. ADR 0056 consumes it
+through a private one-attempt permit and atomic compare-and-replace port with
+explicit indeterminate-write semantics. Transaction restoration, final live
+ownership, retention, and WAL reclamation remain later boundaries.

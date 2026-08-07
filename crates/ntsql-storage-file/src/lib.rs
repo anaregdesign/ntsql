@@ -175,10 +175,16 @@ use ntsql_transaction::{
     DurableCommittedTransactionPageRecoveryComparison,
     DurableCommittedTransactionPageRecoveryComparisonError, DurableTransactionCommitObservation,
     DurableTransactionCommitObservationFieldsError, DurableTransactionPageObservation,
-    DurableTransactionPageObservationBytesError, DurableTransactionRestartObservation,
+    DurableTransactionPageObservationBytesError,
+    DurableTransactionRestartCheckpointPageRepairCandidate,
+    DurableTransactionRestartCheckpointPageRepairComparison,
+    DurableTransactionRestartCheckpointPageRepairComparisonError,
+    DurableTransactionRestartCheckpointPageRepairTargetKind, DurableTransactionRestartObservation,
     TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
-    TransactionPageWriteRecord, TransactionRecoverySource, UnrecoveredTransactionPageStorage,
-    compare_committed_transaction_page_recovery_candidate,
+    TransactionPageWriteRecord, TransactionRecoverySource,
+    TransactionRestartCheckpointPageRepairStore, TransactionRestartCheckpointPageRepairWritePermit,
+    UnrecoveredTransactionPageStorage, compare_committed_transaction_page_recovery_candidate,
+    compare_transaction_restart_checkpoint_page_repair_candidate,
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
@@ -4060,6 +4066,119 @@ impl<const N: usize> Error for FileCommittedPageRecoveryStoreError<N> {
     }
 }
 
+/// Failure during one filesystem atomic replay page replacement.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileRestartCheckpointPageRepairStoreError<const N: usize> {
+    /// The candidate target page position belongs to another lineage.
+    ForeignTargetPagePosition(LogSequenceNumber),
+    /// A committed candidate target position belongs to another lineage.
+    ForeignTargetCommitPosition(LogSequenceNumber),
+    /// The repair permit page position belongs to another lineage.
+    ForeignPermitPagePosition(LogSequenceNumber),
+    /// A repair permit commit position belongs to another lineage.
+    ForeignPermitCommitPosition(LogSequenceNumber),
+    /// The permit page position differs from the candidate target.
+    PermitPagePositionMismatch {
+        /// Candidate target page position.
+        expected: LogSequenceNumber,
+        /// Supplied permit page position.
+        actual: LogSequenceNumber,
+    },
+    /// The permit commit shape or position differs from the candidate target.
+    PermitCommitPositionMismatch {
+        /// Candidate commit position, absent for a raw target.
+        expected: Option<LogSequenceNumber>,
+        /// Supplied permit commit position.
+        actual: Option<LogSequenceNumber>,
+    },
+    /// Current store state could not be projected during the locked recheck.
+    CurrentObservation(Box<PageRecoveryObservationBytesError<N>>),
+    /// Current store state contradicted the candidate.
+    SourceComparison(Box<DurableTransactionRestartCheckpointPageRepairComparisonError>),
+    /// Current store state was valid but no longer matched the candidate source.
+    SourceNotMatched {
+        /// Non-source comparison observed under the lifetime store lock.
+        actual: DurableTransactionRestartCheckpointPageRepairComparison,
+    },
+    /// Shared physical page-store writing failed at an exact typed boundary.
+    PageStore(FilePageStoreError),
+}
+
+impl<const N: usize> fmt::Display for FileRestartCheckpointPageRepairStoreError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ForeignTargetPagePosition(position) => write!(
+                formatter,
+                "replay-repair target page position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::ForeignTargetCommitPosition(position) => write!(
+                formatter,
+                "replay-repair target commit position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::ForeignPermitPagePosition(position) => write!(
+                formatter,
+                "replay-repair permit page position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::ForeignPermitCommitPosition(position) => write!(
+                formatter,
+                "replay-repair permit commit position {} belongs to another lineage",
+                position.get()
+            ),
+            Self::PermitPagePositionMismatch { expected, actual } => write!(
+                formatter,
+                "replay-repair permit page position {} does not match target position {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::PermitCommitPositionMismatch { expected, actual } => write!(
+                formatter,
+                "replay-repair permit commit position {:?} does not match target position {:?}",
+                actual.as_ref().map(LogSequenceNumber::get),
+                expected.as_ref().map(LogSequenceNumber::get)
+            ),
+            Self::CurrentObservation(source) => {
+                write!(
+                    formatter,
+                    "replay-repair current-page observation failed: {source}"
+                )
+            }
+            Self::SourceComparison(source) => {
+                write!(
+                    formatter,
+                    "replay-repair source comparison failed: {source}"
+                )
+            }
+            Self::SourceNotMatched { actual } => write!(
+                formatter,
+                "replay-repair source no longer matches the candidate: {actual:?}"
+            ),
+            Self::PageStore(source) => {
+                write!(formatter, "replay-repair page-store write failed: {source}")
+            }
+        }
+    }
+}
+
+impl<const N: usize> Error for FileRestartCheckpointPageRepairStoreError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CurrentObservation(source) => Some(source.as_ref()),
+            Self::SourceComparison(source) => Some(source.as_ref()),
+            Self::PageStore(source) => Some(source),
+            Self::ForeignTargetPagePosition(_)
+            | Self::ForeignTargetCommitPosition(_)
+            | Self::ForeignPermitPagePosition(_)
+            | Self::ForeignPermitCommitPosition(_)
+            | Self::PermitPagePositionMismatch { .. }
+            | Self::PermitCommitPositionMismatch { .. }
+            | Self::SourceNotMatched { .. } => None,
+        }
+    }
+}
+
 /// Safely inspectable latest snapshot of one stored page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileStoredPage<const N: usize> {
@@ -4666,6 +4785,121 @@ impl<const N: usize> ntsql_transaction::CommittedTransactionPageRecoveryStore<N>
         };
         self.write_snapshot_group(layout, stored, page_index, sequence)
             .map_err(FileCommittedPageRecoveryStoreError::PageStore)
+    }
+}
+
+fn require_file_restart_checkpoint_repair_source_match<const N: usize>(
+    candidate: &DurableTransactionRestartCheckpointPageRepairCandidate<'_, '_, N>,
+    current: Option<&StoredPageSnapshotObservation<N>>,
+) -> Result<(), FileRestartCheckpointPageRepairStoreError<N>> {
+    match compare_transaction_restart_checkpoint_page_repair_candidate(candidate, current) {
+        Ok(DurableTransactionRestartCheckpointPageRepairComparison::SourceMatches) => Ok(()),
+        Ok(actual) => Err(FileRestartCheckpointPageRepairStoreError::SourceNotMatched { actual }),
+        Err(source) => Err(FileRestartCheckpointPageRepairStoreError::SourceComparison(
+            Box::new(source),
+        )),
+    }
+}
+
+impl<const N: usize> TransactionRestartCheckpointPageRepairStore<N> for FilePageStore<N> {
+    type WriteError = FileRestartCheckpointPageRepairStoreError<N>;
+
+    fn compare_and_replace_replay_page(
+        &mut self,
+        candidate: &DurableTransactionRestartCheckpointPageRepairCandidate<'_, '_, N>,
+        permit: TransactionRestartCheckpointPageRepairWritePermit<'_>,
+    ) -> Result<(), Self::WriteError> {
+        let target = candidate.target();
+        if !self.lineage.same_lineage(target.page_position().lineage()) {
+            return Err(
+                FileRestartCheckpointPageRepairStoreError::ForeignTargetPagePosition(
+                    target.page_position().clone(),
+                ),
+            );
+        }
+        let expected_commit_position = match target.kind() {
+            DurableTransactionRestartCheckpointPageRepairTargetKind::Raw => None,
+            DurableTransactionRestartCheckpointPageRepairTargetKind::CommittedTransaction {
+                commit_position,
+                ..
+            } => {
+                if !self.lineage.same_lineage(commit_position.lineage()) {
+                    return Err(
+                        FileRestartCheckpointPageRepairStoreError::ForeignTargetCommitPosition(
+                            commit_position.clone(),
+                        ),
+                    );
+                }
+                Some(commit_position)
+            }
+        };
+        if !self.lineage.same_lineage(permit.page_position().lineage()) {
+            return Err(
+                FileRestartCheckpointPageRepairStoreError::ForeignPermitPagePosition(
+                    permit.page_position().clone(),
+                ),
+            );
+        }
+        if let Some(commit_position) = permit.commit_position()
+            && !self.lineage.same_lineage(commit_position.lineage())
+        {
+            return Err(
+                FileRestartCheckpointPageRepairStoreError::ForeignPermitCommitPosition(
+                    commit_position.clone(),
+                ),
+            );
+        }
+        if permit.page_position() != target.page_position() {
+            return Err(
+                FileRestartCheckpointPageRepairStoreError::PermitPagePositionMismatch {
+                    expected: target.page_position().clone(),
+                    actual: permit.page_position().clone(),
+                },
+            );
+        }
+        if permit.commit_position() != expected_commit_position {
+            return Err(
+                FileRestartCheckpointPageRepairStoreError::PermitCommitPositionMismatch {
+                    expected: expected_commit_position.cloned(),
+                    actual: permit.commit_position().cloned(),
+                },
+            );
+        }
+
+        let page_number = target.page_number();
+        let current = self
+            .page(page_number)
+            .map(FileStoredPage::page_recovery_observation)
+            .transpose()
+            .map_err(|source| {
+                FileRestartCheckpointPageRepairStoreError::CurrentObservation(Box::new(source))
+            })?;
+        require_file_restart_checkpoint_repair_source_match(candidate, current.as_ref())?;
+
+        let layout = PageLayout::for_const::<N>()
+            .map_err(FilePageStoreError::PageWidth)
+            .map_err(FileRestartCheckpointPageRepairStoreError::PageStore)?;
+        let sequence = self
+            .next_sequence
+            .ok_or(FilePageStoreError::StoreSequenceSpaceExhausted)
+            .map_err(FileRestartCheckpointPageRepairStoreError::PageStore)?;
+        let page_index = self.page_index(page_number);
+        if page_index.is_none() {
+            self.pages
+                .try_reserve(1)
+                .map_err(|_| FilePageStoreError::SnapshotCapacityExhausted)
+                .map_err(FileRestartCheckpointPageRepairStoreError::PageStore)?;
+        }
+
+        let stored = FileStoredPage {
+            page_number,
+            page_version: target.page_version(),
+            bytes: *target.bytes(),
+            required_position: target.page_position().clone(),
+            store_sequence: sequence,
+        };
+        self.write_snapshot_group(layout, stored, page_index, sequence)
+            .map_err(FileRestartCheckpointPageRepairStoreError::PageStore)
     }
 }
 

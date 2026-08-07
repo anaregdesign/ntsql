@@ -262,11 +262,13 @@ pub use database_ownership::{
     FileDatabaseCreateFaultTiming, FileDatabaseCreateIoError, FileDatabaseCreateIoStage,
     FileDatabaseCreateLocation, FileDatabaseCreateManifestError,
     FileDatabaseCreateManifestMismatch, FileDatabaseCreateNamespaceEvidence,
-    FileDatabaseCreateOutcome, FileDatabaseCreatePhase, FileDatabaseLayout, FileDatabaseLockRole,
-    FileDatabaseOwnership, FileDatabaseOwnershipIoError, FileDatabaseOwnershipIoStage,
-    FileDatabaseOwnershipOpenError, FileDatabaseOwnershipSelection, RecoveryRequiredFileDatabase,
-    create_file_database, decode_database_owner_control, encode_database_owner_control,
-    open_file_database_ownership, open_recovery_required_file_database,
+    FileDatabaseCreateOutcome, FileDatabaseCreatePhase, FileDatabaseLayout,
+    FileDatabaseLiveOpenError, FileDatabaseLockRole, FileDatabaseOpenPhase, FileDatabaseOwnership,
+    FileDatabaseOwnershipIoError, FileDatabaseOwnershipIoStage, FileDatabaseOwnershipOpenError,
+    FileDatabaseOwnershipSelection, LiveFileDatabase, RecoveredFileDatabaseOuterOwnership,
+    RecoveryRequiredFileDatabase, create_file_database, decode_database_owner_control,
+    encode_database_owner_control, open_file_database_ownership, open_live_file_database,
+    open_live_file_database_with_observer, open_recovery_required_file_database,
 };
 pub use restart_checkpoint_codec::{
     RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,

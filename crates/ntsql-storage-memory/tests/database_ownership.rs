@@ -1,18 +1,25 @@
 use std::{error::Error, io};
 
+use ntsql_compatibility::{CompatibilityContext, CompatibilityProfile};
 use ntsql_database::{
     DatabaseCompositionIdentity, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
     DatabaseId, DatabaseLifecycleGeneration, DatabaseLifecycleStage, DatabaseManifest,
     DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
 };
 use ntsql_storage_memory::{
-    InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError, InMemoryDatabaseCreateFault,
-    InMemoryDatabaseCreateFaultTiming, InMemoryDatabaseCreateManifestError,
-    InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation,
-    InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole, InMemoryDatabaseOwnershipError,
-    InMemoryDatabaseOwnershipSlot, InMemoryDatabaseOwnershipSlotError,
-    InMemoryDatabaseOwnershipWorld,
+    InMemoryCommitLog, InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError,
+    InMemoryDatabaseCreateFault, InMemoryDatabaseCreateFaultTiming,
+    InMemoryDatabaseCreateManifestError, InMemoryDatabaseCreateOutcome,
+    InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation, InMemoryDatabaseLiveOpenRequest,
+    InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole, InMemoryDatabaseOpenPhase,
+    InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSlot,
+    InMemoryDatabaseOwnershipSlotError, InMemoryDatabaseOwnershipWorld,
+    InMemoryDatabaseRecoveryStorage, InMemoryPageStore,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    RestartCheckpointCompletenessBaselineSourceFaultPoint, open_live_in_memory_database,
+    open_live_in_memory_database_with_observer,
 };
+use ntsql_transaction::TransactionPageStorageRecoveryHandoffPhase;
 use ntsql_wal::PersistentLogId;
 
 #[test]
@@ -662,6 +669,160 @@ fn memory_create_conflicts_and_invalid_inputs_do_not_normalize_evidence()
     Ok(())
 }
 
+#[test]
+fn live_open_bootstraps_absent_checkpoint_and_retains_context_and_ownership()
+-> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(70, 170)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+
+    let log = InMemoryCommitLog::<1>::with_persistent_lineage_id(composition.persistent_log_id);
+    let store = InMemoryPageStore::new(&log);
+    let storage = InMemoryDatabaseRecoveryStorage::new(
+        log,
+        store,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+    );
+    let mut phases = Vec::new();
+    let live = open_live_in_memory_database_with_observer(
+        InMemoryDatabaseLiveOpenRequest::new(
+            &slot,
+            composition.database_id,
+            composition.manifest_object_id,
+            composition.manifest,
+            &composition.files,
+            storage,
+            compatibility_context("memory-live")?,
+        ),
+        |phase| phases.push(phase),
+    )?;
+
+    assert_eq!(live.stage(), DatabaseLifecycleStage::Live);
+    assert_eq!(live.identity(), composition.manifest.composition_identity());
+    assert_eq!(
+        live.compatibility_context().target_id().as_str(),
+        "memory-live"
+    );
+    assert_eq!(live.transaction_parts().1.generation(), 0);
+    assert!(slot.is_owned());
+    assert_eq!(
+        phases,
+        [
+            InMemoryDatabaseOpenPhase::CompositionValidated,
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointAbsent,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::FullRecoveryCompleted,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::FullRecoveryRestartAnalyzed,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointBootstrapped,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::ReplayPlanned,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::PageRepairsPrepared,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::PageRepairsCompleted,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::TransactionStateRestored,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::RestartCompleted,
+            ),
+            InMemoryDatabaseOpenPhase::Recovery(
+                TransactionPageStorageRecoveryHandoffPhase::WalRetentionAnalyzed,
+            ),
+            InMemoryDatabaseOpenPhase::LiveReleased,
+        ]
+    );
+    assert_eq!(
+        composition.acquire(&slot).err(),
+        Some(InMemoryDatabaseOwnershipError::Contended {
+            database_id: composition.database_id,
+        })
+    );
+
+    drop(live);
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn rejected_checkpoint_never_bootstraps_or_releases_live() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(71, 171)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+
+    let log = InMemoryCommitLog::<1>::with_persistent_lineage_id(composition.persistent_log_id);
+    let store = InMemoryPageStore::new(&log);
+    let mut checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty();
+    checkpoint.arm_fault(RestartCheckpointCompletenessBaselineSourceFaultPoint::BeforeLoad)?;
+    let storage = InMemoryDatabaseRecoveryStorage::new(log, store, checkpoint);
+    let error = open_live_in_memory_database(InMemoryDatabaseLiveOpenRequest::new(
+        &slot,
+        composition.database_id,
+        composition.manifest_object_id,
+        composition.manifest,
+        &composition.files,
+        storage,
+        compatibility_context("memory-rejected")?,
+    ))
+    .err()
+    .ok_or_else(|| io::Error::other("checkpoint source fault released Live"))?;
+    assert_eq!(
+        error.recovery_phase(),
+        Some(TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected)
+    );
+    assert!(slot.is_owned());
+    drop(error);
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn foreign_concrete_wal_cannot_satisfy_modeled_database_recovery() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(72, 172)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+
+    let foreign_log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id(9_172)?);
+    let foreign_store = InMemoryPageStore::new(&foreign_log);
+    let storage = InMemoryDatabaseRecoveryStorage::new(
+        foreign_log,
+        foreign_store,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+    );
+    let error = open_live_in_memory_database(InMemoryDatabaseLiveOpenRequest::new(
+        &slot,
+        composition.database_id,
+        composition.manifest_object_id,
+        composition.manifest,
+        &composition.files,
+        storage,
+        compatibility_context("memory-foreign")?,
+    ))
+    .err()
+    .ok_or_else(|| io::Error::other("foreign concrete WAL released Live"))?;
+    assert_eq!(error.recovery_phase(), None);
+    assert!(slot.is_owned());
+    drop(error);
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
 struct TestComposition {
     database_id: DatabaseId,
     persistent_log_id: PersistentLogId,
@@ -957,4 +1118,22 @@ fn persistent_log_id(value: u128) -> Result<PersistentLogId, io::Error> {
 
 fn format_version(value: u16) -> Result<DatabaseStorageFormatVersion, io::Error> {
     DatabaseStorageFormatVersion::new(value).ok_or_else(|| io::Error::other("test format is zero"))
+}
+
+fn compatibility_context(target_id: &str) -> Result<CompatibilityContext, Box<dyn Error>> {
+    Ok(CompatibilityContext::try_new(CompatibilityProfile {
+        target_id: target_id.to_owned(),
+        product_release: "test-release".to_owned(),
+        servicing_update: "test-update".to_owned(),
+        product_version: "1.2.3.4".to_owned(),
+        edition: "test-edition".to_owned(),
+        operating_system: "test-operating-system".to_owned(),
+        architecture: "test-architecture".to_owned(),
+        compatibility_level: 42,
+        collation: "test-collation".to_owned(),
+        language: "test-language".to_owned(),
+        lcid: 1,
+        timezone: "test-timezone".to_owned(),
+        session_defaults: vec!["SET TEST_OPTION ON".to_owned()],
+    })?)
 }

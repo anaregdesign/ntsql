@@ -7,14 +7,27 @@ use std::{
     rc::Rc,
 };
 
+use ntsql_compatibility::CompatibilityContext;
 use ntsql_database::{
     DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
     DatabaseCompositionIdentityMismatch, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
     DatabaseId, DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
-    DatabaseStorageFormatVersion, DatabaseStorageIdentity, ManifestSelectedDatabase,
-    RecoveryRequiredDatabase, UnboundDatabase,
+    DatabaseRecoveryFailureCause, DatabaseRecoveryOwner, DatabaseStorageFormatVersion,
+    DatabaseStorageIdentity, FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase,
+    RecoveredDatabaseOwnership, RecoveryRequiredDatabase, UnboundDatabase,
+};
+use ntsql_transaction::{
+    FailedTransactionPageStorageRecoveryHandoff, TransactionCoordinator,
+    TransactionPageStorageRecoveryHandoffPhase, UnrecoveredTransactionPageStorage,
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay,
+    complete_transaction_page_storage_recovery_handoff_with_observer,
 };
 use ntsql_wal::PersistentLogId;
+
+use super::{
+    InMemoryCommitLog, InMemoryPageStore,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+};
 
 /// Nonzero deterministic identity for one modeled opened storage object.
 ///
@@ -1367,6 +1380,429 @@ impl fmt::Debug for InMemoryDatabaseOwnership {
             .field("files", &self.files)
             .finish_non_exhaustive()
     }
+}
+
+/// Concrete in-memory transaction storage supplied to database recovery.
+#[must_use = "unrecovered memory storage must enter database recovery or be dropped"]
+pub struct InMemoryDatabaseRecoveryStorage<const N: usize> {
+    log: InMemoryCommitLog<N>,
+    store: InMemoryPageStore<N>,
+    checkpoint: InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+}
+
+impl<const N: usize> InMemoryDatabaseRecoveryStorage<N> {
+    /// Binds one concrete WAL, page store, and completeness source for open.
+    pub const fn new(
+        log: InMemoryCommitLog<N>,
+        store: InMemoryPageStore<N>,
+        checkpoint: InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    ) -> Self {
+        Self {
+            log,
+            store,
+            checkpoint,
+        }
+    }
+}
+
+impl<const N: usize> fmt::Debug for InMemoryDatabaseRecoveryStorage<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InMemoryDatabaseRecoveryStorage")
+            .field("log", &self.log)
+            .field("store", &self.store)
+            .field("checkpoint", &self.checkpoint)
+            .finish()
+    }
+}
+
+/// Modeled database-wide ownership retained after transaction recovery.
+#[must_use = "live memory database ownership must remain inside its database typestate"]
+pub struct RecoveredInMemoryDatabaseOuterOwnership {
+    ownership: InMemoryDatabaseOwnership,
+    compatibility_context: CompatibilityContext,
+}
+
+impl RecoveredInMemoryDatabaseOuterOwnership {
+    /// Returns the retained inert manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.ownership.manifest()
+    }
+
+    /// Returns the one immutable exact-target context moved through open.
+    #[must_use]
+    pub const fn compatibility_context(&self) -> &CompatibilityContext {
+        &self.compatibility_context
+    }
+}
+
+impl fmt::Debug for RecoveredInMemoryDatabaseOuterOwnership {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecoveredInMemoryDatabaseOuterOwnership")
+            .field("ownership", &self.ownership)
+            .field(
+                "compatibility_target",
+                self.compatibility_context.target_id(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Terminal memory recovery attempt retaining every modeled and concrete owner.
+#[must_use = "failed memory recovery retains all database and child ownership"]
+pub struct FailedInMemoryDatabaseRecoveryAttempt<const N: usize> {
+    _outer_owner: RecoveredInMemoryDatabaseOuterOwnership,
+    failure: FailedTransactionPageStorageRecoveryHandoff<
+        InMemoryCommitLog<N>,
+        InMemoryPageStore<N>,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+        N,
+    >,
+}
+
+impl<const N: usize> FailedInMemoryDatabaseRecoveryAttempt<N> {
+    /// Returns the first transaction recovery phase that did not complete.
+    #[must_use]
+    pub const fn phase(&self) -> TransactionPageStorageRecoveryHandoffPhase {
+        self.failure.phase()
+    }
+}
+
+impl<const N: usize> fmt::Debug for FailedInMemoryDatabaseRecoveryAttempt<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedInMemoryDatabaseRecoveryAttempt")
+            .field("phase", &self.phase())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Memory database open boundary crossed after one complete owning phase.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryDatabaseOpenPhase {
+    /// Five-object modeled ownership and exact child identity were validated.
+    CompositionValidated,
+    /// One transaction recovery handoff phase completed.
+    Recovery(TransactionPageStorageRecoveryHandoffPhase),
+    /// The database domain accepted exact completion evidence and released Live.
+    LiveReleased,
+}
+
+/// Observer input accepted only by the memory recovery-owner implementation.
+pub struct InMemoryDatabaseRecoveryInput<'observer, Observer, const N: usize> {
+    compatibility_context: CompatibilityContext,
+    storage: InMemoryDatabaseRecoveryStorage<N>,
+    observer: &'observer mut Observer,
+}
+
+impl<const N: usize, Observer>
+    DatabaseRecoveryOwner<InMemoryDatabaseRecoveryInput<'_, Observer, N>, N>
+    for InMemoryDatabaseOwnership
+where
+    Observer: FnMut(InMemoryDatabaseOpenPhase),
+{
+    type Source = InMemoryCommitLog<N>;
+    type Store = InMemoryPageStore<N>;
+    type CheckpointSource = InMemoryTransactionRestartCheckpointCompletenessBaselineSource;
+    type RetainedOwner = RecoveredInMemoryDatabaseOuterOwnership;
+    type Failure = FailedInMemoryDatabaseRecoveryAttempt<N>;
+
+    fn complete_database_recovery(
+        self,
+        input: InMemoryDatabaseRecoveryInput<'_, Observer, N>,
+    ) -> Result<
+        (
+            Self::RetainedOwner,
+            WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+                Self::Source,
+                Self::Store,
+                Self::CheckpointSource,
+                N,
+            >,
+        ),
+        Self::Failure,
+    > {
+        let InMemoryDatabaseRecoveryInput {
+            compatibility_context,
+            storage,
+            observer,
+        } = input;
+        let outer_owner = RecoveredInMemoryDatabaseOuterOwnership {
+            ownership: self,
+            compatibility_context,
+        };
+        let InMemoryDatabaseRecoveryStorage {
+            log,
+            store,
+            checkpoint,
+        } = storage;
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_generation_aware_restart_checkpoint_completeness(checkpoint);
+        match complete_transaction_page_storage_recovery_handoff_with_observer(selection, |phase| {
+            observer(InMemoryDatabaseOpenPhase::Recovery(phase))
+        }) {
+            Ok(transaction) => Ok((outer_owner, transaction)),
+            Err(failure) => Err(FailedInMemoryDatabaseRecoveryAttempt {
+                _outer_owner: outer_owner,
+                failure,
+            }),
+        }
+    }
+}
+
+type LiveInMemoryDatabaseDomainOwner<const N: usize> = RecoveredDatabaseOwnership<
+    RecoveredInMemoryDatabaseOuterOwnership,
+    InMemoryCommitLog<N>,
+    InMemoryPageStore<N>,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+type FailedInMemoryDatabaseDomainRecovery<const N: usize> = FailedDatabaseRecovery<
+    FailedInMemoryDatabaseRecoveryAttempt<N>,
+    RecoveredInMemoryDatabaseOuterOwnership,
+    InMemoryCommitLog<N>,
+    InMemoryPageStore<N>,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+/// Recovery-complete memory database owner with one exact target context.
+#[must_use = "live memory database must be closed or dropped"]
+pub struct LiveInMemoryDatabase<const N: usize> {
+    database: LiveDatabase<LiveInMemoryDatabaseDomainOwner<N>>,
+}
+
+impl<const N: usize> LiveInMemoryDatabase<N> {
+    /// Returns the exact selected database composition identity.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.database.identity()
+    }
+
+    /// Returns the database lifecycle stage.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        self.database.stage()
+    }
+
+    /// Returns the one immutable exact-target context moved through open.
+    #[must_use]
+    pub const fn compatibility_context(&self) -> &CompatibilityContext {
+        self.database.owner().outer_owner().compatibility_context()
+    }
+
+    /// Returns the exact manifest retained by modeled ownership.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.database.owner().outer_owner().manifest()
+    }
+
+    /// Borrows the recovered coordinator, WAL, and page store.
+    #[must_use]
+    pub const fn transaction_parts(
+        &self,
+    ) -> (
+        &TransactionCoordinator,
+        &InMemoryCommitLog<N>,
+        &InMemoryPageStore<N>,
+    ) {
+        self.database.owner().transaction().parts()
+    }
+
+    /// Borrows the recovered coordinator, WAL, and page store for live work.
+    pub const fn transaction_parts_mut(
+        &mut self,
+    ) -> (
+        &mut TransactionCoordinator,
+        &mut InMemoryCommitLog<N>,
+        &mut InMemoryPageStore<N>,
+    ) {
+        self.database.owner_mut().transaction_mut().parts_mut()
+    }
+
+    /// Borrows the exact completion and WAL-retention handoff owner.
+    pub const fn recovery_handoff(
+        &self,
+    ) -> &WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        InMemoryCommitLog<N>,
+        InMemoryPageStore<N>,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+        N,
+    > {
+        self.database.owner().transaction()
+    }
+}
+
+impl<const N: usize> fmt::Debug for LiveInMemoryDatabase<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LiveInMemoryDatabase")
+            .field("identity", &self.identity())
+            .field(
+                "compatibility_target",
+                self.compatibility_context().target_id(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// Failure before or during fail-closed memory database open.
+#[must_use = "failed memory database open may retain every database owner"]
+pub enum InMemoryDatabaseLiveOpenError<const N: usize> {
+    /// Modeled database ownership or structural composition validation failed.
+    Ownership(InMemoryDatabaseOwnershipError),
+    /// Transaction recovery or exact completion-evidence binding failed.
+    Recovery(FailedInMemoryDatabaseDomainRecovery<N>),
+}
+
+impl<const N: usize> InMemoryDatabaseLiveOpenError<N> {
+    /// Returns the transaction recovery phase for an adapter-operation failure.
+    #[must_use]
+    pub const fn recovery_phase(&self) -> Option<TransactionPageStorageRecoveryHandoffPhase> {
+        match self {
+            Self::Ownership(_) => None,
+            Self::Recovery(failure) => match failure.cause() {
+                DatabaseRecoveryFailureCause::Operation(failure) => Some(failure.phase()),
+                DatabaseRecoveryFailureCause::Evidence(_) => None,
+            },
+        }
+    }
+}
+
+impl<const N: usize> fmt::Debug for InMemoryDatabaseLiveOpenError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ownership(error) => formatter
+                .debug_tuple("InMemoryDatabaseLiveOpenError::Ownership")
+                .field(error)
+                .finish(),
+            Self::Recovery(error) => formatter
+                .debug_tuple("InMemoryDatabaseLiveOpenError::Recovery")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
+impl<const N: usize> fmt::Display for InMemoryDatabaseLiveOpenError<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ownership(error) => write!(formatter, "memory database open failed: {error}"),
+            Self::Recovery(error) => match error.cause() {
+                DatabaseRecoveryFailureCause::Operation(failure) => write!(
+                    formatter,
+                    "memory database recovery failed before completing {:?}",
+                    failure.phase()
+                ),
+                DatabaseRecoveryFailureCause::Evidence(error) => {
+                    write!(
+                        formatter,
+                        "memory database recovery evidence failed: {error}"
+                    )
+                }
+            },
+        }
+    }
+}
+
+impl<const N: usize> Error for InMemoryDatabaseLiveOpenError<N> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Ownership(error) => Some(error),
+            Self::Recovery(_) => None,
+        }
+    }
+}
+
+/// Complete composition-root input for one fail-closed memory database open.
+#[must_use = "a live-open request must be consumed by the recovery gate"]
+pub struct InMemoryDatabaseLiveOpenRequest<'owner, const N: usize> {
+    slot: &'owner InMemoryDatabaseOwnershipSlot,
+    expected_database_id: DatabaseId,
+    manifest_object_id: InMemoryDatabaseObjectId,
+    manifest: DatabaseManifest,
+    files: &'owner [InMemoryDatabaseFileObservation],
+    storage: InMemoryDatabaseRecoveryStorage<N>,
+    compatibility_context: CompatibilityContext,
+}
+
+impl<'owner, const N: usize> InMemoryDatabaseLiveOpenRequest<'owner, N> {
+    /// Binds one exact compatibility decision to the modeled and concrete owners.
+    pub const fn new(
+        slot: &'owner InMemoryDatabaseOwnershipSlot,
+        expected_database_id: DatabaseId,
+        manifest_object_id: InMemoryDatabaseObjectId,
+        manifest: DatabaseManifest,
+        files: &'owner [InMemoryDatabaseFileObservation],
+        storage: InMemoryDatabaseRecoveryStorage<N>,
+        compatibility_context: CompatibilityContext,
+    ) -> Self {
+        Self {
+            slot,
+            expected_database_id,
+            manifest_object_id,
+            manifest,
+            files,
+            storage,
+            compatibility_context,
+        }
+    }
+}
+
+impl<const N: usize> fmt::Debug for InMemoryDatabaseLiveOpenRequest<'_, N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InMemoryDatabaseLiveOpenRequest")
+            .field("expected_database_id", &self.expected_database_id)
+            .field("manifest_object_id", &self.manifest_object_id)
+            .field("manifest", &self.manifest)
+            .field("files", &self.files)
+            .field("storage", &self.storage)
+            .field("compatibility_context", &self.compatibility_context)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Acquires one modeled composition and recovers concrete memory storage to Live.
+pub fn open_live_in_memory_database<const N: usize>(
+    request: InMemoryDatabaseLiveOpenRequest<'_, N>,
+) -> Result<LiveInMemoryDatabase<N>, InMemoryDatabaseLiveOpenError<N>> {
+    open_live_in_memory_database_with_observer(request, |_| {})
+}
+
+/// Opens memory storage through recovery while reporting completed owning phases.
+pub fn open_live_in_memory_database_with_observer<const N: usize, Observer>(
+    request: InMemoryDatabaseLiveOpenRequest<'_, N>,
+    mut observer: Observer,
+) -> Result<LiveInMemoryDatabase<N>, InMemoryDatabaseLiveOpenError<N>>
+where
+    Observer: FnMut(InMemoryDatabaseOpenPhase),
+{
+    let InMemoryDatabaseLiveOpenRequest {
+        slot,
+        expected_database_id,
+        manifest_object_id,
+        manifest,
+        files,
+        storage,
+        compatibility_context,
+    } = request;
+    let recovery_required = slot
+        .try_acquire_recovery_required(expected_database_id, manifest_object_id, manifest, files)
+        .map_err(InMemoryDatabaseLiveOpenError::Ownership)?;
+    observer(InMemoryDatabaseOpenPhase::CompositionValidated);
+    let database = recovery_required
+        .complete_recovery::<_, N>(InMemoryDatabaseRecoveryInput {
+            compatibility_context,
+            storage,
+            observer: &mut observer,
+        })
+        .map_err(InMemoryDatabaseLiveOpenError::Recovery)?;
+    observer(InMemoryDatabaseOpenPhase::LiveReleased);
+    Ok(LiveInMemoryDatabase { database })
 }
 
 struct InMemoryDatabaseOwnershipGuard {

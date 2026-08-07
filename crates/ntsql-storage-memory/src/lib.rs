@@ -62,10 +62,13 @@ pub use database_ownership::{
     InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError, InMemoryDatabaseCreateFault,
     InMemoryDatabaseCreateFaultTiming, InMemoryDatabaseCreateManifestError,
     InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation,
-    InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole, InMemoryDatabaseOwnership,
+    InMemoryDatabaseLiveOpenError, InMemoryDatabaseLiveOpenRequest, InMemoryDatabaseObjectId,
+    InMemoryDatabaseObjectRole, InMemoryDatabaseOpenPhase, InMemoryDatabaseOwnership,
     InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSelection,
     InMemoryDatabaseOwnershipSlot, InMemoryDatabaseOwnershipSlotError,
-    InMemoryDatabaseOwnershipWorld, RecoveryRequiredInMemoryDatabase,
+    InMemoryDatabaseOwnershipWorld, InMemoryDatabaseRecoveryStorage, LiveInMemoryDatabase,
+    RecoveredInMemoryDatabaseOuterOwnership, RecoveryRequiredInMemoryDatabase,
+    open_live_in_memory_database, open_live_in_memory_database_with_observer,
 };
 
 /// One-shot physical-effect boundary for the next matching log operation.

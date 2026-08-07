@@ -36,7 +36,7 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
     },
     PackagePolicy {
         package: "ntsql-database",
-        normal_dependencies: &["ntsql-wal"],
+        normal_dependencies: &["ntsql-transaction", "ntsql-wal"],
         build_dependencies: &[],
         development_dependencies: &[],
     },
@@ -55,6 +55,7 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
     PackagePolicy {
         package: "ntsql-storage-file",
         normal_dependencies: &[
+            "ntsql-compatibility",
             "ntsql-database",
             "ntsql-page",
             "ntsql-transaction",
@@ -66,6 +67,7 @@ const PACKAGE_POLICIES: &[PackagePolicy] = &[
     PackagePolicy {
         package: "ntsql-storage-memory",
         normal_dependencies: &[
+            "ntsql-compatibility",
             "ntsql-database",
             "ntsql-page",
             "ntsql-transaction",
@@ -379,16 +381,19 @@ mod tests {
              1serde v1.0.0\n\
              1serde_json v1.0.0\n\
              0ntsql-database v0.1.0\n\
+             1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-page v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-recovery-model v0.1.0\n\
              0ntsql-storage-file v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
              1ntsql-database v0.1.0\n\
              1ntsql-page v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
              1ntsql-wal v0.1.0\n\
              0ntsql-storage-memory v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
              1ntsql-database v0.1.0\n\
              1ntsql-page v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
@@ -585,19 +590,22 @@ mod tests {
              1serde v1.0.0\n",
         )?;
 
-        let forbidden = [
+        let normal_forbidden = [
             "ntsql-compatibility",
             "ntsql-contract",
             "ntsql-diagnostics",
             "ntsql-storage-file",
             "ntsql-storage-memory",
-            "ntsql-transaction",
             "serde",
         ];
         let normal_violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
-        assert!(!normal_violations.iter().any(|violation| violation
-            == "package ntsql-database has forbidden direct dependency ntsql-wal"));
-        for dependency in forbidden {
+        for dependency in ["ntsql-transaction", "ntsql-wal"] {
+            assert!(!normal_violations.iter().any(|violation| violation
+                == &format!(
+                    "package ntsql-database has forbidden direct dependency {dependency}"
+                )));
+        }
+        for dependency in normal_forbidden {
             assert!(normal_violations.iter().any(|violation| violation
                 == &format!(
                     "package ntsql-database has forbidden direct dependency {dependency}"
@@ -606,7 +614,10 @@ mod tests {
 
         for kind in [DependencyKind::Build, DependencyKind::Development] {
             let violations = validate_graph(&graph, PACKAGE_POLICIES, kind);
-            for dependency in forbidden.into_iter().chain(["ntsql-wal"]) {
+            for dependency in normal_forbidden
+                .into_iter()
+                .chain(["ntsql-transaction", "ntsql-wal"])
+            {
                 assert!(violations.iter().any(|violation| violation
                     == &format!(
                         "package ntsql-database has forbidden direct{} dependency {dependency}",
@@ -794,6 +805,7 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-diagnostics v0.1.0\n\
              0ntsql-storage-memory v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
              1ntsql-contract v0.1.0\n\
              1ntsql-database v0.1.0\n\
              1ntsql-page v0.1.0\n\
@@ -828,6 +840,8 @@ mod tests {
             == "package ntsql-wal has forbidden direct dependency ntsql-storage-memory"));
         assert!(!violations.iter().any(|violation| violation
             == "package ntsql-storage-memory has forbidden direct dependency ntsql-database"));
+        assert!(!violations.iter().any(|violation| violation
+            == "package ntsql-storage-memory has forbidden direct dependency ntsql-compatibility"));
         Ok(())
     }
 
@@ -842,6 +856,7 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-diagnostics v0.1.0\n\
              0ntsql-storage-file v0.1.0\n\
+             1ntsql-compatibility v0.1.0\n\
              1ntsql-contract v0.1.0\n\
              1ntsql-database v0.1.0\n\
              1ntsql-page v0.1.0\n\
@@ -874,6 +889,8 @@ mod tests {
             == "package ntsql-wal has forbidden direct dependency ntsql-storage-file"));
         assert!(!violations.iter().any(|violation| violation
             == "package ntsql-storage-file has forbidden direct dependency ntsql-database"));
+        assert!(!violations.iter().any(|violation| violation
+            == "package ntsql-storage-file has forbidden direct dependency ntsql-compatibility"));
         Ok(())
     }
 }

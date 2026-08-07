@@ -35,6 +35,7 @@ dependencies = [
 name = "ntsql-database"
 version = "0.1.0"
 dependencies = [
+ "ntsql-transaction",
  "ntsql-wal",
 ]
 
@@ -57,6 +58,7 @@ version = "0.1.0"
 name = "ntsql-storage-file"
 version = "0.1.0"
 dependencies = [
+ "ntsql-compatibility",
  "ntsql-database",
  "ntsql-page",
  "ntsql-recovery-model",
@@ -68,6 +70,7 @@ dependencies = [
 name = "ntsql-storage-memory"
 version = "0.1.0"
 dependencies = [
+ "ntsql-compatibility",
  "ntsql-database",
  "ntsql-page",
  "ntsql-recovery-model",

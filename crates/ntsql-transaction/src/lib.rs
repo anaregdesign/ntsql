@@ -25762,6 +25762,504 @@ where
     }
 }
 
+/// Completed boundary in one fail-closed transaction-storage restart handoff.
+///
+/// These values are inert test observations. They grant no access to the
+/// retained adapters and cannot substitute for any owning restart state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransactionPageStorageRecoveryHandoffPhase {
+    /// Generation-aware selection found no current checkpoint.
+    CheckpointAbsent,
+    /// Complete committed-page recovery finished for an absent checkpoint.
+    FullRecoveryCompleted,
+    /// The recovered complete prefix passed durable restart analysis.
+    FullRecoveryRestartAnalyzed,
+    /// A fresh current completeness checkpoint was published.
+    CheckpointBootstrapped,
+    /// One exact completeness checkpoint was selected.
+    CheckpointSelected,
+    /// The selected checkpoint and current WAL produced one replay window.
+    ReplayPlanned,
+    /// Every replay page has one retained repair decision.
+    PageRepairsPrepared,
+    /// Every prepared page repair completed.
+    PageRepairsCompleted,
+    /// Persisted transaction state was restored into one fresh coordinator.
+    TransactionStateRestored,
+    /// Fresh WAL and page observations completed the selected restart.
+    RestartCompleted,
+    /// Current store and WAL evidence produced one retention analysis.
+    WalRetentionAnalyzed,
+}
+
+type FailedRecoveryPageRepair<Source, Store, CheckpointSource, const N: usize> =
+    FailedTransactionPageStorageRestartCheckpointPageRepair<
+        Source,
+        Store,
+        CheckpointSource,
+        <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+        <Store as TransactionRestartCheckpointPageRepairStore<N>>::WriteError,
+        N,
+    >;
+
+/// Exact owning failure from a complete transaction-storage recovery handoff.
+///
+/// Each variant retains the state that failed. Database composition roots must
+/// keep this value private and require drop/reopen rather than extracting a
+/// fallback or retry owner.
+#[must_use = "failed recovery handoff retains its exact transaction-storage owner"]
+pub enum FailedTransactionPageStorageRecoveryHandoff<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionPageRecoveryInventory<N>
+        + DurableTransactionPageRecoverySource<N>
+        + DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + TransactionRestartCoordinatorEpochSource,
+    Store: CommittedTransactionPageRecoveryStore<N>
+        + DurablePageStoreInventorySource<N>
+        + TransactionRestartCheckpointPageRepairStore<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource
+        + DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    /// Initial checkpoint loading or validation rejected the selected source.
+    CheckpointSelectionRejected(
+        Box<
+            RejectedTransactionPageStorageRestartCheckpointCompleteness<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// Full committed-page recovery failed while bootstrapping an absent slot.
+    FullRecovery(
+        Box<
+            FailedTransactionPageStorageRecoveryWithCompletenessCheckpoint<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// Durable restart analysis failed after full committed-page recovery.
+    FullRecoveryRestartAnalysis(
+        Box<
+            FailedTransactionPageStorageRestartAnalysisWithCompletenessCheckpoint<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// Publishing the bootstrap completeness checkpoint failed.
+    CheckpointBootstrapPublication {
+        /// Restart-analyzed adapters retained after the publication attempt.
+        owner: Box<
+            RestartAnalyzedTransactionPageStorageWithCompletenessCheckpoint<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+        /// Exact preparation or outcome-indeterminate publication cause.
+        error: DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError<
+            <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+            <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+            <CheckpointSource as DurableTransactionRestartCheckpointCompletenessBaselinePublisher>::Error,
+        >,
+    },
+    /// The just-published bootstrap checkpoint was unexpectedly absent.
+    CheckpointBootstrapAbsent(
+        Box<
+            AbsentTransactionPageStorageRestartCheckpointCompleteness<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// The just-published bootstrap checkpoint failed fresh exact selection.
+    CheckpointBootstrapRejected(
+        Box<
+            RejectedTransactionPageStorageRestartCheckpointCompleteness<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// Selected-checkpoint replay planning failed.
+    ReplayPlanning(
+        Box<
+            FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// Read-only page-repair preparation failed.
+    PageRepairPreparation(
+        Box<
+            FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// One whole-plan page-repair attempt failed.
+    PageRepair(Box<FailedRecoveryPageRepair<Source, Store, CheckpointSource, N>>),
+    /// Immutable evidence rejected transaction-state restoration.
+    TransactionRestorationRejected(
+        Box<
+            RejectedTransactionPageStorageRestartCheckpointRestoration<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// Allocating the restart coordinator epoch failed.
+    TransactionRestoration(
+        Box<
+            FailedTransactionPageStorageRestartCheckpointRestoration<
+                Source,
+                Store,
+                CheckpointSource,
+                <Source as TransactionRestartCoordinatorEpochSource>::Error,
+                N,
+            >,
+        >,
+    ),
+    /// Final selected-restart validation failed.
+    RestartCompletion(
+        Box<
+            FailedTransactionPageStorageRestartCheckpointCompletion<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+    /// Whole-store WAL retention analysis failed.
+    WalRetentionAnalysis(
+        Box<
+            FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis<
+                Source,
+                Store,
+                CheckpointSource,
+                N,
+            >,
+        >,
+    ),
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageRecoveryHandoff<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N>
+        + DurableTransactionPageRecoverySource<N>
+        + DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + TransactionRestartCoordinatorEpochSource,
+    Store: CommittedTransactionPageRecoveryStore<N>
+        + DurablePageStoreInventorySource<N>
+        + TransactionRestartCheckpointPageRepairStore<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource
+        + DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    /// Returns the first recovery phase that did not complete.
+    #[must_use]
+    pub const fn phase(&self) -> TransactionPageStorageRecoveryHandoffPhase {
+        match self {
+            Self::CheckpointSelectionRejected(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected
+            }
+            Self::FullRecovery(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::FullRecoveryCompleted
+            }
+            Self::FullRecoveryRestartAnalysis(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::FullRecoveryRestartAnalyzed
+            }
+            Self::CheckpointBootstrapPublication { .. }
+            | Self::CheckpointBootstrapAbsent(_)
+            | Self::CheckpointBootstrapRejected(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointBootstrapped
+            }
+            Self::ReplayPlanning(_) => TransactionPageStorageRecoveryHandoffPhase::ReplayPlanned,
+            Self::PageRepairPreparation(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::PageRepairsPrepared
+            }
+            Self::PageRepair(_) => TransactionPageStorageRecoveryHandoffPhase::PageRepairsCompleted,
+            Self::TransactionRestorationRejected(_) | Self::TransactionRestoration(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::TransactionStateRestored
+            }
+            Self::RestartCompletion(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::RestartCompleted
+            }
+            Self::WalRetentionAnalysis(_) => {
+                TransactionPageStorageRecoveryHandoffPhase::WalRetentionAnalyzed
+            }
+        }
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRecoveryHandoff<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N>
+        + DurableTransactionPageRecoverySource<N>
+        + DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + TransactionRestartCoordinatorEpochSource,
+    Store: CommittedTransactionPageRecoveryStore<N>
+        + DurablePageStoreInventorySource<N>
+        + TransactionRestartCheckpointPageRepairStore<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource
+        + DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRecoveryHandoff")
+            .field("phase", &self.phase())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Completes the approved selected-restart and retention-analysis handoff.
+///
+/// A generation-zero absent checkpoint is bootstrapped only after complete
+/// committed-page recovery and durable restart analysis. A rejected checkpoint
+/// never uses its standalone complete-recovery fallback.
+pub fn complete_transaction_page_storage_recovery_handoff<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+>(
+    selection: TransactionPageStorageRestartCheckpointCompletenessSelection<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+) -> Result<
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    FailedTransactionPageStorageRecoveryHandoff<Source, Store, CheckpointSource, N>,
+>
+where
+    Source: DurableTransactionPageRecoveryInventory<N>
+        + DurableTransactionPageRecoverySource<N>
+        + DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + TransactionRestartCoordinatorEpochSource,
+    Store: CommittedTransactionPageRecoveryStore<N>
+        + DurablePageStoreInventorySource<N>
+        + TransactionRestartCheckpointPageRepairStore<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource
+        + DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    complete_transaction_page_storage_recovery_handoff_with_observer(selection, |_| {})
+}
+
+/// Completes recovery while reporting each successfully crossed phase boundary.
+///
+/// The observer receives inert phase values only. It is intended for
+/// deterministic process-exit tests and cannot obtain or replace an owner.
+pub fn complete_transaction_page_storage_recovery_handoff_with_observer<
+    Source,
+    Store,
+    CheckpointSource,
+    Observer,
+    const N: usize,
+>(
+    selection: TransactionPageStorageRestartCheckpointCompletenessSelection<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    mut observer: Observer,
+) -> Result<
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    FailedTransactionPageStorageRecoveryHandoff<Source, Store, CheckpointSource, N>,
+>
+where
+    Source: DurableTransactionPageRecoveryInventory<N>
+        + DurableTransactionPageRecoverySource<N>
+        + DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + TransactionRestartCoordinatorEpochSource,
+    Store: CommittedTransactionPageRecoveryStore<N>
+        + DurablePageStoreInventorySource<N>
+        + TransactionRestartCheckpointPageRepairStore<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource
+        + DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+    Observer: FnMut(TransactionPageStorageRecoveryHandoffPhase),
+{
+    let selected = match selection {
+        TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) => {
+            observer(TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected);
+            selected
+        }
+        TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(absent) => {
+            observer(TransactionPageStorageRecoveryHandoffPhase::CheckpointAbsent);
+            let recovered = match absent.continue_with_full_recovery().recover() {
+                Ok(recovered) => recovered,
+                Err(failure) => {
+                    return Err(FailedTransactionPageStorageRecoveryHandoff::FullRecovery(
+                        Box::new(failure),
+                    ));
+                }
+            };
+            observer(TransactionPageStorageRecoveryHandoffPhase::FullRecoveryCompleted);
+            let mut analyzed = match recovered.analyze_restart() {
+                Ok(analyzed) => analyzed,
+                Err(failure) => {
+                    return Err(
+                        FailedTransactionPageStorageRecoveryHandoff::FullRecoveryRestartAnalysis(
+                            Box::new(failure),
+                        ),
+                    );
+                }
+            };
+            observer(TransactionPageStorageRecoveryHandoffPhase::FullRecoveryRestartAnalyzed);
+            if let Err(error) =
+                analyzed.publish_restart_checkpoint_completeness_baseline_from_current_prefix()
+            {
+                return Err(
+                    FailedTransactionPageStorageRecoveryHandoff::CheckpointBootstrapPublication {
+                        owner: Box::new(analyzed),
+                        error,
+                    },
+                );
+            }
+            observer(TransactionPageStorageRecoveryHandoffPhase::CheckpointBootstrapped);
+            let (source, store, _, _, checkpoint_source) = analyzed.into_parts();
+            let reselection = UnrecoveredTransactionPageStorage::new(source, store)
+                .select_generation_aware_restart_checkpoint_completeness(checkpoint_source);
+            match reselection {
+                TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(
+                    selected,
+                ) => {
+                    observer(TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected);
+                    selected
+                }
+                TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(absent) => {
+                    return Err(
+                        FailedTransactionPageStorageRecoveryHandoff::CheckpointBootstrapAbsent(
+                            Box::new(absent),
+                        ),
+                    );
+                }
+                TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                    rejected,
+                ) => {
+                    return Err(
+                        FailedTransactionPageStorageRecoveryHandoff::CheckpointBootstrapRejected(
+                            Box::new(rejected),
+                        ),
+                    );
+                }
+            }
+        }
+        TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) => {
+            return Err(
+                FailedTransactionPageStorageRecoveryHandoff::CheckpointSelectionRejected(Box::new(
+                    rejected,
+                )),
+            );
+        }
+    };
+
+    let planned = selected.plan_replay_window().map_err(|failure| {
+        FailedTransactionPageStorageRecoveryHandoff::ReplayPlanning(Box::new(failure))
+    })?;
+    observer(TransactionPageStorageRecoveryHandoffPhase::ReplayPlanned);
+
+    let prepared = match planned.prepare_page_repairs() {
+        TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) => prepared,
+        TransactionPageStorageRestartCheckpointRepairPreparation::Failed(failure) => {
+            return Err(
+                FailedTransactionPageStorageRecoveryHandoff::PageRepairPreparation(Box::new(
+                    failure,
+                )),
+            );
+        }
+    };
+    observer(TransactionPageStorageRecoveryHandoffPhase::PageRepairsPrepared);
+
+    let repaired = match prepared.execute_page_repairs() {
+        TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) => repaired,
+        TransactionPageStorageRestartCheckpointPageRepairExecution::Failed(failure) => {
+            return Err(FailedTransactionPageStorageRecoveryHandoff::PageRepair(
+                Box::new(failure),
+            ));
+        }
+    };
+    observer(TransactionPageStorageRecoveryHandoffPhase::PageRepairsCompleted);
+
+    let restored = match repaired.restore_transaction_state() {
+        TransactionPageStorageRestartCheckpointRestoration::Restored(restored) => restored,
+        TransactionPageStorageRestartCheckpointRestoration::Rejected(rejected) => {
+            return Err(
+                FailedTransactionPageStorageRecoveryHandoff::TransactionRestorationRejected(
+                    Box::new(rejected),
+                ),
+            );
+        }
+        TransactionPageStorageRestartCheckpointRestoration::Failed(failure) => {
+            return Err(
+                FailedTransactionPageStorageRecoveryHandoff::TransactionRestoration(Box::new(
+                    failure,
+                )),
+            );
+        }
+    };
+    observer(TransactionPageStorageRecoveryHandoffPhase::TransactionStateRestored);
+
+    let completed = restored.complete_restart().map_err(|failure| {
+        FailedTransactionPageStorageRecoveryHandoff::RestartCompletion(Box::new(failure))
+    })?;
+    observer(TransactionPageStorageRecoveryHandoffPhase::RestartCompleted);
+
+    let analyzed = completed.analyze_wal_retention().map_err(|failure| {
+        FailedTransactionPageStorageRecoveryHandoff::WalRetentionAnalysis(Box::new(failure))
+    })?;
+    observer(TransactionPageStorageRecoveryHandoffPhase::WalRetentionAnalyzed);
+    Ok(analyzed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32710,6 +33208,8 @@ mod tests {
     struct FakeCompletenessCheckpointPublisher {
         checkpoint: Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>,
         publication_fault: Option<FakeCheckpointPublicationFault>,
+        publication_checkpoint_override:
+            Option<Option<OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation>>,
         publication_calls: usize,
         load_calls: usize,
         events: Option<Rc<RefCell<Vec<&'static str>>>>,
@@ -32724,6 +33224,7 @@ mod tests {
             Self {
                 checkpoint,
                 publication_fault: None,
+                publication_checkpoint_override: None,
                 publication_calls: 0,
                 load_calls: 0,
                 events: None,
@@ -32753,15 +33254,18 @@ mod tests {
                 return Err(FakeFault("completeness publication permit mismatch"));
             }
 
-            let checkpoint = owned_decoded_completeness_checkpoint(baseline);
+            let checkpoint = self
+                .publication_checkpoint_override
+                .take()
+                .unwrap_or_else(|| Some(owned_decoded_completeness_checkpoint(baseline)));
             match self.publication_fault.take() {
                 Some(FakeCheckpointPublicationFault::Before(source)) => Err(source),
                 Some(FakeCheckpointPublicationFault::After(source)) => {
-                    self.checkpoint = Some(checkpoint);
+                    self.checkpoint = checkpoint;
                     Err(source)
                 }
                 None => {
-                    self.checkpoint = Some(checkpoint);
+                    self.checkpoint = checkpoint;
                     Ok(())
                 }
             }
@@ -39651,6 +40155,442 @@ mod tests {
             DurableTransactionRestartCheckpointReplayPlanningError::Source(FakeFault(
                 "post-callback generation source"
             ))
+        ));
+        Ok(())
+    }
+
+    type FakeRecoveryHandoffSelection =
+        TransactionPageStorageRestartCheckpointCompletenessSelection<
+            FakeDurablePageRecoverySource,
+            FakeBatchCommittedPageRecoveryStore,
+            FakeCompletenessCheckpointPublisher,
+            1,
+        >;
+
+    fn fake_recovery_handoff_selection(
+        source: FakeDurablePageRecoverySource,
+        store: FakeBatchCommittedPageRecoveryStore,
+        checkpoint: FakeCompletenessCheckpointPublisher,
+    ) -> FakeRecoveryHandoffSelection {
+        UnrecoveredTransactionPageStorage::new(source, store)
+            .select_generation_aware_restart_checkpoint_completeness(checkpoint)
+    }
+
+    #[test]
+    fn recovery_handoff_never_falls_back_from_initial_checkpoint_rejection() -> Result<(), TestError>
+    {
+        let persistent_log_id =
+            PersistentLogId::new(0x17f0).ok_or(TestError("rejection persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x27f0).ok_or(TestError("foreign checkpoint persistent id"))?,
+        );
+        let foreign_baseline =
+            fake_completeness_baseline(&foreign_lineage, None, Vec::new(), Vec::new())?;
+        let checkpoint = FakeCompletenessCheckpointPublisher::new(Some(
+            owned_decoded_completeness_checkpoint(&foreign_baseline),
+        ));
+
+        let failure =
+            complete_transaction_page_storage_recovery_handoff(fake_recovery_handoff_selection(
+                fake_restart_source(&lineage, None, Vec::new()),
+                FakeBatchCommittedPageRecoveryStore::new(lineage),
+                checkpoint,
+            ))
+            .err()
+            .ok_or(TestError("foreign checkpoint released ownership"))?;
+
+        let FailedTransactionPageStorageRecoveryHandoff::CheckpointSelectionRejected(rejected) =
+            failure
+        else {
+            return Err(TestError("foreign checkpoint failed at the wrong phase"));
+        };
+        assert_eq!(rejected.storage.source.inventory_calls, 0);
+        assert_eq!(rejected.checkpoint_source.load_calls, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_handoff_retains_owner_at_full_recovery_and_restart_analysis_failures()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x17f1).ok_or(TestError("early failure persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+
+        let mut recovery_source = fake_restart_source(&lineage, None, Vec::new());
+        recovery_source.inventory_error = Some(FakeFault("full recovery inventory"));
+        let recovery_failure =
+            complete_transaction_page_storage_recovery_handoff(fake_recovery_handoff_selection(
+                recovery_source,
+                FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+                FakeCompletenessCheckpointPublisher::new(None),
+            ))
+            .err()
+            .ok_or(TestError("full recovery failure released ownership"))?;
+        assert_eq!(
+            recovery_failure.phase(),
+            TransactionPageStorageRecoveryHandoffPhase::FullRecoveryCompleted
+        );
+        assert!(matches!(
+            recovery_failure,
+            FailedTransactionPageStorageRecoveryHandoff::FullRecovery(_)
+        ));
+
+        let mut analysis_source = fake_restart_source(&lineage, None, Vec::new());
+        analysis_source.restart_before_callback_error =
+            Some(FakeFault("full recovery restart analysis"));
+        let analysis_failure =
+            complete_transaction_page_storage_recovery_handoff(fake_recovery_handoff_selection(
+                analysis_source,
+                FakeBatchCommittedPageRecoveryStore::new(lineage),
+                FakeCompletenessCheckpointPublisher::new(None),
+            ))
+            .err()
+            .ok_or(TestError("restart-analysis failure released ownership"))?;
+        assert_eq!(
+            analysis_failure.phase(),
+            TransactionPageStorageRecoveryHandoffPhase::FullRecoveryRestartAnalyzed
+        );
+        assert!(matches!(
+            analysis_failure,
+            FailedTransactionPageStorageRecoveryHandoff::FullRecoveryRestartAnalysis(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_handoff_retains_owner_at_bootstrap_publication_failures() -> Result<(), TestError> {
+        for (fault, message) in [
+            (
+                FakeCheckpointPublicationFault::Before(FakeFault("before bootstrap publication")),
+                "before",
+            ),
+            (
+                FakeCheckpointPublicationFault::After(FakeFault("after bootstrap publication")),
+                "after",
+            ),
+        ] {
+            let persistent_log_id =
+                PersistentLogId::new(0x1800).ok_or(TestError("bootstrap failure persistent id"))?;
+            let lineage = LogLineage::persistent(persistent_log_id);
+            let source = fake_restart_source(&lineage, None, Vec::new());
+            let store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+            let mut checkpoint = FakeCompletenessCheckpointPublisher::new(None);
+            checkpoint.publication_fault = Some(fault);
+            let mut phases = Vec::new();
+
+            let failure = complete_transaction_page_storage_recovery_handoff_with_observer(
+                fake_recovery_handoff_selection(source, store, checkpoint),
+                |phase| phases.push(phase),
+            )
+            .err()
+            .ok_or(TestError(
+                "bootstrap publication failure released ownership",
+            ))?;
+
+            assert_eq!(
+                failure.phase(),
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointBootstrapped,
+                "{message} publication failure"
+            );
+            assert_eq!(
+                phases,
+                [
+                    TransactionPageStorageRecoveryHandoffPhase::CheckpointAbsent,
+                    TransactionPageStorageRecoveryHandoffPhase::FullRecoveryCompleted,
+                    TransactionPageStorageRecoveryHandoffPhase::FullRecoveryRestartAnalyzed,
+                ],
+                "{message} publication failure"
+            );
+            assert!(matches!(
+                failure,
+                FailedTransactionPageStorageRecoveryHandoff::CheckpointBootstrapPublication { .. }
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_handoff_retains_owner_when_bootstrap_reselection_is_absent_or_rejected()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1802).ok_or(TestError("reselection persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x2802).ok_or(TestError("foreign reselection persistent id"))?,
+        );
+        let foreign_baseline =
+            fake_completeness_baseline(&foreign_lineage, None, Vec::new(), Vec::new())?;
+
+        for (checkpoint_override, rejected) in [
+            (None, false),
+            (
+                Some(owned_decoded_completeness_checkpoint(&foreign_baseline)),
+                true,
+            ),
+        ] {
+            let mut checkpoint = FakeCompletenessCheckpointPublisher::new(None);
+            checkpoint.publication_checkpoint_override = Some(checkpoint_override);
+            let failure = complete_transaction_page_storage_recovery_handoff(
+                fake_recovery_handoff_selection(
+                    fake_restart_source(&lineage, None, Vec::new()),
+                    FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+                    checkpoint,
+                ),
+            )
+            .err()
+            .ok_or(TestError(
+                "invalid bootstrap reselection released ownership",
+            ))?;
+
+            assert_eq!(
+                failure.phase(),
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointBootstrapped
+            );
+            assert!(matches!(
+                (rejected, failure),
+                (
+                    false,
+                    FailedTransactionPageStorageRecoveryHandoff::CheckpointBootstrapAbsent(_)
+                ) | (
+                    true,
+                    FailedTransactionPageStorageRecoveryHandoff::CheckpointBootstrapRejected(_)
+                )
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_handoff_retains_owner_at_replay_planning_and_repair_preparation_failures()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1803).ok_or(TestError("middle failure persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let empty_baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let mut planning_source = fake_restart_source(&lineage, None, Vec::new());
+        planning_source.restart_before_callback_error_on_callback =
+            Some((2, FakeFault("replay planning")));
+        let planning_failure =
+            complete_transaction_page_storage_recovery_handoff(fake_recovery_handoff_selection(
+                planning_source,
+                FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+                FakeCompletenessCheckpointPublisher::new(Some(
+                    owned_decoded_completeness_checkpoint(&empty_baseline),
+                )),
+            ))
+            .err()
+            .ok_or(TestError("replay-planning failure released ownership"))?;
+        assert_eq!(
+            planning_failure.phase(),
+            TransactionPageStorageRecoveryHandoffPhase::ReplayPlanned
+        );
+        assert!(matches!(
+            planning_failure,
+            FailedTransactionPageStorageRecoveryHandoff::ReplayPlanning(_)
+        ));
+
+        let page = PageNumber::new(82).ok_or(TestError("repair preparation page"))?;
+        let make_repair_selection = || -> Result<FakeRecoveryHandoffSelection, TestError> {
+            let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[page.get()])?;
+            owner.parts_mut().1.current.clear();
+            let repair_baseline = owner
+                .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+                .map_err(|_| TestError("repair preparation baseline"))?;
+            let (source, store, _, _) = owner.into_parts();
+            Ok(fake_recovery_handoff_selection(
+                source,
+                store,
+                FakeCompletenessCheckpointPublisher::new(Some(
+                    owned_decoded_completeness_checkpoint(&repair_baseline),
+                )),
+            ))
+        };
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(probe) =
+            make_repair_selection()?
+        else {
+            return Err(TestError("repair preparation probe was not selected"));
+        };
+        let planned = probe
+            .plan_replay_window()
+            .map_err(|_| TestError("repair preparation probe planning"))?;
+        let preparation_observation = planned
+            .selected
+            .storage
+            .store
+            .observations
+            .borrow()
+            .len()
+            .checked_add(1)
+            .ok_or(TestError("repair preparation observation overflow"))?;
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(mut selected) =
+            make_repair_selection()?
+        else {
+            return Err(TestError("repair preparation input was not selected"));
+        };
+        selected.storage.store.observation_fault_on_attempt = Some((
+            preparation_observation,
+            page,
+            FakeFault("repair preparation observation"),
+        ));
+        let preparation_failure = complete_transaction_page_storage_recovery_handoff(
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected),
+        )
+        .err()
+        .ok_or(TestError("repair-preparation failure released ownership"))?;
+        assert_eq!(
+            preparation_failure.phase(),
+            TransactionPageStorageRecoveryHandoffPhase::PageRepairsPrepared
+        );
+        assert!(matches!(
+            preparation_failure,
+            FailedTransactionPageStorageRecoveryHandoff::PageRepairPreparation(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_handoff_retains_owner_when_page_repair_write_fails() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1801).ok_or(TestError("repair failure persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page = PageNumber::new(81).ok_or(TestError("repair failure page"))?;
+        let mut owner = batch_restart_analyzed_checkpoint_owner(&lineage, &[page.get()])?;
+        owner.parts_mut().1.current.clear();
+        let baseline = owner
+            .prepare_restart_checkpoint_completeness_baseline_from_current_prefix()
+            .map_err(|_| TestError("repair failure baseline"))?;
+        let (source, mut store, _, _) = owner.into_parts();
+        store.write_fault = Some((
+            page,
+            FakeRecoveryWriteFault::Before(FakeFault("repair write")),
+        ));
+        let checkpoint = FakeCompletenessCheckpointPublisher::new(Some(
+            owned_decoded_completeness_checkpoint(&baseline),
+        ));
+        let mut phases = Vec::new();
+
+        let failure = complete_transaction_page_storage_recovery_handoff_with_observer(
+            fake_recovery_handoff_selection(source, store, checkpoint),
+            |phase| phases.push(phase),
+        )
+        .err()
+        .ok_or(TestError("page repair failure released ownership"))?;
+
+        assert_eq!(
+            failure.phase(),
+            TransactionPageStorageRecoveryHandoffPhase::PageRepairsCompleted
+        );
+        assert_eq!(
+            phases,
+            [
+                TransactionPageStorageRecoveryHandoffPhase::CheckpointSelected,
+                TransactionPageStorageRecoveryHandoffPhase::ReplayPlanned,
+                TransactionPageStorageRecoveryHandoffPhase::PageRepairsPrepared,
+            ]
+        );
+        assert!(matches!(
+            failure,
+            FailedTransactionPageStorageRecoveryHandoff::PageRepair(_)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_handoff_retains_owner_at_restoration_completion_and_retention_failures()
+    -> Result<(), TestError> {
+        for (expected, configure) in [
+            (
+                TransactionPageStorageRecoveryHandoffPhase::TransactionStateRestored,
+                0_u8,
+            ),
+            (
+                TransactionPageStorageRecoveryHandoffPhase::RestartCompleted,
+                1,
+            ),
+            (
+                TransactionPageStorageRecoveryHandoffPhase::WalRetentionAnalyzed,
+                2,
+            ),
+        ] {
+            let persistent_log_id = PersistentLogId::new(0x1810 + u128::from(configure))
+                .ok_or(TestError("late failure persistent id"))?;
+            let lineage = LogLineage::persistent(persistent_log_id);
+            let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+            let mut source = fake_restart_source(&lineage, None, Vec::new());
+            match configure {
+                0 => {
+                    source.restart_epoch_before_error = Some(FakeFault("restoration allocation"));
+                }
+                1 => {
+                    source.restart_before_callback_error_on_callback =
+                        Some((3, FakeFault("completion observation")));
+                }
+                2 => {
+                    source.retention_metadata_error = Some(FakeFault("retention metadata"));
+                }
+                _ => return Err(TestError("unknown late failure configuration")),
+            }
+            let store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+            let checkpoint = FakeCompletenessCheckpointPublisher::new(Some(
+                owned_decoded_completeness_checkpoint(&baseline),
+            ));
+
+            let failure = complete_transaction_page_storage_recovery_handoff(
+                fake_recovery_handoff_selection(source, store, checkpoint),
+            )
+            .err()
+            .ok_or(TestError("late recovery failure released ownership"))?;
+
+            assert_eq!(failure.phase(), expected);
+            assert!(matches!(
+                (configure, failure),
+                (
+                    0,
+                    FailedTransactionPageStorageRecoveryHandoff::TransactionRestoration(_)
+                ) | (
+                    1,
+                    FailedTransactionPageStorageRecoveryHandoff::RestartCompletion(_)
+                ) | (
+                    2,
+                    FailedTransactionPageStorageRecoveryHandoff::WalRetentionAnalysis(_)
+                )
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_handoff_retains_owner_when_restoration_evidence_is_rejected()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1813).ok_or(TestError("restoration rejection persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x2813).ok_or(TestError("foreign restoration persistent id"))?,
+        );
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let mut source = fake_restart_source(&lineage, None, Vec::new());
+        source.restart_epoch_lineage_override = Some(foreign_lineage);
+
+        let failure =
+            complete_transaction_page_storage_recovery_handoff(fake_recovery_handoff_selection(
+                source,
+                FakeBatchCommittedPageRecoveryStore::new(lineage),
+                FakeCompletenessCheckpointPublisher::new(Some(
+                    owned_decoded_completeness_checkpoint(&baseline),
+                )),
+            ))
+            .err()
+            .ok_or(TestError("restoration rejection released ownership"))?;
+
+        assert_eq!(
+            failure.phase(),
+            TransactionPageStorageRecoveryHandoffPhase::TransactionStateRestored
+        );
+        assert!(matches!(
+            failure,
+            FailedTransactionPageStorageRecoveryHandoff::TransactionRestorationRejected(_)
         ));
         Ok(())
     }

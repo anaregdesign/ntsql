@@ -6,7 +6,7 @@
 - Extends: ADR 0013, ADR 0014, ADR 0045, ADR 0052, ADR 0062, ADR 0063,
   ADR 0064
 - Follows: PR #192
-- Extended by: #185, #186, #187, #188
+- Extended by: ADR 0066, #186, #187, #188
 
 ## Context
 

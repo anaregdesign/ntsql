@@ -4,7 +4,7 @@
 - Date: 2026-08-07
 - Issue: #181
 - Extends: ADR 0001, ADR 0012, ADR 0058, ADR 0061
-- Extended by: ADR 0063, ADR 0064, ADR 0065
+- Extended by: ADR 0063, ADR 0064, ADR 0065, ADR 0066
 - Amended by: ADR 0065
 
 ## Context
@@ -145,8 +145,9 @@ ntsql-storage-file ---> ntsql-database
 ```
 
 The architecture checker records complete normal/build/development dependency
-sets. Negative tests reject database-domain dependencies on compatibility
-selection, contracts, diagnostics, transaction policy, serialization, and both
+sets. ADR 0066 later admits one narrow database-to-transaction completion-proof
+edge. Negative tests continue to reject database-domain dependencies on
+compatibility selection, contracts, diagnostics, serialization, and both
 persistence adapters in every dependency kind. Adapter tests prove the inward
 database dependency is permitted while existing reverse-edge checks remain.
 

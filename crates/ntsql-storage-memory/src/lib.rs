@@ -43,6 +43,7 @@ use ntsql_transaction::{
     TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
     TransactionPageWriteRecord, TransactionRecoverySource,
     TransactionRestartCheckpointPageRepairStore, TransactionRestartCheckpointPageRepairWritePermit,
+    TransactionRestartCoordinatorEpochAllocationError, TransactionRestartCoordinatorEpochSource,
     compare_committed_transaction_page_recovery_candidate,
     compare_transaction_restart_checkpoint_page_repair_candidate,
 };
@@ -2447,6 +2448,38 @@ impl<const N: usize> TransactionEpochSource for InMemoryCommitLog<N> {
     }
 }
 
+impl<const N: usize> TransactionRestartCoordinatorEpochSource for InMemoryCommitLog<N> {
+    type Error = InMemoryTransactionEpochError;
+
+    fn allocate_restart_transaction_epoch(
+        &mut self,
+        persisted_epoch_high_water: Option<NonZeroU64>,
+    ) -> Result<
+        (NonZeroU64, LogLineage),
+        TransactionRestartCoordinatorEpochAllocationError<Self::Error>,
+    > {
+        let Some(epoch) = self.next_epoch else {
+            return Err(
+                TransactionRestartCoordinatorEpochAllocationError::IdentitySpaceExhausted {
+                    persisted_epoch_high_water: persisted_epoch_high_water.map(NonZeroU64::get),
+                },
+            );
+        };
+        if let Some(high_water) = persisted_epoch_high_water
+            && epoch <= high_water
+        {
+            return Err(
+                TransactionRestartCoordinatorEpochAllocationError::PersistedEpochHighWaterNotAdvanced {
+                    persisted_epoch_high_water: high_water.get(),
+                    next_epoch: epoch.get(),
+                },
+            );
+        }
+        self.next_epoch = epoch.get().checked_add(1).and_then(NonZeroU64::new);
+        Ok((epoch, self.lineage.clone()))
+    }
+}
+
 impl<const N: usize> TransactionRecoverySource for InMemoryCommitLog<N> {
     type Error = InMemoryTransactionRecoveryError;
 
@@ -3135,7 +3168,8 @@ mod tests {
         RestartAnalyzedTransactionPageStorage, TransactionCoordinator, TransactionLifecycleStatus,
         TransactionPageStorageRestartCheckpointCompletenessSelection,
         TransactionPageStorageRestartCheckpointPageRepairExecution,
-        TransactionPageStorageRestartCheckpointRepairPreparation, TransactionResolutionFailure,
+        TransactionPageStorageRestartCheckpointRepairPreparation,
+        TransactionPageStorageRestartCheckpointRestoration, TransactionResolutionFailure,
         TransactionRestartCheckpointPageRepairFailureCause,
         TransactionRestartCheckpointPageRepairOutcome, UnrecoveredTransactionPageStorage,
         flush_committed_page, recover_committed_transaction_pages,
@@ -3272,6 +3306,36 @@ mod tests {
             TransactionCoordinator::open(&mut restarted).err(),
             Some(InMemoryTransactionEpochError::EpochSpaceExhausted)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn restart_epoch_high_water_survives_memory_restart_and_reopen() -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x1673)
+            .ok_or_else(|| io::Error::other("restart epoch persistent id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id);
+        log.next_epoch = NonZeroU64::new(5);
+        let high_water = NonZeroU64::new(4)
+            .ok_or_else(|| io::Error::other("restart epoch high-water is zero"))?;
+        let (first, _) = log.allocate_restart_transaction_epoch(Some(high_water))?;
+        assert_eq!(first.get(), 5);
+
+        let mut restarted = log.restart();
+        restarted.reopen()?;
+        let (second, _) = restarted.allocate_restart_transaction_epoch(Some(first))?;
+        assert_eq!(second.get(), 6);
+
+        restarted.next_epoch = Some(second);
+        assert!(matches!(
+            restarted.allocate_restart_transaction_epoch(Some(second)),
+            Err(
+                TransactionRestartCoordinatorEpochAllocationError::PersistedEpochHighWaterNotAdvanced {
+                    persisted_epoch_high_water: 6,
+                    next_epoch: 6,
+                }
+            )
+        ));
+        assert_eq!(restarted.next_epoch, Some(second));
         Ok(())
     }
 
@@ -5520,6 +5584,88 @@ mod tests {
                 },
             ]
         );
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("memory transaction restoration failed").into());
+        };
+        let summary = restored.transaction_summary();
+        assert_eq!(summary.transaction_count(), 3);
+        assert_eq!(summary.committed_count(), 2);
+        assert_eq!(summary.unresolved_count(), 1);
+        assert_eq!(summary.coordinator_epoch().get(), 3);
+        assert_eq!(
+            summary
+                .highest_persisted_transaction()
+                .map(|transaction| transaction.epoch()),
+            Some(2)
+        );
+        assert_eq!(summary.indeterminate_allocation_attempt_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn memory_selected_restart_rejects_maximum_persisted_transaction_epoch()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id = PersistentLogId::new(0x1674)
+            .ok_or_else(|| io::Error::other("maximum epoch persistent id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(persistent_log_id);
+        log.next_epoch = Some(NonZeroU64::MAX);
+        let mut store = InMemoryPageStore::new(&log);
+        let mut coordinator = TransactionCoordinator::open(&mut log)?;
+        let page_number =
+            PageNumber::new(240).ok_or_else(|| io::Error::other("maximum epoch page is zero"))?;
+        let active = coordinator.begin()?;
+        let page = UnloggedPage::new(
+            PageAddress::new(LogDurability::lineage(&log), page_number),
+            PageVersion::new(1),
+            PageImage::new([0xF0])?,
+        );
+        let (active, dirty) = coordinator.stage_page_write(active, page, &mut log)?;
+        log.flush_through(dirty.required_position())?;
+        drop((active, dirty, coordinator));
+
+        let mut owner = UnrecoveredTransactionPageStorage::new(log, store)
+            .recover()?
+            .analyze_restart()?;
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log, returned_store, _, _) = owner.into_parts();
+        store = returned_store;
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("maximum epoch checkpoint was not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|source| io::Error::other(source.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("maximum epoch repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("maximum epoch repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Rejected(rejected) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("maximum persisted epoch was accepted").into());
+        };
+        assert!(matches!(
+            rejected.cause(),
+            ntsql_transaction::TransactionRestartRestorationRejection::IdentitySpaceExhausted {
+                persisted_epoch_high_water: Some(u64::MAX),
+            }
+        ));
         Ok(())
     }
 

@@ -660,7 +660,7 @@ impl<const N: usize> UnrecoveredFileTransactionPageStorageWithCompletenessCheckp
         self,
     ) -> FileTransactionPageStorageRestartCheckpointCompletenessSelection<N> {
         self.storage
-            .select_restart_checkpoint_completeness(self.checkpoint)
+            .select_generation_aware_restart_checkpoint_completeness(self.checkpoint)
     }
 }
 

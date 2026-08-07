@@ -582,6 +582,23 @@ fn completeness_composition_opens_wal_page_store_slot_in_fixed_order_and_release
     let (log, store, _, _, checkpoint) = analyzed.into_parts();
     assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
     drop((log, store, checkpoint));
+    let reopened = open_transaction_page_storage_with_completeness_checkpoint::<1, _, _, _>(
+        &log_path,
+        &store_path,
+        &slot_path,
+    )?;
+    let selection = reopened.select_restart_checkpoint_completeness();
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        selection
+    else {
+        return Err(io::Error::other(
+            "empty generation-zero checkpoint required allocated epoch metadata",
+        )
+        .into());
+    };
+    assert_eq!(selected.durable_frontier(), None);
+    assert_composition_locks_held(&log_path, &store_path, &slot_path)?;
+    drop(selected);
     drop(FileCommitLog::<1>::open_transaction_page_capable(
         &log_path,
     )?);

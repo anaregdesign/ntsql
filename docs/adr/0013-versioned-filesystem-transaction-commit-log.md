@@ -5,7 +5,7 @@
 - Issue: #76
 - Extends: ADR 0001, ADR 0005, ADR 0008, ADR 0009, ADR 0010, ADR 0011,
   ADR 0012
-- Extended by: ADR 0014, ADR 0017, ADR 0022
+- Extended by: ADR 0014, ADR 0017, ADR 0022, ADR 0060
 
 ## Context
 

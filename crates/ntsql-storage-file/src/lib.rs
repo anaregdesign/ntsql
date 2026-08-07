@@ -158,11 +158,12 @@
 
 use std::{
     error::Error,
+    ffi::OsString,
     fmt,
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     num::NonZeroU64,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use ntsql_page::{
@@ -180,8 +181,14 @@ use ntsql_transaction::{
     DurableTransactionRestartCheckpointPageRepairComparison,
     DurableTransactionRestartCheckpointPageRepairComparisonError,
     DurableTransactionRestartCheckpointPageRepairTargetKind, DurableTransactionRestartObservation,
+    DurableTransactionRestartPrunedGenerationSource,
     DurableTransactionRestartRetentionMetadataObservation,
-    DurableTransactionRestartRetentionMetadataSource, TransactionCommitRecord,
+    DurableTransactionRestartRetentionMetadataSource,
+    DurableTransactionRestartWalReclamationEffectObservation,
+    DurableTransactionRestartWalReclamationPermit,
+    DurableTransactionRestartWalReclamationReplacementObservation,
+    DurableTransactionRestartWalReclamationSource,
+    DurableTransactionRestartWalReclamationSourceObservation, TransactionCommitRecord,
     TransactionEpochSource, TransactionId, TransactionPageLog, TransactionPageWriteRecord,
     TransactionRecoverySource, TransactionRestartCheckpointPageRepairStore,
     TransactionRestartCheckpointPageRepairWritePermit,
@@ -238,6 +245,7 @@ const FRAME_MAGIC: [u8; 4] = *b"NTSQ";
 const FORMAT_VERSION_V1: u16 = 1;
 const FORMAT_VERSION_V2: u16 = 2;
 const FORMAT_VERSION_V3: u16 = 3;
+const FORMAT_VERSION_V4: u16 = 4;
 const HEADER_LENGTH: usize = 64;
 const HEADER_LENGTH_U16: u16 = 64;
 const HEADER_LENGTH_U64: u64 = 64;
@@ -247,6 +255,20 @@ const FRAME_LENGTH_U64: u64 = 56;
 const HEADER_CHECKSUM_OFFSET: usize = 56;
 const HEADER_V2_PAGE_WIDTH_OFFSET: usize = 32;
 const HEADER_V2_RESERVED_OFFSET: usize = 40;
+const HEADER_V4_LENGTH: usize = 128;
+const HEADER_V4_LENGTH_U16: u16 = 128;
+const HEADER_V4_LENGTH_U64: u64 = 128;
+const HEADER_V4_GENERATION_OFFSET: usize = 40;
+const HEADER_V4_RETAINED_FIRST_OFFSET: usize = 48;
+const HEADER_V4_LOGICAL_HIGH_WATER_OFFSET: usize = 56;
+const HEADER_V4_ALLOCATED_EPOCH_HIGH_WATER_OFFSET: usize = 64;
+const HEADER_V4_ANCHOR_VERSION_OFFSET: usize = 72;
+const HEADER_V4_RETAINED_FIRST_PRESENCE_OFFSET: usize = 74;
+const HEADER_V4_LOGICAL_HIGH_WATER_PRESENCE_OFFSET: usize = 75;
+const HEADER_V4_ANCHOR_VALUE_OFFSET: usize = 80;
+const HEADER_V4_RESERVED_START: usize = 76;
+const HEADER_V4_RESERVED_MIDDLE: usize = 96;
+const HEADER_V4_CHECKSUM_OFFSET: usize = 120;
 const FRAME_CHECKSUM_OFFSET: usize = 48;
 #[cfg(test)]
 const FRAME_CHECKSUM_OFFSET_U64: u64 = 48;
@@ -260,6 +282,7 @@ enum LogFormat {
     V1,
     V2,
     V3,
+    V4,
 }
 
 impl LogFormat {
@@ -268,18 +291,26 @@ impl LogFormat {
             Self::V1 => FORMAT_VERSION_V1,
             Self::V2 => FORMAT_VERSION_V2,
             Self::V3 => FORMAT_VERSION_V3,
+            Self::V4 => FORMAT_VERSION_V4,
+        }
+    }
+
+    const fn frame_version(self) -> u16 {
+        match self {
+            Self::V4 => FORMAT_VERSION_V3,
+            Self::V1 | Self::V2 | Self::V3 => self.version(),
         }
     }
 
     const fn supports_pages(self) -> bool {
         match self {
             Self::V1 => false,
-            Self::V2 | Self::V3 => true,
+            Self::V2 | Self::V3 | Self::V4 => true,
         }
     }
 
     const fn supports_transaction_pages(self) -> bool {
-        matches!(self, Self::V3)
+        matches!(self, Self::V3 | Self::V4)
     }
 }
 
@@ -332,6 +363,22 @@ pub enum FaultPoint {
     BeforeFlush,
     /// Persist the durability marker and advance state, then report failure.
     AfterFlush,
+    /// Fail before reconciling the fixed reclamation candidate.
+    BeforeReclamationCandidateCleanup,
+    /// Fail after locking the replacement candidate but before writing it.
+    BeforeReclamationWrite,
+    /// Fail after beginning to write the replacement candidate.
+    DuringReclamationCopy,
+    /// Fail after writing the candidate but before synchronizing it.
+    BeforeReclamationCandidateSync,
+    /// Synchronize the candidate, then report failure.
+    AfterReclamationCandidateSync,
+    /// Fail after synchronizing the candidate but before rename.
+    BeforeReclamationRename,
+    /// Rename the candidate over the selected path, then report failure.
+    AfterReclamationRename,
+    /// Rename the candidate but fail before parent-directory synchronization.
+    DuringReclamationDirectorySync,
 }
 
 impl fmt::Display for FaultPoint {
@@ -341,6 +388,28 @@ impl fmt::Display for FaultPoint {
             Self::AfterAppend => formatter.write_str("after append"),
             Self::BeforeFlush => formatter.write_str("before flush"),
             Self::AfterFlush => formatter.write_str("after flush"),
+            Self::BeforeReclamationCandidateCleanup => {
+                formatter.write_str("before reclamation candidate cleanup")
+            }
+            Self::BeforeReclamationWrite => {
+                formatter.write_str("before reclamation candidate write")
+            }
+            Self::DuringReclamationCopy => formatter.write_str("during reclamation copy"),
+            Self::BeforeReclamationCandidateSync => {
+                formatter.write_str("before reclamation candidate sync")
+            }
+            Self::AfterReclamationCandidateSync => {
+                formatter.write_str("after reclamation candidate sync")
+            }
+            Self::BeforeReclamationRename => {
+                formatter.write_str("before reclamation candidate rename")
+            }
+            Self::AfterReclamationRename => {
+                formatter.write_str("after reclamation candidate rename")
+            }
+            Self::DuringReclamationDirectorySync => {
+                formatter.write_str("during reclamation directory sync")
+            }
         }
     }
 }
@@ -426,6 +495,15 @@ pub enum FileIoStage {
     SyncCommitPrefix,
     WriteDurableMarker,
     SyncDurableMarker,
+    ReadReclamationCandidateMetadata,
+    RemoveReclamationCandidate,
+    CreateReclamationCandidate,
+    AcquireReclamationCandidateLock,
+    WriteReclamationHeader,
+    WriteReclamationFrame,
+    SyncReclamationCandidate,
+    RenameReclamationCandidate,
+    SyncReclamationDirectory,
 }
 
 impl fmt::Display for FileIoStage {
@@ -466,6 +544,31 @@ impl fmt::Display for FileIoStage {
             Self::WriteDurableMarker => formatter.write_str("writing a durable-through marker"),
             Self::SyncDurableMarker => {
                 formatter.write_str("synchronizing a durable-through marker")
+            }
+            Self::ReadReclamationCandidateMetadata => {
+                formatter.write_str("reading reclamation candidate metadata")
+            }
+            Self::RemoveReclamationCandidate => {
+                formatter.write_str("removing the fixed reclamation candidate")
+            }
+            Self::CreateReclamationCandidate => {
+                formatter.write_str("creating the fixed reclamation candidate")
+            }
+            Self::AcquireReclamationCandidateLock => {
+                formatter.write_str("acquiring the reclamation candidate lock")
+            }
+            Self::WriteReclamationHeader => formatter.write_str("writing the reclaimed WAL header"),
+            Self::WriteReclamationFrame => {
+                formatter.write_str("writing a retained reclamation frame")
+            }
+            Self::SyncReclamationCandidate => {
+                formatter.write_str("synchronizing the reclamation candidate")
+            }
+            Self::RenameReclamationCandidate => {
+                formatter.write_str("renaming the reclamation candidate over the selected WAL")
+            }
+            Self::SyncReclamationDirectory => {
+                formatter.write_str("synchronizing the reclamation parent directory")
             }
         }
     }
@@ -522,55 +625,148 @@ impl Error for FileIoError {
 /// [`FileCommitLog::open_page_capable`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FileFormatErrorReason {
-    HeaderTooShort { actual: u64 },
+    HeaderTooShort {
+        actual: u64,
+    },
     HeaderMagic,
-    HeaderVersion { actual: u16 },
-    HeaderLength { actual: u16 },
-    HeaderFlags { actual: u32 },
+    HeaderVersion {
+        actual: u16,
+    },
+    HeaderLength {
+        actual: u16,
+    },
+    HeaderV4Length {
+        actual: u16,
+    },
+    HeaderFlags {
+        actual: u32,
+    },
     HeaderPageWidthZero,
-    HeaderPageWidthMismatch { expected: u64, actual: u64 },
+    HeaderPageWidthMismatch {
+        expected: u64,
+        actual: u64,
+    },
     HeaderReserved,
-    HeaderChecksum { expected: u64, actual: u64 },
+    HeaderV4GenerationZero,
+    HeaderV4RetainedFirstPresence {
+        actual: u8,
+    },
+    HeaderV4LogicalHighWaterPresence {
+        actual: u8,
+    },
+    HeaderV4RetainedFirstZero,
+    HeaderV4LogicalHighWaterZero,
+    HeaderV4RetainedFirstWithoutHighWater,
+    HeaderV4RetainedFirstBeyondHighWater {
+        retained_first: u64,
+        high_water: u64,
+    },
+    HeaderV4AllocatedEpochHighWaterZero,
+    HeaderV4AnchorVersionZero,
+    HeaderV4Reserved,
+    HeaderV4RetainedFirstMismatch {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    HeaderV4LogicalHighWaterMismatch {
+        expected: Option<u64>,
+        actual: Option<u64>,
+    },
+    HeaderChecksum {
+        expected: u64,
+        actual: u64,
+    },
     LineageIdZero,
     FrameMagic,
-    FrameKind { actual: u16 },
-    FrameVersion { actual: u16 },
-    FrameLength { actual: u16 },
-    FrameFlags { actual: u32 },
+    FrameKind {
+        actual: u16,
+    },
+    FrameVersion {
+        actual: u16,
+    },
+    FrameLength {
+        actual: u16,
+    },
+    FrameFlags {
+        actual: u32,
+    },
     FrameReserved,
-    FrameChecksum { expected: u64, actual: u64 },
-    UnexpectedNonzeroPayload { field: &'static str, actual: u64 },
+    FrameChecksum {
+        expected: u64,
+        actual: u64,
+    },
+    UnexpectedNonzeroPayload {
+        field: &'static str,
+        actual: u64,
+    },
     EpochValueZero,
-    EpochOutOfSequence { expected: u64, actual: u64 },
+    EpochOutOfSequence {
+        expected: u64,
+        actual: u64,
+    },
     EpochSpaceExhausted,
     CommitPositionZero,
-    CommitPositionOutOfSequence { expected: u64, actual: u64 },
+    CommitPositionOutOfSequence {
+        expected: u64,
+        actual: u64,
+    },
     CommitPositionSpaceExhausted,
     CommitEpochZero,
-    CommitEpochUnallocated { actual: u64, highest_allocated: u64 },
+    CommitEpochUnallocated {
+        actual: u64,
+        highest_allocated: u64,
+    },
     CommitSequenceZero,
-    DuplicateTransactionIdentity { epoch: u64, sequence: u64 },
+    DuplicateTransactionIdentity {
+        epoch: u64,
+        sequence: u64,
+    },
     MarkerPositionZero,
-    MarkerDoesNotAdvance { previous: u64, actual: u64 },
-    MarkerReferencesUnknownCommit { actual: u64, highest_committed: u64 },
+    MarkerDoesNotAdvance {
+        previous: u64,
+        actual: u64,
+    },
+    MarkerReferencesUnknownCommit {
+        actual: u64,
+        highest_committed: u64,
+    },
     PageHeaderPositionZero,
-    PageHeaderPositionOutOfSequence { expected: u64, actual: u64 },
+    PageHeaderPositionOutOfSequence {
+        expected: u64,
+        actual: u64,
+    },
     PageHeaderPositionSpaceExhausted,
     PageNumberZero,
     TransactionPageOwnerWithoutHeader,
-    TransactionPageOwnerInterruptedByFrameKind { actual: u16 },
+    TransactionPageOwnerInterruptedByFrameKind {
+        actual: u16,
+    },
     TransactionPageOwnerDuplicate,
     TransactionPageOwnerParentPositionZero,
-    TransactionPageOwnerParentMismatch { expected: u64, actual: u64 },
+    TransactionPageOwnerParentMismatch {
+        expected: u64,
+        actual: u64,
+    },
     TransactionPageOwnerEpochZero,
-    TransactionPageOwnerEpochUnallocated { actual: u64, highest_allocated: u64 },
+    TransactionPageOwnerEpochUnallocated {
+        actual: u64,
+        highest_allocated: u64,
+    },
     TransactionPageOwnerSequenceZero,
     TransactionPageOwnerMissing,
     PageDataWithoutHeader,
     PageDataParentPositionZero,
-    PageDataParentMismatch { expected: u64, actual: u64 },
-    PageDataChunkIndexOutOfSequence { expected: u64, actual: u64 },
-    PageDataInterruptedByFrameKind { actual: u16 },
+    PageDataParentMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    PageDataChunkIndexOutOfSequence {
+        expected: u64,
+        actual: u64,
+    },
+    PageDataInterruptedByFrameKind {
+        actual: u16,
+    },
     PageDataFinalPaddingNonzero,
 }
 
@@ -587,6 +783,9 @@ impl fmt::Display for FileFormatErrorReason {
             Self::HeaderLength { actual } => {
                 write!(formatter, "header length {actual} does not equal 64")
             }
+            Self::HeaderV4Length { actual } => {
+                write!(formatter, "v4 header length {actual} does not equal 128")
+            }
             Self::HeaderFlags { actual } => {
                 write!(formatter, "header flags are nonzero: {actual}")
             }
@@ -596,6 +795,46 @@ impl fmt::Display for FileFormatErrorReason {
                 "v2 header page width {actual} does not equal required width {expected}"
             ),
             Self::HeaderReserved => formatter.write_str("header reserved bytes are nonzero"),
+            Self::HeaderV4GenerationZero => formatter.write_str("v4 WAL generation is zero"),
+            Self::HeaderV4RetainedFirstPresence { actual } => write!(
+                formatter,
+                "v4 retained-first presence byte is not canonical: {actual}"
+            ),
+            Self::HeaderV4LogicalHighWaterPresence { actual } => write!(
+                formatter,
+                "v4 logical-high-water presence byte is not canonical: {actual}"
+            ),
+            Self::HeaderV4RetainedFirstZero => {
+                formatter.write_str("v4 retained-first position is zero")
+            }
+            Self::HeaderV4LogicalHighWaterZero => {
+                formatter.write_str("v4 logical high-water is zero")
+            }
+            Self::HeaderV4RetainedFirstWithoutHighWater => {
+                formatter.write_str("v4 retained-first exists without a logical high-water")
+            }
+            Self::HeaderV4RetainedFirstBeyondHighWater {
+                retained_first,
+                high_water,
+            } => write!(
+                formatter,
+                "v4 retained-first position {retained_first} exceeds logical high-water {high_water}"
+            ),
+            Self::HeaderV4AllocatedEpochHighWaterZero => {
+                formatter.write_str("v4 allocated epoch high-water is zero")
+            }
+            Self::HeaderV4AnchorVersionZero => {
+                formatter.write_str("v4 selected-checkpoint anchor version is zero")
+            }
+            Self::HeaderV4Reserved => formatter.write_str("v4 header reserved bytes are nonzero"),
+            Self::HeaderV4RetainedFirstMismatch { expected, actual } => write!(
+                formatter,
+                "v4 retained-first metadata {expected:?} does not match retained records {actual:?}"
+            ),
+            Self::HeaderV4LogicalHighWaterMismatch { expected, actual } => write!(
+                formatter,
+                "v4 logical high-water metadata {expected:?} does not match durable records {actual:?}"
+            ),
             Self::HeaderChecksum { expected, actual } => write!(
                 formatter,
                 "header checksum mismatch: expected {expected:#018x}, found {actual:#018x}"
@@ -1096,6 +1335,13 @@ impl<const N: usize> Error for FileCommittedPageRecoverySourceError<N> {
 pub enum FileTransactionRestartAnalysisSourceError<const N: usize> {
     /// An uncertain prior WAL write requires reopen before authoritative analysis.
     PoisonedWriter,
+    /// Complete-prefix projection is invalid after an anchored reclamation.
+    PrunedGenerationRequiresCheckpoint {
+        /// Exact nonzero source generation.
+        generation: u64,
+    },
+    /// Physical generation metadata requires a previously allocated epoch.
+    NoAllocatedEpoch,
     /// The unified observation stream could not reserve its durable-prefix bound.
     ObservationCapacityExhausted {
         /// Exact number of durable logical records that required reservation.
@@ -1115,6 +1361,13 @@ impl<const N: usize> fmt::Display for FileTransactionRestartAnalysisSourceError<
             Self::PoisonedWriter => formatter.write_str(
                 "commit-log writer is poisoned; reopen the file before restart analysis",
             ),
+            Self::PrunedGenerationRequiresCheckpoint { generation } => write!(
+                formatter,
+                "filesystem WAL generation {generation} is pruned and requires its anchored checkpoint"
+            ),
+            Self::NoAllocatedEpoch => {
+                formatter.write_str("no filesystem transaction epoch has been allocated")
+            }
             Self::ObservationCapacityExhausted { record_count } => write!(
                 formatter,
                 "filesystem restart observation capacity is exhausted for {record_count} durable records"
@@ -1141,7 +1394,10 @@ impl<const N: usize> Error for FileTransactionRestartAnalysisSourceError<N> {
             Self::PageProjection(source) => Some(source.as_ref()),
             Self::TransactionPageProjection(source) => Some(source.as_ref()),
             Self::CommitProjection(source) => Some(source.as_ref()),
-            Self::PoisonedWriter | Self::ObservationCapacityExhausted { .. } => None,
+            Self::PoisonedWriter
+            | Self::PrunedGenerationRequiresCheckpoint { .. }
+            | Self::NoAllocatedEpoch
+            | Self::ObservationCapacityExhausted { .. } => None,
         }
     }
 }
@@ -1169,6 +1425,118 @@ impl fmt::Display for FileTransactionRestartRetentionMetadataSourceError {
 }
 
 impl Error for FileTransactionRestartRetentionMetadataSourceError {}
+
+/// Failure while observing or replacing one filesystem WAL generation.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FileTransactionRestartWalReclamationError {
+    /// An uncertain prior WAL effect requires a complete reopen.
+    PoisonedWriter,
+    /// This physical source format has no reviewed reclamation encoding.
+    UnsupportedPhysicalFormat {
+        /// Exact unsupported source version.
+        version: u16,
+    },
+    /// The selected WAL path has no final file-name component.
+    MissingFileName,
+    /// No durable transaction epoch exists to preserve in replacement metadata.
+    NoAllocatedEpoch,
+    /// The opaque domain permit does not describe the currently owned source.
+    PermitMismatch,
+    /// The current source generation cannot advance.
+    GenerationExhausted,
+    /// Complete logical records exist beyond the durable frontier.
+    VolatileLogicalSuffix {
+        /// Exact durable logical record count.
+        durable_record_count: usize,
+        /// Exact complete logical record count.
+        total_record_count: usize,
+    },
+    /// The inclusive retained floor is not a current durable record boundary.
+    RetainedBoundaryMissing {
+        /// Exact requested numeric floor.
+        position: u64,
+    },
+    /// The retained frame plan could not reserve memory.
+    FrameCapacityExhausted {
+        /// Exact retained logical record bound.
+        record_count: usize,
+    },
+    /// The fixed candidate resolves to the selected inode.
+    CandidateAliasesSelected,
+    /// One deterministic replacement fault was consumed.
+    InjectedFault(FaultPoint),
+    /// One exact filesystem stage failed.
+    Io(FileIoError),
+}
+
+impl fmt::Display for FileTransactionRestartWalReclamationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PoisonedWriter => {
+                formatter.write_str("commit-log writer is poisoned; reopen before WAL reclamation")
+            }
+            Self::UnsupportedPhysicalFormat { version } => {
+                write!(
+                    formatter,
+                    "filesystem WAL format {version} cannot be reclaimed"
+                )
+            }
+            Self::MissingFileName => {
+                formatter.write_str("selected WAL path has no file-name component")
+            }
+            Self::NoAllocatedEpoch => {
+                formatter.write_str("no filesystem transaction epoch has been allocated")
+            }
+            Self::PermitMismatch => {
+                formatter.write_str("WAL reclamation permit does not match the selected source")
+            }
+            Self::GenerationExhausted => {
+                formatter.write_str("filesystem WAL generation space is exhausted")
+            }
+            Self::VolatileLogicalSuffix {
+                durable_record_count,
+                total_record_count,
+            } => write!(
+                formatter,
+                "filesystem WAL has {total_record_count} complete records but only {durable_record_count} are durable"
+            ),
+            Self::RetainedBoundaryMissing { position } => write!(
+                formatter,
+                "retained WAL floor {position} is not a durable logical record boundary"
+            ),
+            Self::FrameCapacityExhausted { record_count } => write!(
+                formatter,
+                "reclamation frame capacity is exhausted for {record_count} retained logical records"
+            ),
+            Self::CandidateAliasesSelected => {
+                formatter.write_str("reclamation candidate aliases the selected WAL inode")
+            }
+            Self::InjectedFault(point) => {
+                write!(formatter, "injected WAL reclamation failure {point}")
+            }
+            Self::Io(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for FileTransactionRestartWalReclamationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(source) => Some(source),
+            Self::PoisonedWriter
+            | Self::UnsupportedPhysicalFormat { .. }
+            | Self::MissingFileName
+            | Self::NoAllocatedEpoch
+            | Self::PermitMismatch
+            | Self::GenerationExhausted
+            | Self::VolatileLogicalSuffix { .. }
+            | Self::RetainedBoundaryMissing { .. }
+            | Self::FrameCapacityExhausted { .. }
+            | Self::CandidateAliasesSelected
+            | Self::InjectedFault(_) => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct StoredTransactionIdentity {
@@ -1550,9 +1918,14 @@ impl<const N: usize> FileLogRecord<N> {
 #[derive(Debug)]
 pub struct FileCommitLog<const N: usize = 0> {
     file: File,
+    path: PathBuf,
+    parent_directory: File,
     format: LogFormat,
     lineage: LogLineage,
     persistent_id: PersistentLogId,
+    generation: u64,
+    reclaimed_logical_high_water: Option<LogSequenceNumber>,
+    selected_checkpoint_anchor: Option<(u16, u128)>,
     records: Vec<FileLogRecord<N>>,
     durable_len: usize,
     next_epoch: Option<NonZeroU64>,
@@ -1635,7 +2008,7 @@ impl<const N: usize> FileCommitLog<N> {
         P: AsRef<Path>,
     {
         let layout = PageLayout::for_const::<N>().map_err(FileOpenError::PageWidth)?;
-        Self::open_internal(path.as_ref(), HeaderExpectation::V3(layout))
+        Self::open_internal(path.as_ref(), HeaderExpectation::V3OrV4(layout))
     }
 
     fn create_new_internal(
@@ -1665,16 +2038,21 @@ impl<const N: usize> FileCommitLog<N> {
         file.sync_all().map_err(|source| {
             FileCreateError::Io(FileIoError::new(FileIoStage::SyncCreatedFile, source))
         })?;
-        sync_parent_directory(path)?;
+        let parent_directory = sync_parent_directory(path)?;
         file.seek(SeekFrom::End(0)).map_err(|source| {
             FileCreateError::Io(FileIoError::new(FileIoStage::SeekEnd, source))
         })?;
 
         Ok(Self {
             file,
+            path: path.to_path_buf(),
+            parent_directory,
             format,
             lineage: LogLineage::persistent(persistent_id),
             persistent_id,
+            generation: 0,
+            reclaimed_logical_high_water: None,
+            selected_checkpoint_anchor: None,
             records: Vec::new(),
             durable_len: 0,
             next_epoch: Some(NonZeroU64::MIN),
@@ -1685,7 +2063,6 @@ impl<const N: usize> FileCommitLog<N> {
     }
 
     fn open_internal(path: &Path, expectation: HeaderExpectation) -> Result<Self, FileOpenError> {
-        let format = expectation.log_format();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1718,11 +2095,112 @@ impl<const N: usize> FileCommitLog<N> {
         file.read_exact(&mut header).map_err(|source| {
             FileOpenError::Io(FileIoError::new(FileIoStage::ReadHeader, source))
         })?;
-        let persistent_id = parse_header(&header, expectation).map_err(FileOpenError::Format)?;
+        let header_version = read_u16(&header, 8);
+        let (
+            format,
+            persistent_id,
+            generation,
+            reclaimed_retained_first,
+            reclaimed_logical_high_water,
+            allocated_epoch_high_water,
+            selected_checkpoint_anchor,
+            header_length,
+        ) = if header_version == FORMAT_VERSION_V4 {
+            if !expectation.accepts(LogFormat::V4) {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    8,
+                    FileFormatErrorReason::HeaderVersion {
+                        actual: header_version,
+                    },
+                )));
+            }
+            if file_len < HEADER_V4_LENGTH_U64 {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    0,
+                    FileFormatErrorReason::HeaderTooShort { actual: file_len },
+                )));
+            }
+            let mut header_v4 = [0_u8; HEADER_V4_LENGTH];
+            header_v4[..HEADER_LENGTH].copy_from_slice(&header);
+            file.read_exact(&mut header_v4[HEADER_LENGTH..])
+                .map_err(|source| {
+                    FileOpenError::Io(FileIoError::new(FileIoStage::ReadHeader, source))
+                })?;
+            let metadata = parse_header_v4(
+                &header_v4,
+                expectation.page_layout().ok_or_else(|| {
+                    FileOpenError::Format(FileFormatError::new(
+                        HEADER_V2_PAGE_WIDTH_OFFSET as u64,
+                        FileFormatErrorReason::HeaderPageWidthZero,
+                    ))
+                })?,
+            )
+            .map_err(FileOpenError::Format)?;
+            (
+                LogFormat::V4,
+                metadata.persistent_id,
+                metadata.generation,
+                metadata.retained_first,
+                metadata.logical_high_water,
+                Some(metadata.allocated_epoch_high_water),
+                Some(metadata.selected_checkpoint_anchor),
+                HEADER_V4_LENGTH_U64,
+            )
+        } else {
+            let persistent_id =
+                parse_header(&header, expectation).map_err(FileOpenError::Format)?;
+            let format = match header_version {
+                FORMAT_VERSION_V1 => LogFormat::V1,
+                FORMAT_VERSION_V2 => LogFormat::V2,
+                FORMAT_VERSION_V3 => LogFormat::V3,
+                _ => {
+                    return Err(FileOpenError::Format(FileFormatError::new(
+                        8,
+                        FileFormatErrorReason::HeaderVersion {
+                            actual: header_version,
+                        },
+                    )));
+                }
+            };
+            (
+                format,
+                persistent_id,
+                0,
+                None,
+                None,
+                None,
+                None,
+                HEADER_LENGTH_U64,
+            )
+        };
         let lineage = LogLineage::persistent(persistent_id);
-        let mut open_state = OpenState::new(lineage.clone(), expectation.page_layout());
+        let initial_epoch_high_water = allocated_epoch_high_water.map(NonZeroU64::get).unwrap_or(0);
+        let initial_next_position = match reclaimed_retained_first {
+            Some(position) => Some(position),
+            None => match reclaimed_logical_high_water {
+                Some(position) => position.checked_add(1),
+                None => Some(1),
+            },
+        };
+        let initial_completed_position = reclaimed_retained_first
+            .and_then(|position| position.checked_sub(1))
+            .or(reclaimed_logical_high_water)
+            .unwrap_or(0);
+        let initial_durable_position = if reclaimed_retained_first.is_none() {
+            reclaimed_logical_high_water
+        } else {
+            None
+        };
+        let mut open_state = OpenState::new(
+            lineage.clone(),
+            expectation.page_layout(),
+            initial_epoch_high_water,
+            initial_next_position,
+            initial_completed_position,
+            initial_durable_position,
+        );
 
-        let frame_region_len = file_len - HEADER_LENGTH_U64;
+        let frame_region_len = file_len - header_length;
         let complete_frame_count = frame_region_len / FRAME_LENGTH_U64;
         let incomplete_tail_len = frame_region_len % FRAME_LENGTH_U64;
 
@@ -1731,15 +2209,27 @@ impl<const N: usize> FileCommitLog<N> {
             file.read_exact(&mut frame).map_err(|source| {
                 FileOpenError::Io(FileIoError::new(FileIoStage::ReadFrame, source))
             })?;
-            let offset = HEADER_LENGTH_U64 + frame_index * FRAME_LENGTH_U64;
+            let offset = header_length + frame_index * FRAME_LENGTH_U64;
             let decoded = parse_frame(&frame, offset, format).map_err(FileOpenError::Format)?;
             open_state.apply_frame(decoded, offset)?;
         }
 
+        if format == LogFormat::V4
+            && open_state.last_completed_position < reclaimed_logical_high_water.unwrap_or(0)
+        {
+            return Err(FileOpenError::Format(FileFormatError::new(
+                header_length + complete_frame_count * FRAME_LENGTH_U64,
+                FileFormatErrorReason::HeaderV4LogicalHighWaterMismatch {
+                    expected: reclaimed_logical_high_water,
+                    actual: NonZeroU64::new(open_state.last_completed_position)
+                        .map(NonZeroU64::get),
+                },
+            )));
+        }
         let repaired_len = match open_state.pending_page_header_offset() {
             Some(offset) => Some(offset),
             None if incomplete_tail_len > 0 => {
-                Some(HEADER_LENGTH_U64 + complete_frame_count * FRAME_LENGTH_U64)
+                Some(header_length + complete_frame_count * FRAME_LENGTH_U64)
             }
             None => None,
         };
@@ -1754,14 +2244,54 @@ impl<const N: usize> FileCommitLog<N> {
                 FileOpenError::Io(FileIoError::new(FileIoStage::SyncTruncatedTail, source))
             })?;
         }
+        if format == LogFormat::V4 {
+            let actual_retained_first = open_state
+                .records
+                .iter()
+                .take(open_state.durable_len)
+                .next()
+                .map(|record| record.position().get());
+            if reclaimed_retained_first.is_some()
+                && actual_retained_first != reclaimed_retained_first
+            {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    HEADER_V4_RETAINED_FIRST_OFFSET as u64,
+                    FileFormatErrorReason::HeaderV4RetainedFirstMismatch {
+                        expected: reclaimed_retained_first,
+                        actual: actual_retained_first,
+                    },
+                )));
+            }
+            if reclaimed_logical_high_water.is_some_and(|expected| {
+                open_state
+                    .last_durable_position
+                    .is_none_or(|actual| actual < expected)
+            }) {
+                return Err(FileOpenError::Format(FileFormatError::new(
+                    HEADER_V4_LOGICAL_HIGH_WATER_OFFSET as u64,
+                    FileFormatErrorReason::HeaderV4LogicalHighWaterMismatch {
+                        expected: reclaimed_logical_high_water,
+                        actual: open_state.last_durable_position,
+                    },
+                )));
+            }
+        }
         file.seek(SeekFrom::End(0))
             .map_err(|source| FileOpenError::Io(FileIoError::new(FileIoStage::SeekEnd, source)))?;
+        let parent_directory = open_parent_directory_for_open(path)?;
+        cleanup_reclamation_candidate(path, &file, &parent_directory)?;
 
         Ok(Self {
             file,
+            path: path.to_path_buf(),
+            parent_directory,
             format,
             lineage,
             persistent_id,
+            generation,
+            reclaimed_logical_high_water: reclaimed_logical_high_water
+                .map(|position| LogLineage::persistent(persistent_id).position(position)),
+            selected_checkpoint_anchor,
             records: open_state.records,
             durable_len: open_state.durable_len,
             next_epoch: open_state.next_epoch,
@@ -1775,6 +2305,21 @@ impl<const N: usize> FileCommitLog<N> {
     #[must_use]
     pub const fn persistent_id(&self) -> PersistentLogId {
         self.persistent_id
+    }
+
+    /// Returns the selected WAL file's repository-owned physical format version.
+    #[must_use]
+    pub const fn physical_format_version(&self) -> u16 {
+        self.format.version()
+    }
+
+    /// Returns the selected WAL file's physical generation.
+    ///
+    /// Generation zero is an unreclaimed V1-V3 file. Every successful V4
+    /// replacement advances this value exactly once.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Arms one fault without replacing an existing plan.
@@ -1824,6 +2369,7 @@ impl<const N: usize> FileCommitLog<N> {
             .and_then(|index| self.records.get(index))
             .map(FileLogRecord::position)
             .cloned()
+            .or_else(|| self.reclaimed_logical_high_water.clone())
     }
 
     fn consume_fault(&mut self, point: FaultPoint) -> bool {
@@ -2019,6 +2565,62 @@ impl<const N: usize> FileCommitLog<N> {
             .map_err(FileTransactionEpochError::Io)?;
         self.next_epoch = epoch.get().checked_add(1).and_then(NonZeroU64::new);
         Ok((epoch, self.lineage.clone()))
+    }
+
+    fn allocated_epoch_high_water(&self) -> Option<NonZeroU64> {
+        match self.next_epoch {
+            Some(next_epoch) => NonZeroU64::new(next_epoch.get().saturating_sub(1)),
+            None => Some(NonZeroU64::MAX),
+        }
+    }
+
+    fn project_durable_restart_observations(
+        &self,
+    ) -> Result<
+        Vec<DurableTransactionRestartObservation<N>>,
+        FileTransactionRestartAnalysisSourceError<N>,
+    > {
+        let durable_len = self.durable_len;
+        let mut observations = Vec::new();
+        observations.try_reserve(durable_len).map_err(|_| {
+            FileTransactionRestartAnalysisSourceError::ObservationCapacityExhausted {
+                record_count: durable_len,
+            }
+        })?;
+        for record in self.durable_records() {
+            let observation = match record.kind() {
+                FileLogRecordKind::TransactionCommit {
+                    transaction_epoch,
+                    transaction_sequence,
+                } => record
+                    .project_transaction_commit_recovery_observation(
+                        *transaction_epoch,
+                        *transaction_sequence,
+                    )
+                    .map(DurableTransactionRestartObservation::Commit)
+                    .map_err(|source| {
+                        FileTransactionRestartAnalysisSourceError::CommitProjection(Box::new(
+                            source,
+                        ))
+                    })?,
+                FileLogRecordKind::PageWrite(page) => record
+                    .project_page_recovery_observation(page)
+                    .map(DurableTransactionRestartObservation::Page)
+                    .map_err(|source| {
+                        FileTransactionRestartAnalysisSourceError::PageProjection(Box::new(source))
+                    })?,
+                FileLogRecordKind::TransactionPageWrite(transaction_page) => record
+                    .project_transaction_page_recovery_observation(transaction_page)
+                    .map(DurableTransactionRestartObservation::TransactionPage)
+                    .map_err(|source| {
+                        FileTransactionRestartAnalysisSourceError::TransactionPageProjection(
+                            Box::new(source),
+                        )
+                    })?,
+            };
+            observations.push(observation);
+        }
+        Ok(observations)
     }
 }
 
@@ -2253,51 +2855,354 @@ impl<const N: usize> ntsql_transaction::DurableTransactionRestartAnalysisSource<
         if self.poisoned {
             return Err(FileTransactionRestartAnalysisSourceError::PoisonedWriter);
         }
-
-        let durable_len = self.durable_len;
+        if self.generation != 0 {
+            return Err(
+                FileTransactionRestartAnalysisSourceError::PrunedGenerationRequiresCheckpoint {
+                    generation: self.generation,
+                },
+            );
+        }
         let durable_frontier = self.durable_position();
-        let mut observations = Vec::new();
-        observations.try_reserve(durable_len).map_err(|_| {
-            FileTransactionRestartAnalysisSourceError::ObservationCapacityExhausted {
-                record_count: durable_len,
+        let observations = self.project_durable_restart_observations()?;
+        Ok(operation(durable_frontier.as_ref(), &observations))
+    }
+}
+
+impl<const N: usize> DurableTransactionRestartPrunedGenerationSource<N> for FileCommitLog<N> {
+    fn observe_restart_source_generation(
+        &mut self,
+    ) -> Result<u64, <Self as ntsql_transaction::DurableTransactionRestartAnalysisSource<N>>::Error>
+    {
+        if self.poisoned {
+            return Err(FileTransactionRestartAnalysisSourceError::PoisonedWriter);
+        }
+        Ok(self.generation)
+    }
+
+    fn observe_restart_pruned_generation(
+        &mut self,
+    ) -> Result<
+        DurableTransactionRestartWalReclamationSourceObservation,
+        <Self as ntsql_transaction::DurableTransactionRestartAnalysisSource<N>>::Error,
+    > {
+        if self.poisoned {
+            return Err(FileTransactionRestartAnalysisSourceError::PoisonedWriter);
+        }
+        let allocated_epoch_high_water = self
+            .allocated_epoch_high_water()
+            .ok_or(FileTransactionRestartAnalysisSourceError::NoAllocatedEpoch)?;
+        Ok(
+            DurableTransactionRestartWalReclamationSourceObservation::new(
+                self.lineage.clone(),
+                self.format.version(),
+                self.generation,
+                self.durable_records()
+                    .next()
+                    .map(FileLogRecord::position)
+                    .cloned(),
+                self.durable_position(),
+                allocated_epoch_high_water,
+                self.selected_checkpoint_anchor,
+            ),
+        )
+    }
+
+    fn with_durable_transaction_restart_retained_observations<Output, Operation>(
+        &mut self,
+        operation: Operation,
+    ) -> Result<
+        Output,
+        <Self as ntsql_transaction::DurableTransactionRestartAnalysisSource<N>>::Error,
+    >
+    where
+        Operation:
+            for<'evidence> FnOnce(&'evidence [DurableTransactionRestartObservation<N>]) -> Output,
+    {
+        if self.poisoned {
+            return Err(FileTransactionRestartAnalysisSourceError::PoisonedWriter);
+        }
+        let observations = self.project_durable_restart_observations()?;
+        Ok(operation(&observations))
+    }
+}
+
+impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCommitLog<N> {
+    type Error = FileTransactionRestartWalReclamationError;
+
+    fn observe_restart_wal_reclamation_source(
+        &mut self,
+    ) -> Result<DurableTransactionRestartWalReclamationSourceObservation, Self::Error> {
+        if self.poisoned {
+            return Err(FileTransactionRestartWalReclamationError::PoisonedWriter);
+        }
+        let allocated_epoch_high_water = self
+            .allocated_epoch_high_water()
+            .ok_or(FileTransactionRestartWalReclamationError::NoAllocatedEpoch)?;
+        Ok(
+            DurableTransactionRestartWalReclamationSourceObservation::new(
+                self.lineage.clone(),
+                self.format.version(),
+                self.generation,
+                self.durable_records()
+                    .next()
+                    .map(FileLogRecord::position)
+                    .cloned(),
+                self.durable_position(),
+                allocated_epoch_high_water,
+                self.selected_checkpoint_anchor,
+            ),
+        )
+    }
+
+    fn reclaim_restart_wal_prefix(
+        &mut self,
+        permit: DurableTransactionRestartWalReclamationPermit<'_>,
+    ) -> Result<DurableTransactionRestartWalReclamationEffectObservation, Self::Error> {
+        if self.poisoned {
+            return Err(FileTransactionRestartWalReclamationError::PoisonedWriter);
+        }
+        if !matches!(self.format, LogFormat::V3 | LogFormat::V4) {
+            return Err(
+                FileTransactionRestartWalReclamationError::UnsupportedPhysicalFormat {
+                    version: self.format.version(),
+                },
+            );
+        }
+        let allocated_epoch_high_water = self
+            .allocated_epoch_high_water()
+            .ok_or(FileTransactionRestartWalReclamationError::NoAllocatedEpoch)?;
+        let current_high_water = self.durable_position();
+        let current_anchor_matches = match self.selected_checkpoint_anchor {
+            Some((version, value)) => {
+                let permit_anchor = permit.selected_checkpoint_anchor();
+                version == permit_anchor.version() && value == permit_anchor.value()
+            }
+            None => self.generation == 0,
+        };
+        if permit.persistent_log_id() != self.persistent_id
+            || !permit.lineage().same_lineage(&self.lineage)
+            || permit.physical_format_version().get() != self.format.version()
+            || permit.source_generation() != self.generation
+            || permit.durable_frontier() != current_high_water.as_ref()
+            || permit.allocated_epoch_high_water() != allocated_epoch_high_water
+            || !current_anchor_matches
+        {
+            return Err(FileTransactionRestartWalReclamationError::PermitMismatch);
+        }
+        if self.records.len() != self.durable_len {
+            return Err(
+                FileTransactionRestartWalReclamationError::VolatileLogicalSuffix {
+                    durable_record_count: self.durable_len,
+                    total_record_count: self.records.len(),
+                },
+            );
+        }
+        let retained_start = match permit.retained_first_logical_record() {
+            Some(floor) => self
+                .records
+                .iter()
+                .take(self.durable_len)
+                .position(|record| record.position() == floor)
+                .ok_or(
+                    FileTransactionRestartWalReclamationError::RetainedBoundaryMissing {
+                        position: floor.get(),
+                    },
+                )?,
+            None => self.durable_len,
+        };
+        let retained_count = self.durable_len - retained_start;
+        let mut retained_records = Vec::new();
+        retained_records
+            .try_reserve_exact(retained_count)
+            .map_err(
+                |_| FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
+                    record_count: retained_count,
+                },
+            )?;
+        retained_records.extend(
+            self.records[retained_start..self.durable_len]
+                .iter()
+                .cloned(),
+        );
+        let new_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(FileTransactionRestartWalReclamationError::GenerationExhausted)?;
+        let layout = PageLayout::for_const::<N>().map_err(|_| {
+            FileTransactionRestartWalReclamationError::UnsupportedPhysicalFormat {
+                version: self.format.version(),
             }
         })?;
+        let logical_high_water = current_high_water.as_ref().map(LogSequenceNumber::get);
+        let frames = build_reclamation_frame_plan(&retained_records, logical_high_water, layout)?;
+        let retained_logical_record_count =
+            u64::try_from(retained_records.len()).map_err(|_| {
+                FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
+                    record_count: retained_records.len(),
+                }
+            })?;
+        let retained_physical_unit_count = u64::try_from(frames.len()).map_err(|_| {
+            FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
+                record_count: retained_records.len(),
+            }
+        })?;
+        let permit_anchor = permit.selected_checkpoint_anchor();
+        let anchor = (permit_anchor.version(), permit_anchor.value());
+        let header = build_header_v4(
+            self.persistent_id,
+            layout.width_u64,
+            new_generation,
+            permit
+                .retained_first_logical_record()
+                .map(LogSequenceNumber::get),
+            logical_high_water,
+            allocated_epoch_high_water,
+            anchor,
+        );
+        let candidate_path = reclamation_candidate_path(&self.path)
+            .ok_or(FileTransactionRestartWalReclamationError::MissingFileName)?;
 
-        for record in self.durable_records() {
-            let observation = match record.kind() {
-                FileLogRecordKind::TransactionCommit {
-                    transaction_epoch,
-                    transaction_sequence,
-                } => record
-                    .project_transaction_commit_recovery_observation(
-                        *transaction_epoch,
-                        *transaction_sequence,
-                    )
-                    .map(DurableTransactionRestartObservation::Commit)
-                    .map_err(|source| {
-                        FileTransactionRestartAnalysisSourceError::CommitProjection(Box::new(
-                            source,
-                        ))
-                    })?,
-                FileLogRecordKind::PageWrite(page) => record
-                    .project_page_recovery_observation(page)
-                    .map(DurableTransactionRestartObservation::Page)
-                    .map_err(|source| {
-                        FileTransactionRestartAnalysisSourceError::PageProjection(Box::new(source))
-                    })?,
-                FileLogRecordKind::TransactionPageWrite(transaction_page) => record
-                    .project_transaction_page_recovery_observation(transaction_page)
-                    .map(DurableTransactionRestartObservation::TransactionPage)
-                    .map_err(|source| {
-                        FileTransactionRestartAnalysisSourceError::TransactionPageProjection(
-                            Box::new(source),
-                        )
-                    })?,
-            };
-            observations.push(observation);
+        if self.consume_fault(FaultPoint::BeforeReclamationCandidateCleanup) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::BeforeReclamationCandidateCleanup,
+            ));
         }
+        if let Err(source) = remove_reclamation_candidate_for_effect(
+            &candidate_path,
+            &self.file,
+            &self.parent_directory,
+        ) {
+            self.poisoned = true;
+            return Err(source);
+        }
+        let mut candidate = match OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&candidate_path)
+        {
+            Ok(candidate) => candidate,
+            Err(source) => {
+                self.poisoned = true;
+                return Err(FileTransactionRestartWalReclamationError::Io(
+                    FileIoError::new(FileIoStage::CreateReclamationCandidate, source),
+                ));
+            }
+        };
+        if let Err(source) = candidate.try_lock() {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::AcquireReclamationCandidateLock, source.into()),
+            ));
+        }
+        if self.consume_fault(FaultPoint::BeforeReclamationWrite) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::BeforeReclamationWrite,
+            ));
+        }
+        if let Err(source) = candidate.write_all(&header) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::WriteReclamationHeader, source),
+            ));
+        }
+        if self.consume_fault(FaultPoint::DuringReclamationCopy) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::DuringReclamationCopy,
+            ));
+        }
+        for frame in &frames {
+            if let Err(source) = candidate.write_all(frame) {
+                self.poisoned = true;
+                return Err(FileTransactionRestartWalReclamationError::Io(
+                    FileIoError::new(FileIoStage::WriteReclamationFrame, source),
+                ));
+            }
+        }
+        if self.consume_fault(FaultPoint::BeforeReclamationCandidateSync) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::BeforeReclamationCandidateSync,
+            ));
+        }
+        if let Err(source) = candidate.sync_all() {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::SyncReclamationCandidate, source),
+            ));
+        }
+        if self.consume_fault(FaultPoint::AfterReclamationCandidateSync) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::AfterReclamationCandidateSync,
+            ));
+        }
+        if self.consume_fault(FaultPoint::BeforeReclamationRename) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::BeforeReclamationRename,
+            ));
+        }
+        if let Err(source) = fs::rename(&candidate_path, &self.path) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::RenameReclamationCandidate, source),
+            ));
+        }
+        self.file = candidate;
+        if self.consume_fault(FaultPoint::AfterReclamationRename) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::AfterReclamationRename,
+            ));
+        }
+        if self.consume_fault(FaultPoint::DuringReclamationDirectorySync) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::InjectedFault(
+                FaultPoint::DuringReclamationDirectorySync,
+            ));
+        }
+        if let Err(source) = self.parent_directory.sync_all() {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::SyncReclamationDirectory, source),
+            ));
+        }
+        if let Err(source) = self.file.seek(SeekFrom::End(0)) {
+            self.poisoned = true;
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::SeekEnd, source),
+            ));
+        }
+        self.format = LogFormat::V4;
+        self.generation = new_generation;
+        self.reclaimed_logical_high_water = current_high_water.clone();
+        self.selected_checkpoint_anchor = Some(anchor);
+        self.records = retained_records;
+        self.durable_len = self.records.len();
+        self.next_position = match current_high_water {
+            Some(position) => position.get().checked_add(1),
+            None => Some(1),
+        };
+        self.poisoned = false;
 
-        Ok(operation(durable_frontier.as_ref(), &observations))
+        Ok(
+            DurableTransactionRestartWalReclamationEffectObservation::new(
+                DurableTransactionRestartWalReclamationReplacementObservation::new(
+                    permit.source_generation(),
+                    new_generation,
+                    FORMAT_VERSION_V4,
+                ),
+                permit.retained_first_logical_record().cloned(),
+                permit.durable_frontier().cloned(),
+                retained_logical_record_count,
+                retained_physical_unit_count,
+                allocated_epoch_high_water,
+            ),
+        )
     }
 }
 
@@ -2310,11 +3215,9 @@ impl<const N: usize> DurableTransactionRestartRetentionMetadataSource for FileCo
         if self.poisoned {
             return Err(FileTransactionRestartRetentionMetadataSourceError::PoisonedWriter);
         }
-        let allocated_epoch_high_water = match self.next_epoch {
-            Some(next_epoch) => NonZeroU64::new(next_epoch.get().saturating_sub(1))
-                .ok_or(FileTransactionRestartRetentionMetadataSourceError::NoAllocatedEpoch)?,
-            None => NonZeroU64::MAX,
-        };
+        let allocated_epoch_high_water = self
+            .allocated_epoch_high_water()
+            .ok_or(FileTransactionRestartRetentionMetadataSourceError::NoAllocatedEpoch)?;
         Ok(DurableTransactionRestartRetentionMetadataObservation::new(
             self.lineage.clone(),
             allocated_epoch_high_water,
@@ -2494,17 +3397,26 @@ struct OpenState<const N: usize> {
 }
 
 impl<const N: usize> OpenState<N> {
-    fn new(lineage: LogLineage, page_layout: Option<PageLayout>) -> Self {
+    fn new(
+        lineage: LogLineage,
+        page_layout: Option<PageLayout>,
+        highest_allocated_epoch: u64,
+        next_position: Option<u64>,
+        last_completed_position: u64,
+        last_durable_position: Option<u64>,
+    ) -> Self {
         Self {
             lineage,
             page_layout,
             records: Vec::new(),
             durable_len: 0,
-            last_durable_position: None,
-            last_completed_position: 0,
-            highest_allocated_epoch: 0,
-            next_epoch: Some(NonZeroU64::MIN),
-            next_position: Some(1),
+            last_durable_position,
+            last_completed_position,
+            highest_allocated_epoch,
+            next_epoch: highest_allocated_epoch
+                .checked_add(1)
+                .and_then(NonZeroU64::new),
+            next_position,
             pending_page: None,
         }
     }
@@ -3112,17 +4024,163 @@ impl<const N: usize> PendingPageRecord<N> {
     }
 }
 
-fn sync_parent_directory(path: &Path) -> Result<(), FileCreateError> {
+fn commit_log_parent_path(path: &Path) -> Result<&Path, FileCreateError> {
     let parent = match path.parent() {
         Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
         Some(parent) => parent,
         None => return Err(FileCreateError::MissingParentDirectory),
     };
+    Ok(parent)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<File, FileCreateError> {
+    let parent = commit_log_parent_path(path)?;
     let directory = File::open(parent).map_err(|source| {
         FileCreateError::Io(FileIoError::new(FileIoStage::OpenParentDirectory, source))
     })?;
     directory.sync_all().map_err(|source| {
         FileCreateError::Io(FileIoError::new(FileIoStage::SyncParentDirectory, source))
+    })?;
+    Ok(directory)
+}
+
+fn open_parent_directory_for_open(path: &Path) -> Result<File, FileOpenError> {
+    let parent = match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+        Some(parent) => parent,
+        None => {
+            return Err(FileOpenError::Io(FileIoError::new(
+                FileIoStage::OpenParentDirectory,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "commit-log path has no parent directory",
+                ),
+            )));
+        }
+    };
+    File::open(parent).map_err(|source| {
+        FileOpenError::Io(FileIoError::new(FileIoStage::OpenParentDirectory, source))
+    })
+}
+
+fn reclamation_candidate_path(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?;
+    let mut candidate_name = OsString::from(file_name);
+    candidate_name.push(".reclaim-candidate");
+    Some(path.with_file_name(candidate_name))
+}
+
+#[cfg(unix)]
+fn metadata_identifies_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn metadata_identifies_same_file(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    false
+}
+
+fn cleanup_reclamation_candidate(
+    selected_path: &Path,
+    selected_file: &File,
+    parent_directory: &File,
+) -> Result<(), FileOpenError> {
+    let Some(candidate_path) = reclamation_candidate_path(selected_path) else {
+        return Ok(());
+    };
+    match fs::symlink_metadata(&candidate_path) {
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(FileOpenError::Io(FileIoError::new(
+                FileIoStage::ReadReclamationCandidateMetadata,
+                source,
+            )));
+        }
+    };
+    match fs::metadata(&candidate_path) {
+        Ok(candidate_metadata) => {
+            let selected_metadata = selected_file.metadata().map_err(|source| {
+                FileOpenError::Io(FileIoError::new(FileIoStage::ReadMetadata, source))
+            })?;
+            if metadata_identifies_same_file(&selected_metadata, &candidate_metadata) {
+                return Err(FileOpenError::Io(FileIoError::new(
+                    FileIoStage::ReadReclamationCandidateMetadata,
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "reclamation candidate aliases selected WAL",
+                    ),
+                )));
+            }
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(FileOpenError::Io(FileIoError::new(
+                FileIoStage::ReadReclamationCandidateMetadata,
+                source,
+            )));
+        }
+    }
+    fs::remove_file(&candidate_path).map_err(|source| {
+        FileOpenError::Io(FileIoError::new(
+            FileIoStage::RemoveReclamationCandidate,
+            source,
+        ))
+    })?;
+    parent_directory.sync_all().map_err(|source| {
+        FileOpenError::Io(FileIoError::new(
+            FileIoStage::SyncReclamationDirectory,
+            source,
+        ))
+    })
+}
+
+fn remove_reclamation_candidate_for_effect(
+    candidate_path: &Path,
+    selected_file: &File,
+    parent_directory: &File,
+) -> Result<(), FileTransactionRestartWalReclamationError> {
+    match fs::symlink_metadata(candidate_path) {
+        Ok(_) => {}
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::ReadReclamationCandidateMetadata, source),
+            ));
+        }
+    };
+    match fs::metadata(candidate_path) {
+        Ok(candidate_metadata) => {
+            let selected_metadata = selected_file.metadata().map_err(|source| {
+                FileTransactionRestartWalReclamationError::Io(FileIoError::new(
+                    FileIoStage::ReadMetadata,
+                    source,
+                ))
+            })?;
+            if metadata_identifies_same_file(&selected_metadata, &candidate_metadata) {
+                return Err(FileTransactionRestartWalReclamationError::CandidateAliasesSelected);
+            }
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(FileTransactionRestartWalReclamationError::Io(
+                FileIoError::new(FileIoStage::ReadReclamationCandidateMetadata, source),
+            ));
+        }
+    }
+    fs::remove_file(candidate_path).map_err(|source| {
+        FileTransactionRestartWalReclamationError::Io(FileIoError::new(
+            FileIoStage::RemoveReclamationCandidate,
+            source,
+        ))
+    })?;
+    parent_directory.sync_all().map_err(|source| {
+        FileTransactionRestartWalReclamationError::Io(FileIoError::new(
+            FileIoStage::SyncReclamationDirectory,
+            source,
+        ))
     })
 }
 
@@ -3130,22 +4188,22 @@ fn sync_parent_directory(path: &Path) -> Result<(), FileCreateError> {
 enum HeaderExpectation {
     V1,
     V2(PageLayout),
-    V3(PageLayout),
+    V3OrV4(PageLayout),
 }
 
 impl HeaderExpectation {
-    const fn log_format(self) -> LogFormat {
+    const fn accepts(self, format: LogFormat) -> bool {
         match self {
-            Self::V1 => LogFormat::V1,
-            Self::V2(_) => LogFormat::V2,
-            Self::V3(_) => LogFormat::V3,
+            Self::V1 => matches!(format, LogFormat::V1),
+            Self::V2(_) => matches!(format, LogFormat::V2),
+            Self::V3OrV4(_) => matches!(format, LogFormat::V3 | LogFormat::V4),
         }
     }
 
     const fn page_layout(self) -> Option<PageLayout> {
         match self {
             Self::V1 => None,
-            Self::V2(layout) | Self::V3(layout) => Some(layout),
+            Self::V2(layout) | Self::V3OrV4(layout) => Some(layout),
         }
     }
 }
@@ -3158,7 +4216,18 @@ fn parse_header(
         return Err(FileFormatError::new(0, FileFormatErrorReason::HeaderMagic));
     }
     let version = read_u16(header, 8);
-    if version != expectation.log_format().version() {
+    let format = match version {
+        FORMAT_VERSION_V1 => LogFormat::V1,
+        FORMAT_VERSION_V2 => LogFormat::V2,
+        FORMAT_VERSION_V3 => LogFormat::V3,
+        _ => {
+            return Err(FileFormatError::new(
+                8,
+                FileFormatErrorReason::HeaderVersion { actual: version },
+            ));
+        }
+    };
+    if !expectation.accepts(format) {
         return Err(FileFormatError::new(
             8,
             FileFormatErrorReason::HeaderVersion { actual: version },
@@ -3198,7 +4267,7 @@ fn parse_header(
                 ));
             }
         }
-        HeaderExpectation::V2(layout) | HeaderExpectation::V3(layout) => {
+        HeaderExpectation::V2(layout) | HeaderExpectation::V3OrV4(layout) => {
             let page_width = read_u64(header, HEADER_V2_PAGE_WIDTH_OFFSET);
             if page_width == 0 {
                 return Err(FileFormatError::new(
@@ -3240,6 +4309,184 @@ fn parse_header(
     Ok(persistent_id)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct V4HeaderMetadata {
+    persistent_id: PersistentLogId,
+    generation: u64,
+    retained_first: Option<u64>,
+    logical_high_water: Option<u64>,
+    allocated_epoch_high_water: NonZeroU64,
+    selected_checkpoint_anchor: (u16, u128),
+}
+
+fn parse_header_v4(
+    header: &[u8; HEADER_V4_LENGTH],
+    layout: PageLayout,
+) -> Result<V4HeaderMetadata, FileFormatError> {
+    if header[..8] != HEADER_MAGIC {
+        return Err(FileFormatError::new(0, FileFormatErrorReason::HeaderMagic));
+    }
+    let version = read_u16(header, 8);
+    if version != FORMAT_VERSION_V4 {
+        return Err(FileFormatError::new(
+            8,
+            FileFormatErrorReason::HeaderVersion { actual: version },
+        ));
+    }
+    let length = read_u16(header, 10);
+    if usize::from(length) != HEADER_V4_LENGTH {
+        return Err(FileFormatError::new(
+            10,
+            FileFormatErrorReason::HeaderV4Length { actual: length },
+        ));
+    }
+    let flags = read_u32(header, 12);
+    if flags != 0 {
+        return Err(FileFormatError::new(
+            12,
+            FileFormatErrorReason::HeaderFlags { actual: flags },
+        ));
+    }
+    let persistent_id = PersistentLogId::new(read_u128(header, 16))
+        .ok_or_else(|| FileFormatError::new(16, FileFormatErrorReason::LineageIdZero))?;
+    let page_width = read_u64(header, HEADER_V2_PAGE_WIDTH_OFFSET);
+    if page_width == 0 {
+        return Err(FileFormatError::new(
+            HEADER_V2_PAGE_WIDTH_OFFSET as u64,
+            FileFormatErrorReason::HeaderPageWidthZero,
+        ));
+    }
+    if page_width != layout.width_u64 {
+        return Err(FileFormatError::new(
+            HEADER_V2_PAGE_WIDTH_OFFSET as u64,
+            FileFormatErrorReason::HeaderPageWidthMismatch {
+                expected: layout.width_u64,
+                actual: page_width,
+            },
+        ));
+    }
+    let generation = read_u64(header, HEADER_V4_GENERATION_OFFSET);
+    if generation == 0 {
+        return Err(FileFormatError::new(
+            HEADER_V4_GENERATION_OFFSET as u64,
+            FileFormatErrorReason::HeaderV4GenerationZero,
+        ));
+    }
+    let retained_first_raw = read_u64(header, HEADER_V4_RETAINED_FIRST_OFFSET);
+    let retained_first = match header[HEADER_V4_RETAINED_FIRST_PRESENCE_OFFSET] {
+        0 if retained_first_raw == 0 => None,
+        0 => {
+            return Err(FileFormatError::new(
+                HEADER_V4_RETAINED_FIRST_OFFSET as u64,
+                FileFormatErrorReason::HeaderV4Reserved,
+            ));
+        }
+        1 => Some(retained_first_raw),
+        actual => {
+            return Err(FileFormatError::new(
+                HEADER_V4_RETAINED_FIRST_PRESENCE_OFFSET as u64,
+                FileFormatErrorReason::HeaderV4RetainedFirstPresence { actual },
+            ));
+        }
+    };
+    if retained_first == Some(0) {
+        return Err(FileFormatError::new(
+            HEADER_V4_RETAINED_FIRST_OFFSET as u64,
+            FileFormatErrorReason::HeaderV4RetainedFirstZero,
+        ));
+    }
+    let high_water_raw = read_u64(header, HEADER_V4_LOGICAL_HIGH_WATER_OFFSET);
+    let logical_high_water = match header[HEADER_V4_LOGICAL_HIGH_WATER_PRESENCE_OFFSET] {
+        0 if high_water_raw == 0 => None,
+        0 => {
+            return Err(FileFormatError::new(
+                HEADER_V4_LOGICAL_HIGH_WATER_OFFSET as u64,
+                FileFormatErrorReason::HeaderV4Reserved,
+            ));
+        }
+        1 => Some(high_water_raw),
+        actual => {
+            return Err(FileFormatError::new(
+                HEADER_V4_LOGICAL_HIGH_WATER_PRESENCE_OFFSET as u64,
+                FileFormatErrorReason::HeaderV4LogicalHighWaterPresence { actual },
+            ));
+        }
+    };
+    if logical_high_water == Some(0) {
+        return Err(FileFormatError::new(
+            HEADER_V4_LOGICAL_HIGH_WATER_OFFSET as u64,
+            FileFormatErrorReason::HeaderV4LogicalHighWaterZero,
+        ));
+    }
+    match (retained_first, logical_high_water) {
+        (Some(_), None) => {
+            return Err(FileFormatError::new(
+                HEADER_V4_RETAINED_FIRST_OFFSET as u64,
+                FileFormatErrorReason::HeaderV4RetainedFirstWithoutHighWater,
+            ));
+        }
+        (Some(retained_first), Some(high_water)) if retained_first > high_water => {
+            return Err(FileFormatError::new(
+                HEADER_V4_RETAINED_FIRST_OFFSET as u64,
+                FileFormatErrorReason::HeaderV4RetainedFirstBeyondHighWater {
+                    retained_first,
+                    high_water,
+                },
+            ));
+        }
+        (None, None | Some(_)) | (Some(_), Some(_)) => {}
+    }
+    let allocated_epoch_high_water = NonZeroU64::new(read_u64(
+        header,
+        HEADER_V4_ALLOCATED_EPOCH_HIGH_WATER_OFFSET,
+    ))
+    .ok_or_else(|| {
+        FileFormatError::new(
+            HEADER_V4_ALLOCATED_EPOCH_HIGH_WATER_OFFSET as u64,
+            FileFormatErrorReason::HeaderV4AllocatedEpochHighWaterZero,
+        )
+    })?;
+    let anchor_version = read_u16(header, HEADER_V4_ANCHOR_VERSION_OFFSET);
+    if anchor_version == 0 {
+        return Err(FileFormatError::new(
+            HEADER_V4_ANCHOR_VERSION_OFFSET as u64,
+            FileFormatErrorReason::HeaderV4AnchorVersionZero,
+        ));
+    }
+    if header[HEADER_V4_RESERVED_START..HEADER_V4_ANCHOR_VALUE_OFFSET]
+        .iter()
+        .chain(header[HEADER_V4_RESERVED_MIDDLE..HEADER_V4_CHECKSUM_OFFSET].iter())
+        .any(|byte| *byte != 0)
+    {
+        return Err(FileFormatError::new(
+            HEADER_V4_RESERVED_START as u64,
+            FileFormatErrorReason::HeaderV4Reserved,
+        ));
+    }
+    let actual_checksum = read_u64(header, HEADER_V4_CHECKSUM_OFFSET);
+    let expected_checksum = checksum_v1(&header[..HEADER_V4_CHECKSUM_OFFSET]);
+    if actual_checksum != expected_checksum {
+        return Err(FileFormatError::new(
+            HEADER_V4_CHECKSUM_OFFSET as u64,
+            FileFormatErrorReason::HeaderChecksum {
+                expected: expected_checksum,
+                actual: actual_checksum,
+            },
+        ));
+    }
+    Ok(V4HeaderMetadata {
+        persistent_id,
+        generation,
+        retained_first,
+        logical_high_water,
+        allocated_epoch_high_water,
+        selected_checkpoint_anchor: (
+            anchor_version,
+            read_u128(header, HEADER_V4_ANCHOR_VALUE_OFFSET),
+        ),
+    })
+}
+
 fn parse_frame(
     frame: &[u8; FRAME_LENGTH],
     offset: u64,
@@ -3259,7 +4506,7 @@ fn parse_frame(
         )
     })?;
     let version = read_u16(frame, 6);
-    if version != format.version() {
+    if version != format.frame_version() {
         return Err(FileFormatError::new(
             offset + 6,
             FileFormatErrorReason::FrameVersion { actual: version },
@@ -3320,6 +4567,51 @@ fn build_header_v3(persistent_id: PersistentLogId, page_width: u64) -> [u8; HEAD
     build_header(LogFormat::V3, persistent_id, page_width)
 }
 
+fn build_header_v4(
+    persistent_id: PersistentLogId,
+    page_width: u64,
+    generation: u64,
+    retained_first: Option<u64>,
+    logical_high_water: Option<u64>,
+    allocated_epoch_high_water: NonZeroU64,
+    selected_checkpoint_anchor: (u16, u128),
+) -> [u8; HEADER_V4_LENGTH] {
+    let mut header = [0_u8; HEADER_V4_LENGTH];
+    header[..8].copy_from_slice(&HEADER_MAGIC);
+    write_u16(&mut header, 8, FORMAT_VERSION_V4);
+    write_u16(&mut header, 10, HEADER_V4_LENGTH_U16);
+    write_u32(&mut header, 12, 0);
+    write_u128(&mut header, 16, persistent_id.get());
+    write_u64(&mut header, HEADER_V2_PAGE_WIDTH_OFFSET, page_width);
+    write_u64(&mut header, HEADER_V4_GENERATION_OFFSET, generation);
+    if let Some(position) = retained_first {
+        write_u64(&mut header, HEADER_V4_RETAINED_FIRST_OFFSET, position);
+        header[HEADER_V4_RETAINED_FIRST_PRESENCE_OFFSET] = 1;
+    }
+    if let Some(position) = logical_high_water {
+        write_u64(&mut header, HEADER_V4_LOGICAL_HIGH_WATER_OFFSET, position);
+        header[HEADER_V4_LOGICAL_HIGH_WATER_PRESENCE_OFFSET] = 1;
+    }
+    write_u64(
+        &mut header,
+        HEADER_V4_ALLOCATED_EPOCH_HIGH_WATER_OFFSET,
+        allocated_epoch_high_water.get(),
+    );
+    write_u16(
+        &mut header,
+        HEADER_V4_ANCHOR_VERSION_OFFSET,
+        selected_checkpoint_anchor.0,
+    );
+    write_u128(
+        &mut header,
+        HEADER_V4_ANCHOR_VALUE_OFFSET,
+        selected_checkpoint_anchor.1,
+    );
+    let checksum = checksum_v1(&header[..HEADER_V4_CHECKSUM_OFFSET]);
+    write_u64(&mut header, HEADER_V4_CHECKSUM_OFFSET, checksum);
+    header
+}
+
 fn build_header(
     format: LogFormat,
     persistent_id: PersistentLogId,
@@ -3359,7 +4651,7 @@ fn build_frame_with_payload2_bytes(
     let mut frame = [0_u8; FRAME_LENGTH];
     frame[..4].copy_from_slice(&FRAME_MAGIC);
     write_u16(&mut frame, 4, kind.code());
-    write_u16(&mut frame, 6, format.version());
+    write_u16(&mut frame, 6, format.frame_version());
     write_u32(&mut frame, 8, 0);
     write_u16(&mut frame, 12, FRAME_LENGTH_U16);
     write_u16(&mut frame, 14, 0);
@@ -3369,6 +4661,128 @@ fn build_frame_with_payload2_bytes(
     let checksum = checksum_v1(&frame[..FRAME_CHECKSUM_OFFSET]);
     write_u64(&mut frame, FRAME_CHECKSUM_OFFSET, checksum);
     frame
+}
+
+fn build_reclamation_frame_plan<const N: usize>(
+    records: &[FileLogRecord<N>],
+    logical_high_water: Option<u64>,
+    layout: PageLayout,
+) -> Result<Vec<[u8; FRAME_LENGTH]>, FileTransactionRestartWalReclamationError> {
+    let mut frame_count = usize::from(!records.is_empty());
+    for record in records {
+        let record_frame_count = match record.kind() {
+            FileLogRecordKind::TransactionCommit { .. } => Some(1),
+            FileLogRecordKind::PageWrite(_) => 1_usize.checked_add(layout.chunk_count),
+            FileLogRecordKind::TransactionPageWrite(_) => 2_usize.checked_add(layout.chunk_count),
+        }
+        .ok_or(
+            FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
+                record_count: records.len(),
+            },
+        )?;
+        frame_count = frame_count.checked_add(record_frame_count).ok_or(
+            FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
+                record_count: records.len(),
+            },
+        )?;
+    }
+    let mut frames = Vec::new();
+    frames.try_reserve_exact(frame_count).map_err(|_| {
+        FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
+            record_count: records.len(),
+        }
+    })?;
+    for record in records {
+        let position = record.position().get();
+        match record.kind() {
+            FileLogRecordKind::TransactionCommit {
+                transaction_epoch,
+                transaction_sequence,
+            } => frames.push(build_frame(
+                LogFormat::V4,
+                FrameKind::CommitRecord,
+                position,
+                *transaction_epoch,
+                *transaction_sequence,
+            )),
+            FileLogRecordKind::PageWrite(page) => {
+                append_reclamation_page_frames(&mut frames, position, page, None, layout)?;
+            }
+            FileLogRecordKind::TransactionPageWrite(transaction_page) => {
+                append_reclamation_page_frames(
+                    &mut frames,
+                    position,
+                    transaction_page.page_write(),
+                    Some(StoredTransactionIdentity::from_epoch_sequence(
+                        transaction_page.transaction_epoch(),
+                        transaction_page.transaction_sequence(),
+                    )),
+                    layout,
+                )?;
+            }
+        }
+    }
+    if !records.is_empty() {
+        let high_water =
+            logical_high_water.ok_or(FileTransactionRestartWalReclamationError::PermitMismatch)?;
+        frames.push(build_frame(
+            LogFormat::V4,
+            FrameKind::DurableThrough,
+            high_water,
+            0,
+            0,
+        ));
+    }
+    Ok(frames)
+}
+
+fn append_reclamation_page_frames<const N: usize>(
+    frames: &mut Vec<[u8; FRAME_LENGTH]>,
+    position: u64,
+    page: &FilePageWriteRecord<N>,
+    owner: Option<StoredTransactionIdentity>,
+    layout: PageLayout,
+) -> Result<(), FileTransactionRestartWalReclamationError> {
+    let header_kind = if owner.is_some() {
+        FrameKind::TransactionPageHeader
+    } else {
+        FrameKind::PageHeader
+    };
+    frames.push(build_frame(
+        LogFormat::V4,
+        header_kind,
+        position,
+        page.page_number().get(),
+        page.page_version().get(),
+    ));
+    if let Some(owner) = owner {
+        frames.push(build_frame(
+            LogFormat::V4,
+            FrameKind::TransactionPageOwner,
+            position,
+            owner.epoch,
+            owner.sequence,
+        ));
+    }
+    for chunk_index in 0..layout.chunk_count {
+        let mut chunk = [0_u8; PAGE_CHUNK_WIDTH];
+        let start = chunk_index * PAGE_CHUNK_WIDTH;
+        let logical_len = layout.logical_bytes_for_chunk(chunk_index);
+        let end = start + logical_len;
+        chunk[..logical_len].copy_from_slice(&page.bytes()[start..end]);
+        frames.push(build_frame_with_payload2_bytes(
+            LogFormat::V4,
+            FrameKind::PageData,
+            position,
+            u64::try_from(chunk_index).map_err(|_| {
+                FileTransactionRestartWalReclamationError::FrameCapacityExhausted {
+                    record_count: frames.len(),
+                }
+            })?,
+            chunk,
+        ));
+    }
+    Ok(())
 }
 
 fn checksum_v1(bytes: &[u8]) -> u64 {
@@ -5845,6 +7259,48 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wal_open_removes_dangling_candidate_but_rejects_selected_inode_alias()
+    -> Result<(), Box<dyn Error>> {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("wal-candidate-cleanup")?;
+        let path = directory.path().join("commit-log.bin");
+        let candidate = directory.path().join("commit-log.bin.reclaim-candidate");
+        drop(FileCommitLog::<2>::create_new_transaction_page_capable(
+            &path,
+            persistent_id(170)?,
+        )?);
+
+        symlink(
+            directory.path().join("missing-candidate-target"),
+            &candidate,
+        )?;
+        drop(FileCommitLog::<2>::open_transaction_page_capable(&path)?);
+        assert!(!candidate.exists());
+        assert!(fs::symlink_metadata(&candidate).is_err());
+
+        fs::hard_link(&path, &candidate)?;
+        let error = FileCommitLog::<2>::open_transaction_page_capable(&path)
+            .err()
+            .ok_or_else(|| io::Error::other("selected/candidate inode alias was accepted"))?;
+        let FileOpenError::Io(source) = error else {
+            return Err(io::Error::other("candidate alias changed error category").into());
+        };
+        assert_eq!(
+            source.stage(),
+            FileIoStage::ReadReclamationCandidateMetadata
+        );
+        assert_eq!(source.io_source().kind(), io::ErrorKind::InvalidData);
+        assert!(path.exists());
+        assert!(candidate.exists());
+
+        fs::remove_file(&candidate)?;
+        drop(FileCommitLog::<2>::open_transaction_page_capable(&path)?);
+        Ok(())
+    }
+
     #[test]
     fn v1_format_bytes_cover_header_epoch_commit_and_marker() -> Result<(), Box<dyn Error>> {
         let directory = TestDirectory::new("format-bytes-v1")?;
@@ -7714,7 +9170,7 @@ mod tests {
         assert_eq!(
             parse_header(
                 &header,
-                HeaderExpectation::V3(PageLayout::for_const::<10>()?)
+                HeaderExpectation::V3OrV4(PageLayout::for_const::<10>()?)
             )?,
             persistent_id(271)?
         );
@@ -8066,6 +9522,47 @@ mod tests {
         let next_page = unlogged_page(reopened_after.lineage(), 7, 4, [7_u8, 8])?;
         let next_dirty = stage_page_write(&mut reopened_after, next_page)?;
         assert_eq!(next_dirty.required_position().get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn v4_generation_header_has_exact_big_endian_golden_bytes() -> Result<(), Box<dyn Error>> {
+        let persistent_id = persistent_id(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10)?;
+        let allocated_epoch_high_water = NonZeroU64::new(0x5152_5354_5556_5758)
+            .ok_or_else(|| io::Error::other("golden epoch is zero"))?;
+        let actual = build_header_v4(
+            persistent_id,
+            10,
+            0x2122_2324_2526_2728,
+            Some(0x3132_3334_3536_3738),
+            Some(0x4142_4344_4546_4748),
+            allocated_epoch_high_water,
+            (0x6162, 0x7172_7374_7576_7778_797a_7b7c_7d7e_7f80),
+        );
+        let expected = [
+            0x4e, 0x54, 0x53, 0x51, 0x4c, 0x4f, 0x47, 0x31, 0x00, 0x04, 0x00, 0x80, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c,
+            0x0d, 0x0e, 0x0f, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x21, 0x22,
+            0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+            0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+            0x57, 0x58, 0x61, 0x62, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x71, 0x72, 0x73, 0x74,
+            0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x7b, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2b, 0x01, 0xc3, 0x42, 0xeb, 0xdc,
+            0x97, 0x73,
+        ];
+        assert_eq!(actual, expected);
+        assert_eq!(
+            parse_header_v4(&actual, PageLayout::for_const::<10>()?)?,
+            V4HeaderMetadata {
+                persistent_id,
+                generation: 0x2122_2324_2526_2728,
+                retained_first: Some(0x3132_3334_3536_3738),
+                logical_high_water: Some(0x4142_4344_4546_4748),
+                allocated_epoch_high_water,
+                selected_checkpoint_anchor: (0x6162, 0x7172_7374_7576_7778_797a_7b7c_7d7e_7f80,),
+            }
+        );
         Ok(())
     }
 

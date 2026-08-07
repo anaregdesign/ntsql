@@ -36,10 +36,15 @@ use ntsql_transaction::{
     DurableTransactionRestartCheckpointPageRepairComparisonError,
     DurableTransactionRestartCheckpointPageRepairTargetKind, DurableTransactionRestartObservation,
     DurableTransactionRestartPageEntry, DurableTransactionRestartPageState,
-    DurableTransactionRestartReplayStart, DurableTransactionRestartReplayStartCause,
-    DurableTransactionRestartRequiredPageImage,
+    DurableTransactionRestartPrunedGenerationSource, DurableTransactionRestartReplayStart,
+    DurableTransactionRestartReplayStartCause, DurableTransactionRestartRequiredPageImage,
     DurableTransactionRestartRetentionMetadataObservation,
     DurableTransactionRestartRetentionMetadataSource,
+    DurableTransactionRestartWalReclamationEffectObservation,
+    DurableTransactionRestartWalReclamationPermit,
+    DurableTransactionRestartWalReclamationReplacementObservation,
+    DurableTransactionRestartWalReclamationSource,
+    DurableTransactionRestartWalReclamationSourceObservation,
     OwnedDurableTransactionRestartCheckpointBaselineObservation,
     OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
     TransactionCommitRecord, TransactionEpochSource, TransactionId, TransactionPageLog,
@@ -62,6 +67,23 @@ pub enum FaultPoint {
     BeforeFlush,
     /// Advance the durable prefix, then report flush failure.
     AfterFlush,
+    /// Fail before the in-memory generation swap inside
+    /// [`DurableTransactionRestartWalReclamationSource::reclaim_restart_wal_prefix`].
+    ///
+    /// No mutation has been applied when this fault fires: prefix records,
+    /// the generation counter, and the selected-checkpoint anchor are all
+    /// identical to their pre-reclamation values.
+    BeforeGenerationSwap,
+    /// Fail after the in-memory generation swap, record drain, and anchor
+    /// installation inside
+    /// [`DurableTransactionRestartWalReclamationSource::reclaim_restart_wal_prefix`].
+    ///
+    /// The physical mutation is fully installed when this fault fires: the
+    /// durable prefix has been drained, the generation counter has been
+    /// incremented, and the selected-checkpoint anchor has been stored.  A
+    /// caller that receives this error must treat the reclamation outcome as
+    /// indeterminate.
+    AfterGenerationSwap,
 }
 
 impl fmt::Display for FaultPoint {
@@ -71,6 +93,8 @@ impl fmt::Display for FaultPoint {
             Self::AfterAppend => formatter.write_str("after append"),
             Self::BeforeFlush => formatter.write_str("before flush"),
             Self::AfterFlush => formatter.write_str("after flush"),
+            Self::BeforeGenerationSwap => formatter.write_str("before generation swap"),
+            Self::AfterGenerationSwap => formatter.write_str("after generation swap"),
         }
     }
 }
@@ -1044,6 +1068,13 @@ impl<const N: usize> Error for InMemoryCommittedPageRecoverySourceError<N> {
     }
 }
 
+/// Physical format version reported by the in-memory WAL adapter.
+///
+/// The in-memory adapter models only repository-authored physical effects; this
+/// constant anchors the V4 generation contract used in tests without coupling
+/// to a real on-disk layout.
+pub const IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION: u16 = 4;
+
 /// Failure to project one complete in-memory durable prefix for restart analysis.
 #[derive(Debug, Eq, PartialEq)]
 pub enum InMemoryTransactionRestartAnalysisSourceError<const N: usize> {
@@ -1058,6 +1089,14 @@ pub enum InMemoryTransactionRestartAnalysisSourceError<const N: usize> {
     TransactionPageProjection(Box<DurableTransactionPageObservationBytesError<N>>),
     /// One transaction commit could not become restart evidence.
     CommitProjection(Box<DurableTransactionCommitObservationFieldsError>),
+    /// No transaction epoch has been allocated yet.
+    NoAllocatedEpoch,
+    /// The WAL has been pruned at least once; complete-prefix recovery is no
+    /// longer valid and the caller must use the generation-aware path instead.
+    PrunedGenerationRequiresCheckpoint {
+        /// Current source generation that prevents complete-prefix recovery.
+        generation: u64,
+    },
 }
 
 impl<const N: usize> fmt::Display for InMemoryTransactionRestartAnalysisSourceError<N> {
@@ -1079,6 +1118,14 @@ impl<const N: usize> fmt::Display for InMemoryTransactionRestartAnalysisSourceEr
             Self::CommitProjection(source) => {
                 write!(formatter, "commit restart projection failed: {source}")
             }
+            Self::NoAllocatedEpoch => {
+                formatter.write_str("no in-memory transaction epoch has been allocated")
+            }
+            Self::PrunedGenerationRequiresCheckpoint { generation } => write!(
+                formatter,
+                "in-memory WAL has been pruned (generation {generation}); \
+                 complete-prefix recovery requires a checkpoint-based restart instead"
+            ),
         }
     }
 }
@@ -1089,7 +1136,9 @@ impl<const N: usize> Error for InMemoryTransactionRestartAnalysisSourceError<N> 
             Self::PageProjection(source) => Some(source.as_ref()),
             Self::TransactionPageProjection(source) => Some(source.as_ref()),
             Self::CommitProjection(source) => Some(source.as_ref()),
-            Self::ObservationCapacityExhausted { .. } => None,
+            Self::ObservationCapacityExhausted { .. }
+            | Self::NoAllocatedEpoch
+            | Self::PrunedGenerationRequiresCheckpoint { .. } => None,
         }
     }
 }
@@ -1138,6 +1187,75 @@ impl<const N: usize> Error for InMemoryPageStoreInventoryError<N> {
         }
     }
 }
+
+/// Failure to observe or apply an in-memory WAL reclamation operation.
+///
+/// This is the adapter-specific error for
+/// [`DurableTransactionRestartWalReclamationSource`] on
+/// [`InMemoryCommitLog`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InMemoryWalReclamationSourceError {
+    /// No restart or transaction epoch has yet been allocated.
+    NoAllocatedEpoch,
+    /// The opaque domain permit does not match the current in-memory source
+    /// state; the permit was built from a different snapshot.
+    PermitMismatch,
+    /// Complete logical records exist beyond the durable prefix; a volatile
+    /// suffix must be resolved before prefix reclamation can proceed.
+    VolatileLogicalSuffix {
+        /// Number of durably flushed logical records.
+        durable_record_count: usize,
+        /// Total number of complete logical records including the volatile tail.
+        total_record_count: usize,
+    },
+    /// The retained-floor position named in the permit does not correspond to
+    /// any existing durable record in the retained suffix.
+    RetainedBoundaryMissing {
+        /// Raw LSN value that could not be located.
+        position: u64,
+    },
+    /// The current generation cannot be incremented; the u64 counter is full.
+    GenerationExhausted,
+    /// The armed fault fired at its exact physical-effect boundary inside
+    /// [`DurableTransactionRestartWalReclamationSource::reclaim_restart_wal_prefix`].
+    ///
+    /// [`FaultPoint::BeforeGenerationSwap`] means no mutation was applied.
+    /// [`FaultPoint::AfterGenerationSwap`] means the full prefix drain,
+    /// generation increment, and anchor installation are complete.
+    InjectedFault(FaultPoint),
+}
+
+impl fmt::Display for InMemoryWalReclamationSourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoAllocatedEpoch => {
+                formatter.write_str("no in-memory transaction epoch has been allocated")
+            }
+            Self::PermitMismatch => formatter
+                .write_str("WAL reclamation permit does not match the in-memory source state"),
+            Self::VolatileLogicalSuffix {
+                durable_record_count,
+                total_record_count,
+            } => write!(
+                formatter,
+                "in-memory WAL has {total_record_count} total records but only \
+                 {durable_record_count} are durable; volatile suffix must be resolved first"
+            ),
+            Self::RetainedBoundaryMissing { position } => write!(
+                formatter,
+                "retained floor position {position} is not an existing durable record"
+            ),
+            Self::GenerationExhausted => {
+                formatter.write_str("in-memory WAL generation counter is exhausted")
+            }
+            Self::InjectedFault(point) => {
+                write!(formatter, "injected WAL reclamation fault at: {point}")
+            }
+        }
+    }
+}
+
+impl Error for InMemoryWalReclamationSourceError {}
 
 /// Failure to observe in-memory physical restart-allocation metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2339,6 +2457,20 @@ pub struct InMemoryCommitLog<const N: usize = 1> {
     next_epoch: Option<NonZeroU64>,
     next_position: Option<u64>,
     armed_fault: Option<FaultPoint>,
+    /// Physical generation counter; increments by one on each successful
+    /// `reclaim_restart_wal_prefix` call.  Generation zero means no prefix
+    /// has ever been reclaimed.
+    generation: u64,
+    /// Opaque anchor associated with the completeness checkpoint that
+    /// authorized the last reclamation, or `None` for generation zero.
+    selected_checkpoint_anchor: Option<(u16, u128)>,
+    /// Frozen historical durable logical high-water.  Set whenever
+    /// `flush_through` advances durable state and preserved through
+    /// `restart`, `reopen`, and prefix reclamation.  This is the value
+    /// reported as `logical_position_high_water` in every source observation
+    /// and in the reclamation effect, even when the retained durable suffix
+    /// is empty.
+    durable_logical_high_water: Option<LogSequenceNumber>,
 }
 
 impl<const N: usize> InMemoryCommitLog<N> {
@@ -2362,6 +2494,9 @@ impl<const N: usize> InMemoryCommitLog<N> {
             next_epoch: Some(NonZeroU64::MIN),
             next_position: Some(1),
             armed_fault: None,
+            generation: 0,
+            selected_checkpoint_anchor: None,
+            durable_logical_high_water: None,
         }
     }
 
@@ -2381,6 +2516,23 @@ impl<const N: usize> InMemoryCommitLog<N> {
     #[must_use]
     pub const fn armed_fault(&self) -> Option<FaultPoint> {
         self.armed_fault
+    }
+
+    /// Returns the current physical generation counter.
+    ///
+    /// Generation zero means no prefix has been reclaimed yet. Each successful
+    /// [`DurableTransactionRestartWalReclamationSource::reclaim_restart_wal_prefix`]
+    /// increments this by one.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the raw selected-checkpoint anchor stored after the last
+    /// successful reclamation, or `None` when the generation is zero.
+    #[must_use]
+    pub const fn selected_checkpoint_anchor(&self) -> Option<(u16, u128)> {
+        self.selected_checkpoint_anchor
     }
 
     /// Returns every physically appended snapshot, including the volatile suffix.
@@ -2434,6 +2586,9 @@ impl<const N: usize> InMemoryCommitLog<N> {
         for record in &mut self.records {
             let value = record.position.get();
             record.position = lineage.position(value);
+        }
+        if let Some(high_water) = self.durable_logical_high_water.as_mut() {
+            *high_water = lineage.position(high_water.get());
         }
         self.lineage = lineage;
         self.armed_fault = None;
@@ -2697,6 +2852,13 @@ impl<const N: usize> DurableTransactionRestartAnalysisSource<N> for InMemoryComm
             &'evidence [DurableTransactionRestartObservation<N>],
         ) -> Output,
     {
+        if self.generation != 0 {
+            return Err(
+                InMemoryTransactionRestartAnalysisSourceError::PrunedGenerationRequiresCheckpoint {
+                    generation: self.generation,
+                },
+            );
+        }
         let durable_len = self.durable_len;
         let durable_frontier = self.durable_position();
         let mut observations = Vec::new();
@@ -2759,6 +2921,237 @@ impl<const N: usize> DurableTransactionRestartRetentionMetadataSource for InMemo
     }
 }
 
+impl<const N: usize> DurableTransactionRestartPrunedGenerationSource<N> for InMemoryCommitLog<N> {
+    fn observe_restart_source_generation(
+        &mut self,
+    ) -> Result<u64, <Self as DurableTransactionRestartAnalysisSource<N>>::Error> {
+        Ok(self.generation)
+    }
+
+    fn observe_restart_pruned_generation(
+        &mut self,
+    ) -> Result<
+        DurableTransactionRestartWalReclamationSourceObservation,
+        <Self as DurableTransactionRestartAnalysisSource<N>>::Error,
+    > {
+        let allocated_epoch_high_water = match self.next_epoch {
+            Some(next_epoch) => NonZeroU64::new(next_epoch.get().saturating_sub(1))
+                .ok_or(InMemoryTransactionRestartAnalysisSourceError::NoAllocatedEpoch)?,
+            None => NonZeroU64::MAX,
+        };
+        let retained_first = self.durable_records().next().map(|r| r.position().clone());
+        let logical_high_water = self.durable_logical_high_water.clone();
+        Ok(
+            DurableTransactionRestartWalReclamationSourceObservation::new(
+                self.lineage.clone(),
+                IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION,
+                self.generation,
+                retained_first,
+                logical_high_water,
+                allocated_epoch_high_water,
+                self.selected_checkpoint_anchor,
+            ),
+        )
+    }
+
+    fn with_durable_transaction_restart_retained_observations<Output, Operation>(
+        &mut self,
+        operation: Operation,
+    ) -> Result<Output, <Self as DurableTransactionRestartAnalysisSource<N>>::Error>
+    where
+        Operation:
+            for<'evidence> FnOnce(&'evidence [DurableTransactionRestartObservation<N>]) -> Output,
+    {
+        let durable_len = self.durable_len;
+
+        let mut observations = Vec::new();
+        observations.try_reserve(durable_len).map_err(|_| {
+            InMemoryTransactionRestartAnalysisSourceError::ObservationCapacityExhausted {
+                record_count: durable_len,
+            }
+        })?;
+
+        for record in self.durable_records() {
+            let observation = match record.kind() {
+                InMemoryLogRecordKind::TransactionCommit { transaction_id } => record
+                    .project_transaction_commit_recovery_observation(*transaction_id)
+                    .map(DurableTransactionRestartObservation::Commit)
+                    .map_err(|source| {
+                        InMemoryTransactionRestartAnalysisSourceError::CommitProjection(Box::new(
+                            source,
+                        ))
+                    })?,
+                InMemoryLogRecordKind::PageWrite(page) => record
+                    .project_page_recovery_observation(page)
+                    .map(DurableTransactionRestartObservation::Page)
+                    .map_err(|source| {
+                        InMemoryTransactionRestartAnalysisSourceError::PageProjection(Box::new(
+                            source,
+                        ))
+                    })?,
+                InMemoryLogRecordKind::TransactionPageWrite(transaction_page) => record
+                    .project_transaction_page_recovery_observation(transaction_page)
+                    .map(DurableTransactionRestartObservation::TransactionPage)
+                    .map_err(|source| {
+                        InMemoryTransactionRestartAnalysisSourceError::TransactionPageProjection(
+                            Box::new(source),
+                        )
+                    })?,
+            };
+            observations.push(observation);
+        }
+
+        Ok(operation(&observations))
+    }
+}
+
+impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for InMemoryCommitLog<N> {
+    type Error = InMemoryWalReclamationSourceError;
+
+    fn observe_restart_wal_reclamation_source(
+        &mut self,
+    ) -> Result<DurableTransactionRestartWalReclamationSourceObservation, Self::Error> {
+        let allocated_epoch_high_water = match self.next_epoch {
+            Some(next_epoch) => NonZeroU64::new(next_epoch.get().saturating_sub(1))
+                .ok_or(InMemoryWalReclamationSourceError::NoAllocatedEpoch)?,
+            None => NonZeroU64::MAX,
+        };
+        let retained_first = self.durable_records().next().map(|r| r.position().clone());
+        let logical_high_water = self.durable_logical_high_water.clone();
+        Ok(
+            DurableTransactionRestartWalReclamationSourceObservation::new(
+                self.lineage.clone(),
+                IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION,
+                self.generation,
+                retained_first,
+                logical_high_water,
+                allocated_epoch_high_water,
+                self.selected_checkpoint_anchor,
+            ),
+        )
+    }
+
+    fn reclaim_restart_wal_prefix(
+        &mut self,
+        permit: DurableTransactionRestartWalReclamationPermit<'_>,
+    ) -> Result<DurableTransactionRestartWalReclamationEffectObservation, Self::Error> {
+        // Require an allocated epoch before any structural mutation.
+        let allocated_epoch_high_water = match self.next_epoch {
+            Some(next_epoch) => NonZeroU64::new(next_epoch.get().saturating_sub(1))
+                .ok_or(InMemoryWalReclamationSourceError::NoAllocatedEpoch)?,
+            None => NonZeroU64::MAX,
+        };
+
+        // Snapshot the frozen durable high-water BEFORE any mutation.
+        let current_high_water = self.durable_logical_high_water.clone();
+
+        // Validate anchor: generation-0 source has no prior anchor, and the
+        // permit must reflect that.  Any other generation requires the stored
+        // anchor to match the permit exactly.
+        let current_anchor_matches = match self.selected_checkpoint_anchor {
+            Some((version, value)) => {
+                let permit_anchor = permit.selected_checkpoint_anchor();
+                version == permit_anchor.version() && value == permit_anchor.value()
+            }
+            None => self.generation == 0,
+        };
+
+        // Validate every permit field against the current adapter state,
+        // mirroring the file adapter's PermitMismatch contract exactly.
+        let self_persistent_id = self.lineage.persistent_id();
+        if self_persistent_id.is_none_or(|id| id != permit.persistent_log_id())
+            || !permit.lineage().same_lineage(&self.lineage)
+            || permit.physical_format_version().get() != IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION
+            || permit.source_generation() != self.generation
+            || permit.durable_frontier() != current_high_water.as_ref()
+            || permit.allocated_epoch_high_water() != allocated_epoch_high_water
+            || !current_anchor_matches
+        {
+            return Err(InMemoryWalReclamationSourceError::PermitMismatch);
+        }
+
+        // Reject if any complete logical records sit beyond the durable prefix.
+        if self.records.len() != self.durable_len {
+            return Err(InMemoryWalReclamationSourceError::VolatileLogicalSuffix {
+                durable_record_count: self.durable_len,
+                total_record_count: self.records.len(),
+            });
+        }
+
+        // Locate the exact durable record for the retained floor, or drain all
+        // durable records when the permit specifies an empty retained suffix.
+        let retained_start = match permit.retained_first_logical_record() {
+            Some(floor) => self.records[..self.durable_len]
+                .iter()
+                .position(|r| r.position() == floor)
+                .ok_or(InMemoryWalReclamationSourceError::RetainedBoundaryMissing {
+                    position: floor.get(),
+                })?,
+            None => self.durable_len,
+        };
+
+        // Advance the generation with overflow protection.
+        let old_generation = self.generation;
+        let new_generation = old_generation
+            .checked_add(1)
+            .ok_or(InMemoryWalReclamationSourceError::GenerationExhausted)?;
+
+        // One-shot fault point: fires before any in-memory mutation.
+        // Generation, records, and durable_len are unchanged when this fires.
+        if self.consume_fault(FaultPoint::BeforeGenerationSwap) {
+            return Err(InMemoryWalReclamationSourceError::InjectedFault(
+                FaultPoint::BeforeGenerationSwap,
+            ));
+        }
+
+        // Remove prefix records atomically in memory.  Since volatile suffix
+        // was rejected above, durable_len == records.len() and all removed
+        // records are durable.
+        let durable_drop = retained_start;
+        self.records.drain(0..durable_drop);
+        self.durable_len -= durable_drop;
+
+        // Install the new generation and anchor.
+        // `durable_logical_high_water` is intentionally NOT updated here; the
+        // frozen pre-reclamation frontier is the value required by the effect.
+        self.generation = new_generation;
+        let permit_anchor = permit.selected_checkpoint_anchor();
+        self.selected_checkpoint_anchor = Some((permit_anchor.version(), permit_anchor.value()));
+
+        // One-shot fault point: fires after the full mutation is installed.
+        // Prefix is drained, generation is incremented, anchor is stored.
+        // Callers must treat a reclamation that produced this error as
+        // indeterminate (the physical effect is in place).
+        if self.consume_fault(FaultPoint::AfterGenerationSwap) {
+            return Err(InMemoryWalReclamationSourceError::InjectedFault(
+                FaultPoint::AfterGenerationSwap,
+            ));
+        }
+
+        // Build the effect observation from the now-trimmed state.
+        let retained_first = self.durable_records().next().map(|r| r.position().clone());
+        let retained_logical_record_count = self.durable_len as u64;
+
+        Ok(
+            DurableTransactionRestartWalReclamationEffectObservation::new(
+                DurableTransactionRestartWalReclamationReplacementObservation::new(
+                    old_generation,
+                    new_generation,
+                    IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION,
+                ),
+                retained_first,
+                // Frozen pre-reclamation frontier, preserved even when the
+                // retained suffix is empty.
+                current_high_water,
+                retained_logical_record_count,
+                // 1:1 physical/logical mapping in memory.
+                retained_logical_record_count,
+                allocated_epoch_high_water,
+            ),
+        )
+    }
+}
+
 impl<const N: usize> LogDurability for InMemoryCommitLog<N> {
     type Error = InMemoryCommitLogError;
 
@@ -2788,6 +3181,7 @@ impl<const N: usize> LogDurability for InMemoryCommitLog<N> {
         }
 
         self.durable_len = requested_durable_len;
+        self.durable_logical_high_water = Some(self.records[record_index].position().clone());
 
         if self.consume_fault(FaultPoint::AfterFlush) {
             Err(InMemoryCommitLogError::InjectedFault(
@@ -3273,6 +3667,8 @@ mod tests {
         DurableTransactionRestartCompletenessEvidenceError, DurableTransactionRestartPageState,
         DurableTransactionRestartReplayStart, DurableTransactionRestartReplayStartCause,
         DurableTransactionRestartRequiredPageImage, DurableTransactionRestartState,
+        DurableTransactionRestartWalReclamationError,
+        DurableTransactionRestartWalReclamationOutcomeIndeterminateError,
         OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
         RestartAnalyzedTransactionPageStorage, TransactionCoordinator, TransactionLifecycleStatus,
         TransactionPageStorageRestartCheckpointCompletenessSelection,
@@ -5588,7 +5984,9 @@ mod tests {
                 )
             )
         ));
-        let (uncheckpointed, _) = rejected.continue_with_full_recovery();
+        let (uncheckpointed, _) = rejected
+            .continue_with_full_recovery()
+            .map_err(|_| io::Error::other("legacy source rejection denied fallback"))?;
         let recovered = uncheckpointed.recover()?.analyze_restart()?;
         assert!(
             recovered
@@ -5631,7 +6029,11 @@ mod tests {
         assert_eq!(selected.transaction_count(), baseline.transactions().len());
         assert_eq!(selected.page_count(), baseline.pages().len());
 
-        let mut recovered = selected.decline_checkpoint().recover()?.analyze_restart()?;
+        let mut recovered = selected
+            .decline_checkpoint()
+            .map_err(|_| io::Error::other("completeness source checkpoint decline was rejected"))?
+            .recover()?
+            .analyze_restart()?;
         assert!(recovered.recovery_report().pages().iter().all(|page| {
             matches!(
                 page,
@@ -6108,7 +6510,9 @@ mod tests {
                 )
             )
         ));
-        let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+        let (uncheckpointed, rejection) = rejected
+            .continue_with_full_recovery()
+            .map_err(|_| io::Error::other("legacy checkpoint rejection denied fallback"))?;
         assert!(matches!(
             rejection,
             DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
@@ -6124,6 +6528,849 @@ mod tests {
         let (_, _, _, _, checkpoint) = recovered.into_parts();
         assert!(checkpoint.slot().is_some());
         assert_eq!(checkpoint.armed_fault(), None);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Generation-aware WAL source and prefix reclamation tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generation_zero_source_observation_reports_expected_metadata() -> Result<(), Box<dyn Error>>
+    {
+        let id = PersistentLogId::new(0x4001).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(id);
+
+        // observe_restart_source_generation succeeds on empty startup with no
+        // epoch: it reads only the generation counter and requires neither an
+        // allocated epoch nor combined reclamation metadata.
+        assert_eq!(
+            DurableTransactionRestartPrunedGenerationSource::<1>::observe_restart_source_generation(
+                &mut log
+            ),
+            Ok(0),
+            "generation-zero empty startup must return Ok(0) without an epoch"
+        );
+
+        // Before any epoch is allocated, observe_restart_pruned_generation fails.
+        assert!(matches!(
+            DurableTransactionRestartPrunedGenerationSource::<1>::observe_restart_pruned_generation(
+                &mut log
+            ),
+            Err(InMemoryTransactionRestartAnalysisSourceError::NoAllocatedEpoch)
+        ));
+        assert!(matches!(
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log
+            ),
+            Err(InMemoryWalReclamationSourceError::NoAllocatedEpoch)
+        ));
+
+        // Allocate an epoch.
+        let (epoch, lineage) = log.allocate_transaction_epoch()?;
+        assert_eq!(epoch, NonZeroU64::MIN);
+
+        // observe_restart_source_generation still returns Ok(0) after epoch
+        // allocation, without consuming epoch or reclamation metadata.
+        assert_eq!(
+            DurableTransactionRestartPrunedGenerationSource::<1>::observe_restart_source_generation(
+                &mut log
+            ),
+            Ok(0),
+            "generation-zero with epoch must still return Ok(0)"
+        );
+
+        let obs = DurableTransactionRestartPrunedGenerationSource::<1>::observe_restart_pruned_generation(
+            &mut log,
+        )?;
+        assert!(obs.lineage().same_lineage(&lineage));
+        assert_eq!(
+            obs.physical_format_version(),
+            IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION
+        );
+        assert_eq!(obs.source_generation(), 0);
+        assert!(obs.retained_first_logical_record().is_none());
+        assert!(obs.logical_position_high_water().is_none());
+        assert_eq!(obs.allocated_epoch_high_water().get(), 1);
+        assert!(obs.selected_checkpoint_anchor_version().is_none());
+        assert!(obs.selected_checkpoint_anchor_value().is_none());
+
+        // Same values via the reclamation source.
+        let obs2 = DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+            &mut log,
+        )?;
+        assert_eq!(obs2.source_generation(), 0);
+        assert!(obs2.retained_first_logical_record().is_none());
+        assert!(obs2.logical_position_high_water().is_none());
+        Ok(())
+    }
+
+    /// `observe_restart_source_generation` is a pure read: it does not consume
+    /// an armed one-shot fault, does not require an allocated epoch, and
+    /// correctly reflects the generation after a domain reclamation cycle.
+    #[test]
+    fn observe_restart_source_generation_does_not_consume_fault_and_reflects_reclamation()
+    -> Result<(), Box<dyn Error>> {
+        // --- Part 1: no epoch, armed fault is preserved ---
+        let id = PersistentLogId::new(0x4001b).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(id);
+
+        // Arm a fault that targets an unrelated operation.
+        log.arm_fault(FaultPoint::BeforeFlush)?;
+        assert_eq!(log.armed_fault(), Some(FaultPoint::BeforeFlush));
+
+        // observe_restart_source_generation must succeed even with no epoch and
+        // must NOT consume the armed fault.
+        assert_eq!(
+            DurableTransactionRestartPrunedGenerationSource::<1>::observe_restart_source_generation(
+                &mut log
+            ),
+            Ok(0),
+            "must return Ok(0) regardless of armed fault or missing epoch"
+        );
+        assert_eq!(
+            log.armed_fault(),
+            Some(FaultPoint::BeforeFlush),
+            "armed fault must not be consumed by a read-only generation observation"
+        );
+
+        // --- Part 2: generation reflects reclamation (domain path) ---
+        let persistent_log_id =
+            PersistentLogId::new(0x4001c).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 451)?;
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log2, store, _, _) = owner.into_parts();
+        let selection = UnrecoveredTransactionPageStorage::new(log2, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("checkpoint not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("page repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("transaction restoration failed").into());
+        };
+        let completed = restored.complete_restart()?;
+        let analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let reclaimed = analyzed
+            .reclaim_wal_prefix()
+            .map_err(|_| io::Error::other("reclaim failed"))?;
+
+        // After reclamation the generation is 1; observe_restart_source_generation
+        // must return Ok(1) without requiring epoch or reclamation metadata.
+        let (_, mut log2, _, _) = reclaimed.into_parts();
+        assert_eq!(
+            DurableTransactionRestartPrunedGenerationSource::<1>::observe_restart_source_generation(
+                &mut log2
+            ),
+            Ok(1),
+            "generation after reclamation must be Ok(1)"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn retained_suffix_observation_visits_all_durable_records_once() -> Result<(), Box<dyn Error>> {
+        let id = PersistentLogId::new(0x4002).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(id);
+        let _epoch = log.allocate_transaction_epoch()?;
+
+        // Append two records and flush one.
+        let page_number =
+            PageNumber::new(7).ok_or_else(|| io::Error::other("page number is zero"))?;
+        let page_address = PageAddress::new(LogDurability::lineage(&log), page_number);
+        let image = PageImage::new([0x01])?;
+        let unlogged = UnloggedPage::new(page_address, PageVersion::new(1), image);
+        let pos1 = log.append_page(&unlogged)?;
+        log.flush_through(&pos1)?;
+        let pos2 = log.append_page(&unlogged)?;
+        // pos2 is volatile; do NOT flush it.
+
+        let mut callback_count = 0usize;
+        let observed_len =
+            DurableTransactionRestartPrunedGenerationSource::<1>::with_durable_transaction_restart_retained_observations(
+                &mut log,
+                |observations| {
+                    callback_count += 1;
+                    observations.len()
+                },
+            )?;
+        assert_eq!(callback_count, 1, "callback must be invoked exactly once");
+        assert_eq!(
+            observed_len, 1,
+            "only durable records appear in retained suffix"
+        );
+        let _ = pos2; // silence unused warning
+        Ok(())
+    }
+
+    /// Verify that `logical_position_high_water` is updated by each flush and
+    /// is NOT inferred from volatile-record positions or from `next_position`.
+    #[test]
+    fn high_water_preserved_after_flush_tracks_durable_frontier() -> Result<(), Box<dyn Error>> {
+        let id = PersistentLogId::new(0x4003).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(id);
+        let _epoch = log.allocate_transaction_epoch()?;
+
+        let page_number =
+            PageNumber::new(33).ok_or_else(|| io::Error::other("page number is zero"))?;
+        let page_address = PageAddress::new(LogDurability::lineage(&log), page_number);
+        let image = PageImage::new([0xAB])?;
+        let unlogged = UnloggedPage::new(page_address, PageVersion::new(1), image);
+
+        // Initially no high-water.
+        let obs =
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log,
+            )?;
+        assert!(obs.logical_position_high_water().is_none());
+
+        // Flush one record: high-water advances to pos1.
+        let pos1 = log.append_page(&unlogged)?;
+        log.flush_through(&pos1)?;
+        let obs1 =
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log,
+            )?;
+        assert_eq!(
+            obs1.logical_position_high_water().map(|p| p.get()),
+            Some(pos1.get())
+        );
+
+        // Append a volatile record; high-water must NOT advance (pos2 is not flushed).
+        let pos2 = log.append_page(&unlogged)?;
+        let obs2 =
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log,
+            )?;
+        assert_eq!(
+            obs2.logical_position_high_water().map(|p| p.get()),
+            Some(pos1.get()),
+            "volatile append must not advance high-water"
+        );
+
+        // Simulate a restart (truncates volatile records); high-water must be preserved.
+        let log = log.restart();
+        let mut log = log; // rebind as mutable
+        let obs3 =
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log,
+            )?;
+        assert_eq!(
+            obs3.logical_position_high_water().map(|p| p.get()),
+            Some(pos1.get()),
+            "high-water must survive restart"
+        );
+        drop(pos2);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_retained_suffix_reports_none_for_first_and_high_water() -> Result<(), Box<dyn Error>> {
+        let id = PersistentLogId::new(0x4004).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut log = InMemoryCommitLog::<1>::with_persistent_lineage_id(id);
+        let _epoch = log.allocate_transaction_epoch()?;
+
+        // No durable records – observe shows None for both boundaries.
+        let obs =
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log,
+            )?;
+        assert_eq!(obs.source_generation(), 0);
+        assert!(obs.retained_first_logical_record().is_none());
+        assert!(obs.logical_position_high_water().is_none());
+
+        // Retained observations callback receives an empty slice.
+        let len =
+            DurableTransactionRestartPrunedGenerationSource::<1>::with_durable_transaction_restart_retained_observations(
+                &mut log,
+                |observations| observations.len(),
+            )?;
+        assert_eq!(len, 0);
+        Ok(())
+    }
+
+    /// Runs the complete domain reclamation path and verifies the receipt,
+    /// in-memory generation state, and preserved logical high-water.
+    #[test]
+    fn end_to_end_reclamation_advances_generation_and_trims_prefix() -> Result<(), Box<dyn Error>> {
+        let persistent_log_id =
+            PersistentLogId::new(0x4005).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 301)?;
+
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let frontier_before = owner
+            .parts()
+            .0
+            .durable_logical_high_water
+            .as_ref()
+            .map(LogSequenceNumber::get);
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log, store, _, _) = owner.into_parts();
+
+        // Full recovery path.
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("memory checkpoint was not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("page repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("transaction restoration failed").into());
+        };
+        let completed = restored.complete_restart()?;
+
+        // Analyze WAL retention and reclaim through the domain.
+        let analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let reclaimed = analyzed
+            .reclaim_wal_prefix()
+            .map_err(|_| io::Error::other("reclaim failed"))?;
+
+        let receipt = reclaimed.reclamation_receipt();
+        assert_eq!(receipt.old_generation(), 0);
+        assert_eq!(receipt.new_generation(), 1);
+        assert_eq!(
+            receipt.source_physical_format_version(),
+            IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION
+        );
+        assert_eq!(
+            receipt.replacement_physical_format_version(),
+            IN_MEMORY_WAL_PHYSICAL_FORMAT_VERSION
+        );
+        // High-water in the receipt must equal the frozen pre-reclamation frontier.
+        assert_eq!(receipt.logical_position_high_water(), frontier_before);
+
+        // After reclamation, the source reports generation 1 and the same
+        // frozen high-water even when the retained suffix may be empty.
+        let (_, mut log, store, _) = reclaimed.into_parts();
+        let obs_after =
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log,
+            )?;
+        assert_eq!(obs_after.source_generation(), 1);
+        assert_eq!(
+            obs_after.logical_position_high_water().map(|p| p.get()),
+            frontier_before,
+            "high-water must be preserved after reclamation"
+        );
+        log.reopen()?;
+        let reopened_observation =
+            DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(
+                &mut log,
+            )?;
+        assert_eq!(reopened_observation.source_generation(), 1);
+        assert_eq!(
+            reopened_observation
+                .logical_position_high_water()
+                .map(LogSequenceNumber::get),
+            frontier_before
+        );
+        let reopened_checkpoint =
+            InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+                owned_completeness_checkpoint(&baseline),
+            );
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_generation_aware_restart_checkpoint_completeness(reopened_checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("reopened pruned generation was not selected").into());
+        };
+        let _planned = selected
+            .plan_replay_window()
+            .map_err(|source| io::Error::other(source.to_string()))?;
+        Ok(())
+    }
+
+    /// Verifies that appending new records after domain reclamation continues
+    /// the logical position sequence beyond the pre-reclamation high-water,
+    /// not from physical index 0.
+    #[test]
+    fn append_after_reclamation_continues_logical_sequence() -> Result<(), Box<dyn Error>> {
+        let persistent_log_id =
+            PersistentLogId::new(0x4006).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 401)?;
+
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let high_water_before = owner
+            .parts()
+            .0
+            .durable_logical_high_water
+            .as_ref()
+            .map(LogSequenceNumber::get)
+            .ok_or_else(|| io::Error::other("no durable high-water before reclamation"))?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log, store, _, _) = owner.into_parts();
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("page repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("restoration failed").into());
+        };
+        let completed = restored.complete_restart()?;
+        let analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let reclaimed = analyzed
+            .reclaim_wal_prefix()
+            .map_err(|_| io::Error::other("reclaim failed"))?;
+
+        // Get back the source and append a new record.
+        let (_, mut log, _, _) = reclaimed.into_parts();
+        let page_number =
+            PageNumber::new(499).ok_or_else(|| io::Error::other("page number is zero"))?;
+        let page_address = PageAddress::new(LogDurability::lineage(&log), page_number);
+        let image = PageImage::new([0xCE])?;
+        let unlogged = UnloggedPage::new(page_address, PageVersion::new(1), image);
+        let new_pos = log.append_page(&unlogged)?;
+
+        // The new position must be strictly greater than the pre-reclamation
+        // high-water (logical continuation, not physical index 0).
+        assert!(
+            new_pos.get() > high_water_before,
+            "new position {new_pos:?} must be > high-water {high_water_before}"
+        );
+        Ok(())
+    }
+
+    /// Inserting a volatile (unflushed) record after WAL retention analysis but
+    /// before reclamation must produce a typed VolatileLogicalSuffix error.
+    #[test]
+    fn volatile_suffix_rejects_reclamation_with_typed_error() -> Result<(), Box<dyn Error>> {
+        let persistent_log_id =
+            PersistentLogId::new(0x4007).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 501)?;
+
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log, store, _, _) = owner.into_parts();
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("page repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("restoration failed").into());
+        };
+        let completed = restored.complete_restart()?;
+        let mut analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Inject a volatile record AFTER the analysis is frozen but BEFORE
+        // reclamation.  This creates records.len() > durable_len.
+        {
+            let (_, log, _) = analyzed.parts_mut();
+            let page_number =
+                PageNumber::new(599).ok_or_else(|| io::Error::other("page number is zero"))?;
+            let page_address = PageAddress::new(LogDurability::lineage(log), page_number);
+            let image = PageImage::new([0xFF])?;
+            let unlogged = UnloggedPage::new(page_address, PageVersion::new(1), image);
+            let _ = log.append_page(&unlogged)?;
+        }
+
+        // Reclamation must be rejected with the typed VolatileLogicalSuffix error.
+        let Err(failed) = analyzed.reclaim_wal_prefix() else {
+            return Err(
+                io::Error::other("volatile suffix should have caused reclamation failure").into(),
+            );
+        };
+        assert!(
+            matches!(
+                failed.error(),
+                DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                    DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
+                        InMemoryWalReclamationSourceError::VolatileLogicalSuffix { .. }
+                    )
+                )
+            ),
+            "unexpected error: {:?}",
+            failed.error()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn new_error_variants_have_no_source_and_correct_messages() {
+        let err = InMemoryTransactionRestartAnalysisSourceError::<1>::NoAllocatedEpoch;
+        assert!(Error::source(&err).is_none());
+        assert!(err.to_string().contains("epoch"));
+
+        let err2 = InMemoryWalReclamationSourceError::NoAllocatedEpoch;
+        assert!(Error::source(&err2).is_none());
+        assert!(err2.to_string().contains("epoch"));
+
+        let err3 = InMemoryWalReclamationSourceError::PermitMismatch;
+        assert!(Error::source(&err3).is_none());
+        assert!(err3.to_string().contains("permit") || err3.to_string().contains("mismatch"));
+
+        let err4 = InMemoryWalReclamationSourceError::VolatileLogicalSuffix {
+            durable_record_count: 2,
+            total_record_count: 5,
+        };
+        assert!(Error::source(&err4).is_none());
+        let msg4 = err4.to_string();
+        assert!(msg4.contains('2') && msg4.contains('5'), "message: {msg4}");
+
+        let err5 = InMemoryWalReclamationSourceError::RetainedBoundaryMissing { position: 99 };
+        assert!(Error::source(&err5).is_none());
+        assert!(err5.to_string().contains("99"));
+
+        let err6 = InMemoryWalReclamationSourceError::GenerationExhausted;
+        assert!(Error::source(&err6).is_none());
+        assert!(err6.to_string().contains("exhaust") || err6.to_string().contains("generation"));
+
+        let err6b =
+            InMemoryWalReclamationSourceError::InjectedFault(FaultPoint::BeforeGenerationSwap);
+        assert!(Error::source(&err6b).is_none());
+        let msg6b = err6b.to_string();
+        assert!(
+            msg6b.contains("before") || msg6b.contains("generation") || msg6b.contains("fault"),
+            "message: {msg6b}"
+        );
+
+        let err6c =
+            InMemoryWalReclamationSourceError::InjectedFault(FaultPoint::AfterGenerationSwap);
+        assert!(Error::source(&err6c).is_none());
+        let msg6c = err6c.to_string();
+        assert!(
+            msg6c.contains("after") || msg6c.contains("generation") || msg6c.contains("fault"),
+            "message: {msg6c}"
+        );
+
+        let err7 =
+            InMemoryTransactionRestartAnalysisSourceError::<1>::PrunedGenerationRequiresCheckpoint {
+                generation: 3,
+            };
+        assert!(Error::source(&err7).is_none());
+        let msg7 = err7.to_string();
+        assert!(
+            msg7.contains('3') && (msg7.contains("pruned") || msg7.contains("generation")),
+            "message: {msg7}"
+        );
+    }
+
+    /// After one domain reclamation the source is at generation 1.
+    /// `with_durable_transaction_restart_observations` must refuse with
+    /// `PrunedGenerationRequiresCheckpoint` so the caller is forced to use the
+    /// generation-aware checkpoint restart path instead of a full-prefix replay.
+    #[test]
+    fn pruned_generation_rejects_complete_prefix_restart() -> Result<(), Box<dyn Error>> {
+        let persistent_log_id =
+            PersistentLogId::new(0x4009).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 501)?;
+
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log, store, _, _) = owner.into_parts();
+
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("checkpoint not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("page repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("transaction restoration failed").into());
+        };
+        let completed = restored.complete_restart()?;
+        let analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let reclaimed = analyzed
+            .reclaim_wal_prefix()
+            .map_err(|_| io::Error::other("reclaim failed"))?;
+
+        // Source is now at generation 1.
+        let (_, mut log, _, _) = reclaimed.into_parts();
+        assert_eq!(log.generation, 1, "generation must be 1 after reclamation");
+
+        // complete-prefix recovery path must be rejected.
+        let result =
+            DurableTransactionRestartAnalysisSource::<1>::with_durable_transaction_restart_observations(
+                &mut log,
+                |_frontier, _obs| (),
+            );
+        assert!(
+            matches!(
+                result,
+                Err(InMemoryTransactionRestartAnalysisSourceError::PrunedGenerationRequiresCheckpoint {
+                    generation: 1
+                })
+            ),
+            "expected PrunedGenerationRequiresCheckpoint(1), got: {result:?}"
+        );
+        Ok(())
+    }
+
+    /// Arms `BeforeGenerationSwap` and runs the full domain reclamation path.
+    ///
+    /// The fault fires before any in-memory mutation (drain, generation
+    /// increment, anchor install), so the source generation observed before the
+    /// call must still be the same value that was there when the fault was
+    /// armed.  The domain wraps the adapter error as
+    /// `OutcomeIndeterminate(Effect(InjectedFault(BeforeGenerationSwap)))`.
+    #[test]
+    fn before_generation_swap_fault_leaves_state_unchanged() -> Result<(), Box<dyn Error>> {
+        let persistent_log_id =
+            PersistentLogId::new(0x400A).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 601)?;
+
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log, store, _, _) = owner.into_parts();
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("checkpoint not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("page repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("transaction restoration failed").into());
+        };
+        let completed = restored.complete_restart()?;
+        let mut analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Observe generation before the fault and arm the before-swap fault.
+        {
+            let (_, source, _) = analyzed.parts_mut();
+            assert_eq!(source.generation(), 0, "generation must be 0 before fault");
+            source.arm_fault(FaultPoint::BeforeGenerationSwap)?;
+        }
+
+        // Reclamation must fail with the before-swap injected fault.
+        // No mutation is applied: generation, records, and durable_len are
+        // identical to their pre-reclamation values inside the failure wrapper.
+        let Err(failed) = analyzed.reclaim_wal_prefix() else {
+            return Err(io::Error::other("before-swap fault should have caused failure").into());
+        };
+        assert!(
+            matches!(
+                failed.error(),
+                DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                    DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
+                        InMemoryWalReclamationSourceError::InjectedFault(
+                            FaultPoint::BeforeGenerationSwap
+                        )
+                    )
+                )
+            ),
+            "unexpected error: {:?}",
+            failed.error()
+        );
+        Ok(())
+    }
+
+    /// Arms `AfterGenerationSwap` and runs the full domain reclamation path.
+    ///
+    /// The fault fires after the complete in-memory mutation: prefix drain,
+    /// generation increment, and anchor installation are all committed to the
+    /// source.  The domain wraps the error as
+    /// `OutcomeIndeterminate(Effect(InjectedFault(AfterGenerationSwap)))`.
+    ///
+    /// The `AfterGenerationSwap` error shape itself proves the generation swap
+    /// completed: had the fault fired before the mutation, the variant would be
+    /// `BeforeGenerationSwap`.  A fresh `observe_restart_wal_reclamation_source`
+    /// on the source (accessible through the failure wrapper's internal
+    /// `analyzed` field) would report generation=1 and the preserved high-water.
+    #[test]
+    fn after_generation_swap_fault_reports_indeterminate_with_installed_generation()
+    -> Result<(), Box<dyn Error>> {
+        let persistent_log_id =
+            PersistentLogId::new(0x400B).ok_or_else(|| io::Error::other("log id is zero"))?;
+        let mut owner = checkpoint_publication_owner(persistent_log_id, 701)?;
+
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        let checkpoint = InMemoryTransactionRestartCheckpointCompletenessBaselineSource::seeded(
+            owned_completeness_checkpoint(&baseline),
+        );
+        let (log, store, _, _) = owner.into_parts();
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("checkpoint not selected").into());
+        };
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair preparation failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("page repair execution failed").into());
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(io::Error::other("transaction restoration failed").into());
+        };
+        let completed = restored.complete_restart()?;
+        let mut analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // Confirm pre-reclamation state and arm the after-swap fault.
+        {
+            let (_, source, _) = analyzed.parts_mut();
+            assert_eq!(source.generation(), 0, "generation must be 0 before fault");
+            // Observe source before mutation to verify the before/after boundary.
+            let obs = DurableTransactionRestartWalReclamationSource::<1>::observe_restart_wal_reclamation_source(source)?;
+            assert_eq!(obs.source_generation(), 0);
+            source.arm_fault(FaultPoint::AfterGenerationSwap)?;
+        }
+
+        // Reclamation must fail with the after-swap injected fault.
+        // The `AfterGenerationSwap` variant proves the full mutation completed:
+        // drain, generation=1, and anchor are all installed in the source.
+        let Err(failed) = analyzed.reclaim_wal_prefix() else {
+            return Err(io::Error::other("after-swap fault should have caused failure").into());
+        };
+        assert!(
+            matches!(
+                failed.error(),
+                DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                    DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
+                        InMemoryWalReclamationSourceError::InjectedFault(
+                            FaultPoint::AfterGenerationSwap
+                        )
+                    )
+                )
+            ),
+            "unexpected error: {:?}",
+            failed.error()
+        );
         Ok(())
     }
 }

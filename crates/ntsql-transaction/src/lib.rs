@@ -5,7 +5,7 @@ use std::{
     error::Error,
     fmt,
     marker::PhantomData,
-    num::NonZeroU64,
+    num::{NonZeroU16, NonZeroU64},
     sync::Arc,
 };
 
@@ -3886,6 +3886,7 @@ where
                         RejectedTransactionPageStorageRestartCheckpointCompleteness {
                             storage: self,
                             checkpoint_source,
+                            fallback: RestartCheckpointCompleteRecoveryFallback::Allowed,
                             error:
                                 DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
                                     source,
@@ -3914,6 +3915,7 @@ where
                         storage: self,
                         checkpoint_source,
                         baseline: Box::new(baseline),
+                        validation: SelectedRestartCheckpointValidation::CompletePrefix,
                     },
                 )
             }
@@ -3922,6 +3924,7 @@ where
                     RejectedTransactionPageStorageRestartCheckpointCompleteness {
                         storage: self,
                         checkpoint_source,
+                        fallback: RestartCheckpointCompleteRecoveryFallback::Allowed,
                         error:
                             DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
                                 Box::new(source),
@@ -3929,6 +3932,216 @@ where
                     },
                 )
             }
+        }
+    }
+}
+
+impl<Source, Store, const N: usize> UnrecoveredTransactionPageStorage<Source, Store, N>
+where
+    Source: DurableTransactionPageRecoveryInventory<N>
+        + DurableTransactionPageRecoverySource<N>
+        + DurableTransactionRestartPrunedGenerationSource<N>,
+    Store: CommittedTransactionPageRecoveryStore<N>,
+{
+    /// Selects one checkpoint using current physical-generation metadata.
+    ///
+    /// Generation zero delegates to the unchanged complete-prefix validator.
+    /// A later generation instead materializes the untrusted checkpoint
+    /// structurally and requires its exact canonical anchor; it never treats a
+    /// retained suffix as a complete prefix.
+    pub fn select_generation_aware_restart_checkpoint_completeness<CheckpointSource>(
+        mut self,
+        mut checkpoint_source: CheckpointSource,
+    ) -> TransactionPageStorageRestartCheckpointCompletenessSelection<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+    where
+        CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+    {
+        let checkpoint = match checkpoint_source.load_restart_checkpoint_completeness_baseline() {
+            Ok(checkpoint) => checkpoint,
+            Err(source) => {
+                return TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                    RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                        storage: self,
+                        checkpoint_source,
+                        fallback: RestartCheckpointCompleteRecoveryFallback::Denied,
+                        error:
+                            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
+                                source,
+                            ),
+                    },
+                );
+            }
+        };
+        let source_generation = match self.source.observe_restart_source_generation() {
+            Ok(generation) => generation,
+            Err(source) => {
+                return TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                    RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                        storage: self,
+                        checkpoint_source,
+                        fallback: RestartCheckpointCompleteRecoveryFallback::Denied,
+                        error:
+                            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationSource(
+                                source,
+                            ),
+                    },
+                );
+            }
+        };
+        if source_generation == 0 {
+            let Some(checkpoint) = checkpoint else {
+                return TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(
+                    AbsentTransactionPageStorageRestartCheckpointCompleteness {
+                        storage: self,
+                        checkpoint_source,
+                    },
+                );
+            };
+            return match validate_restart_checkpoint_completeness_baseline_against_current_prefix(
+                &mut self.source,
+                &self.store,
+                &checkpoint.as_observation(),
+            ) {
+                Ok(baseline) => {
+                    TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(
+                        SelectedTransactionPageStorageRestartCheckpointCompleteness {
+                            storage: self,
+                            checkpoint_source,
+                            baseline: Box::new(baseline),
+                            validation: SelectedRestartCheckpointValidation::CompletePrefix,
+                        },
+                    )
+                }
+                Err(source) => {
+                    TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                        RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                            storage: self,
+                            checkpoint_source,
+                            fallback: RestartCheckpointCompleteRecoveryFallback::Allowed,
+                            error:
+                                DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(
+                                    Box::new(source),
+                                ),
+                        },
+                    )
+                }
+            };
+        }
+        let metadata = match self.source.observe_restart_pruned_generation() {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                return TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                    RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                        storage: self,
+                        checkpoint_source,
+                        fallback: RestartCheckpointCompleteRecoveryFallback::Denied,
+                        error:
+                            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationSource(
+                                source,
+                            ),
+                    },
+                );
+            }
+        };
+        if metadata.source_generation() != source_generation {
+            return TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                    storage: self,
+                    checkpoint_source,
+                    fallback: RestartCheckpointCompleteRecoveryFallback::Denied,
+                    error:
+                        DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(
+                            Box::new(
+                                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::SourceGenerationChanged {
+                                    expected: source_generation,
+                                    actual: metadata.source_generation(),
+                                },
+                            ),
+                        ),
+                },
+            );
+        }
+        let lineage = DurableTransactionRestartAnalysisSource::lineage(&self.source).clone();
+        if let Err(source) = validate_restart_pruned_generation_metadata(
+            &lineage,
+            self.store.lineage(),
+            &metadata,
+            checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.transactions().durable_frontier()),
+        ) {
+            return TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                    storage: self,
+                    checkpoint_source,
+                    fallback: RestartCheckpointCompleteRecoveryFallback::Denied,
+                    error:
+                        DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(
+                            Box::new(source),
+                        ),
+                },
+            );
+        }
+        let Some(checkpoint) = checkpoint else {
+            return TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                    storage: self,
+                    checkpoint_source,
+                    fallback: RestartCheckpointCompleteRecoveryFallback::Denied,
+                    error:
+                        DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(
+                            Box::new(
+                                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PrunedGenerationCheckpointMissing {
+                                    generation: metadata.source_generation(),
+                                },
+                            ),
+                        ),
+                },
+            );
+        };
+
+        let selected = materialize_anchored_restart_checkpoint(
+            &lineage,
+            &metadata,
+            &checkpoint.as_observation(),
+        )
+        .map(|baseline| {
+            (
+                baseline,
+                SelectedRestartCheckpointValidation::Anchored {
+                    planner: plan_anchored_restart_checkpoint_replay::<Source, Store, N>,
+                },
+            )
+        })
+        .map_err(|source| {
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(
+                Box::new(source),
+            )
+        });
+        match selected {
+            Ok((baseline, validation)) => {
+                TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(
+                    SelectedTransactionPageStorageRestartCheckpointCompleteness {
+                        storage: self,
+                        checkpoint_source,
+                        baseline: Box::new(baseline),
+                        validation,
+                    },
+                )
+            }
+            Err(error) => TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+                RejectedTransactionPageStorageRestartCheckpointCompleteness {
+                    storage: self,
+                    checkpoint_source,
+                    fallback: RestartCheckpointCompleteRecoveryFallback::Denied,
+                    error,
+                },
+            ),
         }
     }
 }
@@ -4194,20 +4407,56 @@ pub enum TransactionPageStorageRestartCheckpointCompletenessSelection<
 ///     let _ = log.flush_through(selected);
 /// }
 /// ```
+type SelectedRestartCheckpointReplayPlanner<Source, Store, const N: usize> = fn(
+    &mut Source,
+    &Store,
+    &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<
+    MaterializedTransactionRestartCheckpointReplay<N>,
+    DurableTransactionRestartCheckpointReplayPlanningError<
+        <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+        <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+    >,
+>;
+
+enum SelectedRestartCheckpointValidation<Source, Store, const N: usize>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    CompletePrefix,
+    Anchored {
+        planner: SelectedRestartCheckpointReplayPlanner<Source, Store, N>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartCheckpointCompleteRecoveryFallback {
+    Allowed,
+    Denied,
+}
+
 #[must_use = "selected checkpoint must be retained, explicitly declined, or dropped"]
 pub struct SelectedTransactionPageStorageRestartCheckpointCompleteness<
     Source,
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
     checkpoint_source: CheckpointSource,
     baseline: Box<DurableTransactionRestartCheckpointCompletenessBaseline>,
+    validation: SelectedRestartCheckpointValidation<Source, Store, N>,
 }
 
 impl<Source, Store, CheckpointSource, const N: usize>
     SelectedTransactionPageStorageRestartCheckpointCompleteness<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the persistent log identity of the exact selected baseline.
     #[must_use]
@@ -4233,19 +4482,30 @@ impl<Source, Store, CheckpointSource, const N: usize>
         self.baseline.pages().len()
     }
 
-    /// Explicitly discards selected evidence and permits only complete recovery.
+    /// Discards complete-prefix evidence before permitting complete recovery.
+    ///
+    /// An anchor-selected checkpoint is returned unchanged because its retained
+    /// suffix cannot authorize complete-prefix recovery.
     pub fn decline_checkpoint(
         self,
-    ) -> UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N> {
+    ) -> Result<UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>, Self>
+    {
+        if matches!(
+            self.validation,
+            SelectedRestartCheckpointValidation::Anchored { .. }
+        ) {
+            return Err(self);
+        }
         let Self {
             storage,
             checkpoint_source,
             baseline: _,
+            validation: _,
         } = self;
-        UncheckpointedTransactionPageStorage {
+        Ok(UncheckpointedTransactionPageStorage {
             storage,
             checkpoint_source,
-        }
+        })
     }
 }
 
@@ -4271,11 +4531,21 @@ where
             N,
         >,
     > {
-        match plan_selected_restart_checkpoint_replay(
-            &mut self.storage.source,
-            &self.storage.store,
-            &self.baseline,
-        ) {
+        let planned = match self.validation {
+            SelectedRestartCheckpointValidation::CompletePrefix => {
+                plan_selected_restart_checkpoint_replay(
+                    &mut self.storage.source,
+                    &self.storage.store,
+                    &self.baseline,
+                )
+            }
+            SelectedRestartCheckpointValidation::Anchored { planner } => planner(
+                &mut self.storage.source,
+                &self.storage.store,
+                &self.baseline,
+            ),
+        };
+        match planned {
             Ok(plan) => Ok(PlannedTransactionPageStorageRestartCheckpointReplay {
                 selected: self,
                 current_analysis: plan.current_analysis,
@@ -4298,6 +4568,9 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
         CheckpointSource,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -4307,6 +4580,653 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
             .field("transaction_count", &self.transaction_count())
             .field("page_count", &self.page_count())
             .finish_non_exhaustive()
+    }
+}
+
+/// Exact contradiction detected before or while validating a reclamation report.
+#[derive(Debug)]
+pub enum DurableTransactionRestartWalReclamationEvidenceError {
+    /// The loaded current checkpoint differs from the privately selected baseline.
+    CurrentCheckpointChanged,
+    /// Fresh retention derivation rejected current WAL/store evidence.
+    FreshRetention(Box<DurableTransactionRestartWalRetentionEvidenceError>),
+    /// Fresh valid retention evidence differs from the frozen analysis.
+    FrozenRetentionAnalysisChanged,
+    /// Reclamation metadata belongs to another WAL lineage.
+    SourceLineageMismatch {
+        /// Frozen analyzed lineage.
+        expected: LogLineage,
+        /// Reclamation-source lineage.
+        actual: LogLineage,
+    },
+    /// The adapter reported reserved physical format version zero.
+    ZeroPhysicalFormatVersion,
+    /// Reclamation source metadata changed after the stable WAL callback.
+    SourceObservationChanged {
+        /// Initially observed generation.
+        expected_generation: u64,
+        /// Reobserved generation.
+        actual_generation: u64,
+    },
+    /// A source position belongs to another lineage.
+    ForeignSourcePosition {
+        /// Foreign position.
+        position: LogSequenceNumber,
+    },
+    /// The source's logical high-water differs from the frozen frontier.
+    SourceLogicalHighWaterChanged {
+        /// Frozen analyzed frontier.
+        expected: Option<u64>,
+        /// Source-reported high-water.
+        actual: Option<u64>,
+    },
+    /// The source's first retained record differs from the complete callback.
+    SourceRetainedFirstRecordChanged {
+        /// First record in the complete logical callback.
+        expected: Option<u64>,
+        /// Source-reported first retained record.
+        actual: Option<u64>,
+    },
+    /// The source already starts after the authorized retention floor.
+    SourceAlreadyPrunedPastFloor {
+        /// First record currently retained.
+        retained_first: u64,
+        /// Frozen inclusive floor.
+        floor: u64,
+    },
+    /// The retained logical-record count cannot fit the portable receipt width.
+    RetainedLogicalRecordCountWidthExceeded {
+        /// Platform-width count that could not be represented.
+        record_count: usize,
+    },
+    /// Exact retained-record evidence could not reserve its required capacity.
+    RetainedObservationCapacityExhausted {
+        /// Number of records that must survive the replacement.
+        record_count: usize,
+    },
+    /// Reclamation metadata's allocator high-water is stale.
+    SourceAllocatedEpochHighWaterChanged {
+        /// Frozen allocator high-water.
+        expected: u64,
+        /// Source-reported allocator high-water.
+        actual: u64,
+    },
+    /// The source omitted or changed the exact selected-checkpoint anchor.
+    SelectedCheckpointAnchorChanged {
+        /// Frozen baseline anchor.
+        expected: DurableTransactionRestartSelectedCheckpointAnchor,
+        /// Source-reported anchor.
+        actual: Option<DurableTransactionRestartSelectedCheckpointAnchor>,
+    },
+    /// The selected source generation cannot advance without wrapping.
+    SourceGenerationExhausted {
+        /// Exhausted source generation.
+        generation: u64,
+    },
+    /// The effect did not advance exactly one generation.
+    EffectGenerationChanged {
+        /// Generation observed before the attempt.
+        expected_old: u64,
+        /// Effect-reported old generation.
+        actual_old: u64,
+        /// Effect-reported replacement generation.
+        actual_new: u64,
+    },
+    /// The effect reported reserved physical format version zero.
+    EffectPhysicalFormatVersionZero,
+    /// The effect report changed the authorized inclusive floor.
+    EffectRetainedFirstRecordChanged {
+        /// Authorized inclusive floor.
+        expected: Option<u64>,
+        /// Effect-reported retained first record.
+        actual: Option<u64>,
+    },
+    /// The effect report changed the frozen logical high-water.
+    EffectLogicalHighWaterChanged {
+        /// Frozen frontier.
+        expected: Option<u64>,
+        /// Effect-reported high-water.
+        actual: Option<u64>,
+    },
+    /// The effect report changed the allocator high-water.
+    EffectAllocatedEpochHighWaterChanged {
+        /// Frozen allocator high-water.
+        expected: u64,
+        /// Effect-reported allocator high-water.
+        actual: u64,
+    },
+    /// The effect report's logical retained-record count is not exact.
+    EffectLogicalRecordCountChanged {
+        /// Count derived before invoking the effect.
+        expected: u64,
+        /// Effect-reported count.
+        actual: u64,
+    },
+    /// A nonempty logical suffix was reported with no physical units.
+    EffectPhysicalUnitCountEmpty {
+        /// Exact nonzero retained logical-record count.
+        retained_logical_record_count: u64,
+    },
+    /// The installed replacement did not report the exact next generation.
+    InstalledGenerationChanged {
+        /// Exact replacement generation required by preflight.
+        expected: u64,
+        /// Installed generation reported after the effect.
+        actual: u64,
+    },
+    /// The installed replacement did not report the effect's physical format.
+    InstalledPhysicalFormatVersionChanged {
+        /// Validated effect-report format.
+        expected: u16,
+        /// Installed source format.
+        actual: u16,
+    },
+    /// The installed retained suffix has a different record count.
+    InstalledRetainedRecordCountChanged {
+        /// Exact count derived before the effect.
+        expected: usize,
+        /// Installed count observed after the effect.
+        actual: usize,
+    },
+    /// One installed retained record differs in kind, position, owner, or payload.
+    InstalledRetainedRecordChanged {
+        /// Zero-based retained-record index.
+        index: usize,
+        /// Expected logical position.
+        expected_position: u64,
+        /// Installed logical position.
+        actual_position: u64,
+    },
+}
+
+/// Definite failure before the reclamation effect was invoked.
+#[derive(Debug)]
+pub enum DurableTransactionRestartWalReclamationPreflightError<
+    WalSourceError,
+    StoreInventoryError,
+    MetadataSourceError,
+    ReclamationSourceError,
+    CheckpointSourceError,
+    StoreObservationError,
+> {
+    /// Current selected-checkpoint loading failed.
+    CheckpointSource(CheckpointSourceError),
+    /// The selected checkpoint disappeared.
+    CurrentCheckpointMissing,
+    /// Complete page-store inventory failed.
+    StoreInventory(StoreInventoryError),
+    /// Retention metadata observation failed.
+    RetentionMetadata(MetadataSourceError),
+    /// Physical reclamation-source observation failed.
+    ReclamationSource(ReclamationSourceError),
+    /// Stable logical-WAL observation failed.
+    WalSource(WalSourceError),
+    /// Anchored retained-suffix validation or store observation failed.
+    ReplayPlanning(
+        Box<
+            DurableTransactionRestartCheckpointReplayPlanningError<
+                WalSourceError,
+                StoreObservationError,
+            >,
+        >,
+    ),
+    /// Untrusted or freshly rederived evidence contradicted frozen authority.
+    Evidence(Box<DurableTransactionRestartWalReclamationEvidenceError>),
+}
+
+/// Terminal failure classification for one consuming reclamation attempt.
+#[derive(Debug)]
+pub enum DurableTransactionRestartWalReclamationError<PreflightError, EffectError, WalSourceError> {
+    /// No reclamation effect was invoked.
+    Preflight(PreflightError),
+    /// The effect was invoked, so its physical outcome cannot be retried safely.
+    OutcomeIndeterminate(
+        DurableTransactionRestartWalReclamationOutcomeIndeterminateError<
+            EffectError,
+            WalSourceError,
+        >,
+    ),
+}
+
+/// Exact terminal cause after the effect invocation boundary.
+#[derive(Debug)]
+pub enum DurableTransactionRestartWalReclamationOutcomeIndeterminateError<
+    EffectError,
+    WalSourceError,
+> {
+    /// The adapter returned an error after invocation.
+    Effect(EffectError),
+    /// The adapter returned a contradictory success report.
+    Receipt(DurableTransactionRestartWalReclamationEvidenceError),
+    /// Reobserving installed physical metadata failed after the effect.
+    InstalledSource(EffectError),
+    /// Reobserving the installed retained suffix failed after the effect.
+    InstalledWal(WalSourceError),
+    /// Installed metadata or retained records contradicted the validated effect.
+    InstalledEvidence(DurableTransactionRestartWalReclamationEvidenceError),
+}
+
+/// Specialized definite preflight failure.
+pub type TransactionPageStorageRestartCheckpointWalReclamationPreflightError<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = DurableTransactionRestartWalReclamationPreflightError<
+    <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+    <Store as DurablePageStoreInventorySource<N>>::InventoryError,
+    <Source as DurableTransactionRestartRetentionMetadataSource>::Error,
+    <Source as DurableTransactionRestartWalReclamationSource<N>>::Error,
+    <CheckpointSource as DurableTransactionRestartCheckpointCompletenessBaselineSource>::Error,
+    <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
+>;
+
+/// Specialized terminal reclamation failure.
+pub type TransactionPageStorageRestartCheckpointWalReclamationError<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = DurableTransactionRestartWalReclamationError<
+    TransactionPageStorageRestartCheckpointWalReclamationPreflightError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    <Source as DurableTransactionRestartWalReclamationSource<N>>::Error,
+    <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+>;
+
+/// Inert validated receipt for one successful atomic prefix reclamation.
+#[must_use]
+pub struct DurableTransactionRestartWalReclamationReceipt {
+    persistent_log_id: PersistentLogId,
+    source_physical_format_version: NonZeroU16,
+    replacement_physical_format_version: NonZeroU16,
+    selected_checkpoint_anchor: DurableTransactionRestartSelectedCheckpointAnchor,
+    effect: DurableTransactionRestartWalReclamationEffectObservation,
+}
+
+impl DurableTransactionRestartWalReclamationReceipt {
+    /// Returns the reclaimed persistent WAL identity.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the exact physical source format authorized for replacement.
+    #[must_use]
+    pub const fn source_physical_format_version(&self) -> u16 {
+        self.source_physical_format_version.get()
+    }
+
+    /// Returns the physical format installed by the successful replacement.
+    #[must_use]
+    pub const fn replacement_physical_format_version(&self) -> u16 {
+        self.replacement_physical_format_version.get()
+    }
+
+    /// Returns the selected-checkpoint anchor bound to the effect.
+    pub const fn selected_checkpoint_anchor(
+        &self,
+    ) -> DurableTransactionRestartSelectedCheckpointAnchor {
+        self.selected_checkpoint_anchor
+    }
+
+    /// Returns the exact replaced generation.
+    #[must_use]
+    pub const fn old_generation(&self) -> u64 {
+        self.effect.replacement.old_generation
+    }
+
+    /// Returns the exact replacement generation.
+    #[must_use]
+    pub const fn new_generation(&self) -> u64 {
+        self.effect.replacement.new_generation
+    }
+
+    /// Returns the inclusive first retained logical record.
+    #[must_use]
+    pub const fn retained_first_logical_record(&self) -> Option<u64> {
+        match &self.effect.retained_first_logical_record {
+            Some(position) => Some(position.get()),
+            None => None,
+        }
+    }
+
+    /// Returns the retained logical position high-water.
+    #[must_use]
+    pub const fn logical_position_high_water(&self) -> Option<u64> {
+        match &self.effect.logical_position_high_water {
+            Some(position) => Some(position.get()),
+            None => None,
+        }
+    }
+
+    /// Returns the exact retained logical-record count.
+    #[must_use]
+    pub const fn retained_logical_record_count(&self) -> u64 {
+        self.effect.retained_logical_record_count
+    }
+
+    /// Returns the adapter-reported retained physical-unit count.
+    #[must_use]
+    pub const fn retained_physical_unit_count(&self) -> u64 {
+        self.effect.retained_physical_unit_count
+    }
+
+    /// Returns the preserved durable allocator high-water.
+    #[must_use]
+    pub const fn allocated_epoch_high_water(&self) -> u64 {
+        self.effect.allocated_epoch_high_water.get()
+    }
+}
+
+impl fmt::Debug for DurableTransactionRestartWalReclamationReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableTransactionRestartWalReclamationReceipt")
+            .field("persistent_log_id", &self.persistent_log_id)
+            .field(
+                "source_physical_format_version",
+                &self.source_physical_format_version,
+            )
+            .field(
+                "replacement_physical_format_version",
+                &self.replacement_physical_format_version,
+            )
+            .field("old_generation", &self.old_generation())
+            .field("new_generation", &self.new_generation())
+            .field(
+                "retained_first_logical_record",
+                &self.retained_first_logical_record(),
+            )
+            .field(
+                "retained_logical_record_count",
+                &self.retained_logical_record_count(),
+            )
+            .field(
+                "retained_physical_unit_count",
+                &self.retained_physical_unit_count(),
+            )
+            .finish()
+    }
+}
+
+/// Inert successful evidence privately retaining the selected checkpoint source.
+///
+/// The checkpoint source has no accessor or extraction path, so this value
+/// cannot recover checkpoint publication or reclamation authority.
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalReclamationEvidence;
+///
+/// fn cannot_extract_checkpoint_source<CheckpointSource, const N: usize>(
+///     evidence: DurableTransactionRestartWalReclamationEvidence<CheckpointSource, N>,
+/// ) -> CheckpointSource {
+///     evidence.checkpoint_source
+/// }
+/// ```
+#[must_use]
+pub struct DurableTransactionRestartWalReclamationEvidence<CheckpointSource, const N: usize> {
+    checkpoint_source: CheckpointSource,
+    completion: TransactionPageStorageRestartCheckpointCompletionEvidence<N>,
+    retention: DurableTransactionRestartWalRetentionAnalysis,
+    receipt: DurableTransactionRestartWalReclamationReceipt,
+}
+
+impl<CheckpointSource, const N: usize>
+    DurableTransactionRestartWalReclamationEvidence<CheckpointSource, N>
+{
+    /// Returns immutable selected-restart completion evidence.
+    pub const fn completion(
+        &self,
+    ) -> &TransactionPageStorageRestartCheckpointCompletionEvidence<N> {
+        &self.completion
+    }
+
+    /// Returns the immutable frozen retention analysis.
+    pub const fn retention(&self) -> &DurableTransactionRestartWalRetentionAnalysis {
+        &self.retention
+    }
+
+    /// Returns the immutable validated reclamation receipt.
+    pub const fn receipt(&self) -> &DurableTransactionRestartWalReclamationReceipt {
+        &self.receipt
+    }
+}
+
+impl<CheckpointSource, const N: usize> fmt::Debug
+    for DurableTransactionRestartWalReclamationEvidence<CheckpointSource, N>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _retained_checkpoint_source = &self.checkpoint_source;
+        formatter
+            .debug_struct("DurableTransactionRestartWalReclamationEvidence")
+            .field("completion", &self.completion)
+            .field("retention", &self.retention)
+            .field("receipt", &self.receipt)
+            .field("checkpoint_source", &format_args!("<retained>"))
+            .finish()
+    }
+}
+
+/// Successful owner after one atomic WAL-prefix reclamation.
+///
+/// It retains all original live owners and immutable startup evidence but
+/// exposes no second reclamation transition.
+#[must_use = "reclaimed selected restart retains all live owners and evidence"]
+pub struct ReclaimedTransactionPageStorageRestartCheckpointReplay<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    analyzed: WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+    receipt: DurableTransactionRestartWalReclamationReceipt,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    ReclaimedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Returns the immutable validated reclamation receipt.
+    pub const fn reclamation_receipt(&self) -> &DurableTransactionRestartWalReclamationReceipt {
+        &self.receipt
+    }
+
+    /// Returns the frozen non-authorizing retention analysis.
+    pub const fn retention_analysis(&self) -> &DurableTransactionRestartWalRetentionAnalysis {
+        &self.analyzed.analysis
+    }
+
+    /// Borrows the coordinator, WAL source, and page store read-only.
+    #[must_use]
+    pub const fn parts(&self) -> (&TransactionCoordinator, &Source, &Store) {
+        self.analyzed.completed.parts()
+    }
+
+    /// Releases live owners and inert evidence without exposing the checkpoint
+    /// source as an independently usable publisher.
+    pub fn into_parts(
+        self,
+    ) -> (
+        TransactionCoordinator,
+        Source,
+        Store,
+        DurableTransactionRestartWalReclamationEvidence<CheckpointSource, N>,
+    ) {
+        let WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay {
+            completed,
+            analysis,
+        } = self.analyzed;
+        let CompletedTransactionPageStorageRestartCheckpointReplay {
+            coordinator,
+            source,
+            store,
+            checkpoint_source,
+            evidence,
+            validation: _,
+        } = completed;
+        (
+            coordinator,
+            source,
+            store,
+            DurableTransactionRestartWalReclamationEvidence {
+                checkpoint_source,
+                completion: evidence,
+                retention: analysis,
+                receipt: self.receipt,
+            },
+        )
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for ReclaimedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReclaimedTransactionPageStorageRestartCheckpointReplay")
+            .field("retention_analysis", &self.analyzed.analysis)
+            .field("receipt", &self.receipt)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Terminal owner retaining every original owner after reclamation failure.
+///
+/// It has no retry, extraction, mutable-parts, publication, or reclamation
+/// method. Dropping it is the only continuation.
+#[must_use = "failed WAL reclamation retains every owner until dropped"]
+pub struct FailedTransactionPageStorageRestartCheckpointWalReclamation<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartWalReclamationSource<N>,
+    Store: DurablePageStoreInventorySource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+{
+    analyzed: Box<
+        WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    >,
+    error: TransactionPageStorageRestartCheckpointWalReclamationError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    FailedTransactionPageStorageRestartCheckpointWalReclamation<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartWalReclamationSource<N>,
+    Store: DurablePageStoreInventorySource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+{
+    /// Returns the exact definite or outcome-indeterminate cause.
+    pub const fn error(
+        &self,
+    ) -> &TransactionPageStorageRestartCheckpointWalReclamationError<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    > {
+        &self.error
+    }
+
+    /// Returns the persistent identity without releasing any retained owner.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.analyzed.analysis.persistent_log_id()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedTransactionPageStorageRestartCheckpointWalReclamation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartWalReclamationSource<N>,
+    Store: DurablePageStoreInventorySource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource,
+    TransactionPageStorageRestartCheckpointWalReclamationError<Source, Store, CheckpointSource, N>:
+        fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedTransactionPageStorageRestartCheckpointWalReclamation")
+            .field("persistent_log_id", &self.persistent_log_id())
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<Source, Store, CheckpointSource, const N: usize>
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartWalReclamationSource<N>,
+    Store: DurablePageStoreInventorySource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource
+        + DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    /// Consumes this owner, revalidates every frozen input, and invokes one
+    /// permit-bound atomic reclamation effect.
+    pub fn reclaim_wal_prefix(
+        self,
+    ) -> Result<
+        ReclaimedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+        FailedTransactionPageStorageRestartCheckpointWalReclamation<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    > {
+        reclaim_analyzed_transaction_restart_wal_prefix(self)
     }
 }
 
@@ -4407,6 +5327,224 @@ impl fmt::Display for DurableTransactionRestartCheckpointReplayBaselineMismatch 
 
 impl Error for DurableTransactionRestartCheckpointReplayBaselineMismatch {}
 
+/// Exact contradiction in one stable retained logical WAL suffix.
+#[derive(Clone, Debug)]
+pub enum DurableTransactionRestartRetainedSuffixEvidenceError {
+    /// Metadata omitted a retained boundary for nonempty observations.
+    RetainedBoundaryMissing {
+        /// Number of retained observations.
+        record_count: usize,
+    },
+    /// Metadata supplied a retained boundary for an empty suffix.
+    RetainedBoundaryWithoutObservations {
+        /// Unexpected retained boundary.
+        retained_first: u64,
+    },
+    /// The first retained observation differs from metadata.
+    RetainedFirstMismatch {
+        /// Metadata boundary.
+        expected: u64,
+        /// First retained observation.
+        actual: u64,
+    },
+    /// A nonempty retained suffix has no logical high-water.
+    LogicalHighWaterMissing {
+        /// Number of retained observations.
+        record_count: usize,
+    },
+    /// The retained tail differs from independent logical high-water.
+    RetainedTailMismatch {
+        /// Independent logical high-water.
+        expected: u64,
+        /// Retained tail.
+        actual: u64,
+    },
+    /// One retained observation belongs to another lineage.
+    ForeignRecordLineage {
+        /// Retained observation index.
+        index: usize,
+        /// Observation kind.
+        kind: DurableTransactionRestartObservationKind,
+        /// Foreign position.
+        position: LogSequenceNumber,
+    },
+    /// One retained observation uses reserved position zero.
+    ZeroRecordPosition {
+        /// Retained observation index.
+        index: usize,
+        /// Observation kind.
+        kind: DurableTransactionRestartObservationKind,
+    },
+    /// Two retained observations claim one position.
+    DuplicateRecordPosition {
+        /// Earlier retained observation index.
+        previous_index: usize,
+        /// Later retained observation index.
+        actual_index: usize,
+        /// Duplicated position.
+        position: u64,
+    },
+    /// Retained positions are not strictly increasing.
+    NonAdvancingRecordPosition {
+        /// Earlier retained observation index.
+        previous_index: usize,
+        /// Earlier position.
+        previous: u64,
+        /// Later retained observation index.
+        actual_index: usize,
+        /// Rejected position.
+        actual: u64,
+    },
+    /// The selected nonempty checkpoint frontier is absent from retained evidence.
+    CheckpointFrontierNotRetained {
+        /// Selected checkpoint frontier.
+        checkpoint_frontier: u64,
+    },
+    /// Allocator metadata is below a retained transaction identity.
+    AllocatorHighWaterBelowTransaction {
+        /// Persisted transaction identity.
+        transaction: DurableTransactionIdentityObservation,
+        /// Durable allocator epoch high-water.
+        allocated_epoch_high_water: u64,
+    },
+    /// A pre-frontier transaction page is not summarized by the checkpoint.
+    CheckpointTransactionPageMismatch {
+        /// Persisted owner.
+        transaction: DurableTransactionIdentityObservation,
+        /// Retained page position.
+        page_position: u64,
+    },
+    /// A pre-frontier commit is not summarized exactly by the checkpoint.
+    CheckpointCommitMismatch {
+        /// Persisted transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Retained commit position.
+        commit_position: u64,
+    },
+    /// A checkpoint count cannot fit the in-memory analysis width.
+    OwnedPageCountWidthExceeded {
+        /// Persisted transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Portable checkpoint count.
+        record_count: u64,
+    },
+    /// The synthesized transaction table could not reserve exact capacity.
+    TransactionCapacityExhausted {
+        /// Checkpoint transaction count.
+        transaction_count: usize,
+    },
+    /// A post-frontier page occurs after its transaction commit.
+    PageAfterCommit {
+        /// Persisted owner.
+        transaction: DurableTransactionIdentityObservation,
+        /// Earlier commit position.
+        commit_position: u64,
+        /// Invalid later page position.
+        page_position: u64,
+    },
+    /// A post-frontier commit duplicates an existing commit.
+    DuplicateCommit {
+        /// Persisted transaction.
+        transaction: DurableTransactionIdentityObservation,
+        /// Earlier commit position.
+        first_commit_position: u64,
+        /// Duplicate commit position.
+        duplicate_commit_position: u64,
+    },
+    /// Counting a transaction-owned page exceeded `usize`.
+    OwnedPageCountExhausted {
+        /// Persisted transaction.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// Replay lower bound cannot be selected from retained observations.
+    ReplayWindow(DurableTransactionRestartCheckpointReplayWindowError),
+}
+
+impl fmt::Display for DurableTransactionRestartRetainedSuffixEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RetainedBoundaryMissing { .. } => {
+                formatter.write_str("nonempty retained WAL suffix has no retained boundary")
+            }
+            Self::RetainedBoundaryWithoutObservations { .. } => {
+                formatter.write_str("empty retained WAL suffix has a retained boundary")
+            }
+            Self::RetainedFirstMismatch { .. } => {
+                formatter.write_str("retained WAL suffix does not start at its metadata boundary")
+            }
+            Self::LogicalHighWaterMissing { .. } => {
+                formatter.write_str("nonempty retained WAL suffix has no logical high-water")
+            }
+            Self::RetainedTailMismatch { .. } => {
+                formatter.write_str("retained WAL suffix does not end at logical high-water")
+            }
+            Self::ForeignRecordLineage { .. } => {
+                formatter.write_str("retained WAL suffix contains a foreign record")
+            }
+            Self::ZeroRecordPosition { .. } => {
+                formatter.write_str("retained WAL suffix contains position zero")
+            }
+            Self::DuplicateRecordPosition { .. } => {
+                formatter.write_str("retained WAL suffix contains a duplicate position")
+            }
+            Self::NonAdvancingRecordPosition { .. } => {
+                formatter.write_str("retained WAL suffix positions are not strictly increasing")
+            }
+            Self::CheckpointFrontierNotRetained { .. } => formatter
+                .write_str("selected checkpoint frontier is not retained in the WAL suffix"),
+            Self::AllocatorHighWaterBelowTransaction { .. } => formatter
+                .write_str("WAL allocator high-water is below a retained transaction identity"),
+            Self::CheckpointTransactionPageMismatch { .. } => formatter
+                .write_str("retained pre-frontier transaction page contradicts the checkpoint"),
+            Self::CheckpointCommitMismatch { .. } => {
+                formatter.write_str("retained pre-frontier commit contradicts the checkpoint")
+            }
+            Self::OwnedPageCountWidthExceeded { .. } => {
+                formatter.write_str("checkpoint owned-page count exceeds the analysis width")
+            }
+            Self::TransactionCapacityExhausted { .. } => {
+                formatter.write_str("retained WAL transaction capacity is exhausted")
+            }
+            Self::PageAfterCommit { .. } => {
+                formatter.write_str("retained WAL transaction page occurs after commit")
+            }
+            Self::DuplicateCommit { .. } => {
+                formatter.write_str("retained WAL suffix contains a duplicate commit")
+            }
+            Self::OwnedPageCountExhausted { .. } => {
+                formatter.write_str("retained WAL transaction page count is exhausted")
+            }
+            Self::ReplayWindow(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartRetainedSuffixEvidenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ReplayWindow(source) => Some(source),
+            Self::RetainedBoundaryMissing { .. }
+            | Self::RetainedBoundaryWithoutObservations { .. }
+            | Self::RetainedFirstMismatch { .. }
+            | Self::LogicalHighWaterMissing { .. }
+            | Self::RetainedTailMismatch { .. }
+            | Self::ForeignRecordLineage { .. }
+            | Self::ZeroRecordPosition { .. }
+            | Self::DuplicateRecordPosition { .. }
+            | Self::NonAdvancingRecordPosition { .. }
+            | Self::CheckpointFrontierNotRetained { .. }
+            | Self::AllocatorHighWaterBelowTransaction { .. }
+            | Self::CheckpointTransactionPageMismatch { .. }
+            | Self::CheckpointCommitMismatch { .. }
+            | Self::OwnedPageCountWidthExceeded { .. }
+            | Self::TransactionCapacityExhausted { .. }
+            | Self::PageAfterCommit { .. }
+            | Self::DuplicateCommit { .. }
+            | Self::OwnedPageCountExhausted { .. } => None,
+        }
+    }
+}
+
 /// Evidence failure while planning one selected checkpoint replay window.
 #[derive(Debug)]
 pub enum DurableTransactionRestartCheckpointReplayPlanningEvidenceError<SourceError, StoreError> {
@@ -4425,6 +5563,17 @@ pub enum DurableTransactionRestartCheckpointReplayPlanningEvidenceError<SourceEr
     CurrentAnalysis(Box<DurableTransactionRestartAnalysisEvidenceError>),
     /// The validated current stream could not form the exact owned replay window.
     ReplayWindow(DurableTransactionRestartCheckpointReplayWindowError),
+    /// Current pruned-generation metadata or checkpoint anchoring was invalid.
+    PrunedGeneration(Box<DurableTransactionRestartPrunedGenerationSelectionEvidenceError>),
+    /// Retained-suffix ordering, transaction, or replay evidence was invalid.
+    RetainedSuffix(Box<DurableTransactionRestartRetainedSuffixEvidenceError>),
+    /// Generation metadata changed across the stable retained-suffix callback.
+    PrunedGenerationMetadataChanged {
+        /// Metadata observed before the callback.
+        expected: Box<DurableTransactionRestartWalReclamationSourceObservation>,
+        /// Metadata observed after the callback.
+        actual: Box<DurableTransactionRestartWalReclamationSourceObservation>,
+    },
 }
 
 impl<SourceError: fmt::Display, StoreError: fmt::Display> fmt::Display
@@ -4446,6 +5595,17 @@ impl<SourceError: fmt::Display, StoreError: fmt::Display> fmt::Display
                 )
             }
             Self::ReplayWindow(source) => source.fmt(formatter),
+            Self::PrunedGeneration(source) => {
+                write!(formatter, "pruned restart generation is invalid: {source}")
+            }
+            Self::RetainedSuffix(source) => {
+                write!(
+                    formatter,
+                    "retained restart WAL suffix is invalid: {source}"
+                )
+            }
+            Self::PrunedGenerationMetadataChanged { .. } => formatter
+                .write_str("pruned restart generation metadata changed during replay planning"),
         }
     }
 }
@@ -4462,6 +5622,9 @@ where
             Self::SelectedBaselineMismatch(source) => Some(source),
             Self::CurrentAnalysis(source) => Some(source.as_ref()),
             Self::ReplayWindow(source) => Some(source),
+            Self::PrunedGeneration(source) => Some(source.as_ref()),
+            Self::RetainedSuffix(source) => Some(source.as_ref()),
+            Self::PrunedGenerationMetadataChanged { .. } => None,
         }
     }
 }
@@ -4706,7 +5869,10 @@ pub struct PlannedTransactionPageStorageRestartCheckpointReplay<
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     selected: SelectedTransactionPageStorageRestartCheckpointCompleteness<
         Source,
         Store,
@@ -4717,8 +5883,22 @@ pub struct PlannedTransactionPageStorageRestartCheckpointReplay<
     replay_observations: Vec<OwnedDurableTransactionRestartReplayObservation<N>>,
 }
 
+/// Owning outcome of declining one selected-checkpoint replay plan.
+pub type TransactionPageStorageRestartCheckpointReplayPlanDecline<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = Result<
+    UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+    Box<PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>>,
+>;
+
 impl<Source, Store, CheckpointSource, const N: usize>
     PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the persistent lineage identity retained by the selected checkpoint.
     #[must_use]
@@ -4758,22 +5938,42 @@ impl<Source, Store, CheckpointSource, const N: usize>
         self.current_analysis.transactions().len()
     }
 
-    /// Discards the private plan and selected baseline before granting full recovery.
+    /// Discards a complete-prefix plan before granting full recovery.
+    ///
+    /// An anchored plan is returned unchanged and can only continue through its
+    /// selected-checkpoint path.
     pub fn decline_replay_plan(
         self,
-    ) -> UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N> {
+    ) -> TransactionPageStorageRestartCheckpointReplayPlanDecline<Source, Store, CheckpointSource, N>
+    {
+        if matches!(
+            self.selected.validation,
+            SelectedRestartCheckpointValidation::Anchored { .. }
+        ) {
+            return Err(Box::new(self));
+        }
         let Self {
             selected,
             current_analysis: _,
             replay_observations: _,
         } = self;
-        selected.decline_checkpoint()
+        let SelectedTransactionPageStorageRestartCheckpointCompleteness {
+            storage,
+            checkpoint_source,
+            baseline: _,
+            validation: _,
+        } = selected;
+        Ok(UncheckpointedTransactionPageStorage {
+            storage,
+            checkpoint_source,
+        })
     }
 }
 
 impl<Source, Store, CheckpointSource, const N: usize>
     PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Consumes the owned replay window into ordered read-only page-repair decisions.
@@ -4804,6 +6004,9 @@ where
 
 impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
     for PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -5135,6 +6338,7 @@ pub enum TransactionPageStorageRestartCheckpointRepairPreparation<
     CheckpointSource,
     const N: usize,
 > where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Every replay page has one privately retained read-only decision.
@@ -5372,14 +6576,31 @@ pub struct PreparedTransactionPageStorageRestartCheckpointRepairs<
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     planned:
         PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
     page_repairs: Vec<PreparedTransactionRestartCheckpointPageRepair<N>>,
 }
 
+/// Owning outcome of declining prepared selected-checkpoint page repairs.
+pub type TransactionPageStorageRestartCheckpointPageRepairsDecline<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = Result<
+    UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+    Box<PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>>,
+>;
+
 impl<Source, Store, CheckpointSource, const N: usize>
     PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the persistent lineage identity retained by the selected checkpoint.
     #[must_use]
@@ -5461,20 +6682,32 @@ impl<Source, Store, CheckpointSource, const N: usize>
             .count()
     }
 
-    /// Discards every private decision and replay record before granting full recovery.
+    /// Discards complete-prefix decisions before granting full recovery.
+    ///
+    /// Anchored decisions are returned unchanged.
     pub fn decline_page_repairs(
         self,
-    ) -> UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N> {
+    ) -> TransactionPageStorageRestartCheckpointPageRepairsDecline<Source, Store, CheckpointSource, N>
+    {
         let Self {
             planned,
-            page_repairs: _,
+            page_repairs,
         } = self;
-        planned.decline_replay_plan()
+        match planned.decline_replay_plan() {
+            Ok(storage) => Ok(storage),
+            Err(planned) => Err(Box::new(Self {
+                planned: *planned,
+                page_repairs,
+            })),
+        }
     }
 }
 
 impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
     for PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -5704,7 +6937,10 @@ pub struct RepairedTransactionPageStorageRestartCheckpointReplay<
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     prepared:
         PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>,
     page_outcomes: Vec<TransactionRestartCheckpointPageRepairOutcome>,
@@ -5712,6 +6948,9 @@ pub struct RepairedTransactionPageStorageRestartCheckpointReplay<
 
 impl<Source, Store, CheckpointSource, const N: usize>
     RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the persistent identity shared by the held recovery resources.
     #[must_use]
@@ -6205,7 +7444,10 @@ pub struct RestoredTransactionPageStorageRestartCheckpointReplay<
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     repaired:
         RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
     coordinator: TransactionCoordinator,
@@ -6214,6 +7456,9 @@ pub struct RestoredTransactionPageStorageRestartCheckpointReplay<
 
 impl<Source, Store, CheckpointSource, const N: usize>
     RestoredTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the persistent identity shared by all retained restart resources.
     #[must_use]
@@ -6250,6 +7495,9 @@ impl<Source, Store, CheckpointSource, const N: usize>
 
 impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
     for RestoredTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -6502,6 +7750,10 @@ impl Error for DurableTransactionRestartCheckpointCompletionEvidenceError {
 pub enum DurableTransactionRestartCheckpointCompletionError<SourceError, StoreError> {
     /// Fresh logical WAL analysis failed.
     RestartAnalysis(DurableTransactionRestartAnalysisError<SourceError>),
+    /// Fresh anchored retained-suffix replay planning failed.
+    ReplayPlanning(
+        Box<DurableTransactionRestartCheckpointReplayPlanningError<SourceError, StoreError>>,
+    ),
     /// Final observation of one prepared page failed.
     StoreObservation {
         /// Page whose exact terminal state could not be observed.
@@ -6520,6 +7772,12 @@ impl<SourceError: fmt::Display, StoreError: fmt::Display> fmt::Display
         match self {
             Self::RestartAnalysis(source) => {
                 write!(formatter, "final logical WAL validation failed: {source}")
+            }
+            Self::ReplayPlanning(source) => {
+                write!(
+                    formatter,
+                    "final anchored retained-suffix validation failed: {source}"
+                )
             }
             Self::StoreObservation {
                 page_number,
@@ -6546,6 +7804,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::RestartAnalysis(source) => Some(source),
+            Self::ReplayPlanning(source) => Some(source.as_ref()),
             Self::StoreObservation { source, .. } => Some(source),
             Self::Evidence(source) => Some(source.as_ref()),
         }
@@ -6720,16 +7979,23 @@ pub struct CompletedTransactionPageStorageRestartCheckpointReplay<
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     coordinator: TransactionCoordinator,
     source: Source,
     store: Store,
     checkpoint_source: CheckpointSource,
     evidence: TransactionPageStorageRestartCheckpointCompletionEvidence<N>,
+    validation: SelectedRestartCheckpointValidation<Source, Store, N>,
 }
 
 impl<Source, Store, CheckpointSource, const N: usize>
     CompletedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the immutable selected-restart completion evidence.
     pub const fn completion_evidence(
@@ -6797,6 +8063,9 @@ where
 
 impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
     for CompletedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -7170,6 +8439,406 @@ impl DurableTransactionRestartWalRetentionAnalysis {
     }
 }
 
+/// Versioned corruption-detection fingerprint of one exact selected checkpoint.
+///
+/// Values are created only from the private authoritative completeness
+/// baseline. They are not checkpoint, WAL, page, or reclamation authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub struct DurableTransactionRestartSelectedCheckpointAnchor {
+    version: u16,
+    value: u128,
+}
+
+impl DurableTransactionRestartSelectedCheckpointAnchor {
+    /// Returns the repository-authored fingerprint format version.
+    #[must_use]
+    pub const fn version(self) -> u16 {
+        self.version
+    }
+
+    /// Returns the inert fingerprint value.
+    #[must_use]
+    pub const fn value(self) -> u128 {
+        self.value
+    }
+}
+
+/// Untrusted adapter observation of the physical WAL reclamation source.
+///
+/// Construction deliberately accepts a zero format version and contradictory
+/// lineage-bound positions. The consuming domain transition validates every
+/// field before creating authority.
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct DurableTransactionRestartWalReclamationSourceObservation {
+    lineage: LogLineage,
+    physical_format_version: u16,
+    source_generation: u64,
+    retained_first_logical_record: Option<LogSequenceNumber>,
+    logical_position_high_water: Option<LogSequenceNumber>,
+    allocated_epoch_high_water: NonZeroU64,
+    selected_checkpoint_anchor: Option<DurableTransactionRestartSelectedCheckpointAnchor>,
+}
+
+impl DurableTransactionRestartWalReclamationSourceObservation {
+    /// Retains one complete untrusted source observation.
+    pub const fn new(
+        lineage: LogLineage,
+        physical_format_version: u16,
+        source_generation: u64,
+        retained_first_logical_record: Option<LogSequenceNumber>,
+        logical_position_high_water: Option<LogSequenceNumber>,
+        allocated_epoch_high_water: NonZeroU64,
+        selected_checkpoint_anchor: Option<(u16, u128)>,
+    ) -> Self {
+        Self {
+            lineage,
+            physical_format_version,
+            source_generation,
+            retained_first_logical_record,
+            logical_position_high_water,
+            allocated_epoch_high_water,
+            selected_checkpoint_anchor: match selected_checkpoint_anchor {
+                Some((version, value)) => {
+                    Some(DurableTransactionRestartSelectedCheckpointAnchor { version, value })
+                }
+                None => None,
+            },
+        }
+    }
+
+    /// Returns the source lineage.
+    pub const fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    /// Returns the raw physical format version.
+    #[must_use]
+    pub const fn physical_format_version(&self) -> u16 {
+        self.physical_format_version
+    }
+
+    /// Returns the source generation. Legacy generation zero is valid.
+    #[must_use]
+    pub const fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    /// Returns the first logical record currently retained by the source.
+    pub const fn retained_first_logical_record(&self) -> Option<&LogSequenceNumber> {
+        self.retained_first_logical_record.as_ref()
+    }
+
+    /// Returns the current logical position high-water mark.
+    pub const fn logical_position_high_water(&self) -> Option<&LogSequenceNumber> {
+        self.logical_position_high_water.as_ref()
+    }
+
+    /// Returns the greatest durably allocated coordinator epoch.
+    #[must_use]
+    pub const fn allocated_epoch_high_water(&self) -> NonZeroU64 {
+        self.allocated_epoch_high_water
+    }
+
+    /// Returns the optional raw selected-checkpoint anchor version.
+    #[must_use]
+    pub const fn selected_checkpoint_anchor_version(&self) -> Option<u16> {
+        match self.selected_checkpoint_anchor {
+            Some(anchor) => Some(anchor.version()),
+            None => None,
+        }
+    }
+
+    /// Returns the optional raw selected-checkpoint anchor value.
+    #[must_use]
+    pub const fn selected_checkpoint_anchor_value(&self) -> Option<u128> {
+        match self.selected_checkpoint_anchor {
+            Some(anchor) => Some(anchor.value()),
+            None => None,
+        }
+    }
+}
+
+/// Untrusted physical identity reported for one installed WAL replacement.
+#[derive(Clone, Copy, Debug)]
+#[must_use]
+pub struct DurableTransactionRestartWalReclamationReplacementObservation {
+    old_generation: u64,
+    new_generation: u64,
+    physical_format_version: u16,
+}
+
+impl DurableTransactionRestartWalReclamationReplacementObservation {
+    /// Retains one complete untrusted replacement identity.
+    pub const fn new(
+        old_generation: u64,
+        new_generation: u64,
+        physical_format_version: u16,
+    ) -> Self {
+        Self {
+            old_generation,
+            new_generation,
+            physical_format_version,
+        }
+    }
+}
+
+/// Untrusted adapter report returned by one reclamation effect invocation.
+///
+/// The domain validates this report before turning it into an inert receipt.
+#[derive(Clone, Debug)]
+#[must_use]
+pub struct DurableTransactionRestartWalReclamationEffectObservation {
+    replacement: DurableTransactionRestartWalReclamationReplacementObservation,
+    retained_first_logical_record: Option<LogSequenceNumber>,
+    logical_position_high_water: Option<LogSequenceNumber>,
+    retained_logical_record_count: u64,
+    retained_physical_unit_count: u64,
+    allocated_epoch_high_water: NonZeroU64,
+}
+
+impl DurableTransactionRestartWalReclamationEffectObservation {
+    /// Retains one complete untrusted effect report.
+    pub const fn new(
+        replacement: DurableTransactionRestartWalReclamationReplacementObservation,
+        retained_first_logical_record: Option<LogSequenceNumber>,
+        logical_position_high_water: Option<LogSequenceNumber>,
+        retained_logical_record_count: u64,
+        retained_physical_unit_count: u64,
+        allocated_epoch_high_water: NonZeroU64,
+    ) -> Self {
+        Self {
+            replacement,
+            retained_first_logical_record,
+            logical_position_high_water,
+            retained_logical_record_count,
+            retained_physical_unit_count,
+            allocated_epoch_high_water,
+        }
+    }
+}
+
+type RestartWalReclamationAttemptBrand<'attempt> = (&'attempt (), fn(&'attempt ()) -> &'attempt ());
+
+/// Single-use proof authorizing one exact atomic WAL-prefix reclamation.
+///
+/// Private fields and an invariant generative brand prevent construction,
+/// cloning, widening, or substitution with detached retention evidence:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalReclamationPermit;
+///
+/// fn cannot_construct<'attempt>() -> DurableTransactionRestartWalReclamationPermit<'attempt> {
+///     DurableTransactionRestartWalReclamationPermit { }
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalReclamationPermit;
+///
+/// fn cannot_clone(permit: DurableTransactionRestartWalReclamationPermit<'_>) {
+///     let _ = permit.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalReclamationPermit;
+///
+/// fn cannot_widen<'attempt>(
+///     permit: DurableTransactionRestartWalReclamationPermit<'attempt>,
+/// ) -> DurableTransactionRestartWalReclamationPermit<'static> {
+///     permit
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartWalReclamationPermit,
+///     DurableTransactionRestartWalRetentionAnalysis,
+/// };
+///
+/// fn analysis_is_not_permit(
+///     analysis: DurableTransactionRestartWalRetentionAnalysis,
+/// ) -> DurableTransactionRestartWalReclamationPermit<'static> {
+///     analysis.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartWalReclamationPermit,
+///     DurableTransactionRestartWalRetentionFloor,
+/// };
+///
+/// fn floor_is_not_permit(
+///     floor: DurableTransactionRestartWalRetentionFloor,
+/// ) -> DurableTransactionRestartWalReclamationPermit<'static> {
+///     floor.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartWalReclamationPermit,
+///     DurableTransactionRestartWalRetentionAnalysis,
+/// };
+///
+/// fn permit_is_not_analysis(
+///     permit: DurableTransactionRestartWalReclamationPermit<'_>,
+/// ) -> DurableTransactionRestartWalRetentionAnalysis {
+///     permit.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartWalReclamationPermit,
+///     DurableTransactionRestartWalRetentionFloor,
+/// };
+///
+/// fn permit_is_not_floor(
+///     permit: DurableTransactionRestartWalReclamationPermit<'_>,
+/// ) -> DurableTransactionRestartWalRetentionFloor {
+///     permit.into()
+/// }
+/// ```
+///
+/// The permit is not append, checkpoint-publication, or page-write authority:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalReclamationPermit;
+/// use ntsql_wal::{CommitLog, LogSequenceNumber};
+///
+/// fn cannot_append<Log, Record>(
+///     log: &mut Log,
+///     permit: &DurableTransactionRestartWalReclamationPermit<'_>,
+/// ) -> Result<LogSequenceNumber, Log::Error>
+/// where
+///     Log: CommitLog<Record>,
+/// {
+///     log.append_commit(permit)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+///     DurableTransactionRestartWalReclamationPermit,
+/// };
+///
+/// fn cannot_publish<Publisher>(
+///     publisher: &mut Publisher,
+///     permit: DurableTransactionRestartWalReclamationPermit<'_>,
+/// ) where
+///     Publisher: DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+/// {
+///     publisher.publish_restart_checkpoint_completeness_baseline(&permit, permit);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_page::{PageStore, PageWritePermit};
+/// use ntsql_transaction::DurableTransactionRestartWalReclamationPermit;
+///
+/// fn cannot_write_page<'attempt>(
+///     permit: DurableTransactionRestartWalReclamationPermit<'attempt>,
+/// ) -> PageWritePermit<'attempt> {
+///     permit.into()
+/// }
+/// ```
+#[derive(Debug)]
+#[must_use]
+pub struct DurableTransactionRestartWalReclamationPermit<'attempt> {
+    persistent_log_id: PersistentLogId,
+    lineage: LogLineage,
+    durable_frontier: Option<LogSequenceNumber>,
+    retained_first_logical_record: Option<LogSequenceNumber>,
+    allocated_epoch_high_water: NonZeroU64,
+    physical_format_version: NonZeroU16,
+    source_generation: u64,
+    selected_checkpoint_anchor: DurableTransactionRestartSelectedCheckpointAnchor,
+    attempt_brand: PhantomData<RestartWalReclamationAttemptBrand<'attempt>>,
+}
+
+impl DurableTransactionRestartWalReclamationPermit<'_> {
+    /// Returns the exact persistent log identity.
+    #[must_use]
+    pub const fn persistent_log_id(&self) -> PersistentLogId {
+        self.persistent_log_id
+    }
+
+    /// Returns the exact runtime lineage.
+    pub const fn lineage(&self) -> &LogLineage {
+        &self.lineage
+    }
+
+    /// Returns the analyzed durable logical frontier.
+    pub const fn durable_frontier(&self) -> Option<&LogSequenceNumber> {
+        self.durable_frontier.as_ref()
+    }
+
+    /// Returns the inclusive first logical record that must remain.
+    pub const fn retained_first_logical_record(&self) -> Option<&LogSequenceNumber> {
+        self.retained_first_logical_record.as_ref()
+    }
+
+    /// Returns the exact durable allocator high-water mark.
+    #[must_use]
+    pub const fn allocated_epoch_high_water(&self) -> NonZeroU64 {
+        self.allocated_epoch_high_water
+    }
+
+    /// Returns the validated nonzero physical source format.
+    #[must_use]
+    pub const fn physical_format_version(&self) -> NonZeroU16 {
+        self.physical_format_version
+    }
+
+    /// Returns the exact source generation authorized for replacement.
+    #[must_use]
+    pub const fn source_generation(&self) -> u64 {
+        self.source_generation
+    }
+
+    /// Returns the exact selected-checkpoint anchor.
+    pub const fn selected_checkpoint_anchor(
+        &self,
+    ) -> DurableTransactionRestartSelectedCheckpointAnchor {
+        self.selected_checkpoint_anchor
+    }
+}
+
+/// WAL port for one observed and permit-bound atomic prefix reclamation.
+///
+/// Safe callers cannot invoke the effect without the private owner permit:
+///
+/// ```compile_fail
+/// use ntsql_transaction::DurableTransactionRestartWalReclamationSource;
+///
+/// fn cannot_invoke_directly<Source: DurableTransactionRestartWalReclamationSource<1>>(
+///     source: &mut Source,
+/// ) {
+///     let _ = source.reclaim_restart_wal_prefix();
+/// }
+/// ```
+pub trait DurableTransactionRestartWalReclamationSource<const N: usize> {
+    /// Adapter-specific observation or outcome-indeterminate effect failure.
+    type Error;
+
+    /// Observes immutable physical-source metadata without reclaiming.
+    fn observe_restart_wal_reclamation_source(
+        &mut self,
+    ) -> Result<DurableTransactionRestartWalReclamationSourceObservation, Self::Error>;
+
+    /// Atomically replaces the exact observed generation while preserving the
+    /// permit-bound inclusive floor and all later logical records.
+    fn reclaim_restart_wal_prefix(
+        &mut self,
+        permit: DurableTransactionRestartWalReclamationPermit<'_>,
+    ) -> Result<DurableTransactionRestartWalReclamationEffectObservation, Self::Error>;
+}
+
 /// Contradiction that prevents a completed restart from yielding a retention floor.
 #[derive(Debug)]
 pub enum DurableTransactionRestartWalRetentionEvidenceError {
@@ -7444,6 +9113,7 @@ pub enum DurableTransactionRestartWalRetentionAnalysisError<
     WalSourceError,
     StoreInventoryError,
     MetadataSourceError,
+    StoreObservationError,
 > {
     /// The complete page-store inventory could not be established.
     StoreInventory(StoreInventoryError),
@@ -7451,20 +9121,31 @@ pub enum DurableTransactionRestartWalRetentionAnalysisError<
     MetadataSource(MetadataSourceError),
     /// The stable logical WAL callback failed.
     WalSource(WalSourceError),
+    /// Anchored retained-suffix validation or store observation failed.
+    ReplayPlanning(
+        Box<
+            DurableTransactionRestartCheckpointReplayPlanningError<
+                WalSourceError,
+                StoreObservationError,
+            >,
+        >,
+    ),
     /// Authoritative inputs contradicted the completed startup evidence.
     Evidence(Box<DurableTransactionRestartWalRetentionEvidenceError>),
 }
 
-impl<WalSourceError, StoreInventoryError, MetadataSourceError> fmt::Display
+impl<WalSourceError, StoreInventoryError, MetadataSourceError, StoreObservationError> fmt::Display
     for DurableTransactionRestartWalRetentionAnalysisError<
         WalSourceError,
         StoreInventoryError,
         MetadataSourceError,
+        StoreObservationError,
     >
 where
     WalSourceError: fmt::Display,
     StoreInventoryError: fmt::Display,
     MetadataSourceError: fmt::Display,
+    StoreObservationError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -7483,6 +9164,12 @@ where
                     "logical WAL retention observation failed: {source}"
                 )
             }
+            Self::ReplayPlanning(source) => {
+                write!(
+                    formatter,
+                    "anchored WAL retention replay validation failed: {source}"
+                )
+            }
             Self::Evidence(source) => {
                 write!(formatter, "WAL retention analysis was rejected: {source}")
             }
@@ -7490,22 +9177,25 @@ where
     }
 }
 
-impl<WalSourceError, StoreInventoryError, MetadataSourceError> Error
+impl<WalSourceError, StoreInventoryError, MetadataSourceError, StoreObservationError> Error
     for DurableTransactionRestartWalRetentionAnalysisError<
         WalSourceError,
         StoreInventoryError,
         MetadataSourceError,
+        StoreObservationError,
     >
 where
     WalSourceError: Error + 'static,
     StoreInventoryError: Error + 'static,
     MetadataSourceError: Error + 'static,
+    StoreObservationError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::StoreInventory(source) => Some(source),
             Self::MetadataSource(source) => Some(source),
             Self::WalSource(source) => Some(source),
+            Self::ReplayPlanning(source) => Some(source.as_ref()),
             Self::Evidence(source) => Some(source.as_ref()),
         }
     }
@@ -7520,6 +9210,7 @@ pub type TransactionPageStorageRestartCheckpointWalRetentionAnalysisError<
     <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
     <Store as DurablePageStoreInventorySource<N>>::InventoryError,
     <Source as DurableTransactionRestartRetentionMetadataSource>::Error,
+    <Store as DurablePageStoreSnapshotSource<N>>::ObservationError,
 >;
 
 /// Live completed-restart owner paired with exact non-authorizing retention evidence.
@@ -7557,7 +9248,10 @@ pub struct WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     completed:
         CompletedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
     analysis: DurableTransactionRestartWalRetentionAnalysis,
@@ -7570,6 +9264,9 @@ impl<Source, Store, CheckpointSource, const N: usize>
         CheckpointSource,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns immutable selected-restart completion evidence.
     pub const fn completion_evidence(
@@ -7655,6 +9352,9 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
         CheckpointSource,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -7888,7 +9588,10 @@ pub struct RejectedTransactionPageStorageRestartCheckpointRestoration<
     Store,
     CheckpointSource,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     repaired:
         RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
     cause: TransactionRestartRestorationRejection,
@@ -7897,6 +9600,9 @@ pub struct RejectedTransactionPageStorageRestartCheckpointRestoration<
 
 impl<Source, Store, CheckpointSource, const N: usize>
     RejectedTransactionPageStorageRestartCheckpointRestoration<Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the exact deterministic rejection.
     #[must_use]
@@ -7918,6 +9624,9 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
         CheckpointSource,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -7939,6 +9648,9 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
         CheckpointSource,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -7956,6 +9668,9 @@ impl<Source, Store, CheckpointSource, const N: usize> Error
         CheckpointSource,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.cause)
@@ -7975,7 +9690,10 @@ pub struct FailedTransactionPageStorageRestartCheckpointRestoration<
     CheckpointSource,
     EpochSourceError,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     repaired:
         RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
     cause: EpochSourceError,
@@ -7990,6 +9708,9 @@ impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize>
         EpochSourceError,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the exact source-specific allocation failure.
     #[must_use]
@@ -8013,7 +9734,9 @@ impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize>
         N,
     >
 where
-    Source: TransactionRestartCoordinatorEpochSource<Error = EpochSourceError>,
+    Source: TransactionRestartCoordinatorEpochSource<Error = EpochSourceError>
+        + DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Retries only the source-dependent epoch allocation boundary.
     pub fn retry(
@@ -8041,6 +9764,8 @@ impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize> fmt::Deb
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
     EpochSourceError: fmt::Debug,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -8065,6 +9790,8 @@ impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize> fmt::Dis
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
     EpochSourceError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -8085,6 +9812,8 @@ impl<Source, Store, CheckpointSource, EpochSourceError, const N: usize> Error
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
     EpochSourceError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -8100,7 +9829,10 @@ pub enum TransactionPageStorageRestartCheckpointRestoration<
     CheckpointSource,
     EpochSourceError,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     /// Transaction entries and one fresh private coordinator are retained.
     Restored(
         RestoredTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
@@ -8129,7 +9861,8 @@ pub enum TransactionPageStorageRestartCheckpointRestoration<
 impl<Source, Store, CheckpointSource, const N: usize>
     RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>
 where
-    Source: TransactionRestartCoordinatorEpochSource,
+    Source: TransactionRestartCoordinatorEpochSource + DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Consumes repaired storage into recovery-owned transaction state.
     ///
@@ -8142,7 +9875,7 @@ where
         Source,
         Store,
         CheckpointSource,
-        Source::Error,
+        <Source as TransactionRestartCoordinatorEpochSource>::Error,
         N,
     > {
         restore_transaction_restart_state(self, 0)
@@ -8177,7 +9910,10 @@ pub struct FailedTransactionPageStorageRestartCheckpointPageRepair<
     ObservationError,
     WriteError,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     prepared:
         PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>,
     completed_prefix: Vec<TransactionRestartCheckpointPageRepairOutcome>,
@@ -8194,6 +9930,9 @@ impl<Source, Store, CheckpointSource, ObservationError, WriteError, const N: usi
         WriteError,
         N,
     >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns outcomes for the strict page prefix completed by this attempt.
     #[must_use]
@@ -8226,6 +9965,7 @@ impl<Source, Store, CheckpointSource, ObservationError, WriteError, const N: usi
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N, ObservationError = ObservationError>
         + TransactionRestartCheckpointPageRepairStore<N, WriteError = WriteError>,
 {
@@ -8258,7 +9998,10 @@ pub enum TransactionPageStorageRestartCheckpointPageRepairExecution<
     ObservationError,
     WriteError,
     const N: usize,
-> {
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     /// Every prepared page was re-observed and resolved in strict order.
     Repaired(
         RepairedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
@@ -8279,6 +10022,7 @@ pub enum TransactionPageStorageRestartCheckpointPageRepairExecution<
 impl<Source, Store, CheckpointSource, const N: usize>
     PreparedTransactionPageStorageRestartCheckpointRepairs<Source, Store, CheckpointSource, N>
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: TransactionRestartCheckpointPageRepairStore<N>,
 {
     /// Consumes prepared evidence and executes its complete immutable page plan.
@@ -8485,12 +10229,34 @@ pub struct FailedTransactionPageStorageRestartCheckpointRepairPreparation<
     CheckpointSource,
     const N: usize,
 > where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
 {
     planned:
         PlannedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
     error: TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
 }
+
+/// Owning outcome of requesting complete recovery after repair preparation failed.
+pub type FailedTransactionPageStorageRestartCheckpointRepairPreparationContinuation<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = Result<
+    (
+        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+        TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
+    ),
+    Box<
+        FailedTransactionPageStorageRestartCheckpointRepairPreparation<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    >,
+>;
 
 impl<Source, Store, CheckpointSource, const N: usize>
     FailedTransactionPageStorageRestartCheckpointRepairPreparation<
@@ -8500,6 +10266,7 @@ impl<Source, Store, CheckpointSource, const N: usize>
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
 {
     /// Returns the exact preparation failure without releasing retained ownership.
@@ -8510,15 +10277,25 @@ where
         &self.error
     }
 
-    /// Destroys the failed plan before returning unchanged full-recovery authority.
+    /// Destroys a failed complete-prefix plan before returning full-recovery authority.
+    ///
+    /// An anchored failure is returned unchanged.
     pub fn continue_with_full_recovery(
         self,
-    ) -> (
-        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
-        TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
-    ) {
+    ) -> FailedTransactionPageStorageRestartCheckpointRepairPreparationContinuation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    > {
         let Self { planned, error } = self;
-        (planned.decline_replay_plan(), error)
+        match planned.decline_replay_plan() {
+            Ok(storage) => Ok((storage, error)),
+            Err(planned) => Err(Box::new(Self {
+                planned: *planned,
+                error,
+            })),
+        }
     }
 }
 
@@ -8530,6 +10307,7 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Debug
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
     Store::ObservationError: fmt::Debug,
 {
@@ -8549,6 +10327,7 @@ impl<Source, Store, CheckpointSource, const N: usize> fmt::Display
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
     Store::ObservationError: fmt::Display,
 {
@@ -8569,6 +10348,7 @@ impl<Source, Store, CheckpointSource, const N: usize> Error
         N,
     >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
     Store::ObservationError: Error + 'static,
 {
@@ -8671,6 +10451,27 @@ pub struct FailedTransactionPageStorageRestartCheckpointReplayPlanning<
     error: TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>,
 }
 
+/// Owning outcome of requesting complete recovery after replay planning failed.
+pub type FailedTransactionPageStorageRestartCheckpointReplayPlanningContinuation<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = Result<
+    (
+        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+        TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>,
+    ),
+    Box<
+        FailedTransactionPageStorageRestartCheckpointReplayPlanning<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    >,
+>;
+
 impl<Source, Store, CheckpointSource, const N: usize>
     FailedTransactionPageStorageRestartCheckpointReplayPlanning<Source, Store, CheckpointSource, N>
 where
@@ -8685,14 +10486,22 @@ where
         &self.error
     }
 
-    /// Explicitly bypasses the failed selected plan while returning its exact cause.
+    /// Bypasses a failed complete-prefix plan while returning its exact cause.
+    ///
+    /// An anchored failure is returned unchanged.
     pub fn continue_with_full_recovery(
         self,
-    ) -> (
-        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
-        TransactionPageStorageRestartCheckpointReplayPlanningError<Source, Store, N>,
-    ) {
-        (self.selected.decline_checkpoint(), self.error)
+    ) -> FailedTransactionPageStorageRestartCheckpointReplayPlanningContinuation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    > {
+        let Self { selected, error } = self;
+        match selected.decline_checkpoint() {
+            Ok(storage) => Ok((storage, error)),
+            Err(selected) => Err(Box::new(Self { selected, error })),
+        }
     }
 }
 
@@ -8859,6 +10668,7 @@ pub struct RejectedTransactionPageStorageRestartCheckpointCompleteness<
 {
     storage: UnrecoveredTransactionPageStorage<Source, Store, N>,
     checkpoint_source: CheckpointSource,
+    fallback: RestartCheckpointCompleteRecoveryFallback,
     error: TransactionPageStorageRestartCheckpointCompletenessSelectionError<
         Source,
         Store,
@@ -8866,6 +10676,32 @@ pub struct RejectedTransactionPageStorageRestartCheckpointCompleteness<
         N,
     >,
 }
+
+/// Owning outcome of requesting complete recovery after checkpoint rejection.
+pub type RejectedTransactionPageStorageRestartCheckpointCompletenessContinuation<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = Result<
+    (
+        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
+        TransactionPageStorageRestartCheckpointCompletenessSelectionError<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    ),
+    Box<
+        RejectedTransactionPageStorageRestartCheckpointCompleteness<
+            Source,
+            Store,
+            CheckpointSource,
+            N,
+        >,
+    >,
+>;
 
 impl<Source, Store, CheckpointSource, const N: usize>
     RejectedTransactionPageStorageRestartCheckpointCompleteness<Source, Store, CheckpointSource, N>
@@ -8887,25 +10723,28 @@ where
         &self.error
     }
 
-    /// Explicitly bypasses the rejected checkpoint while returning its cause.
+    /// Bypasses a rejected complete-prefix checkpoint while returning its cause.
+    ///
+    /// A generation-aware rejection is returned unchanged because its source may
+    /// already have pruned the prefix required by complete recovery.
     pub fn continue_with_full_recovery(
         self,
-    ) -> (
-        UncheckpointedTransactionPageStorage<Source, Store, CheckpointSource, N>,
-        TransactionPageStorageRestartCheckpointCompletenessSelectionError<
-            Source,
-            Store,
-            CheckpointSource,
-            N,
-        >,
-    ) {
-        (
+    ) -> RejectedTransactionPageStorageRestartCheckpointCompletenessContinuation<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    > {
+        if self.fallback == RestartCheckpointCompleteRecoveryFallback::Denied {
+            return Err(Box::new(self));
+        }
+        Ok((
             UncheckpointedTransactionPageStorage {
                 storage: self.storage,
                 checkpoint_source: self.checkpoint_source,
             },
             self.error,
-        )
+        ))
     }
 }
 
@@ -10438,6 +12277,148 @@ impl<const N: usize> From<&DurableTransactionRestartObservation<N>>
     }
 }
 
+enum DurableTransactionRestartObservationRef<'observation, const N: usize> {
+    Page {
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: &'observation [u8; N],
+        position: &'observation LogSequenceNumber,
+    },
+    TransactionPage {
+        transaction: DurableTransactionIdentityObservation,
+        page_number: PageNumber,
+        page_version: PageVersion,
+        bytes: &'observation [u8; N],
+        position: &'observation LogSequenceNumber,
+    },
+    Commit {
+        transaction: DurableTransactionIdentityObservation,
+        position: &'observation LogSequenceNumber,
+    },
+}
+
+trait DurableTransactionRestartObservationView<const N: usize> {
+    fn as_restart_observation_ref(&self) -> DurableTransactionRestartObservationRef<'_, N>;
+
+    fn restart_position(&self) -> &LogSequenceNumber {
+        match self.as_restart_observation_ref() {
+            DurableTransactionRestartObservationRef::Page { position, .. }
+            | DurableTransactionRestartObservationRef::TransactionPage { position, .. }
+            | DurableTransactionRestartObservationRef::Commit { position, .. } => position,
+        }
+    }
+}
+
+impl<const N: usize> DurableTransactionRestartObservationView<N>
+    for DurableTransactionRestartObservation<N>
+{
+    fn as_restart_observation_ref(&self) -> DurableTransactionRestartObservationRef<'_, N> {
+        match self {
+            Self::Page(observation) => DurableTransactionRestartObservationRef::Page {
+                page_number: observation.page_number(),
+                page_version: observation.page_version(),
+                bytes: observation.image().bytes(),
+                position: observation.position(),
+            },
+            Self::TransactionPage(observation) => {
+                let page = observation.page();
+                DurableTransactionRestartObservationRef::TransactionPage {
+                    transaction: observation.owner(),
+                    page_number: page.page_number(),
+                    page_version: page.page_version(),
+                    bytes: page.image().bytes(),
+                    position: observation.position(),
+                }
+            }
+            Self::Commit(observation) => DurableTransactionRestartObservationRef::Commit {
+                transaction: observation.transaction(),
+                position: observation.position(),
+            },
+        }
+    }
+}
+
+impl<const N: usize> DurableTransactionRestartObservationView<N>
+    for OwnedDurableTransactionRestartReplayObservation<N>
+{
+    fn as_restart_observation_ref(&self) -> DurableTransactionRestartObservationRef<'_, N> {
+        match self {
+            Self::Page {
+                page_number,
+                page_version,
+                bytes,
+                position,
+            } => DurableTransactionRestartObservationRef::Page {
+                page_number: *page_number,
+                page_version: *page_version,
+                bytes,
+                position,
+            },
+            Self::TransactionPage {
+                transaction,
+                page_number,
+                page_version,
+                bytes,
+                position,
+            } => DurableTransactionRestartObservationRef::TransactionPage {
+                transaction: *transaction,
+                page_number: *page_number,
+                page_version: *page_version,
+                bytes,
+                position,
+            },
+            Self::Commit {
+                transaction,
+                position,
+            } => DurableTransactionRestartObservationRef::Commit {
+                transaction: *transaction,
+                position,
+            },
+        }
+    }
+}
+
+impl<const N: usize> OwnedDurableTransactionRestartReplayObservation<N> {
+    fn from_restart_observation_view<Observation>(observation: &Observation) -> Self
+    where
+        Observation: DurableTransactionRestartObservationView<N>,
+    {
+        match observation.as_restart_observation_ref() {
+            DurableTransactionRestartObservationRef::Page {
+                page_number,
+                page_version,
+                bytes,
+                position,
+            } => Self::Page {
+                page_number,
+                page_version,
+                bytes: *bytes,
+                position: position.clone(),
+            },
+            DurableTransactionRestartObservationRef::TransactionPage {
+                transaction,
+                page_number,
+                page_version,
+                bytes,
+                position,
+            } => Self::TransactionPage {
+                transaction,
+                page_number,
+                page_version,
+                bytes: *bytes,
+                position: position.clone(),
+            },
+            DurableTransactionRestartObservationRef::Commit {
+                transaction,
+                position,
+            } => Self::Commit {
+                transaction,
+                position: position.clone(),
+            },
+        }
+    }
+}
+
 /// Inert provenance classification for one prepared replay page target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DurableTransactionRestartCheckpointPageRepairTargetKind {
@@ -10567,6 +12548,79 @@ pub trait DurableTransactionRestartAnalysisSource<const N: usize> {
             Option<&'evidence LogSequenceNumber>,
             &'evidence [DurableTransactionRestartObservation<N>],
         ) -> Output;
+}
+
+/// Read-only source for one physical WAL generation and its retained logical suffix.
+///
+/// This port is deliberately distinct from
+/// [`DurableTransactionRestartAnalysisSource`]'s complete-prefix projection.
+/// Generation metadata reports the logical high-water independently from the
+/// retained observations, so an empty retained suffix may coexist with a
+/// nonempty logical high-water. The higher-ranked callback prevents retained
+/// observations from escaping the stable source window.
+///
+/// A source error before or after the callback is authoritative. Implementing
+/// this port grants no checkpoint, replay, page-write, or WAL-reclamation
+/// authority.
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartObservation, DurableTransactionRestartPrunedGenerationSource,
+/// };
+///
+/// fn cannot_escape<'source, Source, const N: usize>(
+///     source: &'source mut Source,
+/// ) -> Result<&'source [DurableTransactionRestartObservation<N>], Source::Error>
+/// where
+///     Source: DurableTransactionRestartPrunedGenerationSource<N>,
+/// {
+///     source.with_durable_transaction_restart_retained_observations(|observations| observations)
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ntsql_transaction::{
+///     DurableTransactionRestartPrunedGenerationSource,
+///     DurableTransactionRestartWalReclamationPermit,
+/// };
+///
+/// fn cannot_reclaim<Source: DurableTransactionRestartPrunedGenerationSource<1>>(
+///     source: &mut Source,
+///     permit: DurableTransactionRestartWalReclamationPermit<'_>,
+/// ) {
+///     source.reclaim_restart_wal_prefix(permit);
+/// }
+/// ```
+pub trait DurableTransactionRestartPrunedGenerationSource<const N: usize>:
+    DurableTransactionRestartAnalysisSource<N>
+{
+    /// Observes only the current physical generation.
+    ///
+    /// Generation zero needs no allocated epoch or retained-suffix metadata and
+    /// can continue through complete-prefix validation. A nonzero result requires
+    /// the complete metadata observation below.
+    fn observe_restart_source_generation(
+        &mut self,
+    ) -> Result<u64, <Self as DurableTransactionRestartAnalysisSource<N>>::Error>;
+
+    /// Observes the current physical generation and independent logical metadata.
+    fn observe_restart_pruned_generation(
+        &mut self,
+    ) -> Result<
+        DurableTransactionRestartWalReclamationSourceObservation,
+        <Self as DurableTransactionRestartAnalysisSource<N>>::Error,
+    >;
+
+    /// Runs one operation while the retained logical suffix is stable.
+    ///
+    /// The slice is retained-suffix evidence, never a complete-prefix claim.
+    fn with_durable_transaction_restart_retained_observations<Output, Operation>(
+        &mut self,
+        operation: Operation,
+    ) -> Result<Output, <Self as DurableTransactionRestartAnalysisSource<N>>::Error>
+    where
+        Operation:
+            for<'evidence> FnOnce(&'evidence [DurableTransactionRestartObservation<N>]) -> Output;
 }
 
 /// Untrusted source projection needed by restart WAL retention analysis.
@@ -11852,6 +13906,169 @@ impl DurableTransactionRestartCheckpointCompletenessBaseline {
     /// Returns the inert replay lower bound from the same evidence window.
     pub const fn replay_start(&self) -> &DurableTransactionRestartReplayStart {
         &self.replay_start
+    }
+}
+
+const RESTART_SELECTED_CHECKPOINT_ANCHOR_VERSION: u16 = 1;
+const RESTART_SELECTED_CHECKPOINT_ANCHOR_DOMAIN: u128 = 0x6e747371_6c2d7273_742d6368_6b2d7631;
+const RESTART_SELECTED_CHECKPOINT_ANCHOR_MULTIPLIER: u128 =
+    0xd6e8_feb8_6659_fd93_a5a3_564e_27f8_8647;
+const RESTART_SELECTED_CHECKPOINT_ANCHOR_INCREMENT: u128 =
+    0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835;
+
+struct RestartSelectedCheckpointAnchorHasher {
+    state: u128,
+}
+
+impl RestartSelectedCheckpointAnchorHasher {
+    const fn new() -> Self {
+        Self {
+            state: RESTART_SELECTED_CHECKPOINT_ANCHOR_DOMAIN,
+        }
+    }
+
+    fn field(&mut self, tag: u128, value: u128) {
+        self.state ^= tag
+            .wrapping_mul(RESTART_SELECTED_CHECKPOINT_ANCHOR_INCREMENT)
+            .wrapping_add(value);
+        self.state = self
+            .state
+            .rotate_left(37)
+            .wrapping_mul(RESTART_SELECTED_CHECKPOINT_ANCHOR_MULTIPLIER)
+            .wrapping_add(RESTART_SELECTED_CHECKPOINT_ANCHOR_INCREMENT);
+        self.state ^= self.state.rotate_right(43);
+    }
+
+    fn optional_u64(&mut self, tag: u128, value: Option<u64>) {
+        match value {
+            None => self.field(tag, 0),
+            Some(value) => {
+                self.field(tag, 1);
+                self.field(tag.wrapping_add(1), u128::from(value));
+            }
+        }
+    }
+
+    const fn finish(self) -> DurableTransactionRestartSelectedCheckpointAnchor {
+        DurableTransactionRestartSelectedCheckpointAnchor {
+            version: RESTART_SELECTED_CHECKPOINT_ANCHOR_VERSION,
+            value: self.state,
+        }
+    }
+}
+
+fn selected_restart_checkpoint_anchor(
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> DurableTransactionRestartSelectedCheckpointAnchor {
+    let mut hasher = RestartSelectedCheckpointAnchorHasher::new();
+    hasher.field(1, baseline.persistent_log_id().get());
+    hasher.optional_u64(2, baseline.durable_frontier());
+    hasher.field(4, baseline.transactions().len() as u128);
+    for (index, entry) in baseline.transactions().iter().enumerate() {
+        hasher.field(5, index as u128);
+        hasher.field(6, u128::from(entry.transaction().epoch()));
+        hasher.field(7, u128::from(entry.transaction().sequence()));
+        hasher.optional_u64(8, entry.first_owned_page_position());
+        hasher.optional_u64(10, entry.last_owned_page_position());
+        hasher.field(12, u128::from(entry.owned_page_record_count()));
+        match entry.state() {
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted => {
+                hasher.field(13, 0);
+            }
+            DurableTransactionRestartCheckpointBaselineState::Committed { commit_position } => {
+                hasher.field(13, 1);
+                hasher.field(14, u128::from(commit_position));
+            }
+        }
+    }
+    hasher.field(15, baseline.pages().len() as u128);
+    for (index, entry) in baseline.pages().iter().enumerate() {
+        hasher.field(16, index as u128);
+        hasher.field(17, u128::from(entry.page_number().get()));
+        match entry.state() {
+            DurableTransactionRestartPageState::NoRequiredImage => {
+                hasher.field(18, 0);
+                hasher.field(19, 0);
+                hasher.field(20, 0);
+            }
+            DurableTransactionRestartPageState::StoreMissing { required } => {
+                hasher.field(18, 1);
+                hash_restart_checkpoint_required_image(&mut hasher, required);
+                hasher.field(20, 0);
+            }
+            DurableTransactionRestartPageState::StoreCurrent {
+                required,
+                stored_position,
+            } => {
+                hasher.field(18, 2);
+                hash_restart_checkpoint_required_image(&mut hasher, required);
+                hasher.field(20, 1);
+                hasher.field(21, u128::from(*stored_position));
+            }
+            DurableTransactionRestartPageState::StoreBehind {
+                stored_position,
+                required,
+            } => {
+                hasher.field(18, 3);
+                hash_restart_checkpoint_required_image(&mut hasher, required);
+                hasher.field(20, 1);
+                hasher.field(21, u128::from(*stored_position));
+            }
+        }
+    }
+    match baseline.replay_start() {
+        DurableTransactionRestartReplayStart::AfterFrontier { frontier } => {
+            hasher.field(26, 0);
+            hasher.optional_u64(27, *frontier);
+            hasher.field(29, 0);
+            hasher.field(30, 0);
+        }
+        DurableTransactionRestartReplayStart::AtPosition { position, cause } => {
+            hasher.field(26, 1);
+            hasher.field(27, 0);
+            hasher.field(29, u128::from(*position));
+            match cause {
+                DurableTransactionRestartReplayStartCause::StoreMissing { page_number } => {
+                    hasher.field(30, 1);
+                    hasher.field(31, u128::from(page_number.get()));
+                }
+                DurableTransactionRestartReplayStartCause::StoreBehind { page_number } => {
+                    hasher.field(30, 2);
+                    hasher.field(31, u128::from(page_number.get()));
+                }
+                DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                    transaction,
+                } => {
+                    hasher.field(30, 3);
+                    hasher.field(31, u128::from(transaction.epoch()));
+                    hasher.field(32, u128::from(transaction.sequence()));
+                }
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn hash_restart_checkpoint_required_image(
+    hasher: &mut RestartSelectedCheckpointAnchorHasher,
+    required: &DurableTransactionRestartRequiredPageImage,
+) {
+    match required {
+        DurableTransactionRestartRequiredPageImage::Raw { page_position } => {
+            hasher.field(19, 1);
+            hasher.field(22, u128::from(*page_position));
+        }
+        DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+            transaction,
+            page_position,
+            commit_position,
+        } => {
+            hasher.field(19, 2);
+            hasher.field(23, u128::from(transaction.epoch()));
+            hasher.field(24, u128::from(transaction.sequence()));
+            hasher.field(22, u128::from(*page_position));
+            hasher.field(25, u128::from(*commit_position));
+        }
     }
 }
 
@@ -14730,6 +16947,420 @@ where
     }
 }
 
+/// Transaction position field rejected while materializing an anchored checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartAnchoredCheckpointTransactionPositionField {
+    /// First transaction-owned page position.
+    FirstOwnedPage,
+    /// Last transaction-owned page position.
+    LastOwnedPage,
+    /// Durable transaction commit position.
+    Commit,
+}
+
+/// Page position field rejected while materializing an anchored checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableTransactionRestartAnchoredCheckpointPagePositionField {
+    /// Required full-image position.
+    RequiredImage,
+    /// Matching commit position for a committed image.
+    RequiredImageCommit,
+    /// Current stored-page backing position.
+    StoredImage,
+}
+
+/// Exact contradiction in generation metadata or an anchor-bound checkpoint.
+#[derive(Debug)]
+pub enum DurableTransactionRestartPrunedGenerationSelectionEvidenceError {
+    /// The WAL source and page store do not protect one lineage.
+    StoreLineageMismatch {
+        /// WAL source lineage.
+        source_lineage: LogLineage,
+        /// Page-store lineage.
+        store_lineage: LogLineage,
+    },
+    /// Generation metadata belongs to another WAL lineage.
+    MetadataLineageMismatch {
+        /// Current WAL source lineage.
+        expected: LogLineage,
+        /// Metadata lineage.
+        actual: LogLineage,
+    },
+    /// The minimal generation observation changed before full pruned metadata.
+    SourceGenerationChanged {
+        /// First observed generation.
+        expected: u64,
+        /// Generation reported by the full metadata observation.
+        actual: u64,
+    },
+    /// The current WAL lineage has no persistent identity.
+    PersistentLineageRequired,
+    /// Physical format version zero is reserved.
+    ZeroPhysicalFormatVersion,
+    /// One metadata position belongs to another lineage.
+    ForeignMetadataPosition {
+        /// Rejected position.
+        position: LogSequenceNumber,
+    },
+    /// One metadata position uses reserved logical position zero.
+    ZeroMetadataPosition {
+        /// Rejected position.
+        position: LogSequenceNumber,
+    },
+    /// A retained boundary was reported without a logical high-water.
+    RetainedBoundaryWithoutHighWater {
+        /// Retained boundary.
+        retained_first: u64,
+    },
+    /// The retained boundary is later than the logical high-water.
+    RetainedBoundaryBeyondHighWater {
+        /// Retained boundary.
+        retained_first: u64,
+        /// Logical high-water.
+        logical_high_water: u64,
+    },
+    /// Legacy generation zero unexpectedly carries a checkpoint anchor.
+    LegacyGenerationHasAnchor {
+        /// Unexpected anchor.
+        actual: DurableTransactionRestartSelectedCheckpointAnchor,
+    },
+    /// A pruned generation omitted its required checkpoint anchor.
+    PrunedGenerationMissingAnchor {
+        /// Physical source generation.
+        generation: u64,
+    },
+    /// A pruned generation has no checkpoint to authenticate its retained suffix.
+    PrunedGenerationCheckpointMissing {
+        /// Physical source generation.
+        generation: u64,
+    },
+    /// The checkpoint supplied the reserved zero persistent identity.
+    ZeroPersistentLogId {
+        /// Rejected identity.
+        persistent_log_id: u128,
+    },
+    /// The checkpoint belongs to another persistent WAL.
+    ForeignPersistentLogId {
+        /// Current persistent WAL identity.
+        expected: PersistentLogId,
+        /// Checkpoint persistent WAL identity.
+        actual: PersistentLogId,
+    },
+    /// A nonempty checkpoint used reserved logical position zero.
+    ZeroCheckpointFrontier,
+    /// The checkpoint frontier is later than generation high-water.
+    CheckpointBeyondLogicalHighWater {
+        /// Checkpoint frontier.
+        checkpoint_frontier: u64,
+        /// Generation logical high-water, or `None`.
+        logical_high_water: Option<u64>,
+    },
+    /// Reclamation has pruned beyond the selected checkpoint frontier.
+    RetainedBoundaryAfterCheckpointFrontier {
+        /// First retained logical record.
+        retained_first: u64,
+        /// Selected checkpoint frontier.
+        checkpoint_frontier: u64,
+    },
+    /// The checkpoint transaction table could not reserve exact capacity.
+    TransactionCapacityExhausted {
+        /// Number of decoded transaction entries.
+        transaction_count: usize,
+    },
+    /// A decoded transaction identity contains a zero component.
+    InvalidTransactionIdentity {
+        /// Decoded entry index.
+        index: usize,
+        /// Exact identity validation cause.
+        source: DurableTransactionIdentityObservationError,
+    },
+    /// Transaction identities are not strictly increasing.
+    TransactionIdentityNotIncreasing {
+        /// Decoded entry index.
+        index: usize,
+        /// Previous identity.
+        previous: DurableTransactionIdentityObservation,
+        /// Rejected identity.
+        actual: DurableTransactionIdentityObservation,
+    },
+    /// Transaction-owned page range and count fields are inconsistent.
+    TransactionOwnedPageShape {
+        /// Decoded entry index.
+        index: usize,
+        /// First owned-page position.
+        first: Option<u64>,
+        /// Last owned-page position.
+        last: Option<u64>,
+        /// Exact persisted count.
+        count: u64,
+    },
+    /// A transaction position is zero or beyond the checkpoint frontier.
+    TransactionPositionOutOfBounds {
+        /// Decoded entry index.
+        index: usize,
+        /// Rejected field.
+        field: DurableTransactionRestartAnchoredCheckpointTransactionPositionField,
+        /// Rejected numeric position.
+        position: u64,
+        /// Checkpoint frontier, or `None`.
+        checkpoint_frontier: Option<u64>,
+    },
+    /// A committed transaction does not commit strictly after all owned pages.
+    TransactionCommitNotAfterOwnedPages {
+        /// Decoded entry index.
+        index: usize,
+        /// Last owned-page position.
+        last_owned_page_position: u64,
+        /// Rejected commit position.
+        commit_position: u64,
+    },
+    /// An unresolved transaction has no owned-page footprint.
+    UncommittedTransactionWithoutOwnedPage {
+        /// Decoded entry index.
+        index: usize,
+        /// Persisted transaction identity.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// Allocator metadata is below a checkpoint transaction epoch.
+    AllocatorHighWaterBelowTransaction {
+        /// Persisted transaction identity.
+        transaction: DurableTransactionIdentityObservation,
+        /// Durable allocator epoch high-water.
+        allocated_epoch_high_water: u64,
+    },
+    /// The checkpoint page table could not reserve exact capacity.
+    PageCapacityExhausted {
+        /// Number of decoded page entries.
+        page_count: usize,
+    },
+    /// A decoded page number is zero.
+    ZeroPageNumber {
+        /// Decoded page-entry index.
+        index: usize,
+    },
+    /// Page numbers are not strictly increasing.
+    PageNumberNotIncreasing {
+        /// Decoded page-entry index.
+        index: usize,
+        /// Previous page number.
+        previous: PageNumber,
+        /// Rejected page number.
+        actual: PageNumber,
+    },
+    /// Page-state discriminant and optional fields have an invalid shape.
+    PageStateShape {
+        /// Decoded page-entry index.
+        index: usize,
+        /// Exact untrusted page entry.
+        actual: DurableTransactionRestartCheckpointCompletenessBaselinePageObservation,
+    },
+    /// A required or stored page position is zero or beyond the checkpoint frontier.
+    PagePositionOutOfBounds {
+        /// Decoded page-entry index.
+        index: usize,
+        /// Rejected field.
+        field: DurableTransactionRestartAnchoredCheckpointPagePositionField,
+        /// Rejected numeric position.
+        position: u64,
+        /// Checkpoint frontier, or `None`.
+        checkpoint_frontier: Option<u64>,
+    },
+    /// A committed required image names no checkpoint transaction.
+    CommittedImageTransactionMissing {
+        /// Decoded page-entry index.
+        index: usize,
+        /// Claimed owner.
+        transaction: DurableTransactionIdentityObservation,
+    },
+    /// A committed required image contradicts the checkpoint transaction entry.
+    CommittedImageTransactionMismatch {
+        /// Decoded page-entry index.
+        index: usize,
+        /// Claimed owner.
+        transaction: DurableTransactionIdentityObservation,
+        /// Required image position.
+        page_position: u64,
+        /// Claimed commit position.
+        commit_position: u64,
+    },
+    /// A stored-behind position is not strictly before its required image.
+    StoreBehindNotBeforeRequiredImage {
+        /// Decoded page-entry index.
+        index: usize,
+        /// Stored backing position.
+        stored_position: u64,
+        /// Required image position.
+        required_position: u64,
+    },
+    /// Decoded replay fields differ from the deterministically rederived lower bound.
+    ReplayShapeMismatch {
+        /// Privately rederived replay lower bound.
+        expected: Box<DurableTransactionRestartReplayStart>,
+        /// Exact untrusted replay fields.
+        actual: DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation,
+    },
+    /// The metadata anchor does not bind the privately materialized checkpoint.
+    SelectedCheckpointAnchorMismatch {
+        /// Canonical anchor of the materialized checkpoint.
+        expected: DurableTransactionRestartSelectedCheckpointAnchor,
+        /// Untrusted metadata anchor.
+        actual: Option<DurableTransactionRestartSelectedCheckpointAnchor>,
+    },
+}
+
+impl fmt::Display for DurableTransactionRestartPrunedGenerationSelectionEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StoreLineageMismatch { .. } => formatter
+                .write_str("restart WAL source and page store belong to different lineages"),
+            Self::MetadataLineageMismatch { .. } => {
+                formatter.write_str("restart WAL generation metadata belongs to another lineage")
+            }
+            Self::SourceGenerationChanged { expected, actual } => write!(
+                formatter,
+                "restart WAL generation changed from {expected} to {actual} during selection"
+            ),
+            Self::PersistentLineageRequired => {
+                formatter.write_str("anchored restart requires a persistent WAL lineage")
+            }
+            Self::ZeroPhysicalFormatVersion => {
+                formatter.write_str("restart WAL physical format version is zero")
+            }
+            Self::ForeignMetadataPosition { .. } => {
+                formatter.write_str("restart WAL generation metadata contains a foreign position")
+            }
+            Self::ZeroMetadataPosition { .. } => {
+                formatter.write_str("restart WAL generation metadata contains position zero")
+            }
+            Self::RetainedBoundaryWithoutHighWater { retained_first } => write!(
+                formatter,
+                "retained WAL boundary {retained_first} has no logical high-water"
+            ),
+            Self::RetainedBoundaryBeyondHighWater {
+                retained_first,
+                logical_high_water,
+            } => write!(
+                formatter,
+                "retained WAL boundary {retained_first} exceeds logical high-water {logical_high_water}"
+            ),
+            Self::LegacyGenerationHasAnchor { .. } => formatter
+                .write_str("legacy WAL generation zero unexpectedly has a checkpoint anchor"),
+            Self::PrunedGenerationMissingAnchor { generation } => write!(
+                formatter,
+                "pruned WAL generation {generation} has no checkpoint anchor"
+            ),
+            Self::PrunedGenerationCheckpointMissing { generation } => write!(
+                formatter,
+                "pruned WAL generation {generation} has no restart checkpoint"
+            ),
+            Self::ZeroPersistentLogId { .. } => {
+                formatter.write_str("anchored checkpoint persistent log identity is zero")
+            }
+            Self::ForeignPersistentLogId { .. } => {
+                formatter.write_str("anchored checkpoint belongs to another persistent WAL")
+            }
+            Self::ZeroCheckpointFrontier => {
+                formatter.write_str("anchored checkpoint frontier is zero")
+            }
+            Self::CheckpointBeyondLogicalHighWater { .. } => {
+                formatter.write_str("anchored checkpoint exceeds generation logical high-water")
+            }
+            Self::RetainedBoundaryAfterCheckpointFrontier { .. } => formatter
+                .write_str("retained WAL boundary is later than the selected checkpoint frontier"),
+            Self::TransactionCapacityExhausted { .. } => {
+                formatter.write_str("anchored checkpoint transaction capacity is exhausted")
+            }
+            Self::InvalidTransactionIdentity { source, .. } => source.fmt(formatter),
+            Self::TransactionIdentityNotIncreasing { .. } => formatter.write_str(
+                "anchored checkpoint transaction identities are not strictly increasing",
+            ),
+            Self::TransactionOwnedPageShape { .. } => formatter
+                .write_str("anchored checkpoint transaction owned-page shape is inconsistent"),
+            Self::TransactionPositionOutOfBounds { .. } => {
+                formatter.write_str("anchored checkpoint transaction position is out of bounds")
+            }
+            Self::TransactionCommitNotAfterOwnedPages { .. } => formatter.write_str(
+                "anchored checkpoint transaction commit does not follow its owned pages",
+            ),
+            Self::UncommittedTransactionWithoutOwnedPage { .. } => {
+                formatter.write_str("anchored checkpoint unresolved transaction has no owned page")
+            }
+            Self::AllocatorHighWaterBelowTransaction { .. } => formatter
+                .write_str("restart WAL allocator high-water is below a checkpoint transaction"),
+            Self::PageCapacityExhausted { .. } => {
+                formatter.write_str("anchored checkpoint page capacity is exhausted")
+            }
+            Self::ZeroPageNumber { .. } => {
+                formatter.write_str("anchored checkpoint page number is zero")
+            }
+            Self::PageNumberNotIncreasing { .. } => {
+                formatter.write_str("anchored checkpoint pages are not strictly increasing")
+            }
+            Self::PageStateShape { .. } => {
+                formatter.write_str("anchored checkpoint page-state shape is inconsistent")
+            }
+            Self::PagePositionOutOfBounds { .. } => {
+                formatter.write_str("anchored checkpoint page position is out of bounds")
+            }
+            Self::CommittedImageTransactionMissing { .. } => {
+                formatter.write_str("anchored checkpoint committed page owner is missing")
+            }
+            Self::CommittedImageTransactionMismatch { .. } => formatter
+                .write_str("anchored checkpoint committed page contradicts its transaction"),
+            Self::StoreBehindNotBeforeRequiredImage { .. } => formatter
+                .write_str("anchored checkpoint stored-behind image is not earlier than required"),
+            Self::ReplayShapeMismatch { .. } => {
+                formatter.write_str("anchored checkpoint replay lower bound is inconsistent")
+            }
+            Self::SelectedCheckpointAnchorMismatch { .. } => {
+                formatter.write_str("restart WAL checkpoint anchor does not match the checkpoint")
+            }
+        }
+    }
+}
+
+impl Error for DurableTransactionRestartPrunedGenerationSelectionEvidenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidTransactionIdentity { source, .. } => Some(source),
+            Self::StoreLineageMismatch { .. }
+            | Self::MetadataLineageMismatch { .. }
+            | Self::SourceGenerationChanged { .. }
+            | Self::PersistentLineageRequired
+            | Self::ZeroPhysicalFormatVersion
+            | Self::ForeignMetadataPosition { .. }
+            | Self::ZeroMetadataPosition { .. }
+            | Self::RetainedBoundaryWithoutHighWater { .. }
+            | Self::RetainedBoundaryBeyondHighWater { .. }
+            | Self::LegacyGenerationHasAnchor { .. }
+            | Self::PrunedGenerationMissingAnchor { .. }
+            | Self::PrunedGenerationCheckpointMissing { .. }
+            | Self::ZeroPersistentLogId { .. }
+            | Self::ForeignPersistentLogId { .. }
+            | Self::ZeroCheckpointFrontier
+            | Self::CheckpointBeyondLogicalHighWater { .. }
+            | Self::RetainedBoundaryAfterCheckpointFrontier { .. }
+            | Self::TransactionCapacityExhausted { .. }
+            | Self::TransactionIdentityNotIncreasing { .. }
+            | Self::TransactionOwnedPageShape { .. }
+            | Self::TransactionPositionOutOfBounds { .. }
+            | Self::TransactionCommitNotAfterOwnedPages { .. }
+            | Self::UncommittedTransactionWithoutOwnedPage { .. }
+            | Self::AllocatorHighWaterBelowTransaction { .. }
+            | Self::PageCapacityExhausted { .. }
+            | Self::ZeroPageNumber { .. }
+            | Self::PageNumberNotIncreasing { .. }
+            | Self::PageStateShape { .. }
+            | Self::PagePositionOutOfBounds { .. }
+            | Self::CommittedImageTransactionMissing { .. }
+            | Self::CommittedImageTransactionMismatch { .. }
+            | Self::StoreBehindNotBeforeRequiredImage { .. }
+            | Self::ReplayShapeMismatch { .. }
+            | Self::SelectedCheckpointAnchorMismatch { .. } => None,
+        }
+    }
+}
+
 /// Failure to load an owned completeness slot or validate it against evidence.
 ///
 /// `CheckpointSource` proves the completeness retrieval itself failed, which
@@ -14752,6 +17383,10 @@ pub enum DurableTransactionRestartCheckpointCompletenessBaselineSourceValidation
             >,
         >,
     ),
+    /// Observing current WAL generation metadata failed.
+    GenerationSource(WalSourceError),
+    /// Generation metadata or an anchor-bound checkpoint was contradictory.
+    GenerationEvidence(Box<DurableTransactionRestartPrunedGenerationSelectionEvidenceError>),
 }
 
 impl<CheckpointSourceError, WalSourceError, StoreError> fmt::Display
@@ -14779,6 +17414,18 @@ where
                     "loaded restart checkpoint completeness validation failed: {source}"
                 )
             }
+            Self::GenerationSource(source) => {
+                write!(
+                    formatter,
+                    "restart checkpoint generation source failed: {source}"
+                )
+            }
+            Self::GenerationEvidence(source) => {
+                write!(
+                    formatter,
+                    "restart checkpoint generation validation failed: {source}"
+                )
+            }
         }
     }
 }
@@ -14798,6 +17445,8 @@ where
         match self {
             Self::CheckpointSource(source) => Some(source),
             Self::BaselineValidation(source) => Some(source.as_ref()),
+            Self::GenerationSource(source) => Some(source),
+            Self::GenerationEvidence(source) => Some(source.as_ref()),
         }
     }
 }
@@ -15441,6 +18090,634 @@ fn compare_restart_checkpoint_completeness_baseline_observation<SourceError, Sto
     Ok(expected)
 }
 
+fn validate_restart_pruned_generation_metadata(
+    lineage: &LogLineage,
+    store_lineage: &LogLineage,
+    metadata: &DurableTransactionRestartWalReclamationSourceObservation,
+    checkpoint_frontier: Option<u64>,
+) -> Result<(), DurableTransactionRestartPrunedGenerationSelectionEvidenceError> {
+    if !lineage.same_lineage(store_lineage) {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::StoreLineageMismatch {
+                source_lineage: lineage.clone(),
+                store_lineage: store_lineage.clone(),
+            },
+        );
+    }
+    if !lineage.same_lineage(metadata.lineage()) {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::MetadataLineageMismatch {
+                expected: lineage.clone(),
+                actual: metadata.lineage().clone(),
+            },
+        );
+    }
+    if metadata.physical_format_version() == 0 {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ZeroPhysicalFormatVersion,
+        );
+    }
+    for position in [
+        metadata.retained_first_logical_record(),
+        metadata.logical_position_high_water(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !lineage.same_lineage(position.lineage()) {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ForeignMetadataPosition {
+                    position: position.clone(),
+                },
+            );
+        }
+        if position.get() == 0 {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ZeroMetadataPosition {
+                    position: position.clone(),
+                },
+            );
+        }
+    }
+    let retained_first = metadata
+        .retained_first_logical_record()
+        .map(LogSequenceNumber::get);
+    let logical_high_water = metadata
+        .logical_position_high_water()
+        .map(LogSequenceNumber::get);
+    match (retained_first, logical_high_water) {
+        (Some(retained_first), None) => {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::RetainedBoundaryWithoutHighWater {
+                    retained_first,
+                },
+            );
+        }
+        (Some(retained_first), Some(logical_high_water)) if retained_first > logical_high_water => {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::RetainedBoundaryBeyondHighWater {
+                    retained_first,
+                    logical_high_water,
+                },
+            );
+        }
+        (None, None) | (None, Some(_)) | (Some(_), Some(_)) => {}
+    }
+    match (
+        metadata.source_generation(),
+        metadata.selected_checkpoint_anchor,
+    ) {
+        (0, Some(actual)) => {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::LegacyGenerationHasAnchor {
+                    actual,
+                },
+            );
+        }
+        (0, None) | (_, Some(_)) => {}
+        (generation, None) => {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PrunedGenerationMissingAnchor {
+                    generation,
+                },
+            );
+        }
+    }
+    if let Some(checkpoint_frontier) = checkpoint_frontier {
+        if checkpoint_frontier == 0 {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ZeroCheckpointFrontier,
+            );
+        }
+        if logical_high_water.is_none_or(|high_water| checkpoint_frontier > high_water) {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::CheckpointBeyondLogicalHighWater {
+                    checkpoint_frontier,
+                    logical_high_water,
+                },
+            );
+        }
+        if let Some(retained_first) = retained_first
+            && retained_first > checkpoint_frontier
+        {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::RetainedBoundaryAfterCheckpointFrontier {
+                    retained_first,
+                    checkpoint_frontier,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn anchored_checkpoint_position_is_bounded(position: u64, frontier: Option<u64>) -> bool {
+    position != 0 && frontier.is_some_and(|frontier| position <= frontier)
+}
+
+fn materialize_anchored_restart_checkpoint_required_image(
+    index: usize,
+    checkpoint_frontier: Option<u64>,
+    transactions: &[DurableTransactionRestartCheckpointBaselineEntry],
+    observation: DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation,
+) -> Result<
+    DurableTransactionRestartRequiredPageImage,
+    DurableTransactionRestartPrunedGenerationSelectionEvidenceError,
+> {
+    let page_position = observation.page_position();
+    if !anchored_checkpoint_position_is_bounded(page_position, checkpoint_frontier) {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PagePositionOutOfBounds {
+                index,
+                field: DurableTransactionRestartAnchoredCheckpointPagePositionField::RequiredImage,
+                position: page_position,
+                checkpoint_frontier,
+            },
+        );
+    }
+    match observation {
+        DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation::Raw {
+            page_position,
+        } => Ok(DurableTransactionRestartRequiredPageImage::Raw { page_position }),
+        DurableTransactionRestartCheckpointCompletenessBaselineRequiredImageObservation::CommittedTransaction {
+            epoch,
+            sequence,
+            page_position,
+            commit_position,
+        } => {
+            if !anchored_checkpoint_position_is_bounded(commit_position, checkpoint_frontier) {
+                return Err(
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PagePositionOutOfBounds {
+                        index,
+                        field: DurableTransactionRestartAnchoredCheckpointPagePositionField::RequiredImageCommit,
+                        position: commit_position,
+                        checkpoint_frontier,
+                    },
+                );
+            }
+            let transaction =
+                DurableTransactionIdentityObservation::new(epoch, sequence).map_err(|source| {
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::InvalidTransactionIdentity {
+                        index,
+                        source,
+                    }
+                })?;
+            let Ok(transaction_index) = transactions
+                .binary_search_by_key(&transaction, DurableTransactionRestartCheckpointBaselineEntry::transaction)
+            else {
+                return Err(
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::CommittedImageTransactionMissing {
+                        index,
+                        transaction,
+                    },
+                );
+            };
+            let transaction_entry = &transactions[transaction_index];
+            let range_contains_page = match (
+                transaction_entry.first_owned_page_position(),
+                transaction_entry.last_owned_page_position(),
+            ) {
+                (Some(first), Some(last)) => first <= page_position && page_position <= last,
+                (None, None) | (None, Some(_)) | (Some(_), None) => false,
+            };
+            if transaction_entry.state().commit_position() != Some(commit_position)
+                || !range_contains_page
+                || page_position >= commit_position
+            {
+                return Err(
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::CommittedImageTransactionMismatch {
+                        index,
+                        transaction,
+                        page_position,
+                        commit_position,
+                    },
+                );
+            }
+            Ok(
+                DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                    transaction,
+                    page_position,
+                    commit_position,
+                },
+            )
+        }
+    }
+}
+
+fn materialize_anchored_restart_checkpoint(
+    lineage: &LogLineage,
+    metadata: &DurableTransactionRestartWalReclamationSourceObservation,
+    checkpoint: &DurableTransactionRestartCheckpointCompletenessBaselineObservation<'_>,
+) -> Result<
+    DurableTransactionRestartCheckpointCompletenessBaseline,
+    DurableTransactionRestartPrunedGenerationSelectionEvidenceError,
+> {
+    let expected_id = lineage.persistent_id().ok_or(
+        DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PersistentLineageRequired,
+    )?;
+    let transaction_observation = checkpoint.transactions();
+    let Some(actual_id) = PersistentLogId::new(transaction_observation.persistent_log_id()) else {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ZeroPersistentLogId {
+                persistent_log_id: transaction_observation.persistent_log_id(),
+            },
+        );
+    };
+    if actual_id != expected_id {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ForeignPersistentLogId {
+                expected: expected_id,
+                actual: actual_id,
+            },
+        );
+    }
+    let checkpoint_frontier = transaction_observation.durable_frontier();
+    if checkpoint_frontier == Some(0) {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ZeroCheckpointFrontier,
+        );
+    }
+
+    let mut transactions = Vec::new();
+    transactions
+        .try_reserve_exact(transaction_observation.transactions().len())
+        .map_err(|_| {
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::TransactionCapacityExhausted {
+                transaction_count: transaction_observation.transactions().len(),
+            }
+        })?;
+    let mut previous_transaction = None;
+    for (index, observation) in transaction_observation
+        .transactions()
+        .iter()
+        .copied()
+        .enumerate()
+    {
+        let transaction =
+            DurableTransactionIdentityObservation::new(observation.epoch(), observation.sequence())
+                .map_err(|source| {
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::InvalidTransactionIdentity {
+                        index,
+                        source,
+                    }
+                })?;
+        if let Some(previous) = previous_transaction
+            && transaction <= previous
+        {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::TransactionIdentityNotIncreasing {
+                    index,
+                    previous,
+                    actual: transaction,
+                },
+            );
+        }
+        if transaction.epoch() > metadata.allocated_epoch_high_water().get() {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::AllocatorHighWaterBelowTransaction {
+                    transaction,
+                    allocated_epoch_high_water: metadata.allocated_epoch_high_water().get(),
+                },
+            );
+        }
+        previous_transaction = Some(transaction);
+
+        let first = observation.first_owned_page_position();
+        let last = observation.last_owned_page_position();
+        let count = observation.owned_page_record_count();
+        let range_count_is_possible = match (first, last, count) {
+            (None, None, 0) => true,
+            (Some(first), Some(last), 1) => first == last,
+            (Some(first), Some(last), count) if count > 1 => {
+                first < last && u128::from(count) <= u128::from(last) - u128::from(first) + 1
+            }
+            (None, None, _) | (None, Some(_), _) | (Some(_), None, _) | (Some(_), Some(_), _) => {
+                false
+            }
+        };
+        if !range_count_is_possible {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::TransactionOwnedPageShape {
+                    index,
+                    first,
+                    last,
+                    count,
+                },
+            );
+        }
+        for (field, position) in [
+            (
+                DurableTransactionRestartAnchoredCheckpointTransactionPositionField::FirstOwnedPage,
+                first,
+            ),
+            (
+                DurableTransactionRestartAnchoredCheckpointTransactionPositionField::LastOwnedPage,
+                last,
+            ),
+        ] {
+            if let Some(position) = position
+                && !anchored_checkpoint_position_is_bounded(position, checkpoint_frontier)
+            {
+                return Err(
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::TransactionPositionOutOfBounds {
+                        index,
+                        field,
+                        position,
+                        checkpoint_frontier,
+                    },
+                );
+            }
+        }
+        let state = match observation.state() {
+            DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted => {
+                if count == 0 {
+                    return Err(
+                        DurableTransactionRestartPrunedGenerationSelectionEvidenceError::UncommittedTransactionWithoutOwnedPage {
+                            index,
+                            transaction,
+                        },
+                    );
+                }
+                DurableTransactionRestartCheckpointBaselineState::Uncommitted
+            }
+            DurableTransactionRestartCheckpointBaselineStateObservation::Committed {
+                commit_position,
+            } => {
+                if !anchored_checkpoint_position_is_bounded(commit_position, checkpoint_frontier) {
+                    return Err(
+                        DurableTransactionRestartPrunedGenerationSelectionEvidenceError::TransactionPositionOutOfBounds {
+                            index,
+                            field: DurableTransactionRestartAnchoredCheckpointTransactionPositionField::Commit,
+                            position: commit_position,
+                            checkpoint_frontier,
+                        },
+                    );
+                }
+                if let Some(last_owned_page_position) = last
+                    && commit_position <= last_owned_page_position
+                {
+                    return Err(
+                        DurableTransactionRestartPrunedGenerationSelectionEvidenceError::TransactionCommitNotAfterOwnedPages {
+                            index,
+                            last_owned_page_position,
+                            commit_position,
+                        },
+                    );
+                }
+                DurableTransactionRestartCheckpointBaselineState::Committed { commit_position }
+            }
+        };
+        transactions.push(DurableTransactionRestartCheckpointBaselineEntry {
+            transaction,
+            first_owned_page_position: first,
+            last_owned_page_position: last,
+            owned_page_record_count: count,
+            state,
+        });
+    }
+
+    let mut pages = Vec::new();
+    pages
+        .try_reserve_exact(checkpoint.pages().len())
+        .map_err(|_| {
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PageCapacityExhausted {
+                page_count: checkpoint.pages().len(),
+            }
+        })?;
+    let mut previous_page = None;
+    for (index, observation) in checkpoint.pages().iter().copied().enumerate() {
+        let Some(page_number) = PageNumber::new(observation.page_number()) else {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ZeroPageNumber {
+                    index,
+                },
+            );
+        };
+        if let Some(previous) = previous_page
+            && page_number <= previous
+        {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PageNumberNotIncreasing {
+                    index,
+                    previous,
+                    actual: page_number,
+                },
+            );
+        }
+        previous_page = Some(page_number);
+
+        let required_observation = observation.required_image();
+        let stored_position = observation.stored_position();
+        let valid_shape = matches!(
+            (
+                observation.state(),
+                required_observation,
+                stored_position,
+            ),
+            (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::NoRequiredImage,
+                None,
+                None,
+            ) | (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreMissing,
+                Some(_),
+                None,
+            ) | (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreCurrent
+                    | DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreBehind,
+                Some(_),
+                Some(_),
+            )
+        );
+        if !valid_shape {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PageStateShape {
+                    index,
+                    actual: observation,
+                },
+            );
+        }
+        let required = required_observation
+            .map(|required| {
+                materialize_anchored_restart_checkpoint_required_image(
+                    index,
+                    checkpoint_frontier,
+                    &transactions,
+                    required,
+                )
+            })
+            .transpose()?;
+        if let Some(stored_position) = stored_position
+            && !anchored_checkpoint_position_is_bounded(stored_position, checkpoint_frontier)
+        {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PagePositionOutOfBounds {
+                    index,
+                    field: DurableTransactionRestartAnchoredCheckpointPagePositionField::StoredImage,
+                    position: stored_position,
+                    checkpoint_frontier,
+                },
+            );
+        }
+        let state = match (observation.state(), required, stored_position) {
+            (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::NoRequiredImage,
+                None,
+                None,
+            ) => DurableTransactionRestartPageState::NoRequiredImage,
+            (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreMissing,
+                Some(required),
+                None,
+            ) => DurableTransactionRestartPageState::StoreMissing { required },
+            (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreCurrent,
+                Some(required),
+                Some(stored_position),
+            ) if stored_position == required.page_position() => {
+                DurableTransactionRestartPageState::StoreCurrent {
+                    required,
+                    stored_position,
+                }
+            }
+            (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreBehind,
+                Some(required),
+                Some(stored_position),
+            ) if stored_position < required.page_position() => {
+                DurableTransactionRestartPageState::StoreBehind {
+                    stored_position,
+                    required,
+                }
+            }
+            (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreBehind,
+                Some(required),
+                Some(stored_position),
+            ) => {
+                return Err(
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::StoreBehindNotBeforeRequiredImage {
+                        index,
+                        stored_position,
+                        required_position: required.page_position(),
+                    },
+                );
+            }
+            (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreCurrent,
+                _,
+                _,
+            )
+            | (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::NoRequiredImage,
+                _,
+                _,
+            )
+            | (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreMissing,
+                _,
+                _,
+            )
+            | (
+                DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreBehind,
+                _,
+                _,
+            ) => {
+                return Err(
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PageStateShape {
+                        index,
+                        actual: observation,
+                    },
+                );
+            }
+        };
+        pages.push(DurableTransactionRestartPageEntry { page_number, state });
+    }
+
+    let mut replay_floor = None;
+    for transaction in &transactions {
+        if matches!(
+            transaction.state(),
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted
+        ) {
+            let Some(position) = transaction.first_owned_page_position() else {
+                return Err(
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::UncommittedTransactionWithoutOwnedPage {
+                        index: 0,
+                        transaction: transaction.transaction(),
+                    },
+                );
+            };
+            lower_restart_replay_start(
+                &mut replay_floor,
+                position,
+                DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                    transaction: transaction.transaction(),
+                },
+            );
+        }
+    }
+    for page in &pages {
+        match page.state() {
+            DurableTransactionRestartPageState::StoreMissing { required } => {
+                lower_restart_replay_start(
+                    &mut replay_floor,
+                    required.page_position(),
+                    DurableTransactionRestartReplayStartCause::StoreMissing {
+                        page_number: page.page_number(),
+                    },
+                );
+            }
+            DurableTransactionRestartPageState::StoreBehind { required, .. } => {
+                lower_restart_replay_start(
+                    &mut replay_floor,
+                    required.page_position(),
+                    DurableTransactionRestartReplayStartCause::StoreBehind {
+                        page_number: page.page_number(),
+                    },
+                );
+            }
+            DurableTransactionRestartPageState::NoRequiredImage
+            | DurableTransactionRestartPageState::StoreCurrent { .. } => {}
+        }
+    }
+    let replay_start = match replay_floor {
+        Some((position, cause)) => {
+            DurableTransactionRestartReplayStart::AtPosition { position, cause }
+        }
+        None => DurableTransactionRestartReplayStart::AfterFrontier {
+            frontier: checkpoint_frontier,
+        },
+    };
+    if !restart_checkpoint_replay_matches_observation(&replay_start, checkpoint.replay()) {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ReplayShapeMismatch {
+                expected: Box::new(replay_start),
+                actual: checkpoint.replay(),
+            },
+        );
+    }
+    let baseline = DurableTransactionRestartCheckpointCompletenessBaseline {
+        transaction_baseline: DurableTransactionRestartCheckpointBaseline {
+            persistent_log_id: expected_id,
+            durable_frontier: checkpoint_frontier,
+            transactions,
+        },
+        pages,
+        replay_start,
+    };
+    let expected_anchor = selected_restart_checkpoint_anchor(&baseline);
+    if metadata.selected_checkpoint_anchor != Some(expected_anchor) {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::SelectedCheckpointAnchorMismatch {
+                expected: expected_anchor,
+                actual: metadata.selected_checkpoint_anchor,
+            },
+        );
+    }
+    Ok(baseline)
+}
+
 fn derive_restart_checkpoint_completeness_baseline_evidence<SourceError, Store, const N: usize>(
     lineage: &LogLineage,
     current_frontier: Option<&LogSequenceNumber>,
@@ -15518,6 +18795,7 @@ where
 struct MaterializedTransactionRestartCheckpointReplay<const N: usize> {
     current_analysis: DurableTransactionRestartAnalysis,
     replay_observations: Vec<OwnedDurableTransactionRestartReplayObservation<N>>,
+    retained_observations: Vec<OwnedDurableTransactionRestartReplayObservation<N>>,
 }
 
 fn select_restart_checkpoint_replay_window<'observations, const N: usize>(
@@ -15651,6 +18929,7 @@ where
     Ok(MaterializedTransactionRestartCheckpointReplay {
         current_analysis,
         replay_observations,
+        retained_observations: Vec::new(),
     })
 }
 
@@ -15692,6 +18971,513 @@ where
         }
         Err(source) => Err(DurableTransactionRestartCheckpointReplayPlanningError::Source(source)),
     }
+}
+
+fn seed_anchored_restart_transaction_analysis(
+    lineage: &LogLineage,
+    logical_high_water: Option<&LogSequenceNumber>,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    retained_record_count: usize,
+) -> Result<DurableTransactionRestartAnalysis, DurableTransactionRestartRetainedSuffixEvidenceError>
+{
+    let mut transactions = Vec::new();
+    transactions
+        .try_reserve_exact(baseline.transactions().len())
+        .map_err(|_| {
+            DurableTransactionRestartRetainedSuffixEvidenceError::TransactionCapacityExhausted {
+                transaction_count: baseline.transactions().len(),
+            }
+        })?;
+    for entry in baseline.transactions() {
+        let transaction = entry.transaction();
+        let owned_page_record_count =
+            usize::try_from(entry.owned_page_record_count()).map_err(|_| {
+                DurableTransactionRestartRetainedSuffixEvidenceError::OwnedPageCountWidthExceeded {
+                    transaction,
+                    record_count: entry.owned_page_record_count(),
+                }
+            })?;
+        let state = match entry.state() {
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted => {
+                DurableTransactionRestartState::Uncommitted
+            }
+            DurableTransactionRestartCheckpointBaselineState::Committed { commit_position } => {
+                DurableTransactionRestartState::Committed {
+                    commit_position: lineage.position(commit_position),
+                }
+            }
+        };
+        transactions.push(DurableTransactionRestartEntry {
+            transaction,
+            first_owned_page_position: entry
+                .first_owned_page_position()
+                .map(|position| lineage.position(position)),
+            last_owned_page_position: entry
+                .last_owned_page_position()
+                .map(|position| lineage.position(position)),
+            owned_page_record_count,
+            state,
+        });
+    }
+    transactions
+        .try_reserve(retained_record_count)
+        .map_err(|_| {
+            DurableTransactionRestartRetainedSuffixEvidenceError::TransactionCapacityExhausted {
+                transaction_count: baseline.transactions().len(),
+            }
+        })?;
+    Ok(DurableTransactionRestartAnalysis {
+        lineage: lineage.clone(),
+        durable_frontier: logical_high_water.cloned(),
+        transactions,
+    })
+}
+
+fn validate_retained_restart_suffix_order<const N: usize>(
+    lineage: &LogLineage,
+    metadata: &DurableTransactionRestartWalReclamationSourceObservation,
+    observations: &[DurableTransactionRestartObservation<N>],
+    checkpoint_frontier: Option<u64>,
+) -> Result<(), DurableTransactionRestartRetainedSuffixEvidenceError> {
+    let retained_first = metadata
+        .retained_first_logical_record()
+        .map(LogSequenceNumber::get);
+    match (retained_first, observations.first()) {
+        (None, Some(_)) => {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::RetainedBoundaryMissing {
+                    record_count: observations.len(),
+                },
+            );
+        }
+        (Some(retained_first), None) => {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::RetainedBoundaryWithoutObservations {
+                    retained_first,
+                },
+            );
+        }
+        (Some(expected), Some(first)) if first.position().get() != expected => {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::RetainedFirstMismatch {
+                    expected,
+                    actual: first.position().get(),
+                },
+            );
+        }
+        (None, None) | (Some(_), Some(_)) => {}
+    }
+
+    let high_water = metadata
+        .logical_position_high_water()
+        .map(LogSequenceNumber::get);
+    match (high_water, observations.last()) {
+        (None, Some(_)) => {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::LogicalHighWaterMissing {
+                    record_count: observations.len(),
+                },
+            );
+        }
+        (Some(expected), Some(tail)) if tail.position().get() != expected => {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::RetainedTailMismatch {
+                    expected,
+                    actual: tail.position().get(),
+                },
+            );
+        }
+        (None, None) | (Some(_), None) | (Some(_), Some(_)) => {}
+    }
+
+    let mut previous = None;
+    for (index, observation) in observations.iter().enumerate() {
+        let position = observation.position();
+        if !lineage.same_lineage(position.lineage()) {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::ForeignRecordLineage {
+                    index,
+                    kind: observation.kind(),
+                    position: position.clone(),
+                },
+            );
+        }
+        if position.get() == 0 {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::ZeroRecordPosition {
+                    index,
+                    kind: observation.kind(),
+                },
+            );
+        }
+        let transaction = match observation {
+            DurableTransactionRestartObservation::Page(_) => None,
+            DurableTransactionRestartObservation::TransactionPage(observation) => {
+                Some(observation.owner())
+            }
+            DurableTransactionRestartObservation::Commit(observation) => {
+                Some(observation.transaction())
+            }
+        };
+        if let Some(transaction) = transaction
+            && transaction.epoch() > metadata.allocated_epoch_high_water().get()
+        {
+            return Err(
+                DurableTransactionRestartRetainedSuffixEvidenceError::AllocatorHighWaterBelowTransaction {
+                    transaction,
+                    allocated_epoch_high_water: metadata.allocated_epoch_high_water().get(),
+                },
+            );
+        }
+        if let Some((previous_index, previous_position)) = previous {
+            if position.get() == previous_position {
+                return Err(
+                    DurableTransactionRestartRetainedSuffixEvidenceError::DuplicateRecordPosition {
+                        previous_index,
+                        actual_index: index,
+                        position: position.get(),
+                    },
+                );
+            }
+            if position.get() < previous_position {
+                return Err(
+                    DurableTransactionRestartRetainedSuffixEvidenceError::NonAdvancingRecordPosition {
+                        previous_index,
+                        previous: previous_position,
+                        actual_index: index,
+                        actual: position.get(),
+                    },
+                );
+            }
+        }
+        previous = Some((index, position.get()));
+    }
+    if let Some(checkpoint_frontier) = checkpoint_frontier
+        && observations
+            .binary_search_by_key(&checkpoint_frontier, |observation| {
+                observation.position().get()
+            })
+            .is_err()
+    {
+        return Err(
+            DurableTransactionRestartRetainedSuffixEvidenceError::CheckpointFrontierNotRetained {
+                checkpoint_frontier,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_retained_checkpoint_transaction_page(
+    analysis: &DurableTransactionRestartAnalysis,
+    transaction: DurableTransactionIdentityObservation,
+    page_position: u64,
+) -> Result<(), DurableTransactionRestartRetainedSuffixEvidenceError> {
+    let Ok(index) = analysis
+        .transactions
+        .binary_search_by_key(&transaction, |entry| entry.transaction)
+    else {
+        return Err(
+            DurableTransactionRestartRetainedSuffixEvidenceError::CheckpointTransactionPageMismatch {
+                transaction,
+                page_position,
+            },
+        );
+    };
+    let entry = &analysis.transactions[index];
+    let in_range = match (
+        entry.first_owned_page_position.as_ref(),
+        entry.last_owned_page_position.as_ref(),
+    ) {
+        (Some(first), Some(last)) => first.get() <= page_position && page_position <= last.get(),
+        (None, None) | (None, Some(_)) | (Some(_), None) => false,
+    };
+    if !in_range {
+        return Err(
+            DurableTransactionRestartRetainedSuffixEvidenceError::CheckpointTransactionPageMismatch {
+                transaction,
+                page_position,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_retained_checkpoint_commit(
+    analysis: &DurableTransactionRestartAnalysis,
+    transaction: DurableTransactionIdentityObservation,
+    commit_position: u64,
+) -> Result<(), DurableTransactionRestartRetainedSuffixEvidenceError> {
+    let matches = analysis
+        .transactions
+        .binary_search_by_key(&transaction, |entry| entry.transaction)
+        .ok()
+        .and_then(|index| analysis.transactions.get(index))
+        .and_then(|entry| entry.state().commit_position())
+        .is_some_and(|position| position.get() == commit_position);
+    if !matches {
+        return Err(
+            DurableTransactionRestartRetainedSuffixEvidenceError::CheckpointCommitMismatch {
+                transaction,
+                commit_position,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn apply_retained_restart_suffix<const N: usize>(
+    analysis: &mut DurableTransactionRestartAnalysis,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    observations: &[DurableTransactionRestartObservation<N>],
+) -> Result<(), DurableTransactionRestartRetainedSuffixEvidenceError> {
+    let checkpoint_frontier = baseline.durable_frontier();
+    for observation in observations {
+        let position = observation.position().get();
+        let after_checkpoint = checkpoint_frontier.is_none_or(|frontier| position > frontier);
+        match observation {
+            DurableTransactionRestartObservation::Page(_) => {}
+            DurableTransactionRestartObservation::TransactionPage(observation)
+                if !after_checkpoint =>
+            {
+                validate_retained_checkpoint_transaction_page(
+                    analysis,
+                    observation.owner(),
+                    position,
+                )?;
+            }
+            DurableTransactionRestartObservation::Commit(observation) if !after_checkpoint => {
+                validate_retained_checkpoint_commit(analysis, observation.transaction(), position)?;
+            }
+            DurableTransactionRestartObservation::TransactionPage(observation) => {
+                let transaction = observation.owner();
+                match analysis
+                    .transactions
+                    .binary_search_by_key(&transaction, |entry| entry.transaction)
+                {
+                    Ok(index) => {
+                        let entry = &mut analysis.transactions[index];
+                        if let DurableTransactionRestartState::Committed { commit_position } =
+                            &entry.state
+                        {
+                            return Err(
+                                DurableTransactionRestartRetainedSuffixEvidenceError::PageAfterCommit {
+                                    transaction,
+                                    commit_position: commit_position.get(),
+                                    page_position: position,
+                                },
+                            );
+                        }
+                        entry.owned_page_record_count = entry
+                            .owned_page_record_count
+                            .checked_add(1)
+                            .ok_or(
+                                DurableTransactionRestartRetainedSuffixEvidenceError::OwnedPageCountExhausted {
+                                    transaction,
+                                },
+                            )?;
+                        entry.last_owned_page_position = Some(observation.position().clone());
+                    }
+                    Err(index) => analysis.transactions.insert(
+                        index,
+                        DurableTransactionRestartEntry {
+                            transaction,
+                            first_owned_page_position: Some(observation.position().clone()),
+                            last_owned_page_position: Some(observation.position().clone()),
+                            owned_page_record_count: 1,
+                            state: DurableTransactionRestartState::Uncommitted,
+                        },
+                    ),
+                }
+            }
+            DurableTransactionRestartObservation::Commit(observation) => {
+                let transaction = observation.transaction();
+                match analysis
+                    .transactions
+                    .binary_search_by_key(&transaction, |entry| entry.transaction)
+                {
+                    Ok(index) => {
+                        let entry = &mut analysis.transactions[index];
+                        match &entry.state {
+                            DurableTransactionRestartState::Uncommitted => {
+                                entry.state = DurableTransactionRestartState::Committed {
+                                    commit_position: observation.position().clone(),
+                                };
+                            }
+                            DurableTransactionRestartState::Committed {
+                                commit_position: first_commit_position,
+                            } => {
+                                return Err(
+                                    DurableTransactionRestartRetainedSuffixEvidenceError::DuplicateCommit {
+                                        transaction,
+                                        first_commit_position: first_commit_position.get(),
+                                        duplicate_commit_position: position,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(index) => analysis.transactions.insert(
+                        index,
+                        DurableTransactionRestartEntry {
+                            transaction,
+                            first_owned_page_position: None,
+                            last_owned_page_position: None,
+                            owned_page_record_count: 0,
+                            state: DurableTransactionRestartState::Committed {
+                                commit_position: observation.position().clone(),
+                            },
+                        },
+                    ),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_anchored_restart_checkpoint_replay_evidence<const N: usize>(
+    lineage: &LogLineage,
+    metadata: &DurableTransactionRestartWalReclamationSourceObservation,
+    observations: &[DurableTransactionRestartObservation<N>],
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<
+    MaterializedTransactionRestartCheckpointReplay<N>,
+    DurableTransactionRestartRetainedSuffixEvidenceError,
+> {
+    validate_retained_restart_suffix_order(
+        lineage,
+        metadata,
+        observations,
+        baseline.durable_frontier(),
+    )?;
+    let mut current_analysis = seed_anchored_restart_transaction_analysis(
+        lineage,
+        metadata.logical_position_high_water(),
+        baseline,
+        observations.len(),
+    )?;
+    apply_retained_restart_suffix(&mut current_analysis, baseline, observations)?;
+
+    let replay_window =
+        select_restart_checkpoint_replay_window(observations, baseline.replay_start())
+            .map_err(DurableTransactionRestartRetainedSuffixEvidenceError::ReplayWindow)?;
+    let mut replay_observations = Vec::new();
+    reserve_restart_checkpoint_replay_observations(&mut replay_observations, replay_window.len())
+        .map_err(DurableTransactionRestartRetainedSuffixEvidenceError::ReplayWindow)?;
+    replay_observations.extend(
+        replay_window
+            .iter()
+            .map(OwnedDurableTransactionRestartReplayObservation::from),
+    );
+    let mut retained_observations = Vec::new();
+    reserve_restart_checkpoint_replay_observations(&mut retained_observations, observations.len())
+        .map_err(DurableTransactionRestartRetainedSuffixEvidenceError::ReplayWindow)?;
+    retained_observations.extend(
+        observations
+            .iter()
+            .map(OwnedDurableTransactionRestartReplayObservation::from),
+    );
+    Ok(MaterializedTransactionRestartCheckpointReplay {
+        current_analysis,
+        replay_observations,
+        retained_observations,
+    })
+}
+
+fn validate_anchored_restart_planning_metadata(
+    lineage: &LogLineage,
+    store_lineage: &LogLineage,
+    metadata: &DurableTransactionRestartWalReclamationSourceObservation,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<(), DurableTransactionRestartPrunedGenerationSelectionEvidenceError> {
+    validate_restart_pruned_generation_metadata(
+        lineage,
+        store_lineage,
+        metadata,
+        baseline.durable_frontier(),
+    )?;
+    let expected = selected_restart_checkpoint_anchor(baseline);
+    if metadata.source_generation() == 0 || metadata.selected_checkpoint_anchor != Some(expected) {
+        return Err(
+            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::SelectedCheckpointAnchorMismatch {
+                expected,
+                actual: metadata.selected_checkpoint_anchor,
+            },
+        );
+    }
+    for entry in baseline.transactions() {
+        if entry.transaction().epoch() > metadata.allocated_epoch_high_water().get() {
+            return Err(
+                DurableTransactionRestartPrunedGenerationSelectionEvidenceError::AllocatorHighWaterBelowTransaction {
+                    transaction: entry.transaction(),
+                    allocated_epoch_high_water: metadata.allocated_epoch_high_water().get(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn plan_anchored_restart_checkpoint_replay<Source, Store, const N: usize>(
+    source: &mut Source,
+    store: &Store,
+    baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+) -> Result<
+    MaterializedTransactionRestartCheckpointReplay<N>,
+    DurableTransactionRestartCheckpointReplayPlanningError<
+        <Source as DurableTransactionRestartAnalysisSource<N>>::Error,
+        Store::ObservationError,
+    >,
+>
+where
+    Source: DurableTransactionRestartPrunedGenerationSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    let lineage = source.lineage().clone();
+    let store_lineage = store.lineage().clone();
+    let metadata = source
+        .observe_restart_pruned_generation()
+        .map_err(DurableTransactionRestartCheckpointReplayPlanningError::Source)?;
+    validate_anchored_restart_planning_metadata(&lineage, &store_lineage, &metadata, baseline)
+        .map_err(|source| {
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(Box::new(
+                DurableTransactionRestartCheckpointReplayPlanningEvidenceError::PrunedGeneration(
+                    Box::new(source),
+                ),
+            ))
+        })?;
+
+    let planned = source.with_durable_transaction_restart_retained_observations(|observations| {
+        plan_anchored_restart_checkpoint_replay_evidence(
+            &lineage,
+            &metadata,
+            observations,
+            baseline,
+        )
+    });
+    let planned =
+        planned.map_err(DurableTransactionRestartCheckpointReplayPlanningError::Source)?;
+    let reobserved = source
+        .observe_restart_pruned_generation()
+        .map_err(DurableTransactionRestartCheckpointReplayPlanningError::Source)?;
+    if !restart_wal_reclamation_source_observations_match(&metadata, &reobserved) {
+        return Err(
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(Box::new(
+                DurableTransactionRestartCheckpointReplayPlanningEvidenceError::PrunedGenerationMetadataChanged {
+                    expected: Box::new(metadata),
+                    actual: Box::new(reobserved),
+                },
+            )),
+        );
+    }
+    planned.map_err(|source| {
+        DurableTransactionRestartCheckpointReplayPlanningError::Evidence(Box::new(
+            DurableTransactionRestartCheckpointReplayPlanningEvidenceError::RetainedSuffix(
+                Box::new(source),
+            ),
+        ))
+    })
 }
 
 fn reserve_restart_checkpoint_repair_page_inventory(
@@ -16289,6 +20075,7 @@ fn prepare_transaction_restart_checkpoint_page_repairs<
     TransactionPageStorageRestartCheckpointRepairPreparationError<Store, N>,
 >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
 {
     let replay_lineage = planned.current_analysis.lineage().clone();
@@ -16496,6 +20283,7 @@ fn attempt_prepared_transaction_restart_checkpoint_page_repairs<
     TransactionRestartCheckpointPageRepairFailureCause<Store::ObservationError, Store::WriteError>,
 >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: TransactionRestartCheckpointPageRepairStore<N>,
 {
     let replay_lineage = prepared.planned.current_analysis.lineage().clone();
@@ -16655,6 +20443,7 @@ fn execute_prepared_transaction_restart_checkpoint_page_repairs<
     N,
 >
 where
+    Source: DurableTransactionRestartAnalysisSource<N>,
     Store: TransactionRestartCheckpointPageRepairStore<N>,
 {
     completed_prefix.clear();
@@ -16755,7 +20544,11 @@ fn prepare_transaction_restart_restoration<Source, Store, CheckpointSource, cons
         CheckpointSource,
         N,
     >,
-) -> Result<PreparedTransactionRestartRestoration, TransactionRestartRestorationEvidenceError> {
+) -> Result<PreparedTransactionRestartRestoration, TransactionRestartRestorationEvidenceError>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     let planned = &repaired.prepared.planned;
     prepare_transaction_restart_restoration_evidence(
         &planned.selected.baseline,
@@ -16999,7 +20792,8 @@ fn rejected_transaction_restart_restoration<Source, Store, CheckpointSource, con
     N,
 >
 where
-    Source: TransactionRestartCoordinatorEpochSource,
+    Source: TransactionRestartCoordinatorEpochSource + DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     TransactionPageStorageRestartCheckpointRestoration::Rejected(
         RejectedTransactionPageStorageRestartCheckpointRestoration {
@@ -17022,11 +20816,12 @@ fn restore_transaction_restart_state<Source, Store, CheckpointSource, const N: u
     Source,
     Store,
     CheckpointSource,
-    Source::Error,
+    <Source as TransactionRestartCoordinatorEpochSource>::Error,
     N,
 >
 where
-    Source: TransactionRestartCoordinatorEpochSource,
+    Source: TransactionRestartCoordinatorEpochSource + DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
 {
     let prepared = match prepare_transaction_restart_restoration(&repaired) {
         Ok(prepared) => prepared,
@@ -17152,7 +20947,11 @@ fn validate_completed_transaction_restart_evidence<
         N,
     >,
     fresh_analysis: &DurableTransactionRestartAnalysis,
-) -> Result<(), DurableTransactionRestartCheckpointCompletionEvidenceError> {
+) -> Result<(), DurableTransactionRestartCheckpointCompletionEvidenceError>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
     validate_completed_transaction_restart_evidence_parts(
         &restored.repaired.prepared.planned.selected.baseline,
         &restored.repaired.prepared.planned.current_analysis,
@@ -17517,15 +21316,37 @@ where
     Source: DurableTransactionRestartAnalysisSource<N>,
     Store: DurablePageStoreSnapshotSource<N>,
 {
-    let fresh_analysis = match analyze_durable_transaction_restart(
-        &mut restored.repaired.prepared.planned.selected.storage.source,
-    ) {
-        Ok(analysis) => analysis,
-        Err(source) => {
-            return Err(FailedTransactionPageStorageRestartCheckpointCompletion {
-                restored: Box::new(restored),
-                error: DurableTransactionRestartCheckpointCompletionError::RestartAnalysis(source),
-            });
+    let selected = &mut restored.repaired.prepared.planned.selected;
+    let fresh_analysis = match &selected.validation {
+        SelectedRestartCheckpointValidation::CompletePrefix => {
+            match analyze_durable_transaction_restart(&mut selected.storage.source) {
+                Ok(analysis) => analysis,
+                Err(source) => {
+                    return Err(FailedTransactionPageStorageRestartCheckpointCompletion {
+                        restored: Box::new(restored),
+                        error: DurableTransactionRestartCheckpointCompletionError::RestartAnalysis(
+                            source,
+                        ),
+                    });
+                }
+            }
+        }
+        SelectedRestartCheckpointValidation::Anchored { planner } => {
+            match planner(
+                &mut selected.storage.source,
+                &selected.storage.store,
+                &selected.baseline,
+            ) {
+                Ok(materialized) => materialized.current_analysis,
+                Err(source) => {
+                    return Err(FailedTransactionPageStorageRestartCheckpointCompletion {
+                        restored: Box::new(restored),
+                        error: DurableTransactionRestartCheckpointCompletionError::ReplayPlanning(
+                            Box::new(source),
+                        ),
+                    });
+                }
+            }
         }
     };
     if let Err(source) = validate_completed_transaction_restart_evidence(&restored, &fresh_analysis)
@@ -17564,6 +21385,7 @@ where
         storage,
         checkpoint_source,
         baseline,
+        validation,
     } = selected;
     let UnrecoveredTransactionPageStorage {
         source,
@@ -17583,12 +21405,23 @@ where
             page_outcomes,
             transaction_summary: summary,
         },
+        validation,
     })
 }
 
-fn wal_retention_evidence_error<WalSourceError, StoreError, MetadataError>(
+fn wal_retention_evidence_error<
+    WalSourceError,
+    StoreError,
+    MetadataError,
+    StoreObservationError,
+>(
     source: DurableTransactionRestartWalRetentionEvidenceError,
-) -> DurableTransactionRestartWalRetentionAnalysisError<WalSourceError, StoreError, MetadataError> {
+) -> DurableTransactionRestartWalRetentionAnalysisError<
+    WalSourceError,
+    StoreError,
+    MetadataError,
+    StoreObservationError,
+> {
     DurableTransactionRestartWalRetentionAnalysisError::Evidence(Box::new(source))
 }
 
@@ -17611,15 +21444,18 @@ fn validate_wal_retention_inventory_order<const N: usize>(
     Ok(())
 }
 
-fn push_wal_retention_requirement<const N: usize>(
+fn push_wal_retention_requirement<Observation, const N: usize>(
     lineage: &LogLineage,
     durable_frontier: Option<&LogSequenceNumber>,
-    observations: &[DurableTransactionRestartObservation<N>],
+    observations: &[Observation],
     position: u64,
     cause: DurableTransactionRestartWalRetentionRequirementCause,
     requirements: &mut Vec<DurableTransactionRestartWalRetentionRequirement>,
     retained_first_record: &mut Option<LogSequenceNumber>,
-) -> Result<(), DurableTransactionRestartWalRetentionEvidenceError> {
+) -> Result<(), DurableTransactionRestartWalRetentionEvidenceError>
+where
+    Observation: DurableTransactionRestartObservationView<N>,
+{
     let Some(frontier) = durable_frontier else {
         return Err(
             DurableTransactionRestartWalRetentionEvidenceError::RequirementInEmptyPrefix {
@@ -17637,9 +21473,9 @@ fn push_wal_retention_requirement<const N: usize>(
             },
         );
     }
-    let Ok(index) =
-        observations.binary_search_by_key(&position, |observation| observation.position().get())
-    else {
+    let Ok(index) = observations.binary_search_by_key(&position, |observation| {
+        observation.restart_position().get()
+    }) else {
         return Err(
             DurableTransactionRestartWalRetentionEvidenceError::RequirementNotRecordBoundary {
                 cause,
@@ -17647,7 +21483,7 @@ fn push_wal_retention_requirement<const N: usize>(
             },
         );
     };
-    let actual = observations[index].position().clone();
+    let actual = observations[index].restart_position().clone();
     if !lineage.same_lineage(actual.lineage()) {
         return Err(
             DurableTransactionRestartWalRetentionEvidenceError::RequirementNotRecordBoundary {
@@ -17669,23 +21505,51 @@ fn push_wal_retention_requirement<const N: usize>(
     Ok(())
 }
 
-struct CompletedTransactionRestartWalRetentionEvidenceInput<'evidence, const N: usize> {
+struct CompletedTransactionRestartWalRetentionEvidenceInput<'evidence, Observation, const N: usize>
+{
     coordinator: &'evidence TransactionCoordinator,
     completion: &'evidence TransactionPageStorageRestartCheckpointCompletionEvidence<N>,
     lineage: &'evidence LogLineage,
     store_lineage: &'evidence LogLineage,
     durable_frontier: Option<&'evidence LogSequenceNumber>,
-    observations: &'evidence [DurableTransactionRestartObservation<N>],
+    observations: &'evidence [Observation],
     inventory: &'evidence [StoredPageSnapshotObservation<N>],
     metadata: &'evidence DurableTransactionRestartRetentionMetadataObservation,
 }
 
 fn analyze_completed_transaction_restart_wal_retention_evidence<const N: usize>(
-    input: CompletedTransactionRestartWalRetentionEvidenceInput<'_, N>,
+    input: CompletedTransactionRestartWalRetentionEvidenceInput<
+        '_,
+        DurableTransactionRestartObservation<N>,
+        N,
+    >,
 ) -> Result<
     DurableTransactionRestartWalRetentionAnalysis,
     DurableTransactionRestartWalRetentionEvidenceError,
 > {
+    let fresh_analysis = analyze_durable_transaction_restart_evidence(
+        input.lineage,
+        input.durable_frontier,
+        input.observations,
+    )
+    .map_err(
+        |source| DurableTransactionRestartWalRetentionEvidenceError::RestartAnalysis {
+            source: Box::new(source),
+        },
+    )?;
+    derive_completed_transaction_restart_wal_retention_evidence(input, &fresh_analysis)
+}
+
+fn derive_completed_transaction_restart_wal_retention_evidence<Observation, const N: usize>(
+    input: CompletedTransactionRestartWalRetentionEvidenceInput<'_, Observation, N>,
+    fresh_analysis: &DurableTransactionRestartAnalysis,
+) -> Result<
+    DurableTransactionRestartWalRetentionAnalysis,
+    DurableTransactionRestartWalRetentionEvidenceError,
+>
+where
+    Observation: DurableTransactionRestartObservationView<N>,
+{
     let CompletedTransactionRestartWalRetentionEvidenceInput {
         coordinator,
         completion,
@@ -17696,19 +21560,12 @@ fn analyze_completed_transaction_restart_wal_retention_evidence<const N: usize>(
         inventory,
         metadata,
     } = input;
-    let fresh_analysis =
-        analyze_durable_transaction_restart_evidence(lineage, durable_frontier, observations)
-            .map_err(|source| {
-                DurableTransactionRestartWalRetentionEvidenceError::RestartAnalysis {
-                    source: Box::new(source),
-                }
-            })?;
     validate_completed_transaction_restart_evidence_parts(
         &completion.selected_baseline,
         &completion.current_analysis,
         coordinator,
         completion.transaction_summary(),
-        &fresh_analysis,
+        fresh_analysis,
     )
     .map_err(
         |source| DurableTransactionRestartWalRetentionEvidenceError::Completion {
@@ -17766,14 +21623,12 @@ fn analyze_completed_transaction_restart_wal_retention_evidence<const N: usize>(
             }
         })?;
     for observation in observations {
-        match observation {
-            DurableTransactionRestartObservation::Page(observation) => {
-                page_numbers.push(observation.page_number());
+        match observation.as_restart_observation_ref() {
+            DurableTransactionRestartObservationRef::Page { page_number, .. }
+            | DurableTransactionRestartObservationRef::TransactionPage { page_number, .. } => {
+                page_numbers.push(page_number);
             }
-            DurableTransactionRestartObservation::TransactionPage(observation) => {
-                page_numbers.push(observation.page().page_number());
-            }
-            DurableTransactionRestartObservation::Commit(_) => {}
+            DurableTransactionRestartObservationRef::Commit { .. } => {}
         }
     }
     page_numbers.extend(
@@ -17840,13 +21695,14 @@ fn analyze_completed_transaction_restart_wal_retention_evidence<const N: usize>(
 
     for page_number in page_numbers {
         let required =
-            latest_required_restart_page_image(&fresh_analysis, page_number, observations)
-                .map_err(|source| {
+            latest_required_restart_page_image(fresh_analysis, page_number, observations).map_err(
+                |source| {
                     DurableTransactionRestartWalRetentionEvidenceError::PageInventorySnapshot {
                         page_number,
                         source: Box::new(source),
                     }
-                })?;
+                },
+            )?;
         let snapshot = inventory
             .binary_search_by_key(&page_number, StoredPageSnapshotObservation::page_number)
             .ok()
@@ -17856,7 +21712,7 @@ fn analyze_completed_transaction_restart_wal_retention_evidence<const N: usize>(
             (None, Some(snapshot)) => {
                 let stored_position = validate_restart_page_snapshot(
                     lineage,
-                    &fresh_analysis,
+                    fresh_analysis,
                     observations,
                     page_number,
                     snapshot,
@@ -17885,7 +21741,7 @@ fn analyze_completed_transaction_restart_wal_retention_evidence<const N: usize>(
             (Some(required), Some(snapshot)) => {
                 let stored_position = validate_restart_page_snapshot(
                     lineage,
-                    &fresh_analysis,
+                    fresh_analysis,
                     observations,
                     page_number,
                     snapshot,
@@ -18032,42 +21888,1027 @@ where
         }
     };
     let lineage = completed.source.lineage().clone();
-    let analysis = completed
-        .source
-        .with_durable_transaction_restart_observations(|durable_frontier, observations| {
-            analyze_completed_transaction_restart_wal_retention_evidence(
+    let analysis = match &completed.validation {
+        SelectedRestartCheckpointValidation::CompletePrefix => {
+            match completed
+                .source
+                .with_durable_transaction_restart_observations(|durable_frontier, observations| {
+                    analyze_completed_transaction_restart_wal_retention_evidence(
+                        CompletedTransactionRestartWalRetentionEvidenceInput {
+                            coordinator: &completed.coordinator,
+                            completion: &completed.evidence,
+                            lineage: &lineage,
+                            store_lineage: &store_lineage,
+                            durable_frontier,
+                            observations,
+                            inventory: &inventory,
+                            metadata: &metadata,
+                        },
+                    )
+                }) {
+                Ok(Ok(analysis)) => analysis,
+                Ok(Err(source)) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                            completed: Box::new(completed),
+                            error: wal_retention_evidence_error(source),
+                        },
+                    );
+                }
+                Err(source) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                            completed: Box::new(completed),
+                            error: DurableTransactionRestartWalRetentionAnalysisError::WalSource(
+                                source,
+                            ),
+                        },
+                    );
+                }
+            }
+        }
+        SelectedRestartCheckpointValidation::Anchored { planner } => {
+            let materialized = match planner(
+                &mut completed.source,
+                &completed.store,
+                &completed.evidence.selected_baseline,
+            ) {
+                Ok(materialized) => materialized,
+                Err(source) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                            completed: Box::new(completed),
+                            error:
+                                DurableTransactionRestartWalRetentionAnalysisError::ReplayPlanning(
+                                    Box::new(source),
+                                ),
+                        },
+                    );
+                }
+            };
+            match derive_completed_transaction_restart_wal_retention_evidence(
                 CompletedTransactionRestartWalRetentionEvidenceInput {
                     coordinator: &completed.coordinator,
                     completion: &completed.evidence,
                     lineage: &lineage,
                     store_lineage: &store_lineage,
-                    durable_frontier,
-                    observations,
+                    durable_frontier: materialized.current_analysis.durable_frontier(),
+                    observations: &materialized.retained_observations,
                     inventory: &inventory,
                     metadata: &metadata,
                 },
+                &materialized.current_analysis,
+            ) {
+                Ok(analysis) => analysis,
+                Err(source) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
+                            completed: Box::new(completed),
+                            error: wal_retention_evidence_error(source),
+                        },
+                    );
+                }
+            }
+        }
+    };
+    Ok(
+        WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay {
+            completed,
+            analysis,
+        },
+    )
+}
+
+fn restart_checkpoint_completeness_baseline_matches_owned_observation(
+    expected: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    actual: &OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation,
+) -> bool {
+    let transactions = actual.transactions();
+    if transactions.persistent_log_id() != expected.persistent_log_id().get()
+        || transactions.durable_frontier() != expected.durable_frontier()
+        || transactions.transactions().len() != expected.transactions().len()
+        || actual.pages().len() != expected.pages().len()
+        || !restart_checkpoint_replay_matches_observation(expected.replay_start(), actual.replay())
+    {
+        return false;
+    }
+    if !expected
+        .transactions()
+        .iter()
+        .zip(transactions.transactions())
+        .all(|(expected, actual)| restart_checkpoint_entry_matches_observation(expected, *actual))
+    {
+        return false;
+    }
+    expected
+        .pages()
+        .iter()
+        .zip(actual.pages())
+        .all(|(expected, actual)| {
+            restart_checkpoint_page_entry_matches_observation(expected, *actual)
+        })
+}
+
+fn restart_wal_retention_analyses_match(
+    expected: &DurableTransactionRestartWalRetentionAnalysis,
+    actual: &DurableTransactionRestartWalRetentionAnalysis,
+) -> bool {
+    expected.persistent_log_id == actual.persistent_log_id
+        && expected.lineage.same_lineage(&actual.lineage)
+        && expected.durable_frontier == actual.durable_frontier
+        && expected.floor.retained_first_record == actual.floor.retained_first_record
+        && expected.allocated_epoch_high_water == actual.allocated_epoch_high_water
+        && expected.store_page_count == actual.store_page_count
+        && expected.unresolved_transaction_count == actual.unresolved_transaction_count
+        && expected.requirements.len() == actual.requirements.len()
+        && expected
+            .requirements
+            .iter()
+            .zip(&actual.requirements)
+            .all(|(expected, actual)| {
+                expected.position == actual.position && expected.cause == actual.cause
+            })
+}
+
+fn restart_wal_reclamation_source_observations_match(
+    expected: &DurableTransactionRestartWalReclamationSourceObservation,
+    actual: &DurableTransactionRestartWalReclamationSourceObservation,
+) -> bool {
+    expected.lineage.same_lineage(&actual.lineage)
+        && expected.physical_format_version == actual.physical_format_version
+        && expected.source_generation == actual.source_generation
+        && expected.retained_first_logical_record == actual.retained_first_logical_record
+        && expected.logical_position_high_water == actual.logical_position_high_water
+        && expected.allocated_epoch_high_water == actual.allocated_epoch_high_water
+        && expected.selected_checkpoint_anchor == actual.selected_checkpoint_anchor
+}
+
+struct RestartWalReclamationPermitInput {
+    persistent_log_id: PersistentLogId,
+    lineage: LogLineage,
+    durable_frontier: Option<LogSequenceNumber>,
+    retained_first_logical_record: Option<LogSequenceNumber>,
+    allocated_epoch_high_water: NonZeroU64,
+    physical_format_version: NonZeroU16,
+    source_generation: u64,
+    selected_checkpoint_anchor: DurableTransactionRestartSelectedCheckpointAnchor,
+}
+
+fn with_restart_wal_reclamation_permit<Output, Operation>(
+    input: RestartWalReclamationPermitInput,
+    operation: Operation,
+) -> Output
+where
+    Operation:
+        for<'attempt> FnOnce(DurableTransactionRestartWalReclamationPermit<'attempt>) -> Output,
+{
+    operation(DurableTransactionRestartWalReclamationPermit {
+        persistent_log_id: input.persistent_log_id,
+        lineage: input.lineage,
+        durable_frontier: input.durable_frontier,
+        retained_first_logical_record: input.retained_first_logical_record,
+        allocated_epoch_high_water: input.allocated_epoch_high_water,
+        physical_format_version: input.physical_format_version,
+        source_generation: input.source_generation,
+        selected_checkpoint_anchor: input.selected_checkpoint_anchor,
+        attempt_brand: PhantomData,
+    })
+}
+
+struct RestartWalReclamationValidatedPreflight<const N: usize> {
+    source_physical_format_version: NonZeroU16,
+    source_generation: u64,
+    selected_checkpoint_anchor: DurableTransactionRestartSelectedCheckpointAnchor,
+    retained_logical_record_count: u64,
+    retained_observations: Vec<OwnedDurableTransactionRestartReplayObservation<N>>,
+}
+
+fn validate_restart_wal_reclamation_source_evidence<Observation, const N: usize>(
+    frozen: &DurableTransactionRestartWalRetentionAnalysis,
+    source: &DurableTransactionRestartWalReclamationSourceObservation,
+    observations: &[Observation],
+    selected_checkpoint_anchor: DurableTransactionRestartSelectedCheckpointAnchor,
+) -> Result<
+    RestartWalReclamationValidatedPreflight<N>,
+    DurableTransactionRestartWalReclamationEvidenceError,
+>
+where
+    Observation: DurableTransactionRestartObservationView<N>,
+{
+    if !frozen.lineage.same_lineage(source.lineage()) {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceLineageMismatch {
+                expected: frozen.lineage.clone(),
+                actual: source.lineage().clone(),
+            },
+        );
+    }
+    let Some(physical_format_version) = NonZeroU16::new(source.physical_format_version()) else {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::ZeroPhysicalFormatVersion,
+        );
+    };
+    for position in [
+        source.retained_first_logical_record(),
+        source.logical_position_high_water(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !frozen.lineage.same_lineage(position.lineage()) {
+            return Err(
+                DurableTransactionRestartWalReclamationEvidenceError::ForeignSourcePosition {
+                    position: position.clone(),
+                },
+            );
+        }
+    }
+    let expected_high_water = frozen.durable_frontier();
+    let actual_high_water = source
+        .logical_position_high_water()
+        .map(LogSequenceNumber::get);
+    if actual_high_water != expected_high_water {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceLogicalHighWaterChanged {
+                expected: expected_high_water,
+                actual: actual_high_water,
+            },
+        );
+    }
+    let expected_first = observations
+        .first()
+        .map(DurableTransactionRestartObservationView::restart_position)
+        .map(LogSequenceNumber::get);
+    let actual_first = source
+        .retained_first_logical_record()
+        .map(LogSequenceNumber::get);
+    if actual_first != expected_first {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceRetainedFirstRecordChanged {
+                expected: expected_first,
+                actual: actual_first,
+            },
+        );
+    }
+    if let (Some(retained_first), Some(floor)) = (
+        actual_first,
+        frozen
+            .floor
+            .retained_first_record
+            .as_ref()
+            .map(LogSequenceNumber::get),
+    ) && retained_first > floor
+    {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceAlreadyPrunedPastFloor {
+                retained_first,
+                floor,
+            },
+        );
+    }
+    if source.allocated_epoch_high_water() != frozen.allocated_epoch_high_water {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceAllocatedEpochHighWaterChanged {
+                expected: frozen.allocated_epoch_high_water.get(),
+                actual: source.allocated_epoch_high_water().get(),
+            },
+        );
+    }
+    let anchor_matches = match (
+        source.source_generation(),
+        source.selected_checkpoint_anchor,
+    ) {
+        (0, None) => true,
+        (0, Some(_)) => false,
+        (_, Some(actual)) => actual == selected_checkpoint_anchor,
+        (_, None) => false,
+    };
+    if !anchor_matches {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SelectedCheckpointAnchorChanged {
+                expected: selected_checkpoint_anchor,
+                actual: source.selected_checkpoint_anchor,
+            },
+        );
+    }
+    if source.source_generation() == u64::MAX {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceGenerationExhausted {
+                generation: source.source_generation(),
+            },
+        );
+    }
+    let retained_record_count = match &frozen.floor.retained_first_record {
+        None => 0,
+        Some(floor) => observations
+            .iter()
+            .filter(|observation| observation.restart_position().get() >= floor.get())
+            .count(),
+    };
+    let retained_logical_record_count = u64::try_from(retained_record_count).map_err(|_| {
+        DurableTransactionRestartWalReclamationEvidenceError::RetainedLogicalRecordCountWidthExceeded {
+            record_count: retained_record_count,
+        }
+    })?;
+    let mut retained_observations = Vec::new();
+    retained_observations
+        .try_reserve_exact(retained_record_count)
+        .map_err(|_| {
+            DurableTransactionRestartWalReclamationEvidenceError::RetainedObservationCapacityExhausted {
+                record_count: retained_record_count,
+            }
+        })?;
+    if let Some(floor) = &frozen.floor.retained_first_record {
+        retained_observations.extend(
+            observations
+                .iter()
+                .filter(|observation| observation.restart_position().get() >= floor.get())
+                .map(
+                    OwnedDurableTransactionRestartReplayObservation::from_restart_observation_view,
+                ),
+        );
+    }
+    Ok(RestartWalReclamationValidatedPreflight {
+        source_physical_format_version: physical_format_version,
+        source_generation: source.source_generation(),
+        selected_checkpoint_anchor,
+        retained_logical_record_count,
+        retained_observations,
+    })
+}
+
+fn effect_position_value(
+    position: Option<&LogSequenceNumber>,
+    lineage: &LogLineage,
+) -> Result<Option<u64>, DurableTransactionRestartWalReclamationEvidenceError> {
+    match position {
+        Some(position) if !lineage.same_lineage(position.lineage()) => Err(
+            DurableTransactionRestartWalReclamationEvidenceError::ForeignSourcePosition {
+                position: position.clone(),
+            },
+        ),
+        Some(position) => Ok(Some(position.get())),
+        None => Ok(None),
+    }
+}
+
+fn validate_restart_wal_reclamation_effect<const N: usize>(
+    frozen: &DurableTransactionRestartWalRetentionAnalysis,
+    validated: &RestartWalReclamationValidatedPreflight<N>,
+    effect: DurableTransactionRestartWalReclamationEffectObservation,
+) -> Result<
+    DurableTransactionRestartWalReclamationReceipt,
+    DurableTransactionRestartWalReclamationEvidenceError,
+> {
+    let expected_new_generation = validated.source_generation + 1;
+    if effect.replacement.old_generation != validated.source_generation
+        || effect.replacement.new_generation != expected_new_generation
+    {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::EffectGenerationChanged {
+                expected_old: validated.source_generation,
+                actual_old: effect.replacement.old_generation,
+                actual_new: effect.replacement.new_generation,
+            },
+        );
+    }
+    let Some(replacement_physical_format_version) =
+        NonZeroU16::new(effect.replacement.physical_format_version)
+    else {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::EffectPhysicalFormatVersionZero,
+        );
+    };
+    let actual_first = effect_position_value(
+        effect.retained_first_logical_record.as_ref(),
+        &frozen.lineage,
+    )?;
+    let expected_first = frozen
+        .floor
+        .retained_first_record
+        .as_ref()
+        .map(LogSequenceNumber::get);
+    if actual_first != expected_first {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::EffectRetainedFirstRecordChanged {
+                expected: expected_first,
+                actual: actual_first,
+            },
+        );
+    }
+    let actual_high_water =
+        effect_position_value(effect.logical_position_high_water.as_ref(), &frozen.lineage)?;
+    if actual_high_water != frozen.durable_frontier() {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::EffectLogicalHighWaterChanged {
+                expected: frozen.durable_frontier(),
+                actual: actual_high_water,
+            },
+        );
+    }
+    if effect.allocated_epoch_high_water != frozen.allocated_epoch_high_water {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::EffectAllocatedEpochHighWaterChanged {
+                expected: frozen.allocated_epoch_high_water.get(),
+                actual: effect.allocated_epoch_high_water.get(),
+            },
+        );
+    }
+    if effect.retained_logical_record_count != validated.retained_logical_record_count {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::EffectLogicalRecordCountChanged {
+                expected: validated.retained_logical_record_count,
+                actual: effect.retained_logical_record_count,
+            },
+        );
+    }
+    if effect.retained_logical_record_count != 0 && effect.retained_physical_unit_count == 0 {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::EffectPhysicalUnitCountEmpty {
+                retained_logical_record_count: effect.retained_logical_record_count,
+            },
+        );
+    }
+    Ok(DurableTransactionRestartWalReclamationReceipt {
+        persistent_log_id: frozen.persistent_log_id,
+        source_physical_format_version: validated.source_physical_format_version,
+        replacement_physical_format_version,
+        selected_checkpoint_anchor: validated.selected_checkpoint_anchor,
+        effect,
+    })
+}
+
+fn validate_installed_restart_wal_reclamation_source<const N: usize>(
+    frozen: &DurableTransactionRestartWalRetentionAnalysis,
+    validated: &RestartWalReclamationValidatedPreflight<N>,
+    receipt: &DurableTransactionRestartWalReclamationReceipt,
+    installed: &DurableTransactionRestartWalReclamationSourceObservation,
+) -> Result<(), DurableTransactionRestartWalReclamationEvidenceError> {
+    if !frozen.lineage.same_lineage(installed.lineage()) {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceLineageMismatch {
+                expected: frozen.lineage.clone(),
+                actual: installed.lineage().clone(),
+            },
+        );
+    }
+    let expected_generation = validated.source_generation + 1;
+    if installed.source_generation() != expected_generation {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::InstalledGenerationChanged {
+                expected: expected_generation,
+                actual: installed.source_generation(),
+            },
+        );
+    }
+    let expected_format = receipt.replacement_physical_format_version();
+    if installed.physical_format_version() != expected_format {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::InstalledPhysicalFormatVersionChanged {
+                expected: expected_format,
+                actual: installed.physical_format_version(),
+            },
+        );
+    }
+    let expected_first = frozen
+        .floor
+        .retained_first_record
+        .as_ref()
+        .map(LogSequenceNumber::get);
+    let actual_first =
+        effect_position_value(installed.retained_first_logical_record(), &frozen.lineage)?;
+    if actual_first != expected_first {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceRetainedFirstRecordChanged {
+                expected: expected_first,
+                actual: actual_first,
+            },
+        );
+    }
+    let expected_high_water = frozen.durable_frontier();
+    let actual_high_water =
+        effect_position_value(installed.logical_position_high_water(), &frozen.lineage)?;
+    if actual_high_water != expected_high_water {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceLogicalHighWaterChanged {
+                expected: expected_high_water,
+                actual: actual_high_water,
+            },
+        );
+    }
+    if installed.allocated_epoch_high_water() != frozen.allocated_epoch_high_water {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SourceAllocatedEpochHighWaterChanged {
+                expected: frozen.allocated_epoch_high_water.get(),
+                actual: installed.allocated_epoch_high_water().get(),
+            },
+        );
+    }
+    if installed.selected_checkpoint_anchor != Some(validated.selected_checkpoint_anchor) {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::SelectedCheckpointAnchorChanged {
+                expected: validated.selected_checkpoint_anchor,
+                actual: installed.selected_checkpoint_anchor,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn validate_installed_restart_wal_retained_observations<const N: usize>(
+    expected: &[OwnedDurableTransactionRestartReplayObservation<N>],
+    actual: &[DurableTransactionRestartObservation<N>],
+) -> Result<(), DurableTransactionRestartWalReclamationEvidenceError> {
+    if actual.len() != expected.len() {
+        return Err(
+            DurableTransactionRestartWalReclamationEvidenceError::InstalledRetainedRecordCountChanged {
+                expected: expected.len(),
+                actual: actual.len(),
+            },
+        );
+    }
+    for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+        let actual = OwnedDurableTransactionRestartReplayObservation::from(actual);
+        if *expected != actual {
+            return Err(
+                DurableTransactionRestartWalReclamationEvidenceError::InstalledRetainedRecordChanged {
+                    index,
+                    expected_position: owned_replay_observation_position(expected).get(),
+                    actual_position: owned_replay_observation_position(&actual).get(),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reclaim_analyzed_transaction_restart_wal_prefix<
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+>(
+    analyzed: WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+        Source,
+        Store,
+        CheckpointSource,
+        N,
+    >,
+) -> Result<
+    ReclaimedTransactionPageStorageRestartCheckpointReplay<Source, Store, CheckpointSource, N>,
+    FailedTransactionPageStorageRestartCheckpointWalReclamation<Source, Store, CheckpointSource, N>,
+>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource
+        + DurableTransactionRestartPrunedGenerationSource<N>
+        + DurableTransactionRestartWalReclamationSource<N>,
+    Store: DurablePageStoreInventorySource<N>,
+    CheckpointSource: DurableTransactionRestartCheckpointCompletenessBaselineSource
+        + DurableTransactionRestartCheckpointCompletenessBaselinePublisher,
+{
+    let mut analyzed = Box::new(analyzed);
+    let checkpoint = match analyzed
+        .completed
+        .checkpoint_source
+        .load_restart_checkpoint_completeness_baseline()
+    {
+        Ok(Some(checkpoint)) => checkpoint,
+        Ok(None) => {
+            return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                analyzed,
+                error: DurableTransactionRestartWalReclamationError::Preflight(
+                    DurableTransactionRestartWalReclamationPreflightError::CurrentCheckpointMissing,
+                ),
+            });
+        }
+        Err(source) => {
+            return Err(
+                FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                    analyzed,
+                    error: DurableTransactionRestartWalReclamationError::Preflight(
+                        DurableTransactionRestartWalReclamationPreflightError::CheckpointSource(
+                            source,
+                        ),
+                    ),
+                },
+            );
+        }
+    };
+    if !restart_checkpoint_completeness_baseline_matches_owned_observation(
+        &analyzed.completed.evidence.selected_baseline,
+        &checkpoint,
+    ) {
+        return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+            analyzed,
+            error: DurableTransactionRestartWalReclamationError::Preflight(
+                DurableTransactionRestartWalReclamationPreflightError::Evidence(Box::new(
+                    DurableTransactionRestartWalReclamationEvidenceError::CurrentCheckpointChanged,
+                )),
+            ),
+        });
+    }
+    let inventory = match analyzed.completed.store.durable_page_store_inventory() {
+        Ok(inventory) => inventory,
+        Err(source) => {
+            return Err(
+                FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                    analyzed,
+                    error: DurableTransactionRestartWalReclamationError::Preflight(
+                        DurableTransactionRestartWalReclamationPreflightError::StoreInventory(
+                            source,
+                        ),
+                    ),
+                },
+            );
+        }
+    };
+    let store_lineage = analyzed.completed.store.lineage().clone();
+    let metadata =
+        match analyzed
+            .completed
+            .source
+            .observe_restart_retention_metadata()
+        {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                analyzed,
+                error: DurableTransactionRestartWalReclamationError::Preflight(
+                    DurableTransactionRestartWalReclamationPreflightError::RetentionMetadata(
+                        source,
+                    ),
+                ),
+            });
+            }
+        };
+    let reclamation_source =
+        match analyzed
+            .completed
+            .source
+            .observe_restart_wal_reclamation_source()
+        {
+            Ok(observation) => observation,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                analyzed,
+                error: DurableTransactionRestartWalReclamationError::Preflight(
+                    DurableTransactionRestartWalReclamationPreflightError::ReclamationSource(
+                        source,
+                    ),
+                ),
+            });
+            }
+        };
+    let lineage = analyzed.completed.source.lineage().clone();
+    let selected_checkpoint_anchor =
+        selected_restart_checkpoint_anchor(&analyzed.completed.evidence.selected_baseline);
+    if reclamation_source.source_generation() == u64::MAX {
+        return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+            analyzed,
+            error: DurableTransactionRestartWalReclamationError::Preflight(
+                DurableTransactionRestartWalReclamationPreflightError::Evidence(Box::new(
+                    DurableTransactionRestartWalReclamationEvidenceError::SourceGenerationExhausted {
+                        generation: u64::MAX,
+                    },
+                )),
+            ),
+        });
+    }
+    let validated = match &analyzed.completed.validation {
+        SelectedRestartCheckpointValidation::CompletePrefix => {
+            let validation = analyzed
+                .completed
+                .source
+                .with_durable_transaction_restart_observations(
+                    |durable_frontier, observations| {
+                        let fresh = analyze_completed_transaction_restart_wal_retention_evidence(
+                            CompletedTransactionRestartWalRetentionEvidenceInput {
+                                coordinator: &analyzed.completed.coordinator,
+                                completion: &analyzed.completed.evidence,
+                                lineage: &lineage,
+                                store_lineage: &store_lineage,
+                                durable_frontier,
+                                observations,
+                                inventory: &inventory,
+                                metadata: &metadata,
+                            },
+                        )
+                        .map_err(|source| {
+                            DurableTransactionRestartWalReclamationEvidenceError::FreshRetention(
+                                Box::new(source),
+                            )
+                        })?;
+                        if !restart_wal_retention_analyses_match(&analyzed.analysis, &fresh) {
+                            return Err(
+                                DurableTransactionRestartWalReclamationEvidenceError::FrozenRetentionAnalysisChanged,
+                            );
+                        }
+                        validate_restart_wal_reclamation_source_evidence(
+                            &analyzed.analysis,
+                            &reclamation_source,
+                            observations,
+                            selected_checkpoint_anchor,
+                        )
+                    },
+                );
+            match validation {
+                Ok(Ok(validated)) => validated,
+                Ok(Err(source)) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                            analyzed,
+                            error: DurableTransactionRestartWalReclamationError::Preflight(
+                                DurableTransactionRestartWalReclamationPreflightError::Evidence(
+                                    Box::new(source),
+                                ),
+                            ),
+                        },
+                    );
+                }
+                Err(source) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                            analyzed,
+                            error: DurableTransactionRestartWalReclamationError::Preflight(
+                                DurableTransactionRestartWalReclamationPreflightError::WalSource(
+                                    source,
+                                ),
+                            ),
+                        },
+                    );
+                }
+            }
+        }
+        SelectedRestartCheckpointValidation::Anchored { planner } => {
+            let materialized = match planner(
+                &mut analyzed.completed.source,
+                &analyzed.completed.store,
+                &analyzed.completed.evidence.selected_baseline,
+            ) {
+                Ok(materialized) => materialized,
+                Err(source) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                            analyzed,
+                            error: DurableTransactionRestartWalReclamationError::Preflight(
+                                DurableTransactionRestartWalReclamationPreflightError::ReplayPlanning(
+                                    Box::new(source),
+                                ),
+                            ),
+                        },
+                    );
+                }
+            };
+            let fresh = match derive_completed_transaction_restart_wal_retention_evidence(
+                CompletedTransactionRestartWalRetentionEvidenceInput {
+                    coordinator: &analyzed.completed.coordinator,
+                    completion: &analyzed.completed.evidence,
+                    lineage: &lineage,
+                    store_lineage: &store_lineage,
+                    durable_frontier: materialized.current_analysis.durable_frontier(),
+                    observations: &materialized.retained_observations,
+                    inventory: &inventory,
+                    metadata: &metadata,
+                },
+                &materialized.current_analysis,
+            ) {
+                Ok(fresh) => fresh,
+                Err(source) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                            analyzed,
+                            error: DurableTransactionRestartWalReclamationError::Preflight(
+                                DurableTransactionRestartWalReclamationPreflightError::Evidence(
+                                    Box::new(
+                                        DurableTransactionRestartWalReclamationEvidenceError::FreshRetention(
+                                            Box::new(source),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        },
+                    );
+                }
+            };
+            if !restart_wal_retention_analyses_match(&analyzed.analysis, &fresh) {
+                return Err(
+                    FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                        analyzed,
+                        error: DurableTransactionRestartWalReclamationError::Preflight(
+                            DurableTransactionRestartWalReclamationPreflightError::Evidence(
+                                Box::new(
+                                    DurableTransactionRestartWalReclamationEvidenceError::FrozenRetentionAnalysisChanged,
+                                ),
+                            ),
+                        ),
+                    },
+                );
+            }
+            match validate_restart_wal_reclamation_source_evidence(
+                &analyzed.analysis,
+                &reclamation_source,
+                &materialized.retained_observations,
+                selected_checkpoint_anchor,
+            ) {
+                Ok(validated) => validated,
+                Err(source) => {
+                    return Err(
+                        FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                            analyzed,
+                            error: DurableTransactionRestartWalReclamationError::Preflight(
+                                DurableTransactionRestartWalReclamationPreflightError::Evidence(
+                                    Box::new(source),
+                                ),
+                            ),
+                        },
+                    );
+                }
+            }
+        }
+    };
+    let reobserved_source =
+        match analyzed
+            .completed
+            .source
+            .observe_restart_wal_reclamation_source()
+        {
+            Ok(observation) => observation,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                analyzed,
+                error: DurableTransactionRestartWalReclamationError::Preflight(
+                    DurableTransactionRestartWalReclamationPreflightError::ReclamationSource(
+                        source,
+                    ),
+                ),
+            });
+            }
+        };
+    if !restart_wal_reclamation_source_observations_match(&reclamation_source, &reobserved_source) {
+        return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+            analyzed,
+            error: DurableTransactionRestartWalReclamationError::Preflight(
+                DurableTransactionRestartWalReclamationPreflightError::Evidence(Box::new(
+                    DurableTransactionRestartWalReclamationEvidenceError::SourceObservationChanged {
+                        expected_generation: reclamation_source.source_generation(),
+                        actual_generation: reobserved_source.source_generation(),
+                    },
+                )),
+            ),
+        });
+    }
+
+    let permit_input = RestartWalReclamationPermitInput {
+        persistent_log_id: analyzed.analysis.persistent_log_id,
+        lineage: analyzed.analysis.lineage.clone(),
+        durable_frontier: analyzed.analysis.durable_frontier.clone(),
+        retained_first_logical_record: analyzed.analysis.floor.retained_first_record.clone(),
+        allocated_epoch_high_water: analyzed.analysis.allocated_epoch_high_water,
+        physical_format_version: validated.source_physical_format_version,
+        source_generation: validated.source_generation,
+        selected_checkpoint_anchor: validated.selected_checkpoint_anchor,
+    };
+    let effect = with_restart_wal_reclamation_permit(permit_input, |permit| {
+        analyzed.completed.source.reclaim_restart_wal_prefix(permit)
+    });
+    let effect =
+        match effect {
+            Ok(effect) => effect,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                analyzed,
+                error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                    DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
+                        source,
+                    ),
+                ),
+            });
+            }
+        };
+    let receipt =
+        match validate_restart_wal_reclamation_effect(&analyzed.analysis, &validated, effect) {
+            Ok(receipt) => receipt,
+            Err(source) => {
+                return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                    analyzed,
+                    error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                        DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Receipt(
+                            source,
+                        ),
+                    ),
+                });
+            }
+        };
+    let installed_source = match analyzed
+        .completed
+        .source
+        .observe_restart_wal_reclamation_source()
+    {
+        Ok(source) => source,
+        Err(source) => {
+            return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                    analyzed,
+                    error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                        DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledSource(
+                            source,
+                        ),
+                    ),
+                });
+        }
+    };
+    if let Err(source) = validate_installed_restart_wal_reclamation_source(
+        &analyzed.analysis,
+        &validated,
+        &receipt,
+        &installed_source,
+    ) {
+        return Err(
+            FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                analyzed,
+                error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                    DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledEvidence(
+                        source,
+                    ),
+                ),
+            },
+        );
+    }
+    let installed_records = analyzed
+        .completed
+        .source
+        .with_durable_transaction_restart_retained_observations(|observations| {
+            validate_installed_restart_wal_retained_observations(
+                &validated.retained_observations,
+                observations,
             )
         });
-    match analysis {
-        Ok(Ok(analysis)) => Ok(
-            WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay {
-                completed,
-                analysis,
-            },
-        ),
-        Ok(Err(source)) => Err(
-            FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
-                completed: Box::new(completed),
-                error: wal_retention_evidence_error(source),
-            },
-        ),
-        Err(source) => Err(
-            FailedTransactionPageStorageRestartCheckpointWalRetentionAnalysis {
-                completed: Box::new(completed),
-                error: DurableTransactionRestartWalRetentionAnalysisError::WalSource(source),
-            },
-        ),
+    match installed_records {
+        Ok(Ok(())) => {}
+        Ok(Err(source)) => {
+            return Err(
+                FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                    analyzed,
+                    error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                        DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledEvidence(
+                            source,
+                        ),
+                    ),
+                },
+            );
+        }
+        Err(source) => {
+            return Err(
+                FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                    analyzed,
+                    error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                        DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledWal(
+                            source,
+                        ),
+                    ),
+                },
+            );
+        }
     }
+    let reobserved_installed_source = match analyzed
+        .completed
+        .source
+        .observe_restart_wal_reclamation_source()
+    {
+        Ok(source) => source,
+        Err(source) => {
+            return Err(FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                    analyzed,
+                    error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                        DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledSource(
+                            source,
+                        ),
+                    ),
+                });
+        }
+    };
+    if !restart_wal_reclamation_source_observations_match(
+        &installed_source,
+        &reobserved_installed_source,
+    ) {
+        return Err(
+            FailedTransactionPageStorageRestartCheckpointWalReclamation {
+                analyzed,
+                error: DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                    DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledEvidence(
+                        DurableTransactionRestartWalReclamationEvidenceError::SourceObservationChanged {
+                            expected_generation: installed_source.source_generation(),
+                            actual_generation: reobserved_installed_source.source_generation(),
+                        },
+                    ),
+                ),
+            },
+        );
+    }
+    Ok(ReclaimedTransactionPageStorageRestartCheckpointReplay {
+        analyzed: *analyzed,
+        receipt,
+    })
 }
 
 fn validate_restart_checkpoint_completeness_baseline_against_current_prefix<
@@ -18867,29 +23708,36 @@ fn restart_transaction_entry(
         })
 }
 
-fn latest_required_restart_page_image<const N: usize>(
+fn latest_required_restart_page_image<Observation, const N: usize>(
     analysis: &DurableTransactionRestartAnalysis,
     page_number: PageNumber,
-    observations: &[DurableTransactionRestartObservation<N>],
+    observations: &[Observation],
 ) -> Result<
     Option<DurableTransactionRestartRequiredPageImage>,
     DurableTransactionRestartCompletenessEvidenceError,
-> {
+>
+where
+    Observation: DurableTransactionRestartObservationView<N>,
+{
     let mut required = None;
     for observation in observations {
-        match observation {
-            DurableTransactionRestartObservation::Page(observation)
-                if observation.page_number() == page_number =>
-            {
+        match observation.as_restart_observation_ref() {
+            DurableTransactionRestartObservationRef::Page {
+                page_number: actual_page,
+                position,
+                ..
+            } if actual_page == page_number => {
                 required = Some(DurableTransactionRestartRequiredPageImage::Raw {
-                    page_position: observation.position().get(),
+                    page_position: position.get(),
                 });
             }
-            DurableTransactionRestartObservation::TransactionPage(observation)
-                if observation.page().page_number() == page_number =>
-            {
-                let transaction = observation.owner();
-                let page_position = observation.position().get();
+            DurableTransactionRestartObservationRef::TransactionPage {
+                transaction,
+                page_number: actual_page,
+                position,
+                ..
+            } if actual_page == page_number => {
+                let page_position = position.get();
                 let entry =
                     restart_transaction_entry(analysis, page_number, transaction, page_position)?;
                 if let DurableTransactionRestartState::Committed { commit_position } = entry.state()
@@ -18903,9 +23751,9 @@ fn latest_required_restart_page_image<const N: usize>(
                     );
                 }
             }
-            DurableTransactionRestartObservation::Page(_)
-            | DurableTransactionRestartObservation::TransactionPage(_)
-            | DurableTransactionRestartObservation::Commit(_) => {}
+            DurableTransactionRestartObservationRef::Page { .. }
+            | DurableTransactionRestartObservationRef::TransactionPage { .. }
+            | DurableTransactionRestartObservationRef::Commit { .. } => {}
         }
     }
     Ok(required)
@@ -18919,13 +23767,16 @@ fn snapshot_payload_matches<const N: usize>(
     snapshot.page_version() == page_version && snapshot.image().bytes() == bytes
 }
 
-fn validate_restart_page_snapshot<const N: usize>(
+fn validate_restart_page_snapshot<Observation, const N: usize>(
     lineage: &LogLineage,
     analysis: &DurableTransactionRestartAnalysis,
-    observations: &[DurableTransactionRestartObservation<N>],
+    observations: &[Observation],
     page_number: PageNumber,
     snapshot: &StoredPageSnapshotObservation<N>,
-) -> Result<u64, DurableTransactionRestartCompletenessEvidenceError> {
+) -> Result<u64, DurableTransactionRestartCompletenessEvidenceError>
+where
+    Observation: DurableTransactionRestartObservationView<N>,
+{
     if snapshot.page_number() != page_number {
         return Err(
             DurableTransactionRestartCompletenessEvidenceError::UnexpectedSnapshotPage {
@@ -18961,9 +23812,9 @@ fn validate_restart_page_snapshot<const N: usize>(
         );
     }
 
-    let Ok(index) =
-        observations.binary_search_by_key(&position, |observation| observation.position().get())
-    else {
+    let Ok(index) = observations.binary_search_by_key(&position, |observation| {
+        observation.restart_position().get()
+    }) else {
         return Err(
             DurableTransactionRestartCompletenessEvidenceError::SnapshotPositionUnbacked {
                 page_number,
@@ -18971,15 +23822,14 @@ fn validate_restart_page_snapshot<const N: usize>(
             },
         );
     };
-    match &observations[index] {
-        DurableTransactionRestartObservation::Page(observation)
-            if observation.page_number() == page_number =>
-        {
-            if !snapshot_payload_matches(
-                snapshot,
-                observation.page_version(),
-                observation.image().bytes(),
-            ) {
+    match observations[index].as_restart_observation_ref() {
+        DurableTransactionRestartObservationRef::Page {
+            page_number: actual_page,
+            page_version,
+            bytes,
+            ..
+        } if actual_page == page_number => {
+            if !snapshot_payload_matches(snapshot, page_version, bytes) {
                 return Err(
                     DurableTransactionRestartCompletenessEvidenceError::SnapshotPayloadContradiction {
                         page_number,
@@ -18988,14 +23838,14 @@ fn validate_restart_page_snapshot<const N: usize>(
                 );
             }
         }
-        DurableTransactionRestartObservation::TransactionPage(observation)
-            if observation.page().page_number() == page_number =>
-        {
-            if !snapshot_payload_matches(
-                snapshot,
-                observation.page().page_version(),
-                observation.page().image().bytes(),
-            ) {
+        DurableTransactionRestartObservationRef::TransactionPage {
+            transaction,
+            page_number: actual_page,
+            page_version,
+            bytes,
+            ..
+        } if actual_page == page_number => {
+            if !snapshot_payload_matches(snapshot, page_version, bytes) {
                 return Err(
                     DurableTransactionRestartCompletenessEvidenceError::SnapshotPayloadContradiction {
                         page_number,
@@ -19003,7 +23853,6 @@ fn validate_restart_page_snapshot<const N: usize>(
                     },
                 );
             }
-            let transaction = observation.owner();
             let entry = restart_transaction_entry(analysis, page_number, transaction, position)?;
             if matches!(entry.state(), DurableTransactionRestartState::Uncommitted) {
                 return Err(
@@ -19015,9 +23864,9 @@ fn validate_restart_page_snapshot<const N: usize>(
                 );
             }
         }
-        DurableTransactionRestartObservation::Page(_)
-        | DurableTransactionRestartObservation::TransactionPage(_)
-        | DurableTransactionRestartObservation::Commit(_) => {
+        DurableTransactionRestartObservationRef::Page { .. }
+        | DurableTransactionRestartObservationRef::TransactionPage { .. }
+        | DurableTransactionRestartObservationRef::Commit { .. } => {
             return Err(
                 DurableTransactionRestartCompletenessEvidenceError::SnapshotPositionUnbacked {
                     page_number,
@@ -21324,6 +26173,34 @@ mod tests {
         retention_metadata_lineage_override: Option<LogLineage>,
         retention_metadata_epoch_override: Option<NonZeroU64>,
         retention_source_constraint: Option<LogSequenceNumber>,
+        reclamation_observation_error: Option<FakeFault>,
+        reclamation_observation_error_after_effect: Option<FakeFault>,
+        reclamation_lineage_override: Option<LogLineage>,
+        reclamation_format_version: u16,
+        reclamation_replacement_format_version: Option<u16>,
+        reclamation_generation: u64,
+        reclamation_retained_first_override: Option<Option<LogSequenceNumber>>,
+        reclamation_frontier_override: Option<Option<LogSequenceNumber>>,
+        reclamation_epoch_override: Option<NonZeroU64>,
+        reclamation_anchor: Option<DurableTransactionRestartSelectedCheckpointAnchor>,
+        reclamation_effect_error: Option<FakeFault>,
+        reclamation_effect_calls: usize,
+        reclamation_effect_override:
+            Option<DurableTransactionRestartWalReclamationEffectObservation>,
+        reclamation_drop_last_retained_after_effect: bool,
+        reclamation_replace_last_retained_after_effect:
+            Option<DurableTransactionRestartObservation<1>>,
+        reclamation_events: Option<Rc<RefCell<Vec<&'static str>>>>,
+        generation_observation_calls: usize,
+        generation_after_minimal_observation: Option<u64>,
+        reclamation_observation_calls: usize,
+        reclamation_generation_after_first_observation: Option<u64>,
+        retained_restart_before_callback_error: Option<FakeFault>,
+        retained_restart_before_callback_error_after_effect: Option<FakeFault>,
+        retained_restart_after_callback_error: Option<FakeFault>,
+        retained_restart_generation_after_callback: Option<u64>,
+        retained_restart_observation_error_after_callback: Option<FakeFault>,
+        retained_restart_callbacks: usize,
     }
 
     impl FakeDurablePageRecoverySource {
@@ -21371,6 +26248,32 @@ mod tests {
                 retention_metadata_lineage_override: None,
                 retention_metadata_epoch_override: None,
                 retention_source_constraint: None,
+                reclamation_observation_error: None,
+                reclamation_observation_error_after_effect: None,
+                reclamation_lineage_override: None,
+                reclamation_format_version: 1,
+                reclamation_replacement_format_version: None,
+                reclamation_generation: 0,
+                reclamation_retained_first_override: None,
+                reclamation_frontier_override: None,
+                reclamation_epoch_override: None,
+                reclamation_anchor: None,
+                reclamation_effect_error: None,
+                reclamation_effect_calls: 0,
+                reclamation_effect_override: None,
+                reclamation_drop_last_retained_after_effect: false,
+                reclamation_replace_last_retained_after_effect: None,
+                reclamation_events: None,
+                generation_observation_calls: 0,
+                generation_after_minimal_observation: None,
+                reclamation_observation_calls: 0,
+                reclamation_generation_after_first_observation: None,
+                retained_restart_before_callback_error: None,
+                retained_restart_before_callback_error_after_effect: None,
+                retained_restart_after_callback_error: None,
+                retained_restart_generation_after_callback: None,
+                retained_restart_observation_error_after_callback: None,
+                retained_restart_callbacks: 0,
             }
         }
     }
@@ -21404,6 +26307,11 @@ mod tests {
                 &'evidence [DurableTransactionRestartObservation<1>],
             ) -> Output,
         {
+            if self.reclamation_generation != 0 {
+                return Err(FakeFault(
+                    "pruned fake generation requires its anchored checkpoint",
+                ));
+            }
             if let Some(source) = self.restart_before_callback_error.take() {
                 return Err(source);
             }
@@ -21452,9 +26360,13 @@ mod tests {
         fn observe_restart_retention_metadata(
             &mut self,
         ) -> Result<DurableTransactionRestartRetentionMetadataObservation, Self::Error> {
+            if let Some(events) = &self.reclamation_events {
+                events.borrow_mut().push("retention-metadata");
+            }
             if let Some(source) = self.retention_metadata_error.take() {
                 return Err(source);
             }
+
             let allocated_epoch_high_water = match self.retention_metadata_epoch_override {
                 Some(epoch) => epoch,
                 None => self
@@ -21471,6 +26383,205 @@ mod tests {
                 allocated_epoch_high_water,
                 self.retention_source_constraint.clone(),
             ))
+        }
+    }
+
+    impl DurableTransactionRestartPrunedGenerationSource<1> for FakeDurablePageRecoverySource {
+        fn observe_restart_source_generation(&mut self) -> Result<u64, Self::Error> {
+            self.generation_observation_calls = self
+                .generation_observation_calls
+                .checked_add(1)
+                .ok_or(FakeFault("generation observation count exhausted"))?;
+            if let Some(source) = self.reclamation_observation_error.take() {
+                return Err(source);
+            }
+            let generation = self.reclamation_generation;
+            if let Some(replacement) = self.generation_after_minimal_observation.take() {
+                self.reclamation_generation = replacement;
+            }
+            Ok(generation)
+        }
+
+        fn observe_restart_pruned_generation(
+            &mut self,
+        ) -> Result<
+            DurableTransactionRestartWalReclamationSourceObservation,
+            <Self as DurableTransactionRestartAnalysisSource<1>>::Error,
+        > {
+            self.observe_restart_wal_reclamation_source()
+        }
+
+        fn with_durable_transaction_restart_retained_observations<Output, Operation>(
+            &mut self,
+            operation: Operation,
+        ) -> Result<Output, <Self as DurableTransactionRestartAnalysisSource<1>>::Error>
+        where
+            Operation: for<'evidence> FnOnce(
+                &'evidence [DurableTransactionRestartObservation<1>],
+            ) -> Output,
+        {
+            if let Some(source) = self.retained_restart_before_callback_error.take() {
+                return Err(source);
+            }
+            self.retained_restart_callbacks = self
+                .retained_restart_callbacks
+                .checked_add(1)
+                .ok_or(FakeFault("retained restart callback count exhausted"))?;
+            let output = operation(&self.restart_observations);
+            if let Some(generation) = self.retained_restart_generation_after_callback.take() {
+                self.reclamation_generation = generation;
+            }
+            if let Some(source) = self
+                .retained_restart_observation_error_after_callback
+                .take()
+            {
+                self.reclamation_observation_error = Some(source);
+            }
+            if let Some(source) = self.retained_restart_after_callback_error.take() {
+                return Err(source);
+            }
+            Ok(output)
+        }
+    }
+
+    impl DurableTransactionRestartWalReclamationSource<1> for FakeDurablePageRecoverySource {
+        type Error = FakeFault;
+
+        fn observe_restart_wal_reclamation_source(
+            &mut self,
+        ) -> Result<DurableTransactionRestartWalReclamationSourceObservation, Self::Error> {
+            self.reclamation_observation_calls += 1;
+            if let Some(events) = &self.reclamation_events {
+                events.borrow_mut().push("reclamation-observe");
+            }
+            if let Some(source) = self.reclamation_observation_error.take() {
+                return Err(source);
+            }
+            let retained_first_logical_record = self
+                .reclamation_retained_first_override
+                .clone()
+                .unwrap_or_else(|| {
+                    self.restart_observations
+                        .first()
+                        .map(DurableTransactionRestartObservation::position)
+                        .cloned()
+                });
+            let observation = DurableTransactionRestartWalReclamationSourceObservation::new(
+                self.reclamation_lineage_override
+                    .clone()
+                    .unwrap_or_else(|| self.lineage.clone()),
+                self.reclamation_format_version,
+                self.reclamation_generation,
+                retained_first_logical_record,
+                self.reclamation_frontier_override
+                    .clone()
+                    .unwrap_or_else(|| self.restart_frontier.clone()),
+                self.reclamation_epoch_override
+                    .or_else(|| {
+                        self.restart_epoch_allocations
+                            .last()
+                            .copied()
+                            .and_then(NonZeroU64::new)
+                    })
+                    .ok_or(FakeFault("reclamation source has no allocated epoch"))?,
+                self.reclamation_anchor
+                    .map(|anchor| (anchor.version(), anchor.value())),
+            );
+            if self.reclamation_observation_calls == 1
+                && let Some(generation) = self.reclamation_generation_after_first_observation.take()
+            {
+                self.reclamation_generation = generation;
+            }
+            Ok(observation)
+        }
+
+        fn reclaim_restart_wal_prefix(
+            &mut self,
+            permit: DurableTransactionRestartWalReclamationPermit<'_>,
+        ) -> Result<DurableTransactionRestartWalReclamationEffectObservation, Self::Error> {
+            self.reclamation_effect_calls += 1;
+            if let Some(events) = &self.reclamation_events {
+                events.borrow_mut().push("reclamation-effect");
+            }
+            let anchor_matches = match self.reclamation_anchor {
+                Some(anchor) => permit.selected_checkpoint_anchor() == anchor,
+                None => self.reclamation_generation == 0,
+            };
+            if !permit.lineage().same_lineage(&self.lineage)
+                || permit.persistent_log_id()
+                    != self
+                        .lineage
+                        .persistent_id()
+                        .ok_or(FakeFault("reclamation source has no persistent identity"))?
+                || permit.source_generation() != self.reclamation_generation
+                || permit.physical_format_version().get() != self.reclamation_format_version
+                || !anchor_matches
+                || permit.durable_frontier() != self.restart_frontier.as_ref()
+            {
+                return Err(FakeFault("reclamation permit mismatch"));
+            }
+            if let Some(source) = self.reclamation_effect_error.take() {
+                return Err(source);
+            }
+            if let Some(effect) = self.reclamation_effect_override.take() {
+                return Ok(effect);
+            }
+            let retained_logical_record_count = match permit.retained_first_logical_record() {
+                None => 0,
+                Some(floor) => u64::try_from(
+                    self.restart_observations
+                        .iter()
+                        .filter(|observation| observation.position().get() >= floor.get())
+                        .count(),
+                )
+                .map_err(|_| FakeFault("reclamation retained count width"))?,
+            };
+            let new_generation = self
+                .reclamation_generation
+                .checked_add(1)
+                .ok_or(FakeFault("reclamation generation exhausted"))?;
+            let replacement_format_version = self
+                .reclamation_replacement_format_version
+                .unwrap_or(self.reclamation_format_version);
+            let effect = DurableTransactionRestartWalReclamationEffectObservation::new(
+                DurableTransactionRestartWalReclamationReplacementObservation::new(
+                    self.reclamation_generation,
+                    new_generation,
+                    replacement_format_version,
+                ),
+                permit.retained_first_logical_record().cloned(),
+                permit.durable_frontier().cloned(),
+                retained_logical_record_count,
+                retained_logical_record_count,
+                permit.allocated_epoch_high_water(),
+            );
+            match permit.retained_first_logical_record() {
+                Some(floor) => self
+                    .restart_observations
+                    .retain(|observation| observation.position().get() >= floor.get()),
+                None => self.restart_observations.clear(),
+            }
+            self.reclamation_generation = new_generation;
+            self.reclamation_format_version = replacement_format_version;
+            self.reclamation_anchor = Some(permit.selected_checkpoint_anchor());
+            if self.reclamation_drop_last_retained_after_effect {
+                self.restart_observations.pop();
+            }
+            if let Some(replacement) = self.reclamation_replace_last_retained_after_effect.take()
+                && let Some(last) = self.restart_observations.last_mut()
+            {
+                *last = replacement;
+            }
+            if let Some(source) = self.reclamation_observation_error_after_effect.take() {
+                self.reclamation_observation_error = Some(source);
+            }
+            if let Some(source) = self
+                .retained_restart_before_callback_error_after_effect
+                .take()
+            {
+                self.retained_restart_before_callback_error = Some(source);
+            }
+            Ok(effect)
         }
     }
 
@@ -21677,6 +26788,7 @@ mod tests {
         attempts: Vec<PageNumber>,
         inventory_error: Option<FakeFault>,
         inventory_override: Option<Vec<FakeRecoverySnapshot>>,
+        inventory_events: Option<Rc<RefCell<Vec<&'static str>>>>,
     }
 
     impl FakeBatchCommittedPageRecoveryStore {
@@ -21692,6 +26804,7 @@ mod tests {
                 attempts: Vec::new(),
                 inventory_error: None,
                 inventory_override: None,
+                inventory_events: None,
             }
         }
 
@@ -21750,6 +26863,9 @@ mod tests {
         fn durable_page_store_inventory(
             &mut self,
         ) -> Result<Vec<StoredPageSnapshotObservation<1>>, Self::InventoryError> {
+            if let Some(events) = &self.inventory_events {
+                events.borrow_mut().push("store-inventory");
+            }
             if let Some(source) = self.inventory_error.take() {
                 return Err(source);
             }
@@ -25605,6 +30721,13 @@ mod tests {
         FakeCompletenessCheckpointSource,
         1,
     >;
+    type FakeWalRetentionAnalyzedRestartCheckpoint =
+        WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+            FakeDurablePageRecoverySource,
+            FakeBatchCommittedPageRecoveryStore,
+            FakeCompletenessCheckpointSource,
+            1,
+        >;
 
     fn restart_analyzed_checkpoint_owner(
         lineage: &LogLineage,
@@ -27349,6 +32472,22 @@ mod tests {
         }
     }
 
+    impl DurableTransactionRestartCheckpointCompletenessBaselinePublisher
+        for FakeCompletenessCheckpointSource
+    {
+        type Error = FakeFault;
+
+        fn publish_restart_checkpoint_completeness_baseline(
+            &mut self,
+            _baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+            _permit: DurableTransactionRestartCheckpointCompletenessBaselinePublicationPermit<'_>,
+        ) -> Result<(), Self::Error> {
+            Err(FakeFault(
+                "reclamation attempt must not publish the selected checkpoint",
+            ))
+        }
+    }
+
     type FakeSelectedRestartCheckpoint =
         SelectedTransactionPageStorageRestartCheckpointCompleteness<
             FakeDurablePageRecoverySource,
@@ -27508,6 +32647,48 @@ mod tests {
             FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
             baseline,
         )
+    }
+
+    fn prepare_fake_wal_reclamation(
+        completed: FakeCompletedRestartCheckpoint,
+    ) -> Result<FakeWalRetentionAnalyzedRestartCheckpoint, TestError> {
+        completed
+            .analyze_wal_retention()
+            .map_err(|_| TestError("fake WAL retention analysis"))
+    }
+
+    fn prepare_fake_raw_wal_reclamation(
+        lineage: &LogLineage,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+        page_number: PageNumber,
+    ) -> Result<FakeWalRetentionAnalyzedRestartCheckpoint, TestError> {
+        prepare_fake_wal_reclamation(complete_fake_raw_restart_page_positions(
+            lineage,
+            baseline,
+            page_number,
+            &[1],
+        )?)
+    }
+
+    fn require_fake_reclamation_preflight_failure(
+        analyzed: FakeWalRetentionAnalyzedRestartCheckpoint,
+    ) -> Result<(), TestError> {
+        let failed = analyzed
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("stale reclamation preflight was accepted"))?;
+        if !matches!(
+            failed.error,
+            DurableTransactionRestartWalReclamationError::Preflight(_)
+        ) {
+            return Err(TestError(
+                "stale reclamation reached indeterminate effect boundary",
+            ));
+        }
+        if failed.analyzed.completed.source.reclamation_effect_calls != 0 {
+            return Err(TestError("stale reclamation invoked the effect"));
+        }
+        Ok(())
     }
 
     fn restore_fake_raw_restart_page(
@@ -28960,6 +34141,7 @@ mod tests {
 
         let failure = selected
             .decline_checkpoint()
+            .map_err(|_| TestError("complete-prefix checkpoint decline was rejected"))?
             .recover()
             .err()
             .ok_or(TestError("armed full recovery unexpectedly succeeded"))?;
@@ -29069,6 +34251,7 @@ mod tests {
 
         let analyzed = selected
             .decline_checkpoint()
+            .map_err(|_| TestError("behind complete-prefix checkpoint decline was rejected"))?
             .recover()
             .map_err(|_| TestError("behind full recovery failed"))?
             .analyze_restart()
@@ -29156,7 +34339,9 @@ mod tests {
         ));
         assert_eq!(events.borrow().as_slice(), ["completeness-checkpoint"]);
 
-        let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+        let (uncheckpointed, rejection) = rejected
+            .continue_with_full_recovery()
+            .map_err(|_| TestError("legacy checkpoint rejection denied fallback"))?;
         assert!(matches!(
             rejection,
             DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::CheckpointSource(
@@ -29252,7 +34437,9 @@ mod tests {
                     )
                 )
             ));
-            let (uncheckpointed, _) = rejected.continue_with_full_recovery();
+            let (uncheckpointed, _) = rejected
+                .continue_with_full_recovery()
+                .map_err(|_| TestError("legacy source rejection denied fallback"))?;
             let analyzed = uncheckpointed
                 .recover()
                 .map_err(|_| TestError("identity-rejected full recovery failed"))?
@@ -29321,7 +34508,9 @@ mod tests {
                 )
             )
         ));
-        let (uncheckpointed, _) = rejected.continue_with_full_recovery();
+        let (uncheckpointed, _) = rejected
+            .continue_with_full_recovery()
+            .map_err(|_| TestError("legacy baseline rejection denied fallback"))?;
         let analyzed = uncheckpointed
             .recover()
             .map_err(|_| TestError("empty-frontier full recovery failed"))?
@@ -29441,7 +34630,9 @@ mod tests {
             )
         ));
 
-        let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+        let (uncheckpointed, rejection) = rejected
+            .continue_with_full_recovery()
+            .map_err(|_| TestError("legacy checkpoint source rejection denied fallback"))?;
         assert!(matches!(
             rejection,
             DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(_)
@@ -29514,6 +34705,7 @@ mod tests {
         assert_eq!(full.selected.checkpoint_source.calls, 1);
         let analyzed = full
             .decline_replay_plan()
+            .map_err(|_| TestError("full-stream complete-prefix plan decline was rejected"))?
             .recover()
             .map_err(|_| TestError("full-stream fallback recovery failed"))?
             .analyze_restart()
@@ -29722,7 +34914,9 @@ mod tests {
                 "restart replay planning failed: complete current restart analysis failed: transaction 162:1 has duplicate commits at positions 2 and 4"
             ))
         );
-        let (uncheckpointed, malformed_error) = malformed.continue_with_full_recovery();
+        let (uncheckpointed, malformed_error) = malformed
+            .continue_with_full_recovery()
+            .map_err(|_| TestError("malformed complete-prefix fallback was rejected"))?;
         assert!(matches!(
             malformed_error,
             DurableTransactionRestartCheckpointReplayPlanningError::Evidence(_)
@@ -29878,7 +35072,9 @@ mod tests {
             );
             assert_eq!(failed.selected.checkpoint_source.calls, 1);
 
-            let (uncheckpointed, error) = failed.continue_with_full_recovery();
+            let (uncheckpointed, error) = failed
+                .continue_with_full_recovery()
+                .map_err(|_| TestError("source-failed complete-prefix fallback was rejected"))?;
             assert!(matches!(
                 error,
                 DurableTransactionRestartCheckpointReplayPlanningError::Source(actual)
@@ -30166,6 +35362,7 @@ mod tests {
 
         let analyzed = prepared
             .decline_page_repairs()
+            .map_err(|_| TestError("prepared complete-prefix repairs decline was rejected"))?
             .recover()
             .map_err(|_| TestError("prepared repair fallback recovery"))?
             .analyze_restart()
@@ -30218,7 +35415,9 @@ mod tests {
         );
         assert_eq!(failed.planned.selected.storage.source.restart_callbacks, 2);
         assert!(failed.planned.selected.storage.store.attempts.is_empty());
-        let (_uncheckpointed, error) = failed.continue_with_full_recovery();
+        let (_uncheckpointed, error) = failed
+            .continue_with_full_recovery()
+            .map_err(|_| TestError("complete-prefix repair fallback was rejected"))?;
         Ok(error)
     }
 
@@ -30761,7 +35960,9 @@ mod tests {
             preparation_source.source().map(ToString::to_string),
             Some(String::from("repair observation"))
         );
-        let (uncheckpointed, error) = failed.continue_with_full_recovery();
+        let (uncheckpointed, error) = failed
+            .continue_with_full_recovery()
+            .map_err(|_| TestError("store-failed complete-prefix fallback was rejected"))?;
         assert!(matches!(
             error,
             DurableTransactionRestartCheckpointRepairPreparationError::StoreObservation { .. }
@@ -31688,6 +36889,688 @@ mod tests {
     }
 
     #[test]
+    fn selected_checkpoint_anchor_covers_every_authoritative_field_and_order()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1700).ok_or(TestError("anchor persistent id"))?;
+        let first_transaction = durable_identity(170, 1)?;
+        let second_transaction = durable_identity(170, 2)?;
+        let first_page = PageNumber::new(230).ok_or(TestError("anchor first page"))?;
+        let second_page = PageNumber::new(231).ok_or(TestError("anchor second page"))?;
+        let baseline = DurableTransactionRestartCheckpointCompletenessBaseline {
+            transaction_baseline: DurableTransactionRestartCheckpointBaseline {
+                persistent_log_id,
+                durable_frontier: Some(19),
+                transactions: vec![
+                    DurableTransactionRestartCheckpointBaselineEntry {
+                        transaction: first_transaction,
+                        first_owned_page_position: Some(2),
+                        last_owned_page_position: Some(7),
+                        owned_page_record_count: 2,
+                        state: DurableTransactionRestartCheckpointBaselineState::Committed {
+                            commit_position: 9,
+                        },
+                    },
+                    DurableTransactionRestartCheckpointBaselineEntry {
+                        transaction: second_transaction,
+                        first_owned_page_position: Some(11),
+                        last_owned_page_position: Some(11),
+                        owned_page_record_count: 1,
+                        state: DurableTransactionRestartCheckpointBaselineState::Uncommitted,
+                    },
+                ],
+            },
+            pages: vec![
+                DurableTransactionRestartPageEntry {
+                    page_number: first_page,
+                    state: DurableTransactionRestartPageState::StoreCurrent {
+                        required:
+                            DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                                transaction: first_transaction,
+                                page_position: 7,
+                                commit_position: 9,
+                            },
+                        stored_position: 7,
+                    },
+                },
+                DurableTransactionRestartPageEntry {
+                    page_number: second_page,
+                    state: DurableTransactionRestartPageState::StoreBehind {
+                        stored_position: 3,
+                        required: DurableTransactionRestartRequiredPageImage::Raw {
+                            page_position: 13,
+                        },
+                    },
+                },
+            ],
+            replay_start: DurableTransactionRestartReplayStart::AtPosition {
+                position: 11,
+                cause: DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                    transaction: second_transaction,
+                },
+            },
+        };
+        let anchor = selected_restart_checkpoint_anchor(&baseline);
+        assert_eq!(anchor.version(), 1);
+        assert_eq!(anchor.value(), 0x2d4b_6d2a_34bd_3e9e_bfbc_3090_213f_7548);
+
+        let mut mutations = Vec::new();
+        mutations
+            .try_reserve_exact(22)
+            .map_err(|_| TestError("anchor mutations"))?;
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.persistent_log_id =
+            PersistentLogId::new(0x1701).ok_or(TestError("mutated anchor id"))?;
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.durable_frontier = None;
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.transactions[0].transaction = second_transaction;
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.transactions[0].first_owned_page_position = Some(3);
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.transactions[0].last_owned_page_position = Some(8);
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.transactions[0].owned_page_record_count = 3;
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.transactions[0].state =
+            DurableTransactionRestartCheckpointBaselineState::Uncommitted;
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.transactions[0].state =
+            DurableTransactionRestartCheckpointBaselineState::Committed {
+                commit_position: 10,
+            };
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.transaction_baseline.transactions.swap(0, 1);
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.pages[0].page_number = second_page;
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.pages[0].state = DurableTransactionRestartPageState::StoreMissing {
+            required: DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                transaction: first_transaction,
+                page_position: 7,
+                commit_position: 9,
+            },
+        };
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        if let DurableTransactionRestartPageState::StoreCurrent { required, .. } =
+            &mut mutated.pages[0].state
+        {
+            *required = DurableTransactionRestartRequiredPageImage::Raw { page_position: 7 };
+        }
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        if let DurableTransactionRestartPageState::StoreCurrent {
+            required:
+                DurableTransactionRestartRequiredPageImage::CommittedTransaction { transaction, .. },
+            ..
+        } = &mut mutated.pages[0].state
+        {
+            *transaction = second_transaction;
+        }
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        if let DurableTransactionRestartPageState::StoreCurrent {
+            required:
+                DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                    page_position, ..
+                },
+            ..
+        } = &mut mutated.pages[0].state
+        {
+            *page_position = 8;
+        }
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        if let DurableTransactionRestartPageState::StoreCurrent {
+            required:
+                DurableTransactionRestartRequiredPageImage::CommittedTransaction {
+                    commit_position, ..
+                },
+            ..
+        } = &mut mutated.pages[0].state
+        {
+            *commit_position = 10;
+        }
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        if let DurableTransactionRestartPageState::StoreCurrent {
+            stored_position, ..
+        } = &mut mutated.pages[0].state
+        {
+            *stored_position = 6;
+        }
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        if let DurableTransactionRestartPageState::StoreBehind {
+            required: DurableTransactionRestartRequiredPageImage::Raw { page_position },
+            ..
+        } = &mut mutated.pages[1].state
+        {
+            *page_position = 14;
+        }
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.pages.swap(0, 1);
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.replay_start =
+            DurableTransactionRestartReplayStart::AfterFrontier { frontier: Some(19) };
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.replay_start = DurableTransactionRestartReplayStart::AtPosition {
+            position: 12,
+            cause: DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                transaction: second_transaction,
+            },
+        };
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.replay_start = DurableTransactionRestartReplayStart::AtPosition {
+            position: 11,
+            cause: DurableTransactionRestartReplayStartCause::StoreBehind {
+                page_number: second_page,
+            },
+        };
+        mutations.push(mutated);
+        let mut mutated = baseline.clone();
+        mutated.replay_start = DurableTransactionRestartReplayStart::AtPosition {
+            position: 11,
+            cause: DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                transaction: first_transaction,
+            },
+        };
+        mutations.push(mutated);
+
+        for mutation in &mutations {
+            assert_ne!(selected_restart_checkpoint_anchor(mutation), anchor);
+        }
+        let mut after_frontier = baseline.clone();
+        after_frontier.replay_start =
+            DurableTransactionRestartReplayStart::AfterFrontier { frontier: Some(19) };
+        let after_frontier_anchor = selected_restart_checkpoint_anchor(&after_frontier);
+        after_frontier.replay_start =
+            DurableTransactionRestartReplayStart::AfterFrontier { frontier: Some(18) };
+        assert_ne!(
+            selected_restart_checkpoint_anchor(&after_frontier),
+            after_frontier_anchor
+        );
+        let mut store_cause = baseline.clone();
+        store_cause.replay_start = DurableTransactionRestartReplayStart::AtPosition {
+            position: 11,
+            cause: DurableTransactionRestartReplayStartCause::StoreMissing {
+                page_number: first_page,
+            },
+        };
+        let store_cause_anchor = selected_restart_checkpoint_anchor(&store_cause);
+        store_cause.replay_start = DurableTransactionRestartReplayStart::AtPosition {
+            position: 11,
+            cause: DurableTransactionRestartReplayStartCause::StoreMissing {
+                page_number: second_page,
+            },
+        };
+        assert_ne!(
+            selected_restart_checkpoint_anchor(&store_cause),
+            store_cause_anchor
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wal_reclamation_revalidates_in_order_and_returns_one_exact_receipt() -> Result<(), TestError>
+    {
+        let persistent_log_id =
+            PersistentLogId::new(0x1702).ok_or(TestError("reclamation persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let page_number = PageNumber::new(232).ok_or(TestError("reclamation page"))?;
+        let mut analyzed = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        analyzed
+            .completed
+            .source
+            .reclamation_replacement_format_version = Some(2);
+        let events = Rc::new(RefCell::new(Vec::new()));
+        analyzed.completed.checkpoint_source.events = Some(Rc::clone(&events));
+        analyzed.completed.store.inventory_events = Some(Rc::clone(&events));
+        analyzed.completed.source.restart_events = Some(Rc::clone(&events));
+        analyzed.completed.source.reclamation_events = Some(Rc::clone(&events));
+        assert_eq!(analyzed.completed.source.reclamation_generation, 0);
+        assert_eq!(analyzed.completed.source.reclamation_anchor, None);
+
+        let reclaimed = analyzed
+            .reclaim_wal_prefix()
+            .map_err(|_| TestError("valid WAL reclamation failed"))?;
+        assert_eq!(
+            events.borrow().as_slice(),
+            [
+                "completeness-checkpoint",
+                "store-inventory",
+                "retention-metadata",
+                "reclamation-observe",
+                "wal",
+                "reclamation-observe",
+                "reclamation-effect",
+                "reclamation-observe",
+                "reclamation-observe",
+            ]
+        );
+        let receipt = reclaimed.reclamation_receipt();
+        assert_eq!(receipt.persistent_log_id(), persistent_log_id);
+        assert_eq!(receipt.source_physical_format_version(), 1);
+        assert_eq!(receipt.replacement_physical_format_version(), 2);
+        assert_eq!(receipt.old_generation(), 0);
+        assert_eq!(receipt.new_generation(), 1);
+        assert_eq!(receipt.retained_first_logical_record(), Some(1));
+        assert_eq!(receipt.logical_position_high_water(), Some(1));
+        assert_eq!(receipt.retained_logical_record_count(), 1);
+        assert_eq!(receipt.retained_physical_unit_count(), 1);
+        assert_eq!(receipt.allocated_epoch_high_water(), 1);
+        let (_, source, _, evidence) = reclaimed.into_parts();
+        assert_eq!(source.reclamation_effect_calls, 1);
+        assert_eq!(
+            source.reclamation_anchor,
+            Some(evidence.receipt().selected_checkpoint_anchor())
+        );
+        assert_eq!(evidence.receipt().new_generation(), 1);
+        assert_eq!(evidence.retention().durable_frontier(), Some(1));
+        assert_eq!(evidence.completion().current_frontier(), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn wal_reclamation_rejects_every_stale_preflight_class_before_effect() -> Result<(), TestError>
+    {
+        let persistent_log_id =
+            PersistentLogId::new(0x1703).ok_or(TestError("stale reclamation persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let page_number = PageNumber::new(233).ok_or(TestError("stale reclamation page"))?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.checkpoint_source.checkpoint = None;
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        if let Some(checkpoint) = &mut stale.completed.checkpoint_source.checkpoint {
+            checkpoint.transactions.durable_frontier = Some(1);
+        }
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.store.inventory_error = Some(FakeFault("stale inventory"));
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.retention_metadata_error =
+            Some(FakeFault("stale retention metadata"));
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_observation_error =
+            Some(FakeFault("stale reclamation metadata"));
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.restart_before_callback_error = Some(FakeFault("stale WAL"));
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.restart_frontier = Some(lineage.position(2));
+        stale
+            .completed
+            .source
+            .restart_observations
+            .push(restart_raw_page(&lineage, page_number.get(), 2)?);
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.store.current[0].byte ^= 0xff;
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.retention_metadata_epoch_override = NonZeroU64::new(2);
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_format_version = 0;
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x170f).ok_or(TestError("foreign reclamation lineage"))?,
+        );
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_lineage_override = Some(foreign_lineage.clone());
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_frontier_override =
+            Some(Some(foreign_lineage.position(1)));
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_frontier_override = Some(None);
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_retained_first_override = Some(None);
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_epoch_override = NonZeroU64::new(2);
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_anchor = Some(selected_restart_checkpoint_anchor(
+            &stale.completed.evidence.selected_baseline,
+        ));
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_generation = 1;
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_generation = 1;
+        let expected_anchor =
+            selected_restart_checkpoint_anchor(&stale.completed.evidence.selected_baseline);
+        stale.completed.source.reclamation_anchor =
+            Some(DurableTransactionRestartSelectedCheckpointAnchor {
+                version: expected_anchor.version(),
+                value: expected_anchor.value() ^ 1,
+            });
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.reclamation_generation = u64::MAX;
+        stale.completed.source.reclamation_anchor = Some(selected_restart_checkpoint_anchor(
+            &stale.completed.evidence.selected_baseline,
+        ));
+        let stale = stale
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("exhausted reclamation generation was accepted"))?;
+        assert!(matches!(
+            stale.error(),
+            DurableTransactionRestartWalReclamationError::Preflight(
+                DurableTransactionRestartWalReclamationPreflightError::Evidence(source)
+            ) if matches!(
+                source.as_ref(),
+                DurableTransactionRestartWalReclamationEvidenceError::SourceGenerationExhausted {
+                    generation: u64::MAX,
+                }
+            )
+        ));
+        assert_eq!(stale.analyzed.completed.source.reclamation_effect_calls, 0);
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale
+            .completed
+            .source
+            .reclamation_generation_after_first_observation = Some(1);
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.analysis.store_page_count = 2;
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        stale.completed.source.retention_source_constraint = Some(lineage.position(1));
+        require_fake_reclamation_preflight_failure(stale)?;
+
+        let mut stale = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        let _active = stale.completed.coordinator.begin()?;
+        require_fake_reclamation_preflight_failure(stale)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wal_reclamation_effect_failures_and_bad_receipts_are_terminal() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1704).ok_or(TestError("terminal reclamation persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let page_number = PageNumber::new(234).ok_or(TestError("terminal reclamation page"))?;
+
+        let mut failed = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        failed.completed.source.reclamation_effect_error =
+            Some(FakeFault("indeterminate reclamation"));
+        let failed = failed
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("effect failure was accepted"))?;
+        assert!(matches!(
+            failed.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
+                    FakeFault("indeterminate reclamation")
+                )
+            )
+        ));
+        assert_eq!(failed.analyzed.completed.source.reclamation_effect_calls, 1);
+
+        let mut uninstalled = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        uninstalled.completed.source.reclamation_effect_override = Some(
+            DurableTransactionRestartWalReclamationEffectObservation::new(
+                DurableTransactionRestartWalReclamationReplacementObservation::new(0, 1, 1),
+                Some(lineage.position(1)),
+                Some(lineage.position(1)),
+                1,
+                1,
+                NonZeroU64::MIN,
+            ),
+        );
+        let uninstalled = uninstalled
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("uninstalled replacement report was accepted"))?;
+        assert!(matches!(
+            uninstalled.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledEvidence(
+                    DurableTransactionRestartWalReclamationEvidenceError::InstalledGenerationChanged {
+                        expected: 1,
+                        actual: 0,
+                    }
+                )
+            )
+        ));
+        assert_eq!(
+            uninstalled
+                .analyzed
+                .completed
+                .source
+                .reclamation_effect_calls,
+            1
+        );
+
+        let mut installed_source_failure =
+            prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        installed_source_failure
+            .completed
+            .source
+            .reclamation_observation_error_after_effect =
+            Some(FakeFault("installed source observation"));
+        let installed_source_failure = installed_source_failure
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("installed source failure was accepted"))?;
+        assert!(matches!(
+            installed_source_failure.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledSource(
+                    FakeFault("installed source observation")
+                )
+            )
+        ));
+
+        let mut installed_wal_failure =
+            prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        installed_wal_failure
+            .completed
+            .source
+            .retained_restart_before_callback_error_after_effect =
+            Some(FakeFault("installed retained suffix"));
+        let installed_wal_failure = installed_wal_failure
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("installed WAL failure was accepted"))?;
+        assert!(matches!(
+            installed_wal_failure.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledWal(
+                    FakeFault("installed retained suffix")
+                )
+            )
+        ));
+
+        let mut installed_record_failure =
+            prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        installed_record_failure
+            .completed
+            .source
+            .reclamation_retained_first_override = Some(Some(lineage.position(1)));
+        installed_record_failure
+            .completed
+            .source
+            .reclamation_drop_last_retained_after_effect = true;
+        let installed_record_failure = installed_record_failure
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("installed record loss was accepted"))?;
+        assert!(matches!(
+            installed_record_failure.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledEvidence(
+                    DurableTransactionRestartWalReclamationEvidenceError::InstalledRetainedRecordCountChanged {
+                        expected: 1,
+                        actual: 0,
+                    }
+                )
+            )
+        ));
+
+        let mut installed_payload_failure =
+            prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        installed_payload_failure
+            .completed
+            .source
+            .reclamation_replace_last_retained_after_effect =
+            Some(restart_raw_page(&lineage, page_number.get() - 1, 1)?);
+        let installed_payload_failure = installed_payload_failure
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("installed payload change was accepted"))?;
+        assert!(matches!(
+            installed_payload_failure.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::InstalledEvidence(
+                    DurableTransactionRestartWalReclamationEvidenceError::InstalledRetainedRecordChanged {
+                        index: 0,
+                        expected_position: 1,
+                        actual_position: 1,
+                    }
+                )
+            )
+        ));
+
+        let mut invalid = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        invalid.completed.source.reclamation_effect_override = Some(
+            DurableTransactionRestartWalReclamationEffectObservation::new(
+                DurableTransactionRestartWalReclamationReplacementObservation::new(0, 1, 1),
+                Some(lineage.position(1)),
+                Some(lineage.position(1)),
+                2,
+                1,
+                NonZeroU64::MIN,
+            ),
+        );
+        let invalid = invalid
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("invalid reclamation receipt was accepted"))?;
+        assert!(matches!(
+            invalid.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Receipt(source)
+            ) if matches!(
+                source,
+                DurableTransactionRestartWalReclamationEvidenceError::EffectLogicalRecordCountChanged {
+                    expected: 1,
+                    actual: 2,
+                }
+            )
+        ));
+        assert_eq!(
+            invalid.analyzed.completed.source.reclamation_effect_calls,
+            1
+        );
+
+        let mut invalid = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        invalid.completed.source.reclamation_effect_override = Some(
+            DurableTransactionRestartWalReclamationEffectObservation::new(
+                DurableTransactionRestartWalReclamationReplacementObservation::new(0, 2, 1),
+                Some(lineage.position(1)),
+                Some(lineage.position(1)),
+                1,
+                1,
+                NonZeroU64::MIN,
+            ),
+        );
+        let invalid = invalid
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("skipped reclamation generation was accepted"))?;
+        assert!(matches!(
+            invalid.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Receipt(source)
+            ) if matches!(
+                source,
+                DurableTransactionRestartWalReclamationEvidenceError::EffectGenerationChanged {
+                    expected_old: 0,
+                    actual_old: 0,
+                    actual_new: 2,
+                }
+            )
+        ));
+
+        let mut invalid = prepare_fake_raw_wal_reclamation(&lineage, &baseline, page_number)?;
+        invalid.completed.source.reclamation_effect_override = Some(
+            DurableTransactionRestartWalReclamationEffectObservation::new(
+                DurableTransactionRestartWalReclamationReplacementObservation::new(0, 1, 0),
+                Some(lineage.position(1)),
+                Some(lineage.position(1)),
+                1,
+                1,
+                NonZeroU64::MIN,
+            ),
+        );
+        let invalid = invalid
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or(TestError("zero replacement format was accepted"))?;
+        assert!(matches!(
+            invalid.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Receipt(
+                    DurableTransactionRestartWalReclamationEvidenceError::EffectPhysicalFormatVersionZero
+                )
+            )
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn failed_replay_page_repair_retries_the_whole_plan_after_before_and_after_faults()
     -> Result<(), TestError> {
         let persistent_log_id =
@@ -32596,5 +38479,1179 @@ mod tests {
             )
         );
         assert!(replay_observations.is_empty());
+    }
+
+    fn anchored_restart_source(
+        lineage: &LogLineage,
+        logical_high_water: Option<u64>,
+        observations: Vec<DurableTransactionRestartObservation<1>>,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+        allocated_epoch_high_water: u64,
+    ) -> Result<FakeDurablePageRecoverySource, TestError> {
+        let mut source = fake_restart_source(
+            lineage,
+            logical_high_water.map(|position| lineage.position(position)),
+            observations,
+        );
+        source.reclamation_generation = 1;
+        source.reclamation_epoch_override = NonZeroU64::new(allocated_epoch_high_water);
+        source.reclamation_anchor = Some(selected_restart_checkpoint_anchor(baseline));
+        Ok(source)
+    }
+
+    fn select_fake_generation_aware_restart_checkpoint(
+        source: FakeDurablePageRecoverySource,
+        store: FakeBatchCommittedPageRecoveryStore,
+        baseline: &DurableTransactionRestartCheckpointCompletenessBaseline,
+    ) -> Result<FakeSelectedRestartCheckpoint, TestError> {
+        let checkpoint = FakeCompletenessCheckpointSource::new(Some(
+            owned_decoded_completeness_checkpoint(baseline),
+        ));
+        match UnrecoveredTransactionPageStorage::new(source, store)
+            .select_generation_aware_restart_checkpoint_completeness(checkpoint)
+        {
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) => {
+                Ok(selected)
+            }
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(_) => {
+                Err(TestError("generation-aware checkpoint was absent"))
+            }
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(_) => {
+                Err(TestError("generation-aware checkpoint was rejected"))
+            }
+        }
+    }
+
+    #[test]
+    fn generation_zero_selection_and_planning_keep_the_complete_prefix_path_unchanged()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1705).ok_or(TestError("generation zero persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page = PageNumber::new(201).ok_or(TestError("generation zero page"))?;
+        let snapshot = FakeRecoverySnapshot {
+            page_number: page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(page.get()).map_err(|_| TestError("generation zero page byte"))?,
+            page_position: lineage.position(1),
+        };
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, page.get(), 1)?],
+            vec![snapshot.clone()],
+        )?;
+        let mut source = fake_restart_source(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, page.get(), 1)?],
+        );
+        source.reclamation_epoch_override = NonZeroU64::new(1);
+        source.retained_restart_before_callback_error =
+            Some(FakeFault("generation zero retained suffix must not run"));
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage.clone());
+        store.current.push(snapshot);
+        let selected = select_fake_generation_aware_restart_checkpoint(source, store, &baseline)?;
+        assert_eq!(selected.storage.source.restart_callbacks, 1);
+        assert_eq!(selected.storage.source.retained_restart_callbacks, 0);
+        assert_eq!(selected.storage.source.generation_observation_calls, 1);
+        assert_eq!(selected.storage.source.reclamation_observation_calls, 0);
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("generation zero complete-prefix planning"))?;
+        assert_eq!(planned.current_frontier(), Some(1));
+        assert_eq!(planned.selected.storage.source.restart_callbacks, 2);
+        assert_eq!(
+            planned.selected.storage.source.retained_restart_callbacks,
+            0
+        );
+
+        let mut legacy_source = fake_restart_source(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, page.get(), 1)?],
+        );
+        legacy_source.reclamation_observation_error =
+            Some(FakeFault("legacy selection must not observe generation"));
+        let mut legacy_store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        legacy_store.current.push(FakeRecoverySnapshot {
+            page_number: page,
+            page_version: PageVersion::new(1),
+            byte: u8::try_from(page.get()).map_err(|_| TestError("legacy page byte"))?,
+            page_position: planned.current_analysis.lineage().position(1),
+        });
+        let legacy_checkpoint = FakeCompletenessCheckpointSource::new(Some(
+            owned_decoded_completeness_checkpoint(&baseline),
+        ));
+        let legacy = UnrecoveredTransactionPageStorage::new(legacy_source, legacy_store)
+            .select_restart_checkpoint_completeness(legacy_checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(legacy) = legacy
+        else {
+            return Err(TestError("standalone complete-prefix selection changed"));
+        };
+        assert_eq!(legacy.storage.source.reclamation_observation_calls, 0);
+
+        let mut empty_source = fake_restart_source(
+            planned.current_analysis.lineage(),
+            None,
+            Vec::<DurableTransactionRestartObservation<1>>::new(),
+        );
+        empty_source.restart_next_epoch = None;
+        let empty_store =
+            FakeBatchCommittedPageRecoveryStore::new(planned.current_analysis.lineage().clone());
+        let empty = UnrecoveredTransactionPageStorage::new(empty_source, empty_store)
+            .select_generation_aware_restart_checkpoint_completeness(
+                FakeCompletenessCheckpointSource::new(None),
+            );
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Absent(empty) = empty
+        else {
+            return Err(TestError(
+                "complete empty generation required allocator metadata",
+            ));
+        };
+        assert_eq!(empty.storage.source.restart_callbacks, 0);
+        assert_eq!(empty.storage.source.generation_observation_calls, 1);
+        assert_eq!(empty.storage.source.reclamation_observation_calls, 0);
+
+        let empty_baseline = fake_completeness_baseline(
+            planned.current_analysis.lineage(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )?;
+        let mut empty_source = fake_restart_source(
+            planned.current_analysis.lineage(),
+            None,
+            Vec::<DurableTransactionRestartObservation<1>>::new(),
+        );
+        empty_source.restart_next_epoch = None;
+        let selected = select_fake_generation_aware_restart_checkpoint(
+            empty_source,
+            FakeBatchCommittedPageRecoveryStore::new(planned.current_analysis.lineage().clone()),
+            &empty_baseline,
+        )?;
+        assert_eq!(selected.storage.source.restart_callbacks, 1);
+        assert_eq!(selected.storage.source.generation_observation_calls, 1);
+        assert_eq!(selected.storage.source.reclamation_observation_calls, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_zero_checkpoint_rejection_still_permits_complete_recovery()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x170d).ok_or(TestError("generation zero fallback id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page = PageNumber::new(215).ok_or(TestError("generation zero fallback page"))?;
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, page.get(), 1)?],
+            vec![FakeRecoverySnapshot {
+                page_number: page,
+                page_version: PageVersion::new(1),
+                byte: 215,
+                page_position: lineage.position(1),
+            }],
+        )?;
+        let mut source = fake_restart_source(
+            &lineage,
+            Some(lineage.position(2)),
+            vec![
+                restart_raw_page(&lineage, page.get(), 1)?,
+                restart_raw_page(&lineage, page.get(), 2)?,
+            ],
+        );
+        source.reclamation_epoch_override = NonZeroU64::new(1);
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        store.current.push(FakeRecoverySnapshot {
+            page_number: page,
+            page_version: PageVersion::new(3),
+            byte: 3,
+            page_position: source.lineage.position(3),
+        });
+        let selection = UnrecoveredTransactionPageStorage::new(source, store)
+            .select_generation_aware_restart_checkpoint_completeness(
+                FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                    &baseline,
+                ))),
+            );
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected) =
+            selection
+        else {
+            return Err(TestError(
+                "invalid generation zero checkpoint was not rejected",
+            ));
+        };
+        assert!(matches!(
+            rejected.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(_)
+        ));
+        if rejected.continue_with_full_recovery().is_err() {
+            return Err(TestError(
+                "generation zero checkpoint rejection denied complete recovery",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn anchored_restart_materializes_checkpoint_and_applies_only_post_frontier_transactions()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1706).ok_or(TestError("anchored persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let committed = durable_identity(1, 1)?;
+        let unresolved = durable_identity(2, 1)?;
+        let committed_page = PageNumber::new(202).ok_or(TestError("anchored committed page"))?;
+        let unresolved_page = PageNumber::new(203).ok_or(TestError("anchored unresolved page"))?;
+        let raw_page = PageNumber::new(204).ok_or(TestError("anchored raw page"))?;
+        let checkpoint_observations = vec![
+            restart_owned_page(&lineage, committed, committed_page.get(), 1)?,
+            restart_commit(&lineage, committed, 3)?,
+            restart_owned_page(&lineage, unresolved, unresolved_page.get(), 4)?,
+            restart_raw_page(&lineage, raw_page.get(), 5)?,
+        ];
+        let checkpoint_snapshots = vec![
+            FakeRecoverySnapshot {
+                page_number: committed_page,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(committed_page.get())
+                    .map_err(|_| TestError("committed checkpoint byte"))?,
+                page_position: lineage.position(1),
+            },
+            FakeRecoverySnapshot {
+                page_number: raw_page,
+                page_version: PageVersion::new(5),
+                byte: u8::try_from(raw_page.get()).map_err(|_| TestError("raw checkpoint byte"))?,
+                page_position: lineage.position(5),
+            },
+        ];
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(5)),
+            checkpoint_observations,
+            checkpoint_snapshots.clone(),
+        )?;
+        assert!(matches!(
+            baseline.replay_start(),
+            DurableTransactionRestartReplayStart::AtPosition {
+                position: 4,
+                cause: DurableTransactionRestartReplayStartCause::UncommittedTransaction {
+                    transaction,
+                },
+            } if *transaction == unresolved
+        ));
+
+        let retained = vec![
+            restart_owned_page(&lineage, unresolved, unresolved_page.get(), 4)?,
+            restart_raw_page(&lineage, raw_page.get(), 5)?,
+            restart_owned_page(&lineage, unresolved, unresolved_page.get(), 6)?,
+            restart_commit(&lineage, unresolved, 7)?,
+            restart_raw_page(&lineage, raw_page.get(), 8)?,
+        ];
+        let mut source = anchored_restart_source(&lineage, Some(8), retained, &baseline, 2)?;
+        source.restart_before_callback_error = Some(FakeFault(
+            "anchored selection must not call complete prefix",
+        ));
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        store.current = checkpoint_snapshots;
+        let selected = select_fake_generation_aware_restart_checkpoint(source, store, &baseline)?;
+        assert_eq!(selected.storage.source.restart_callbacks, 0);
+        assert_eq!(selected.storage.source.generation_observation_calls, 1);
+        assert_eq!(selected.storage.source.reclamation_observation_calls, 1);
+
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("anchored replay planning"))?;
+        assert_eq!(planned.checkpoint_frontier(), Some(5));
+        assert_eq!(planned.current_frontier(), Some(8));
+        assert_eq!(planned.inclusive_replay_start(), Some(4));
+        assert_eq!(planned.replay_record_count(), 5);
+        assert_eq!(planned.current_transaction_count(), 2);
+        assert_eq!(planned.selected.storage.source.restart_callbacks, 0);
+        assert_eq!(
+            planned.selected.storage.source.retained_restart_callbacks,
+            1
+        );
+        assert_eq!(
+            planned
+                .current_analysis
+                .transactions()
+                .binary_search_by_key(&unresolved, DurableTransactionRestartEntry::transaction)
+                .ok()
+                .and_then(|index| planned.current_analysis.transactions().get(index))
+                .map(DurableTransactionRestartEntry::owned_page_record_count),
+            Some(2)
+        );
+        assert!(matches!(
+            planned
+                .current_analysis
+                .transactions()
+                .binary_search_by_key(&unresolved, DurableTransactionRestartEntry::transaction)
+                .ok()
+                .and_then(|index| planned.current_analysis.transactions().get(index))
+                .map(DurableTransactionRestartEntry::state),
+            Some(DurableTransactionRestartState::Committed { commit_position })
+                if commit_position.get() == 7
+        ));
+        match planned.prepare_page_repairs() {
+            TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) => {
+                assert_eq!(prepared.repair_candidate_count(), 2);
+            }
+            TransactionPageStorageRestartCheckpointRepairPreparation::Failed(_) => {
+                return Err(TestError("anchored plan did not reach repair preparation"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn anchored_restart_accepts_empty_retained_suffix_with_independent_high_water()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1707).ok_or(TestError("empty suffix persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let source = anchored_restart_source(&lineage, Some(9), Vec::new(), &baseline, 7)?;
+        let store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        let planned = select_fake_generation_aware_restart_checkpoint(source, store, &baseline)?
+            .plan_replay_window()
+            .map_err(|_| TestError("empty anchored suffix planning"))?;
+        assert_eq!(planned.checkpoint_frontier(), None);
+        assert_eq!(planned.current_frontier(), Some(9));
+        assert_eq!(planned.replay_record_count(), 0);
+        assert_eq!(planned.current_transaction_count(), 0);
+        assert_eq!(
+            planned.selected.storage.source.retained_restart_callbacks,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn anchored_restart_cannot_fall_back_to_complete_prefix_recovery() -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x170a).ok_or(TestError("anchored fallback persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let make_selected = || -> Result<FakeSelectedRestartCheckpoint, TestError> {
+            select_fake_generation_aware_restart_checkpoint(
+                anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?,
+                FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+                &baseline,
+            )
+        };
+
+        let selected = make_selected()?
+            .decline_checkpoint()
+            .err()
+            .ok_or(TestError(
+                "anchored selected checkpoint granted full recovery",
+            ))?;
+        assert!(matches!(
+            selected.validation,
+            SelectedRestartCheckpointValidation::Anchored { .. }
+        ));
+
+        let planned = make_selected()?
+            .plan_replay_window()
+            .map_err(|_| TestError("anchored fallback plan"))?
+            .decline_replay_plan()
+            .err()
+            .ok_or(TestError("anchored replay plan granted full recovery"))?;
+        assert_eq!(planned.selected.storage.source.restart_callbacks, 0);
+
+        let planned = make_selected()?
+            .plan_replay_window()
+            .map_err(|_| TestError("anchored fallback prepared plan"))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("anchored fallback repair preparation failed"));
+        };
+        let prepared = prepared
+            .decline_page_repairs()
+            .err()
+            .ok_or(TestError("anchored repair decisions granted full recovery"))?;
+        assert_eq!(
+            prepared.planned.selected.storage.source.restart_callbacks,
+            0
+        );
+
+        let mut failed_planning = make_selected()?;
+        failed_planning
+            .storage
+            .source
+            .retained_restart_before_callback_error = Some(FakeFault("anchored planning failure"));
+        let failed_planning = failed_planning
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("anchored planning fault was accepted"))?
+            .continue_with_full_recovery()
+            .err()
+            .ok_or(TestError("anchored planning failure granted full recovery"))?;
+        assert!(matches!(
+            failed_planning.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Source(FakeFault(
+                "anchored planning failure"
+            ))
+        ));
+
+        let page = PageNumber::new(206).ok_or(TestError("anchored preparation failure page"))?;
+        let source = anchored_restart_source(
+            &lineage,
+            Some(1),
+            vec![restart_raw_page(&lineage, page.get(), 1)?],
+            &baseline,
+            1,
+        )?;
+        let selected = select_fake_generation_aware_restart_checkpoint(
+            source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+            &baseline,
+        )?;
+        let mut planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("anchored preparation failure plan"))?;
+        planned.selected.storage.store.observation_fault =
+            Some((page, FakeFault("anchored preparation failure")));
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Failed(failed_preparation) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("anchored preparation fault was accepted"));
+        };
+        let failed_preparation = failed_preparation
+            .continue_with_full_recovery()
+            .err()
+            .ok_or(TestError(
+                "anchored repair preparation failure granted full recovery",
+            ))?;
+        assert!(matches!(
+            failed_preparation.error(),
+            DurableTransactionRestartCheckpointRepairPreparationError::StoreObservation {
+                page_number,
+                source: FakeFault("anchored preparation failure"),
+            } if *page_number == page
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn anchored_restart_completion_retention_and_v4_reclamation_use_only_retained_suffix()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x170b).ok_or(TestError("anchored reclaim persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+        let mut source = anchored_restart_source(&lineage, Some(9), Vec::new(), &baseline, 1)?;
+        source.reclamation_format_version = 4;
+        source.reclamation_replacement_format_version = Some(4);
+        source.restart_before_callback_error =
+            Some(FakeFault("anchored pipeline entered complete prefix"));
+        let selected = select_fake_generation_aware_restart_checkpoint(
+            source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage),
+            &baseline,
+        )?;
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("anchored reclaim planning"))?;
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("anchored reclaim preparation failed"));
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(TestError("anchored reclaim repair failed"));
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(TestError("anchored reclaim restoration failed"));
+        };
+        let completed = restored
+            .complete_restart()
+            .map_err(|_| TestError("anchored reclaim completion failed"))?;
+        assert_eq!(completed.source.restart_callbacks, 0);
+        assert_eq!(completed.source.retained_restart_callbacks, 2);
+
+        let analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|_| TestError("anchored retained-suffix analysis failed"))?;
+        assert_eq!(analyzed.completed.source.restart_callbacks, 0);
+        assert_eq!(analyzed.completed.source.retained_restart_callbacks, 3);
+        assert_eq!(analyzed.retention_analysis().durable_frontier(), Some(9));
+        assert_eq!(
+            analyzed
+                .retention_analysis()
+                .floor()
+                .retained_first_record(),
+            None
+        );
+
+        let reclaimed = analyzed
+            .reclaim_wal_prefix()
+            .map_err(|_| TestError("anchored V4 reclamation failed"))?;
+        let receipt = reclaimed.reclamation_receipt();
+        assert_eq!(receipt.source_physical_format_version(), 4);
+        assert_eq!(receipt.replacement_physical_format_version(), 4);
+        assert_eq!(receipt.old_generation(), 1);
+        assert_eq!(receipt.new_generation(), 2);
+        assert_eq!(receipt.logical_position_high_water(), Some(9));
+        assert_eq!(receipt.retained_first_logical_record(), None);
+        assert_eq!(receipt.retained_logical_record_count(), 0);
+        let (_, source, _, _) = reclaimed.into_parts();
+        assert_eq!(source.restart_callbacks, 0);
+        assert_eq!(source.retained_restart_callbacks, 5);
+        assert_eq!(source.reclamation_effect_calls, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn anchored_reclamation_retains_page_backing_records_before_replay_window()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x170c).ok_or(TestError("anchored floor persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let committed = durable_identity(1, 1)?;
+        let unresolved = durable_identity(2, 1)?;
+        let committed_page =
+            PageNumber::new(212).ok_or(TestError("anchored floor committed page"))?;
+        let unresolved_page =
+            PageNumber::new(213).ok_or(TestError("anchored floor unresolved page"))?;
+        let raw_page = PageNumber::new(214).ok_or(TestError("anchored floor raw page"))?;
+        let checkpoint_snapshots = vec![
+            FakeRecoverySnapshot {
+                page_number: committed_page,
+                page_version: PageVersion::new(1),
+                byte: u8::try_from(committed_page.get())
+                    .map_err(|_| TestError("anchored floor committed byte"))?,
+                page_position: lineage.position(1),
+            },
+            FakeRecoverySnapshot {
+                page_number: raw_page,
+                page_version: PageVersion::new(5),
+                byte: u8::try_from(raw_page.get())
+                    .map_err(|_| TestError("anchored floor raw byte"))?,
+                page_position: lineage.position(5),
+            },
+        ];
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(5)),
+            vec![
+                restart_owned_page(&lineage, committed, committed_page.get(), 1)?,
+                restart_commit(&lineage, committed, 3)?,
+                restart_owned_page(&lineage, unresolved, unresolved_page.get(), 4)?,
+                restart_raw_page(&lineage, raw_page.get(), 5)?,
+            ],
+            checkpoint_snapshots.clone(),
+        )?;
+        let retained = vec![
+            restart_owned_page(&lineage, committed, committed_page.get(), 1)?,
+            restart_commit(&lineage, committed, 3)?,
+            restart_owned_page(&lineage, unresolved, unresolved_page.get(), 4)?,
+            restart_raw_page(&lineage, raw_page.get(), 5)?,
+            restart_owned_page(&lineage, unresolved, unresolved_page.get(), 6)?,
+            restart_commit(&lineage, unresolved, 7)?,
+            restart_raw_page(&lineage, raw_page.get(), 8)?,
+        ];
+        let mut source = anchored_restart_source(&lineage, Some(8), retained, &baseline, 2)?;
+        source.reclamation_format_version = 4;
+        source.reclamation_replacement_format_version = Some(4);
+        source.restart_next_epoch = NonZeroU64::new(3);
+        source.restart_before_callback_error =
+            Some(FakeFault("anchored floor entered complete prefix"));
+        let mut store = FakeBatchCommittedPageRecoveryStore::new(lineage);
+        store.current = checkpoint_snapshots;
+        let selected = select_fake_generation_aware_restart_checkpoint(source, store, &baseline)?;
+        let planned = selected
+            .plan_replay_window()
+            .map_err(|_| TestError("anchored floor planning"))?;
+        assert_eq!(planned.inclusive_replay_start(), Some(4));
+        assert_eq!(planned.replay_record_count(), 5);
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(TestError("anchored floor preparation failed"));
+        };
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(TestError("anchored floor repair failed"));
+        };
+        let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+            repaired.restore_transaction_state()
+        else {
+            return Err(TestError("anchored floor restoration failed"));
+        };
+        let mut completed = restored
+            .complete_restart()
+            .map_err(|_| TestError("anchored floor completion failed"))?;
+        completed.source.reclamation_epoch_override = NonZeroU64::new(3);
+        let analyzed = completed
+            .analyze_wal_retention()
+            .map_err(|_| TestError("anchored floor retention failed"))?;
+        assert_eq!(
+            analyzed
+                .retention_analysis()
+                .floor()
+                .retained_first_record(),
+            Some(1)
+        );
+        let reclaimed = analyzed
+            .reclaim_wal_prefix()
+            .map_err(|_| TestError("anchored floor reclamation failed"))?;
+        assert_eq!(
+            reclaimed
+                .reclamation_receipt()
+                .retained_first_logical_record(),
+            Some(1)
+        );
+        assert_eq!(
+            reclaimed
+                .reclamation_receipt()
+                .retained_logical_record_count(),
+            7
+        );
+        let (_, source, _, _) = reclaimed.into_parts();
+        assert_eq!(
+            source
+                .restart_observations
+                .first()
+                .map(|observation| observation.position().get()),
+            Some(1)
+        );
+        assert_eq!(source.restart_callbacks, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn generation_aware_selection_rejects_anchor_metadata_and_structural_corruption()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1708).ok_or(TestError("selection rejection persistent id"))?;
+        let foreign_id =
+            PersistentLogId::new(0x2708).ok_or(TestError("selection rejection foreign id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let foreign_lineage = LogLineage::persistent(foreign_id);
+        let baseline = fake_completeness_baseline(&lineage, None, Vec::new(), Vec::new())?;
+
+        let missing_checkpoint_source =
+            anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        let missing_checkpoint = UnrecoveredTransactionPageStorage::new(
+            missing_checkpoint_source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(None),
+        );
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+            missing_checkpoint,
+        ) = missing_checkpoint
+        else {
+            return Err(TestError("missing pruned checkpoint was accepted"));
+        };
+        assert!(matches!(
+            missing_checkpoint.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PrunedGenerationCheckpointMissing {
+                        generation: 1
+                    }
+                )
+        ));
+        let missing_checkpoint = missing_checkpoint
+            .continue_with_full_recovery()
+            .err()
+            .ok_or(TestError(
+                "missing pruned checkpoint granted complete recovery",
+            ))?;
+        assert_eq!(missing_checkpoint.storage.source.restart_callbacks, 0);
+
+        let mut checkpoint_fault = FakeCompletenessCheckpointSource::new(Some(
+            owned_decoded_completeness_checkpoint(&baseline),
+        ));
+        checkpoint_fault.fault = Some(FakeFault("generation-aware checkpoint fault"));
+        let checkpoint_fault = UnrecoveredTransactionPageStorage::new(
+            anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(checkpoint_fault);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+            checkpoint_fault,
+        ) = checkpoint_fault
+        else {
+            return Err(TestError("generation-aware checkpoint fault was accepted"));
+        };
+        assert!(
+            checkpoint_fault.continue_with_full_recovery().is_err(),
+            "generation-unknown checkpoint failure granted complete recovery"
+        );
+
+        let mut generation_fault_source =
+            anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        generation_fault_source.reclamation_observation_error =
+            Some(FakeFault("generation observation fault"));
+        let generation_fault = UnrecoveredTransactionPageStorage::new(
+            generation_fault_source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                &baseline,
+            ))),
+        );
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(
+            generation_fault,
+        ) = generation_fault
+        else {
+            return Err(TestError("generation observation fault was accepted"));
+        };
+        assert!(
+            generation_fault.continue_with_full_recovery().is_err(),
+            "generation observation failure granted complete recovery"
+        );
+
+        let mut generation_changed =
+            anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        generation_changed.generation_after_minimal_observation = Some(2);
+        let generation_changed = UnrecoveredTransactionPageStorage::new(
+            generation_changed,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                &baseline,
+            ))),
+        );
+        assert!(matches!(
+            generation_changed,
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(ref rejected)
+                if matches!(
+                    rejected.error(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                        if matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::SourceGenerationChanged {
+                                expected: 1,
+                                actual: 2,
+                            }
+                        )
+                )
+        ));
+
+        let mut missing = anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        missing.reclamation_anchor = None;
+        let missing = UnrecoveredTransactionPageStorage::new(
+            missing,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                &baseline,
+            ))),
+        );
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(missing) =
+            missing
+        else {
+            return Err(TestError("missing pruned anchor was accepted"));
+        };
+        assert!(matches!(
+            missing.error(),
+            DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PrunedGenerationMissingAnchor {
+                        generation: 1
+                    }
+                )
+        ));
+
+        let mut legacy_anchor = fake_restart_source(
+            &lineage,
+            None,
+            Vec::<DurableTransactionRestartObservation<1>>::new(),
+        );
+        legacy_anchor.reclamation_epoch_override = NonZeroU64::new(1);
+        legacy_anchor.reclamation_anchor = Some(selected_restart_checkpoint_anchor(&baseline));
+        let legacy_anchor = UnrecoveredTransactionPageStorage::new(
+            legacy_anchor,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                &baseline,
+            ))),
+        );
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(legacy_anchor) =
+            legacy_anchor
+        else {
+            return Err(TestError(
+                "generation-zero selection required allocator-backed metadata",
+            ));
+        };
+        assert_eq!(
+            legacy_anchor.storage.source.reclamation_observation_calls,
+            0
+        );
+
+        let mut wrong_anchor =
+            anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        let expected = selected_restart_checkpoint_anchor(&baseline);
+        wrong_anchor.reclamation_anchor = Some(DurableTransactionRestartSelectedCheckpointAnchor {
+            version: expected.version(),
+            value: expected.value() ^ 1,
+        });
+        let wrong_anchor = UnrecoveredTransactionPageStorage::new(
+            wrong_anchor,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                &baseline,
+            ))),
+        );
+        assert!(matches!(
+            &wrong_anchor,
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(rejected)
+                if matches!(
+                    rejected.error(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                        if matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::SelectedCheckpointAnchorMismatch { .. }
+                        )
+                )
+        ));
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(wrong_anchor) =
+            wrong_anchor
+        else {
+            return Err(TestError("wrong anchored checkpoint changed outcome"));
+        };
+        assert!(
+            wrong_anchor.continue_with_full_recovery().is_err(),
+            "anchor mismatch granted complete recovery"
+        );
+
+        let mut wrong_lineage =
+            anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        wrong_lineage.reclamation_lineage_override = Some(foreign_lineage);
+        let wrong_lineage = UnrecoveredTransactionPageStorage::new(
+            wrong_lineage,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                &baseline,
+            ))),
+        );
+        assert!(matches!(
+            wrong_lineage,
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(ref rejected)
+                if matches!(
+                    rejected.error(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                        if matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::MetadataLineageMismatch { .. }
+                        )
+                )
+        ));
+
+        let mut zero_format = anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        zero_format.reclamation_format_version = 0;
+        let zero_format = UnrecoveredTransactionPageStorage::new(
+            zero_format,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(owned_decoded_completeness_checkpoint(
+                &baseline,
+            ))),
+        );
+        assert!(matches!(
+            zero_format,
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(ref rejected)
+                if matches!(
+                    rejected.error(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                        if matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::ZeroPhysicalFormatVersion
+                        )
+                )
+        ));
+
+        let invalid_checkpoint =
+            OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+                OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+                    persistent_log_id.get(),
+                    Some(3),
+                    vec![DurableTransactionRestartCheckpointBaselineEntryObservation::new(
+                        0,
+                        1,
+                        Some(1),
+                        Some(1),
+                        1,
+                        DurableTransactionRestartCheckpointBaselineStateObservation::Uncommitted,
+                    )],
+                ),
+                Vec::new(),
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation::new(
+                    DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation::AtPosition,
+                    None,
+                    Some(1),
+                    Some(
+                        DurableTransactionRestartCheckpointCompletenessBaselineReplayCauseObservation::UncommittedTransaction {
+                            epoch: 0,
+                            sequence: 1,
+                        },
+                    ),
+                ),
+            );
+        let invalid_checkpoint_source =
+            anchored_restart_source(&lineage, Some(3), Vec::new(), &baseline, 1)?;
+        let invalid_checkpoint = UnrecoveredTransactionPageStorage::new(
+            invalid_checkpoint_source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(invalid_checkpoint)),
+        );
+        assert!(matches!(
+            invalid_checkpoint,
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(ref rejected)
+                if matches!(
+                    rejected.error(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                        if matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::InvalidTransactionIdentity { .. }
+                        )
+                )
+        ));
+
+        let invalid_page =
+            OwnedDurableTransactionRestartCheckpointCompletenessBaselineObservation::new(
+                OwnedDurableTransactionRestartCheckpointBaselineObservation::new(
+                    persistent_log_id.get(),
+                    None,
+                    Vec::new(),
+                ),
+                vec![
+                    DurableTransactionRestartCheckpointCompletenessBaselinePageObservation::new(
+                        1,
+                        DurableTransactionRestartCheckpointCompletenessBaselinePageStateObservation::StoreCurrent,
+                        None,
+                        None,
+                    ),
+                ],
+                DurableTransactionRestartCheckpointCompletenessBaselineReplayObservation::new(
+                    DurableTransactionRestartCheckpointCompletenessBaselineReplayKindObservation::AfterFrontier,
+                    None,
+                    None,
+                    None,
+                ),
+            );
+        let invalid_page_source =
+            anchored_restart_source(&lineage, Some(1), Vec::new(), &baseline, 1)?;
+        let invalid_page = UnrecoveredTransactionPageStorage::new(
+            invalid_page_source,
+            FakeBatchCommittedPageRecoveryStore::new(lineage),
+        )
+        .select_generation_aware_restart_checkpoint_completeness(
+            FakeCompletenessCheckpointSource::new(Some(invalid_page)),
+        );
+        assert!(matches!(
+            invalid_page,
+            TransactionPageStorageRestartCheckpointCompletenessSelection::Rejected(ref rejected)
+                if matches!(
+                    rejected.error(),
+                    DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::GenerationEvidence(source)
+                        if matches!(
+                            source.as_ref(),
+                            DurableTransactionRestartPrunedGenerationSelectionEvidenceError::PageStateShape { .. }
+                        )
+                )
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn anchored_planning_rejects_suffix_shape_toctou_and_authoritative_source_errors()
+    -> Result<(), TestError> {
+        let persistent_log_id =
+            PersistentLogId::new(0x1709).ok_or(TestError("suffix rejection persistent id"))?;
+        let lineage = LogLineage::persistent(persistent_log_id);
+        let page = PageNumber::new(205).ok_or(TestError("suffix rejection page"))?;
+        let baseline = fake_completeness_baseline(
+            &lineage,
+            Some(lineage.position(1)),
+            vec![restart_raw_page(&lineage, page.get(), 1)?],
+            Vec::new(),
+        )?;
+        let make_selected = || -> Result<FakeSelectedRestartCheckpoint, TestError> {
+            let source = anchored_restart_source(
+                &lineage,
+                Some(2),
+                vec![
+                    restart_raw_page(&lineage, page.get(), 1)?,
+                    restart_raw_page(&lineage, page.get(), 2)?,
+                ],
+                &baseline,
+                1,
+            )?;
+            select_fake_generation_aware_restart_checkpoint(
+                source,
+                FakeBatchCommittedPageRecoveryStore::new(lineage.clone()),
+                &baseline,
+            )
+        };
+
+        let mut wrong_first = make_selected()?;
+        wrong_first.storage.source.restart_observations.remove(0);
+        wrong_first
+            .storage
+            .source
+            .reclamation_retained_first_override = Some(Some(lineage.position(1)));
+        let wrong_first = wrong_first
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("wrong retained first was accepted"))?;
+        assert!(matches!(
+            wrong_first.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointReplayPlanningEvidenceError::RetainedSuffix(suffix)
+                        if matches!(
+                            suffix.as_ref(),
+                            DurableTransactionRestartRetainedSuffixEvidenceError::RetainedFirstMismatch {
+                                expected: 1,
+                                actual: 2,
+                            }
+                        )
+                )
+        ));
+
+        let mut wrong_tail = make_selected()?;
+        wrong_tail.storage.source.restart_observations.pop();
+        wrong_tail.storage.source.reclamation_frontier_override = Some(Some(lineage.position(2)));
+        let wrong_tail = wrong_tail
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("wrong retained tail was accepted"))?;
+        assert!(matches!(
+            wrong_tail.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointReplayPlanningEvidenceError::RetainedSuffix(suffix)
+                        if matches!(
+                            suffix.as_ref(),
+                            DurableTransactionRestartRetainedSuffixEvidenceError::RetainedTailMismatch {
+                                expected: 2,
+                                actual: 1,
+                            }
+                        )
+                )
+        ));
+
+        let foreign_lineage = LogLineage::persistent(
+            PersistentLogId::new(0x2709).ok_or(TestError("foreign suffix lineage"))?,
+        );
+        let mut foreign = make_selected()?;
+        foreign.storage.source.restart_observations[0] =
+            restart_raw_page(&foreign_lineage, page.get(), 1)?;
+        foreign.storage.source.reclamation_retained_first_override =
+            Some(Some(lineage.position(1)));
+        let foreign = foreign
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("foreign retained suffix record was accepted"))?;
+        assert!(matches!(
+            foreign.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointReplayPlanningEvidenceError::RetainedSuffix(suffix)
+                        if matches!(
+                            suffix.as_ref(),
+                            DurableTransactionRestartRetainedSuffixEvidenceError::ForeignRecordLineage {
+                                index: 0,
+                                ..
+                            }
+                        )
+                )
+        ));
+
+        let mut changed = make_selected()?;
+        changed
+            .storage
+            .source
+            .retained_restart_generation_after_callback = Some(2);
+        let changed = changed
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("generation metadata TOCTOU was accepted"))?;
+        assert!(matches!(
+            changed.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Evidence(source)
+                if matches!(
+                    source.as_ref(),
+                    DurableTransactionRestartCheckpointReplayPlanningEvidenceError::PrunedGenerationMetadataChanged {
+                        expected,
+                        actual,
+                    } if expected.source_generation() == 1
+                        && actual.source_generation() == 2
+                )
+        ));
+
+        let mut authoritative = make_selected()?;
+        authoritative.storage.source.restart_observations.remove(0);
+        authoritative
+            .storage
+            .source
+            .reclamation_retained_first_override = Some(Some(lineage.position(1)));
+        authoritative
+            .storage
+            .source
+            .retained_restart_after_callback_error =
+            Some(FakeFault("authoritative retained suffix source"));
+        let authoritative = authoritative
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError("retained suffix source error was accepted"))?;
+        assert!(matches!(
+            authoritative.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Source(FakeFault(
+                "authoritative retained suffix source"
+            ))
+        ));
+
+        let mut post_observation = make_selected()?;
+        post_observation
+            .storage
+            .source
+            .retained_restart_observation_error_after_callback =
+            Some(FakeFault("post-callback generation source"));
+        let post_observation = post_observation
+            .plan_replay_window()
+            .err()
+            .ok_or(TestError(
+                "post-callback generation source error was accepted",
+            ))?;
+        assert!(matches!(
+            post_observation.error(),
+            DurableTransactionRestartCheckpointReplayPlanningError::Source(FakeFault(
+                "post-callback generation source"
+            ))
+        ));
+        Ok(())
     }
 }

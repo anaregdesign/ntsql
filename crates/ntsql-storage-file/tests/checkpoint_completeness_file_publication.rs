@@ -11,12 +11,13 @@ use ntsql_page::{
     PageAddress, PageImage, PageNumber, PageVersion, StoredPageSnapshotObservation, UnloggedPage,
 };
 use ntsql_storage_file::{
-    FileCommitLog, FileCommittedPageRecoveryObservationError, FilePageStore, FilePageStoreError,
-    FileRestartCheckpointCompletenessBaselinePublicationError,
+    FaultPoint, FileCommitLog, FileCommittedPageRecoveryObservationError, FilePageStore,
+    FilePageStoreError, FileRestartCheckpointCompletenessBaselinePublicationError,
     FileRestartCheckpointCompletenessBaselinePublicationFaultPoint,
     FileRestartCheckpointCompletenessBaselineSource, FileRestartCheckpointPageRepairStoreError,
     FileRestartCheckpointSlotIoStage, FileTransactionRestartAnalysisSourceError,
-    PageStoreFaultPoint, encode_restart_checkpoint_completeness_baseline,
+    FileTransactionRestartWalReclamationError, PageStoreFaultPoint,
+    encode_restart_checkpoint_completeness_baseline,
     open_transaction_page_storage_with_completeness_checkpoint,
 };
 use ntsql_transaction::{
@@ -29,20 +30,28 @@ use ntsql_transaction::{
     DurableTransactionRestartCheckpointCompletenessBaselineValidationError,
     DurableTransactionRestartCheckpointCompletenessBaselineValidationEvidenceError,
     DurableTransactionRestartCompletenessError, DurableTransactionRestartCompletenessEvidenceError,
-    DurableTransactionRestartPageState, RestartAnalyzedTransactionPageStorage,
-    TransactionCoordinator, TransactionPageStorageRestartCheckpointCompletenessSelection,
+    DurableTransactionRestartPageState, DurableTransactionRestartWalReclamationError,
+    DurableTransactionRestartWalReclamationOutcomeIndeterminateError,
+    RestartAnalyzedTransactionPageStorage, TransactionCoordinator,
+    TransactionPageStorageRestartCheckpointCompletenessSelection,
     TransactionPageStorageRestartCheckpointPageRepairExecution,
     TransactionPageStorageRestartCheckpointRepairPreparation,
     TransactionPageStorageRestartCheckpointRestoration,
     TransactionRestartCheckpointPageRepairFailureCause,
     TransactionRestartCheckpointPageRepairOutcome, UnrecoveredTransactionPageStorage,
-    flush_committed_page,
+    WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay, flush_committed_page,
 };
 use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
 
 static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
 type FileOwner = RestartAnalyzedTransactionPageStorage<FileCommitLog<2>, FilePageStore<2>, 2>;
+type FileReclamationOwner = WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay<
+    FileCommitLog<2>,
+    FilePageStore<2>,
+    FileRestartCheckpointCompletenessBaselineSource,
+    2,
+>;
 
 type FilePublicationError =
     DurableTransactionRestartCheckpointCompletenessBaselineCurrentPublicationError<
@@ -248,7 +257,9 @@ fn pre_recovery_selection_accepts_missing_page_then_retains_slot_through_full_re
     assert_eq!(selected.transaction_count(), baseline.transactions().len());
     assert_eq!(selected.page_count(), 1);
 
-    let uncheckpointed = selected.decline_checkpoint();
+    let uncheckpointed = selected
+        .decline_checkpoint()
+        .map_err(|_| io::Error::other("generation-zero checkpoint denied full recovery"))?;
     assert_file_composition_locked(directory.path(), &slot_path)?;
     let recovered = uncheckpointed.recover()?;
     assert_file_composition_locked(directory.path(), &slot_path)?;
@@ -577,6 +588,315 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
 }
 
 #[test]
+fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Result<(), Box<dyn Error>>
+{
+    let directory = TestDirectory::new("wal-reclamation-generations")?;
+    let persistent_log_id = persistent_log_id(17001)?;
+    let wal_path = directory.path().join("wal.bin");
+    let page_store_path = directory.path().join("pages.bin");
+    let slot_path = directory.path().join("completeness");
+    let mut owner = analyzed_owner(directory.path(), persistent_log_id)?;
+
+    let pruned_position = append_committed_transaction(&mut owner)?;
+    assert_eq!(pruned_position, 1);
+    append_committed_page(&mut owner, 170, 1, [0x17, 0x01])?;
+    let durable_frontier = owner
+        .parts()
+        .0
+        .durable_position()
+        .ok_or_else(|| io::Error::other("reclamation source frontier is empty"))?;
+    assert_eq!(durable_frontier.get(), 3);
+
+    let mut checkpoint =
+        FileRestartCheckpointCompletenessBaselineSource::create_new(&slot_path, persistent_log_id)?;
+    let published = owner
+        .publish_restart_checkpoint_completeness_baseline_from_current_prefix(&mut checkpoint)?;
+    assert_eq!(published.durable_frontier(), Some(durable_frontier.get()));
+    drop((owner, checkpoint));
+
+    let opened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        &wal_path,
+        &page_store_path,
+        &slot_path,
+    )?;
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        opened.select_restart_checkpoint_completeness()
+    else {
+        return Err(io::Error::other("V3 reclamation checkpoint was not selected").into());
+    };
+    let planned = selected.plan_replay_window()?;
+    assert_eq!(planned.replay_record_count(), 0);
+    let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+        planned.prepare_page_repairs()
+    else {
+        return Err(io::Error::other("V3 reclamation preparation failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+        prepared.execute_page_repairs()
+    else {
+        return Err(io::Error::other("V3 reclamation page execution failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+        repaired.restore_transaction_state()
+    else {
+        return Err(io::Error::other("V3 reclamation restoration failed").into());
+    };
+    assert_eq!(restored.transaction_summary().coordinator_epoch().get(), 3);
+    let completed = restored.complete_restart()?;
+    let analyzed = completed.analyze_wal_retention()?;
+    assert_eq!(
+        analyzed
+            .retention_analysis()
+            .floor()
+            .retained_first_record(),
+        Some(2)
+    );
+    let reclaimed = analyzed
+        .reclaim_wal_prefix()
+        .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    let receipt = reclaimed.reclamation_receipt();
+    assert_eq!(receipt.source_physical_format_version(), 3);
+    assert_eq!(receipt.replacement_physical_format_version(), 4);
+    assert_eq!(receipt.old_generation(), 0);
+    assert_eq!(receipt.new_generation(), 1);
+    assert_eq!(receipt.retained_first_logical_record(), Some(2));
+    assert_eq!(
+        receipt.logical_position_high_water(),
+        Some(durable_frontier.get())
+    );
+    assert_eq!(receipt.retained_logical_record_count(), 2);
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let (coordinator, log, store, evidence) = reclaimed.into_parts();
+    assert_eq!(
+        log.durable_records()
+            .map(|record| record.position().get())
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    drop((coordinator, log, store, evidence));
+
+    let reopened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        &wal_path,
+        &page_store_path,
+        &slot_path,
+    )?;
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        reopened.select_restart_checkpoint_completeness()
+    else {
+        return Err(io::Error::other("anchored V4 checkpoint was not selected").into());
+    };
+    let planned = selected.plan_replay_window()?;
+    assert_eq!(planned.replay_record_count(), 0);
+    let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+        planned.prepare_page_repairs()
+    else {
+        return Err(io::Error::other("V4 reclamation preparation failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+        prepared.execute_page_repairs()
+    else {
+        return Err(io::Error::other("V4 reclamation page execution failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+        repaired.restore_transaction_state()
+    else {
+        return Err(io::Error::other("V4 reclamation restoration failed").into());
+    };
+    assert_eq!(restored.transaction_summary().coordinator_epoch().get(), 4);
+    let analyzed = restored.complete_restart()?.analyze_wal_retention()?;
+    let reclaimed = analyzed
+        .reclaim_wal_prefix()
+        .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    let receipt = reclaimed.reclamation_receipt();
+    assert_eq!(receipt.source_physical_format_version(), 4);
+    assert_eq!(receipt.replacement_physical_format_version(), 4);
+    assert_eq!(receipt.old_generation(), 1);
+    assert_eq!(receipt.new_generation(), 2);
+    assert_eq!(receipt.retained_first_logical_record(), Some(2));
+    assert_eq!(
+        receipt.logical_position_high_water(),
+        Some(durable_frontier.get())
+    );
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+
+    let (coordinator, mut log, store, evidence) = reclaimed.into_parts();
+    drop(coordinator);
+    let mut next_coordinator = TransactionCoordinator::open(&mut log)?;
+    let active = next_coordinator.begin()?;
+    assert_eq!(active.transaction_id().epoch().get(), 5);
+    let committed = next_coordinator.commit(active, &mut log)?;
+    assert_eq!(committed.log_position().get(), 4);
+    log.flush_through(committed.log_position())?;
+    drop((next_coordinator, log, store, evidence));
+
+    let reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    assert_eq!(
+        reopened
+            .durable_records()
+            .map(|record| record.position().get())
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    assert_eq!(
+        reopened.durable_position().map(|position| position.get()),
+        Some(4)
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("wal-reclamation-empty")?;
+    let persistent_log_id = persistent_log_id(17002)?;
+    let wal_path = directory.path().join("wal.bin");
+    let slot_path = directory.path().join("completeness");
+    let analyzed = prepare_reclamation_owner(directory.path(), persistent_log_id, None)?;
+    assert_eq!(analyzed.retention_analysis().durable_frontier(), Some(1));
+    assert_eq!(
+        analyzed
+            .retention_analysis()
+            .floor()
+            .retained_first_record(),
+        None
+    );
+
+    let reclaimed = analyzed
+        .reclaim_wal_prefix()
+        .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    let receipt = reclaimed.reclamation_receipt();
+    assert_eq!(receipt.source_physical_format_version(), 3);
+    assert_eq!(receipt.replacement_physical_format_version(), 4);
+    assert_eq!(receipt.old_generation(), 0);
+    assert_eq!(receipt.new_generation(), 1);
+    assert_eq!(receipt.retained_first_logical_record(), None);
+    assert_eq!(receipt.logical_position_high_water(), Some(1));
+    assert_eq!(receipt.retained_logical_record_count(), 0);
+    assert_eq!(receipt.retained_physical_unit_count(), 0);
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    let (coordinator, log, store, evidence) = reclaimed.into_parts();
+    assert!(log.durable_records().next().is_none());
+    assert_eq!(
+        log.durable_position().map(|position| position.get()),
+        Some(1)
+    );
+    drop((coordinator, log, store, evidence));
+
+    let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    assert_eq!(reopened.physical_format_version(), 4);
+    assert_eq!(reopened.generation(), 1);
+    assert!(reopened.durable_records().next().is_none());
+    assert_eq!(
+        reopened.durable_position().map(|position| position.get()),
+        Some(1)
+    );
+    let mut coordinator = TransactionCoordinator::open(&mut reopened)?;
+    let active = coordinator.begin()?;
+    assert_eq!(active.transaction_id().epoch().get(), 3);
+    let committed = coordinator.commit(active, &mut reopened)?;
+    assert_eq!(committed.log_position().get(), 2);
+    reopened.flush_through(committed.log_position())?;
+    drop((coordinator, reopened));
+
+    let reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    assert_eq!(
+        reopened
+            .durable_records()
+            .map(|record| record.position().get())
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    assert_eq!(
+        reopened.durable_position().map(|position| position.get()),
+        Some(2)
+    );
+    Ok(())
+}
+
+#[test]
+fn every_wal_reclamation_fault_reopens_one_selected_generation() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("wal-reclamation-faults")?;
+    for (index, fault) in [
+        FaultPoint::BeforeReclamationCandidateCleanup,
+        FaultPoint::BeforeReclamationWrite,
+        FaultPoint::DuringReclamationCopy,
+        FaultPoint::BeforeReclamationCandidateSync,
+        FaultPoint::AfterReclamationCandidateSync,
+        FaultPoint::BeforeReclamationRename,
+        FaultPoint::AfterReclamationRename,
+        FaultPoint::DuringReclamationDirectorySync,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case_path = directory.path().join(format!("case-{index}"));
+        fs::create_dir(&case_path)?;
+        let persistent_log_id = persistent_log_id(17100 + index as u128)?;
+        let wal_path = case_path.join("wal.bin");
+        let slot_path = case_path.join("completeness");
+        let candidate_path = case_path.join("wal.bin.reclaim-candidate");
+        let mut analyzed = prepare_reclamation_owner(
+            &case_path,
+            persistent_log_id,
+            Some((171 + index as u64, [0x17, index as u8])),
+        )?;
+        if fault == FaultPoint::BeforeReclamationCandidateCleanup {
+            write_synced_new(&candidate_path, b"stale unselected candidate")?;
+        }
+        analyzed.parts_mut().1.arm_fault(fault)?;
+
+        let failed = analyzed
+            .reclaim_wal_prefix()
+            .err()
+            .ok_or_else(|| io::Error::other("injected reclamation fault reported success"))?;
+        assert!(matches!(
+            failed.error(),
+            DurableTransactionRestartWalReclamationError::OutcomeIndeterminate(
+                DurableTransactionRestartWalReclamationOutcomeIndeterminateError::Effect(
+                    FileTransactionRestartWalReclamationError::InjectedFault(actual)
+                )
+            ) if *actual == fault
+        ));
+        assert_file_composition_locked(&case_path, &slot_path)?;
+        let renamed = matches!(
+            fault,
+            FaultPoint::AfterReclamationRename | FaultPoint::DuringReclamationDirectorySync
+        );
+        assert_eq!(candidate_path.exists(), !renamed);
+        drop(failed);
+
+        let reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+        assert_eq!(
+            reopened.physical_format_version(),
+            if renamed { 4 } else { 3 }
+        );
+        assert_eq!(reopened.generation(), u64::from(renamed));
+        assert_eq!(
+            reopened
+                .durable_records()
+                .map(|record| record.position().get())
+                .collect::<Vec<_>>(),
+            if renamed { vec![2, 3] } else { vec![1, 2, 3] }
+        );
+        assert!(
+            !candidate_path.exists(),
+            "a candidate survived fresh selected-file open after {fault}"
+        );
+        drop(reopened);
+        let reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+        assert_eq!(
+            reopened.physical_format_version(),
+            if renamed { 4 } else { 3 }
+        );
+        assert_eq!(reopened.generation(), u64::from(renamed));
+        assert!(
+            !candidate_path.exists(),
+            "candidate cleanup did not converge after repeated reopen for {fault}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_locks()
 -> Result<(), Box<dyn Error>> {
     let directory = TestDirectory::new("replay-repair-faults")?;
@@ -819,7 +1139,7 @@ fn failed_page_repair_preparation_retains_filesystem_locks_through_fallback()
     assert_eq!(fs::read(&page_store_path)?, page_store_before_preparation);
     assert_file_composition_locked(directory.path(), &slot_path)?;
 
-    let (uncheckpointed, error) = failed.continue_with_full_recovery();
+    let (uncheckpointed, error) = failed.continue_with_full_recovery()?;
     assert!(matches!(
         error,
         ntsql_transaction::DurableTransactionRestartCheckpointRepairPreparationError::StoreObservation {
@@ -978,7 +1298,7 @@ fn published_completeness_validates_after_safe_suffix_and_rejects_advanced_selec
             )
         )
     ));
-    let (uncheckpointed, rejection) = rejected.continue_with_full_recovery();
+    let (uncheckpointed, rejection) = rejected.continue_with_full_recovery()?;
     assert!(matches!(
         rejection,
         DurableTransactionRestartCheckpointCompletenessBaselineSourceValidationError::BaselineValidation(_)
@@ -1319,6 +1639,68 @@ fn append_committed_page(
     let committed = coordinator.commit(active, log)?;
     flush_committed_page(&committed, log, store, dirty)?;
     Ok(())
+}
+
+fn append_committed_transaction(owner: &mut FileOwner) -> Result<u64, Box<dyn Error>> {
+    let (log, _) = owner.parts_mut();
+    let mut coordinator = TransactionCoordinator::open(log)?;
+    let active = coordinator.begin()?;
+    let committed = coordinator.commit(active, log)?;
+    let position = committed.log_position().clone();
+    log.flush_through(&position)?;
+    Ok(position.get())
+}
+
+fn prepare_reclamation_owner(
+    directory: &Path,
+    persistent_log_id: PersistentLogId,
+    retained_page: Option<(u64, [u8; 2])>,
+) -> Result<FileReclamationOwner, Box<dyn Error>> {
+    let mut owner = analyzed_owner(directory, persistent_log_id)?;
+    let slot_path = directory.join("completeness");
+    let mut checkpoint =
+        FileRestartCheckpointCompletenessBaselineSource::create_new(&slot_path, persistent_log_id)?;
+    if retained_page.is_none() {
+        let _ = owner.publish_restart_checkpoint_completeness_baseline_from_current_prefix(
+            &mut checkpoint,
+        )?;
+    }
+    assert_eq!(append_committed_transaction(&mut owner)?, 1);
+    if let Some((page_number, bytes)) = retained_page {
+        append_committed_page(&mut owner, page_number, 1, bytes)?;
+        let _ = owner.publish_restart_checkpoint_completeness_baseline_from_current_prefix(
+            &mut checkpoint,
+        )?;
+    }
+    drop((owner, checkpoint));
+
+    let opened = open_transaction_page_storage_with_completeness_checkpoint::<2, _, _, _>(
+        directory.join("wal.bin"),
+        directory.join("pages.bin"),
+        &slot_path,
+    )?;
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+        opened.select_restart_checkpoint_completeness()
+    else {
+        return Err(io::Error::other("reclamation helper checkpoint was not selected").into());
+    };
+    let planned = selected.plan_replay_window()?;
+    let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+        planned.prepare_page_repairs()
+    else {
+        return Err(io::Error::other("reclamation helper preparation failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+        prepared.execute_page_repairs()
+    else {
+        return Err(io::Error::other("reclamation helper page execution failed").into());
+    };
+    let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
+        repaired.restore_transaction_state()
+    else {
+        return Err(io::Error::other("reclamation helper restoration failed").into());
+    };
+    Ok(restored.complete_restart()?.analyze_wal_retention()?)
 }
 
 fn append_committed_page_without_store_flush(

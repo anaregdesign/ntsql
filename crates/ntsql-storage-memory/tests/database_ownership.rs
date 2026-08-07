@@ -2,8 +2,10 @@ use std::{error::Error, io};
 
 use ntsql_compatibility::{CompatibilityContext, CompatibilityProfile};
 use ntsql_database::{
-    DatabaseCompositionIdentity, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
-    DatabaseId, DatabaseLifecycleGeneration, DatabaseLifecycleStage, DatabaseManifest,
+    DatabaseCleanCloseCertificate, DatabaseClosePreparationFailureCause,
+    DatabaseClosePreparationPreflightError, DatabaseCompositionIdentity, DatabaseFileId,
+    DatabaseFileIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleGeneration,
+    DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestLifecycleState,
     DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
 };
 use ntsql_storage_memory::{
@@ -15,11 +17,20 @@ use ntsql_storage_memory::{
     InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSlot,
     InMemoryDatabaseOwnershipSlotError, InMemoryDatabaseOwnershipWorld,
     InMemoryDatabaseRecoveryStorage, InMemoryPageStore,
+    InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError,
     InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
-    RestartCheckpointCompletenessBaselineSourceFaultPoint, open_live_in_memory_database,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError, LiveInMemoryDatabase,
+    RestartCheckpointCompletenessBaselineSourceFaultPoint,
+    TransactionPageStorageCleanCloseCheckpointFaultPoint, open_live_in_memory_database,
     open_live_in_memory_database_with_observer,
 };
-use ntsql_transaction::TransactionPageStorageRecoveryHandoffPhase;
+use ntsql_transaction::{
+    DurableTransactionPageStorageCleanCloseBeforePublicationError,
+    DurableTransactionPageStorageCleanCloseEvidenceError,
+    DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError,
+    DurableTransactionPageStorageCleanClosePreparationError, TransactionLifecycleStatus,
+    TransactionPageStorageRecoveryHandoffPhase,
+};
 use ntsql_wal::PersistentLogId;
 
 #[test]
@@ -759,6 +770,352 @@ fn live_open_bootstraps_absent_checkpoint_and_retains_context_and_ownership()
 }
 
 #[test]
+fn empty_live_close_preparation_binds_adjacent_certificate_and_retains_ownership()
+-> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(73, 173)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+    let live = open_empty_live(
+        &composition,
+        &slot,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+        "memory-close",
+    )?;
+
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("empty memory database close preparation failed"))?;
+
+    assert_eq!(pending.stage(), DatabaseLifecycleStage::ClosePending);
+    assert_eq!(
+        pending.identity(),
+        composition.manifest.composition_identity()
+    );
+    assert_eq!(
+        pending.target_identity().lifecycle_generation().get(),
+        pending.identity().lifecycle_generation().get() + 1
+    );
+    assert_eq!(
+        pending.target_identity().storage_identity(),
+        pending.identity().storage_identity()
+    );
+    assert_eq!(
+        pending.target_manifest().lifecycle_state(),
+        DatabaseManifestLifecycleState::Clean(pending.certificate())
+    );
+    assert_eq!(
+        pending
+            .target_manifest()
+            .require_successor_of(pending.manifest()),
+        Ok(())
+    );
+    assert_eq!(pending.manifest(), composition.manifest);
+    assert_eq!(
+        pending.compatibility_context().target_id().as_str(),
+        "memory-close"
+    );
+    let certificate = pending.certificate();
+    assert_eq!(
+        certificate.source_generation(),
+        composition
+            .manifest
+            .composition_identity()
+            .lifecycle_generation()
+    );
+    assert_eq!(certificate.durable_wal_frontier(), None);
+    assert_eq!(certificate.allocated_transaction_epoch_high_water(), 1);
+    assert_ne!(certificate.checkpoint_anchor_version(), 0);
+    assert_eq!(certificate.transaction_entry_count(), 0);
+    assert_eq!(certificate.page_entry_count(), 0);
+    assert!(slot.is_owned());
+    assert_eq!(
+        composition.acquire(&slot).err(),
+        Some(InMemoryDatabaseOwnershipError::Contended {
+            database_id: composition.database_id,
+        })
+    );
+
+    let abandoned = pending.abandon();
+    assert_eq!(abandoned.stage(), DatabaseLifecycleStage::Abandoned);
+    assert_eq!(
+        abandoned.identity(),
+        composition.manifest.composition_identity()
+    );
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn committed_nonempty_live_close_binds_fresh_frontier_and_transaction_count()
+-> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(79, 179)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+    let mut live = open_empty_live(
+        &composition,
+        &slot,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+        "memory-nonempty-close",
+    )?;
+    let (coordinator, log, _) = live.transaction_parts_mut();
+    let active = coordinator.begin()?;
+    coordinator.commit(active, log)?;
+
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("committed memory database close preparation failed"))?;
+    let certificate = pending.certificate();
+    assert_eq!(certificate.durable_wal_frontier(), Some(1));
+    assert_eq!(certificate.allocated_transaction_epoch_high_water(), 1);
+    assert_eq!(certificate.transaction_entry_count(), 1);
+    assert_eq!(certificate.page_entry_count(), 0);
+    assert_eq!(
+        pending.target_manifest().lifecycle_state(),
+        DatabaseManifestLifecycleState::Clean(certificate)
+    );
+    drop(pending.abandon());
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn active_transaction_close_failure_is_terminal_until_explicit_abandon()
+-> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(74, 174)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+    let mut live = open_empty_live(
+        &composition,
+        &slot,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+        "memory-active-close",
+    )?;
+    let active = live.transaction_parts_mut().0.begin()?;
+    let active_id = active.transaction_id();
+    drop(active);
+
+    let failure = live
+        .prepare_close()
+        .err()
+        .ok_or_else(|| io::Error::other("active transaction unexpectedly closed cleanly"))?;
+    assert_eq!(
+        failure.identity(),
+        composition.manifest.composition_identity()
+    );
+    match failure.cause() {
+        DatabaseClosePreparationFailureCause::Transaction(transaction) => {
+            assert!(matches!(
+                transaction.error(),
+                DurableTransactionPageStorageCleanClosePreparationError::BeforePublication(
+                    DurableTransactionPageStorageCleanCloseBeforePublicationError::Evidence(
+                        DurableTransactionPageStorageCleanCloseEvidenceError::CoordinatorLifecycleNotTerminal {
+                            transaction,
+                            status: TransactionLifecycleStatus::Active,
+                        }
+                    )
+                ) if *transaction == active_id
+            ));
+        }
+        _ => return Err(io::Error::other("active transaction returned wrong close cause").into()),
+    }
+    assert!(slot.is_owned());
+
+    let abandoned = failure.abandon();
+    assert_eq!(abandoned.stage(), DatabaseLifecycleStage::Abandoned);
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn every_clean_close_candidate_fault_is_terminally_outcome_indeterminate()
+-> Result<(), Box<dyn Error>> {
+    let faults = [
+        TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforePublish,
+        TransactionPageStorageCleanCloseCheckpointFaultPoint::AfterPublish,
+        TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforeLoad,
+    ];
+    for (index, fault) in faults.into_iter().enumerate() {
+        let composition = TestComposition::new_create(75 + index as u128, 175 + index as u128)?;
+        let mut world = InMemoryDatabaseOwnershipWorld::new();
+        let slot = composition.slot(&mut world)?;
+        drop(composition.create(&slot, None)?);
+        let mut checkpoint =
+            InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty();
+        checkpoint.arm_clean_close_fault(fault)?;
+        let live = open_empty_live(
+            &composition,
+            &slot,
+            checkpoint,
+            "memory-close-candidate-fault",
+        )?;
+
+        let failure = live
+            .prepare_close()
+            .err()
+            .ok_or_else(|| io::Error::other("armed clean-close candidate fault did not fire"))?;
+        match failure.cause() {
+            DatabaseClosePreparationFailureCause::Transaction(transaction) => {
+                assert!(transaction.error().outcome_is_indeterminate());
+                match (fault, transaction.error()) {
+                    (
+                        TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforePublish
+                        | TransactionPageStorageCleanCloseCheckpointFaultPoint::AfterPublish,
+                        DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                            DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::Publication(
+                                publication,
+                            ),
+                        ),
+                    ) => assert_eq!(
+                        publication.cause(),
+                        &InMemoryTransactionRestartCheckpointCompletenessBaselinePublicationError::CleanCloseInjectedFault(fault)
+                    ),
+                    (
+                        TransactionPageStorageCleanCloseCheckpointFaultPoint::BeforeLoad,
+                        DurableTransactionPageStorageCleanClosePreparationError::OutcomeIndeterminate(
+                            DurableTransactionPageStorageCleanCloseOutcomeIndeterminateError::CheckpointReload(
+                                source,
+                            ),
+                        ),
+                    ) => assert_eq!(
+                        source,
+                        &InMemoryTransactionRestartCheckpointCompletenessBaselineSourceError::CleanCloseInjectedFault(fault)
+                    ),
+                    _ => {
+                        return Err(
+                            io::Error::other(
+                                "clean-close fault returned wrong transaction cause",
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+            _ => {
+                return Err(io::Error::other(
+                    "clean-close candidate fault returned wrong database cause",
+                )
+                .into());
+            }
+        }
+        assert!(slot.is_owned());
+        drop(failure.abandon());
+        assert!(!slot.is_owned());
+    }
+    Ok(())
+}
+
+#[test]
+fn lifecycle_generation_exhaustion_precedes_transaction_close_effect() -> Result<(), Box<dyn Error>>
+{
+    let mut composition = TestComposition::new_create(76, 176)?;
+    let source = composition.manifest;
+    composition.manifest = DatabaseManifest::recovery_required(
+        DatabaseCompositionIdentity::new(
+            composition.database_id,
+            DatabaseLifecycleGeneration::new(u64::MAX)
+                .ok_or_else(|| io::Error::other("maximum generation is zero"))?,
+            composition.persistent_log_id,
+            &source.composition_identity().ordered_files(),
+        )?,
+        source.storage_formats(),
+        source.required_features(),
+    );
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    let live = open_empty_live(
+        &composition,
+        &slot,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+        "memory-exhausted-close",
+    )?;
+
+    let failure = live
+        .prepare_close()
+        .err()
+        .ok_or_else(|| io::Error::other("exhausted lifecycle generation advanced"))?;
+    match failure.cause() {
+        DatabaseClosePreparationFailureCause::Preflight(
+            DatabaseClosePreparationPreflightError::LifecycleGeneration(source),
+        ) => assert_eq!(source.current.get(), u64::MAX),
+        _ => return Err(io::Error::other("generation exhaustion returned wrong cause").into()),
+    }
+    assert!(slot.is_owned());
+    drop(failure.abandon());
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn clean_source_manifest_is_rejected_before_transaction_close_publication()
+-> Result<(), Box<dyn Error>> {
+    let mut composition = TestComposition::new_create(78, 178)?;
+    let certificate = DatabaseCleanCloseCertificate::new(
+        composition
+            .manifest
+            .composition_identity()
+            .lifecycle_generation(),
+        None,
+        1,
+        1,
+        1,
+        0,
+        0,
+    )?;
+    composition.manifest = composition.manifest.next_clean(certificate)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    let live = open_empty_live(
+        &composition,
+        &slot,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+        "memory-clean-source-close",
+    )?;
+
+    let failure = live
+        .prepare_close()
+        .err()
+        .ok_or_else(|| io::Error::other("clean source manifest prepared another clean close"))?;
+    match failure.cause() {
+        DatabaseClosePreparationFailureCause::Preflight(
+            DatabaseClosePreparationPreflightError::SourceManifestLifecycle {
+                actual: DatabaseManifestLifecycleState::Clean(actual),
+            },
+        ) => assert_eq!(*actual, certificate),
+        _ => return Err(io::Error::other("clean source manifest returned wrong cause").into()),
+    }
+    assert!(slot.is_owned());
+    drop(failure.abandon());
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn live_abandon_relinquishes_ownership_without_close_preparation() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(77, 177)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+    let live = open_empty_live(
+        &composition,
+        &slot,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+        "memory-abandon",
+    )?;
+
+    let abandoned = live.abandon();
+    assert_eq!(abandoned.stage(), DatabaseLifecycleStage::Abandoned);
+    assert_eq!(
+        abandoned.identity(),
+        composition.manifest.composition_identity()
+    );
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
 fn rejected_checkpoint_never_bootstraps_or_releases_live() -> Result<(), Box<dyn Error>> {
     let composition = TestComposition::new_create(71, 171)?;
     let mut world = InMemoryDatabaseOwnershipWorld::new();
@@ -821,6 +1178,27 @@ fn foreign_concrete_wal_cannot_satisfy_modeled_database_recovery() -> Result<(),
     drop(error);
     assert!(!slot.is_owned());
     Ok(())
+}
+
+fn open_empty_live(
+    composition: &TestComposition,
+    slot: &InMemoryDatabaseOwnershipSlot,
+    checkpoint: InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    target_id: &str,
+) -> Result<LiveInMemoryDatabase<1>, Box<dyn Error>> {
+    let log = InMemoryCommitLog::<1>::with_persistent_lineage_id(composition.persistent_log_id);
+    let store = InMemoryPageStore::new(&log);
+    Ok(open_live_in_memory_database(
+        InMemoryDatabaseLiveOpenRequest::new(
+            slot,
+            composition.database_id,
+            composition.manifest_object_id,
+            composition.manifest,
+            &composition.files,
+            InMemoryDatabaseRecoveryStorage::new(log, store, checkpoint),
+            compatibility_context(target_id)?,
+        ),
+    )?)
 }
 
 struct TestComposition {

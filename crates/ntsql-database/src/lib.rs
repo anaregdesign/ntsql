@@ -8,6 +8,10 @@ use std::{
 
 use ntsql_transaction::{
     DurablePageStoreSnapshotSource, DurableTransactionRestartAnalysisSource,
+    DurableTransactionRestartRetentionMetadataSource,
+    FailedTransactionPageStorageCleanClosePreparation, PreparedTransactionPageStorageCleanClose,
+    TransactionPageStorageCleanCloseCheckpointPublisher,
+    TransactionPageStorageCleanCloseCheckpointSource,
     WalRetentionAnalyzedTransactionPageStorageRestartCheckpointReplay,
 };
 use ntsql_wal::PersistentLogId;
@@ -1395,6 +1399,8 @@ pub enum DatabaseLifecycleStage {
     ClosePending,
     /// The exact composition reached an orderly terminal close.
     Closed,
+    /// Live or close-pending authority was explicitly relinquished without clean publication.
+    Abandoned,
     /// A closed owner has been consumed into a drop attempt.
     DropPending,
     /// The database reached the terminal dropped state.
@@ -2066,6 +2072,19 @@ impl<Owner> LiveDatabase<Owner> {
     pub const fn owner_mut(&mut self) -> &mut Owner {
         &mut self._owner
     }
+
+    /// Relinquishes live authority without attempting any durable close effect.
+    ///
+    /// This explicit outcome drops the retained adapter owners and leaves the
+    /// selected durable manifest recovery-required.
+    pub fn abandon(self) -> AbandonedDatabase {
+        let Self {
+            _owner: owner,
+            identity,
+        } = self;
+        drop(owner);
+        AbandonedDatabase { identity }
+    }
 }
 
 define_owned_database_state!(
@@ -2073,10 +2092,533 @@ define_owned_database_state!(
     ///
     /// Construction remains private until the close protocol owns an effectful
     /// transition and outcome-indeterminate failure state.
-    #[must_use = "close-pending database ownership must resolve or be dropped"]
+    #[must_use = "close-pending database ownership must publish, be abandoned, or be dropped"]
     ClosePendingDatabase,
     DatabaseLifecycleStage::ClosePending
 );
+
+/// Database-level contradiction discovered while binding a transaction close proof.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseClosePreparationEvidenceError {
+    /// The transaction proof describes another persistent WAL.
+    PersistentLogIdMismatch {
+        /// Manifest-selected persistent WAL identity.
+        expected: PersistentLogId,
+        /// Persistent WAL identity bound by the transaction proof.
+        actual: PersistentLogId,
+    },
+    /// A proof field could not form the canonical database certificate.
+    Certificate(DatabaseCleanCloseCertificateError),
+    /// The retained source manifest could not construct the exact clean successor.
+    TargetManifest(DatabaseManifestCleanSuccessorError),
+}
+
+impl fmt::Display for DatabaseClosePreparationEvidenceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PersistentLogIdMismatch { expected, actual } => write!(
+                formatter,
+                "transaction close proof persistent log ID {} does not match selected database persistent log ID {}",
+                actual.get(),
+                expected.get()
+            ),
+            Self::Certificate(source) => source.fmt(formatter),
+            Self::TargetManifest(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DatabaseClosePreparationEvidenceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::PersistentLogIdMismatch { .. } => None,
+            Self::Certificate(source) => Some(source),
+            Self::TargetManifest(source) => Some(source),
+        }
+    }
+}
+
+/// Trusted outer-owner observation required before transaction close publication.
+pub trait DatabaseCloseSourceManifestOwner {
+    /// Returns the exact selected manifest retained under database-wide ownership.
+    fn close_source_manifest(&self) -> DatabaseManifest;
+}
+
+/// Source-manifest contradiction detected before transaction close publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseClosePreparationPreflightError {
+    /// The retained manifest does not identify the Live database composition.
+    SourceManifestIdentity(DatabaseCompositionIdentityMismatch),
+    /// The retained manifest is not recovery-required.
+    SourceManifestLifecycle {
+        /// Rejected inert source lifecycle state.
+        actual: DatabaseManifestLifecycleState,
+    },
+    /// No adjacent lifecycle generation can represent a clean successor.
+    LifecycleGeneration(DatabaseLifecycleGenerationExhausted),
+}
+
+impl fmt::Display for DatabaseClosePreparationPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceManifestIdentity(source) => {
+                write!(
+                    formatter,
+                    "database close source manifest identity mismatch: {source}"
+                )
+            }
+            Self::SourceManifestLifecycle { actual } => write!(
+                formatter,
+                "database close source manifest lifecycle is {actual}, not recovery required"
+            ),
+            Self::LifecycleGeneration(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for DatabaseClosePreparationPreflightError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SourceManifestIdentity(source) => Some(source),
+            Self::SourceManifestLifecycle { .. } => None,
+            Self::LifecycleGeneration(source) => Some(source),
+        }
+    }
+}
+
+/// Exact database and transaction owners retained after close preparation.
+///
+/// Construction is private to [`LiveDatabase::prepare_close`]. The transaction
+/// owner and its proof remain inseparable until a later synchronized manifest
+/// publication transition consumes this value.
+///
+/// ```compile_fail
+/// use ntsql_database::PreparedDatabaseCloseOwnership;
+///
+/// fn cannot_extract_transaction<OuterOwner, Source, Store, CheckpointSource, const N: usize>(
+///     prepared: PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+/// ) {
+///     let _transaction = prepared.into_transaction();
+/// }
+/// ```
+#[must_use = "prepared database close ownership must remain inside ClosePending"]
+pub struct PreparedDatabaseCloseOwnership<
+    OuterOwner,
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    outer_owner: OuterOwner,
+    transaction: PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N>,
+    certificate: DatabaseCleanCloseCertificate,
+    target_manifest: DatabaseManifest,
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Borrows the retained database-wide owner.
+    #[must_use]
+    pub const fn outer_owner(&self) -> &OuterOwner {
+        &self.outer_owner
+    }
+
+    /// Borrows the inseparable transaction close owner and proof.
+    pub const fn transaction(
+        &self,
+    ) -> &PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N> {
+        &self.transaction
+    }
+
+    /// Returns the exact database clean-close certificate.
+    #[must_use]
+    pub const fn certificate(&self) -> DatabaseCleanCloseCertificate {
+        self.certificate
+    }
+
+    /// Returns the exact adjacent composition targeted by clean publication.
+    #[must_use]
+    pub const fn target_identity(&self) -> DatabaseCompositionIdentity {
+        self.target_manifest.composition_identity()
+    }
+
+    /// Returns the exact adjacent clean manifest awaiting publication.
+    #[must_use]
+    pub const fn target_manifest(&self) -> DatabaseManifest {
+        self.target_manifest
+    }
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedDatabaseCloseOwnership")
+            .field("certificate", &self.certificate)
+            .field("target_manifest", &self.target_manifest)
+            .field("outer_owner", &format_args!("<retained>"))
+            .field("transaction", &format_args!("<retained>"))
+            .finish()
+    }
+}
+
+enum FailedDatabaseClosePreparationState<
+    RecoveredOwner,
+    OuterOwner,
+    TransactionFailure,
+    PreparedTransaction,
+> {
+    Preflight {
+        _owner: Box<RecoveredOwner>,
+        error: DatabaseClosePreparationPreflightError,
+    },
+    Transaction {
+        _owners: Box<(OuterOwner, TransactionFailure)>,
+    },
+    Evidence {
+        _owners: Box<(OuterOwner, PreparedTransaction)>,
+        error: DatabaseClosePreparationEvidenceError,
+    },
+}
+
+type DatabaseClosePreparationStateFor<OuterOwner, Source, Store, CheckpointSource, const N: usize> =
+    FailedDatabaseClosePreparationState<
+        RecoveredDatabaseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+        OuterOwner,
+        FailedTransactionPageStorageCleanClosePreparation<Source, Store, CheckpointSource, N>,
+        PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N>,
+    >;
+
+struct FailedDatabaseClosePreparationInner<State> {
+    identity: DatabaseCompositionIdentity,
+    state: State,
+}
+
+/// Borrowed cause of one terminal database close-preparation failure.
+#[derive(Debug)]
+pub enum DatabaseClosePreparationFailureCause<'failure, TransactionFailure> {
+    /// Source manifest or adjacent lifecycle preflight failed.
+    Preflight(&'failure DatabaseClosePreparationPreflightError),
+    /// Fresh transaction-storage close preparation failed.
+    Transaction(&'failure TransactionFailure),
+    /// The produced transaction proof contradicted the selected database.
+    Evidence(&'failure DatabaseClosePreparationEvidenceError),
+}
+
+/// Terminal owner retained when database close preparation cannot complete.
+///
+/// There is no stale same-owner retry or adapter extraction. The caller may
+/// inspect the cause and explicitly abandon ownership before reopening from
+/// durable state.
+///
+/// ```compile_fail
+/// use ntsql_database::FailedDatabaseClosePreparation;
+///
+/// fn cannot_retry<OuterOwner, Source, Store, CheckpointSource, const N: usize>(
+///     failure: FailedDatabaseClosePreparation<
+///         OuterOwner,
+///         Source,
+///         Store,
+///         CheckpointSource,
+///         N,
+///     >,
+/// ) {
+///     let _retry = failure.retry();
+/// }
+/// ```
+#[must_use = "failed database close preparation retains all ownership until abandoned or dropped"]
+pub struct FailedDatabaseClosePreparation<
+    OuterOwner,
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+{
+    inner: Box<
+        FailedDatabaseClosePreparationInner<
+            DatabaseClosePreparationStateFor<OuterOwner, Source, Store, CheckpointSource, N>,
+        >,
+    >,
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    FailedDatabaseClosePreparation<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+{
+    fn new(
+        identity: DatabaseCompositionIdentity,
+        state: DatabaseClosePreparationStateFor<OuterOwner, Source, Store, CheckpointSource, N>,
+    ) -> Self {
+        Self {
+            inner: Box::new(FailedDatabaseClosePreparationInner { identity, state }),
+        }
+    }
+
+    /// Returns the recovery-required composition retained by the failed owner.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.inner.identity
+    }
+
+    /// Returns the exact failure cause without releasing any owner.
+    #[must_use]
+    pub const fn cause(
+        &self,
+    ) -> DatabaseClosePreparationFailureCause<
+        '_,
+        FailedTransactionPageStorageCleanClosePreparation<Source, Store, CheckpointSource, N>,
+    > {
+        match &self.inner.state {
+            FailedDatabaseClosePreparationState::Preflight { error, .. } => {
+                DatabaseClosePreparationFailureCause::Preflight(error)
+            }
+            FailedDatabaseClosePreparationState::Transaction { _owners } => {
+                DatabaseClosePreparationFailureCause::Transaction(&_owners.1)
+            }
+            FailedDatabaseClosePreparationState::Evidence { error, .. } => {
+                DatabaseClosePreparationFailureCause::Evidence(error)
+            }
+        }
+    }
+
+    /// Explicitly relinquishes every retained owner without publishing clean state.
+    pub fn abandon(self) -> AbandonedDatabase {
+        let identity = self.inner.identity;
+        drop(self);
+        AbandonedDatabase { identity }
+    }
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for FailedDatabaseClosePreparation<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+    FailedTransactionPageStorageCleanClosePreparation<Source, Store, CheckpointSource, N>:
+        fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedDatabaseClosePreparation")
+            .field("identity", &self.inner.identity)
+            .field("cause", &self.cause())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Result of the only database Live-to-ClosePending preparation transition.
+pub type DatabaseClosePreparationResult<
+    OuterOwner,
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = Result<
+    ClosePendingDatabase<
+        PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+    >,
+    FailedDatabaseClosePreparation<OuterOwner, Source, Store, CheckpointSource, N>,
+>;
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    LiveDatabase<RecoveredDatabaseOwnership<OuterOwner, Source, Store, CheckpointSource, N>>
+where
+    OuterOwner: DatabaseCloseSourceManifestOwner,
+    Source: DurableTransactionRestartAnalysisSource<N>
+        + DurableTransactionRestartRetentionMetadataSource,
+    Store: DurablePageStoreSnapshotSource<N>,
+    CheckpointSource: TransactionPageStorageCleanCloseCheckpointSource
+        + TransactionPageStorageCleanCloseCheckpointPublisher,
+{
+    /// Consumes Live before deriving and binding a fresh transaction close proof.
+    ///
+    /// Generation exhaustion is rejected before transaction candidate
+    /// publication. Every later failure is terminal and retains the exact
+    /// database and transaction owners for explicit unclean abandonment.
+    pub fn prepare_close(
+        self,
+    ) -> DatabaseClosePreparationResult<OuterOwner, Source, Store, CheckpointSource, N> {
+        let Self {
+            _owner: recovered,
+            identity,
+        } = self;
+        let source_manifest = recovered.outer_owner.close_source_manifest();
+        if let Err(source) = identity.require_exact_match(source_manifest.composition_identity()) {
+            return Err(FailedDatabaseClosePreparation::new(
+                identity,
+                FailedDatabaseClosePreparationState::Preflight {
+                    _owner: Box::new(recovered),
+                    error: DatabaseClosePreparationPreflightError::SourceManifestIdentity(source),
+                },
+            ));
+        }
+        if let actual @ DatabaseManifestLifecycleState::Clean(_) = source_manifest.lifecycle_state()
+        {
+            return Err(FailedDatabaseClosePreparation::new(
+                identity,
+                FailedDatabaseClosePreparationState::Preflight {
+                    _owner: Box::new(recovered),
+                    error: DatabaseClosePreparationPreflightError::SourceManifestLifecycle {
+                        actual,
+                    },
+                },
+            ));
+        }
+        if let Err(source) = identity.lifecycle_generation().checked_next() {
+            return Err(FailedDatabaseClosePreparation::new(
+                identity,
+                FailedDatabaseClosePreparationState::Preflight {
+                    _owner: Box::new(recovered),
+                    error: DatabaseClosePreparationPreflightError::LifecycleGeneration(source),
+                },
+            ));
+        }
+
+        let RecoveredDatabaseOwnership {
+            outer_owner,
+            transaction,
+        } = recovered;
+        let transaction = match transaction.prepare_clean_close() {
+            Ok(transaction) => transaction,
+            Err(failure) => {
+                return Err(FailedDatabaseClosePreparation::new(
+                    identity,
+                    FailedDatabaseClosePreparationState::Transaction {
+                        _owners: Box::new((outer_owner, failure)),
+                    },
+                ));
+            }
+        };
+
+        let (
+            actual_persistent_log_id,
+            durable_frontier,
+            allocated_epoch_high_water,
+            checkpoint_anchor,
+            transaction_entry_count,
+            page_entry_count,
+        ) = {
+            let proof = transaction.proof();
+            (
+                proof.persistent_log_id(),
+                proof.durable_frontier(),
+                proof.allocated_epoch_high_water(),
+                proof.checkpoint_anchor(),
+                proof.transaction_entry_count(),
+                proof.page_entry_count(),
+            )
+        };
+        let expected_persistent_log_id = identity.persistent_log_id();
+        if actual_persistent_log_id != expected_persistent_log_id {
+            return Err(FailedDatabaseClosePreparation::new(
+                identity,
+                FailedDatabaseClosePreparationState::Evidence {
+                    _owners: Box::new((outer_owner, transaction)),
+                    error: DatabaseClosePreparationEvidenceError::PersistentLogIdMismatch {
+                        expected: expected_persistent_log_id,
+                        actual: actual_persistent_log_id,
+                    },
+                },
+            ));
+        }
+
+        let certificate = match DatabaseCleanCloseCertificate::new(
+            identity.lifecycle_generation(),
+            durable_frontier,
+            allocated_epoch_high_water,
+            checkpoint_anchor.version(),
+            checkpoint_anchor.value(),
+            transaction_entry_count,
+            page_entry_count,
+        ) {
+            Ok(certificate) => certificate,
+            Err(source) => {
+                return Err(FailedDatabaseClosePreparation::new(
+                    identity,
+                    FailedDatabaseClosePreparationState::Evidence {
+                        _owners: Box::new((outer_owner, transaction)),
+                        error: DatabaseClosePreparationEvidenceError::Certificate(source),
+                    },
+                ));
+            }
+        };
+        let target_manifest = match source_manifest.next_clean(certificate) {
+            Ok(target_manifest) => target_manifest,
+            Err(error) => {
+                return Err(FailedDatabaseClosePreparation::new(
+                    identity,
+                    FailedDatabaseClosePreparationState::Evidence {
+                        _owners: Box::new((outer_owner, transaction)),
+                        error: DatabaseClosePreparationEvidenceError::TargetManifest(error),
+                    },
+                ));
+            }
+        };
+
+        Ok(ClosePendingDatabase {
+            _owner: PreparedDatabaseCloseOwnership {
+                outer_owner,
+                transaction,
+                certificate,
+                target_manifest,
+            },
+            identity,
+        })
+    }
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    ClosePendingDatabase<
+        PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Borrows the exact owners and evidence awaiting manifest publication.
+    pub const fn prepared(
+        &self,
+    ) -> &PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N> {
+        &self._owner
+    }
+}
+
+impl<Owner> ClosePendingDatabase<Owner> {
+    /// Relinquishes close-pending authority without publishing clean state.
+    pub fn abandon(self) -> AbandonedDatabase {
+        let Self {
+            _owner: owner,
+            identity,
+        } = self;
+        drop(owner);
+        AbandonedDatabase { identity }
+    }
+}
 
 define_owned_database_state!(
     /// Exact composition that completed an orderly terminal close.
@@ -2087,6 +2629,37 @@ define_owned_database_state!(
     ClosedDatabase,
     DatabaseLifecycleStage::Closed
 );
+
+/// Terminal inert record of authority relinquished without clean publication.
+///
+/// The retained durable manifest remains recovery-required at `identity`.
+#[must_use]
+pub struct AbandonedDatabase {
+    identity: DatabaseCompositionIdentity,
+}
+
+impl AbandonedDatabase {
+    /// Returns the last selected recovery-required composition.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.identity
+    }
+
+    /// Returns this terminal in-process lifecycle outcome.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        DatabaseLifecycleStage::Abandoned
+    }
+}
+
+impl fmt::Debug for AbandonedDatabase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AbandonedDatabase")
+            .field("identity", &self.identity)
+            .finish()
+    }
+}
 
 define_owned_database_state!(
     /// Closed owner consumed into an exact drop attempt.

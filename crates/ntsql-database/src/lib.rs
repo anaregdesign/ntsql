@@ -3,7 +3,7 @@
 use std::{
     error::Error,
     fmt,
-    num::{NonZeroU64, NonZeroU128},
+    num::{NonZeroU16, NonZeroU64, NonZeroU128},
 };
 
 use ntsql_wal::PersistentLogId;
@@ -467,6 +467,44 @@ impl DatabaseCompositionIdentity {
         })
     }
 
+    /// Compares database, file-role, and WAL identities while ignoring generation.
+    ///
+    /// This is the stable-storage comparison used before a lifecycle successor
+    /// checks its generation separately.
+    pub fn require_same_storage_identity(
+        self,
+        actual: Self,
+    ) -> Result<(), DatabaseCompositionIdentityMismatch> {
+        if self.database_id != actual.database_id {
+            return Err(DatabaseCompositionIdentityMismatch::DatabaseId {
+                expected: self.database_id,
+                actual: actual.database_id,
+            });
+        }
+        for role in [
+            DatabaseFileRole::Wal,
+            DatabaseFileRole::PageStore,
+            DatabaseFileRole::RestartCheckpoint,
+        ] {
+            let expected = self.file_id(role);
+            let actual = actual.file_id(role);
+            if expected != actual {
+                return Err(DatabaseCompositionIdentityMismatch::FileId {
+                    role,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        if self.persistent_log_id != actual.persistent_log_id {
+            return Err(DatabaseCompositionIdentityMismatch::PersistentLogId {
+                expected: self.persistent_log_id,
+                actual: actual.persistent_log_id,
+            });
+        }
+        Ok(())
+    }
+
     /// Compares every identity in stable field order.
     pub fn require_exact_match(
         self,
@@ -580,6 +618,321 @@ impl fmt::Display for DatabaseCompositionIdentityMismatch {
 }
 
 impl Error for DatabaseCompositionIdentityMismatch {}
+
+/// Nonzero required persistent-format version for one database file role.
+///
+/// The numeric value is inert. Each outer adapter decides whether it supports
+/// the selected requirement and compares it with the opened child file.
+///
+/// ```compile_fail
+/// use std::num::NonZeroU16;
+/// use ntsql_database::DatabaseStorageFormatVersion;
+///
+/// let forged = DatabaseStorageFormatVersion(NonZeroU16::MIN);
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DatabaseStorageFormatVersion(NonZeroU16);
+
+impl DatabaseStorageFormatVersion {
+    /// Wraps one nonzero repository-owned format version.
+    #[must_use]
+    pub const fn new(value: u16) -> Option<Self> {
+        match NonZeroU16::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// Returns the numeric format version for adapter comparison.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
+}
+
+/// Exact required child-format versions for one database composition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseStorageFormatRequirements {
+    wal: DatabaseStorageFormatVersion,
+    page_store: DatabaseStorageFormatVersion,
+    restart_checkpoint: DatabaseStorageFormatVersion,
+}
+
+impl DatabaseStorageFormatRequirements {
+    /// Binds one nonzero required version to every fixed file role.
+    #[must_use]
+    pub const fn new(
+        wal: DatabaseStorageFormatVersion,
+        page_store: DatabaseStorageFormatVersion,
+        restart_checkpoint: DatabaseStorageFormatVersion,
+    ) -> Self {
+        Self {
+            wal,
+            page_store,
+            restart_checkpoint,
+        }
+    }
+
+    /// Returns the required persistent-format version for `role`.
+    #[must_use]
+    pub const fn version(self, role: DatabaseFileRole) -> DatabaseStorageFormatVersion {
+        match role {
+            DatabaseFileRole::Wal => self.wal,
+            DatabaseFileRole::PageStore => self.page_store,
+            DatabaseFileRole::RestartCheckpoint => self.restart_checkpoint,
+        }
+    }
+}
+
+/// Required database feature bits not understood by this repository version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseRequiredFeaturesError {
+    /// Exact complete decoded bit set.
+    pub actual: u64,
+    /// Exact subset that this repository version does not understand.
+    pub unknown: u64,
+}
+
+impl fmt::Display for DatabaseRequiredFeaturesError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "database required feature bits {:#018x} contain unknown bits {:#018x}",
+            self.actual, self.unknown
+        )
+    }
+}
+
+impl Error for DatabaseRequiredFeaturesError {}
+
+/// Validated required feature set for one database manifest.
+///
+/// Version 1 defines no required features. Keeping this checked type separate
+/// prevents a future reader from silently ignoring a bit it does not implement.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DatabaseRequiredFeatures(u64);
+
+impl DatabaseRequiredFeatures {
+    const KNOWN_BITS: u64 = 0;
+
+    /// No required database features.
+    pub const NONE: Self = Self(0);
+
+    /// Validates that every required bit is understood by this repository version.
+    pub const fn from_bits(bits: u64) -> Result<Self, DatabaseRequiredFeaturesError> {
+        let unknown = bits & !Self::KNOWN_BITS;
+        if unknown != 0 {
+            return Err(DatabaseRequiredFeaturesError {
+                actual: bits,
+                unknown,
+            });
+        }
+        Ok(Self(bits))
+    }
+
+    /// Returns the canonical required-feature bit set.
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+}
+
+/// Persisted lifecycle state understood by manifest format version 1.
+///
+/// Later clean-close and tombstone issues must add their states together with
+/// the evidence fields and version policy that make those states meaningful.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum DatabaseManifestLifecycleState {
+    /// Startup must complete the approved recovery path before live release.
+    RecoveryRequired,
+}
+
+impl fmt::Display for DatabaseManifestLifecycleState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RecoveryRequired => formatter.write_str("recovery required"),
+        }
+    }
+}
+
+/// Validated inert content of one repository-owned database manifest.
+///
+/// A manifest contains identity and compatibility requirements only. It owns no
+/// decoded bytes, path, lock, opened adapter, recovery evidence, or live
+/// authority.
+///
+/// ```compile_fail
+/// use ntsql_database::{DatabaseManifest, LiveDatabase};
+///
+/// fn cannot_promote_manifest<Owner>(manifest: DatabaseManifest) -> LiveDatabase<Owner> {
+///     manifest.into()
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseManifest {
+    composition_identity: DatabaseCompositionIdentity,
+    lifecycle_state: DatabaseManifestLifecycleState,
+    storage_formats: DatabaseStorageFormatRequirements,
+    required_features: DatabaseRequiredFeatures,
+}
+
+impl DatabaseManifest {
+    /// Constructs the only lifecycle state supported by manifest format version 1.
+    #[must_use]
+    pub const fn recovery_required(
+        composition_identity: DatabaseCompositionIdentity,
+        storage_formats: DatabaseStorageFormatRequirements,
+        required_features: DatabaseRequiredFeatures,
+    ) -> Self {
+        Self {
+            composition_identity,
+            lifecycle_state: DatabaseManifestLifecycleState::RecoveryRequired,
+            storage_formats,
+            required_features,
+        }
+    }
+
+    /// Returns the exact database and child storage identities.
+    #[must_use]
+    pub const fn composition_identity(self) -> DatabaseCompositionIdentity {
+        self.composition_identity
+    }
+
+    /// Returns the inert persisted lifecycle state.
+    #[must_use]
+    pub const fn lifecycle_state(self) -> DatabaseManifestLifecycleState {
+        self.lifecycle_state
+    }
+
+    /// Returns the exact required child-format versions.
+    #[must_use]
+    pub const fn storage_formats(self) -> DatabaseStorageFormatRequirements {
+        self.storage_formats
+    }
+
+    /// Returns the validated required feature set.
+    #[must_use]
+    pub const fn required_features(self) -> DatabaseRequiredFeatures {
+        self.required_features
+    }
+
+    /// Produces the same recovery-required manifest at the exact next generation.
+    pub fn next_recovery_required(self) -> Result<Self, DatabaseLifecycleGenerationExhausted> {
+        Ok(Self::recovery_required(
+            self.composition_identity.next_generation()?,
+            self.storage_formats,
+            self.required_features,
+        ))
+    }
+
+    /// Validates this manifest as the exact next generation after `previous`.
+    ///
+    /// This comparison is explicit because decoding one isolated frame has no
+    /// prior generation against which it could detect regression.
+    pub fn require_successor_of(
+        self,
+        previous: Self,
+    ) -> Result<(), DatabaseManifestSuccessorError> {
+        previous
+            .composition_identity
+            .require_same_storage_identity(self.composition_identity)
+            .map_err(DatabaseManifestSuccessorError::CompositionIdentity)?;
+        previous
+            .composition_identity
+            .lifecycle_generation()
+            .require_successor(self.composition_identity.lifecycle_generation())
+            .map_err(DatabaseManifestSuccessorError::LifecycleGeneration)?;
+        for role in [
+            DatabaseFileRole::Wal,
+            DatabaseFileRole::PageStore,
+            DatabaseFileRole::RestartCheckpoint,
+        ] {
+            let expected = previous.storage_formats.version(role);
+            let actual = self.storage_formats.version(role);
+            if expected != actual {
+                return Err(DatabaseManifestSuccessorError::StorageFormatVersion {
+                    role,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        if previous.required_features != self.required_features {
+            return Err(DatabaseManifestSuccessorError::RequiredFeatures {
+                expected: previous.required_features,
+                actual: self.required_features,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Rejection of a manifest claimed as one exact lifecycle successor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseManifestSuccessorError {
+    /// Database, child-file, or persistent-WAL identity changed.
+    CompositionIdentity(DatabaseCompositionIdentityMismatch),
+    /// The lifecycle generation regressed, skipped, or exhausted.
+    LifecycleGeneration(DatabaseLifecycleGenerationTransitionError),
+    /// One child persistent-format requirement changed without migration.
+    StorageFormatVersion {
+        /// Changed file role.
+        role: DatabaseFileRole,
+        /// Previously selected required version.
+        expected: DatabaseStorageFormatVersion,
+        /// Proposed required version.
+        actual: DatabaseStorageFormatVersion,
+    },
+    /// Required feature bits changed without migration.
+    RequiredFeatures {
+        /// Previously selected required feature set.
+        expected: DatabaseRequiredFeatures,
+        /// Proposed required feature set.
+        actual: DatabaseRequiredFeatures,
+    },
+}
+
+impl fmt::Display for DatabaseManifestSuccessorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CompositionIdentity(source) => {
+                write!(formatter, "database manifest identity changed: {source}")
+            }
+            Self::LifecycleGeneration(source) => {
+                write!(
+                    formatter,
+                    "database manifest generation is invalid: {source}"
+                )
+            }
+            Self::StorageFormatVersion {
+                role,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "database manifest {role} format changed from {} to {}",
+                expected.get(),
+                actual.get()
+            ),
+            Self::RequiredFeatures { expected, actual } => write!(
+                formatter,
+                "database manifest required features changed from {:#018x} to {:#018x}",
+                expected.bits(),
+                actual.bits()
+            ),
+        }
+    }
+}
+
+impl Error for DatabaseManifestSuccessorError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::CompositionIdentity(source) => Some(source),
+            Self::LifecycleGeneration(source) => Some(source),
+            Self::StorageFormatVersion { .. } | Self::RequiredFeatures { .. } => None,
+        }
+    }
+}
 
 /// Observable label for a typed database lifecycle owner.
 ///
@@ -1032,6 +1385,11 @@ mod tests {
         PersistentLogId::new(value).ok_or(TestValueError("test log ID must be nonzero"))
     }
 
+    fn format_version(value: u16) -> Result<DatabaseStorageFormatVersion, TestValueError> {
+        DatabaseStorageFormatVersion::new(value)
+            .ok_or(TestValueError("test format version must be nonzero"))
+    }
+
     fn composition(
         database: u128,
         lifecycle_generation: u64,
@@ -1055,6 +1413,23 @@ mod tests {
             &files,
         )
         .map_err(|_| TestValueError("test composition must be valid"))
+    }
+
+    fn manifest(
+        database: u128,
+        lifecycle_generation: u64,
+        wal_file: u128,
+        wal_format: u16,
+    ) -> Result<DatabaseManifest, TestValueError> {
+        Ok(DatabaseManifest::recovery_required(
+            composition(database, lifecycle_generation, wal_file, 4, 5, 6)?,
+            DatabaseStorageFormatRequirements::new(
+                format_version(wal_format)?,
+                format_version(1)?,
+                format_version(1)?,
+            ),
+            DatabaseRequiredFeatures::NONE,
+        ))
     }
 
     #[test]
@@ -1252,6 +1627,124 @@ mod tests {
             Err(DatabaseLifecycleGenerationTransitionError::Skipped {
                 expected: generation(3)?,
                 proposed: generation(4)?,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn required_features_and_storage_versions_are_checked() -> Result<(), TestValueError> {
+        assert_eq!(
+            DatabaseRequiredFeatures::from_bits(0),
+            Ok(DatabaseRequiredFeatures::NONE)
+        );
+        for actual in [1, 0x8000_0000_0000_0000] {
+            assert_eq!(
+                DatabaseRequiredFeatures::from_bits(actual),
+                Err(DatabaseRequiredFeaturesError {
+                    actual,
+                    unknown: actual,
+                })
+            );
+        }
+        assert_eq!(DatabaseStorageFormatVersion::new(0), None);
+
+        let formats = DatabaseStorageFormatRequirements::new(
+            format_version(4)?,
+            format_version(2)?,
+            format_version(3)?,
+        );
+        assert_eq!(formats.version(DatabaseFileRole::Wal), format_version(4)?);
+        assert_eq!(
+            formats.version(DatabaseFileRole::PageStore),
+            format_version(2)?
+        );
+        assert_eq!(
+            formats.version(DatabaseFileRole::RestartCheckpoint),
+            format_version(3)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_successor_preserves_storage_and_advances_exactly_once() -> Result<(), TestValueError>
+    {
+        let previous = manifest(1, 2, 3, 4)?;
+        assert_eq!(
+            previous.lifecycle_state(),
+            DatabaseManifestLifecycleState::RecoveryRequired
+        );
+        assert_eq!(previous.required_features(), DatabaseRequiredFeatures::NONE);
+
+        let next = previous
+            .next_recovery_required()
+            .map_err(|_| TestValueError("test manifest generation must advance"))?;
+        assert_eq!(next.require_successor_of(previous), Ok(()));
+        assert_eq!(
+            previous.require_successor_of(previous),
+            Err(DatabaseManifestSuccessorError::LifecycleGeneration(
+                DatabaseLifecycleGenerationTransitionError::NotStrictlyIncreasing {
+                    current: generation(2)?,
+                    proposed: generation(2)?,
+                }
+            ))
+        );
+
+        let skipped = manifest(1, 4, 3, 4)?;
+        assert_eq!(
+            skipped.require_successor_of(previous),
+            Err(DatabaseManifestSuccessorError::LifecycleGeneration(
+                DatabaseLifecycleGenerationTransitionError::Skipped {
+                    expected: generation(3)?,
+                    proposed: generation(4)?,
+                }
+            ))
+        );
+
+        let foreign_wal = manifest(1, 3, 9, 4)?;
+        assert_eq!(
+            foreign_wal.require_successor_of(previous),
+            Err(DatabaseManifestSuccessorError::CompositionIdentity(
+                DatabaseCompositionIdentityMismatch::FileId {
+                    role: DatabaseFileRole::Wal,
+                    expected: file_id(3)?,
+                    actual: file_id(9)?,
+                }
+            ))
+        );
+
+        let changed_format = manifest(1, 3, 3, 5)?;
+        assert_eq!(
+            changed_format.require_successor_of(previous),
+            Err(DatabaseManifestSuccessorError::StorageFormatVersion {
+                role: DatabaseFileRole::Wal,
+                expected: format_version(4)?,
+                actual: format_version(5)?,
+            })
+        );
+
+        let changed_features = DatabaseManifest::recovery_required(
+            next.composition_identity(),
+            next.storage_formats(),
+            DatabaseRequiredFeatures(1),
+        );
+        assert_eq!(
+            changed_features.require_successor_of(previous),
+            Err(DatabaseManifestSuccessorError::RequiredFeatures {
+                expected: DatabaseRequiredFeatures::NONE,
+                actual: DatabaseRequiredFeatures(1),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maximum_manifest_generation_is_explicitly_exhausted() -> Result<(), TestValueError> {
+        let exhausted = manifest(1, u64::MAX, 3, 4)?;
+        assert_eq!(
+            exhausted.next_recovery_required(),
+            Err(DatabaseLifecycleGenerationExhausted {
+                current: generation(u64::MAX)?,
             })
         );
         Ok(())

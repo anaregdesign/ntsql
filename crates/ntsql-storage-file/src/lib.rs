@@ -121,6 +121,13 @@
 //! observation. It never sorts, deduplicates, infers, compares, or authorizes
 //! semantic relationships.
 //!
+//! The independent database-manifest codec uses one fixed 160-byte
+//! `NTSQDBM1`/`NTSQDBE1` frame. It binds repository-owned database, lifecycle,
+//! child-file, persistent-WAL, required-format, and required-feature identities.
+//! Decoding validates the complete frame and returns only an inert
+//! `ntsql_database::DatabaseManifest`; it performs no file I/O, publication,
+//! locking, recovery, or live-authority transition.
+//!
 //! ## Filesystem restart checkpoint baseline source
 //!
 //! One caller-selected checkpoint slot directory contains an immutable
@@ -198,11 +205,16 @@ use ntsql_transaction::{
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
+mod database_manifest_codec;
 mod restart_checkpoint_codec;
 mod restart_checkpoint_completeness_codec;
 mod restart_checkpoint_completeness_file;
 mod restart_checkpoint_file;
 
+pub use database_manifest_codec::{
+    DATABASE_MANIFEST_V1_LENGTH, DatabaseManifestDecodeError, decode_database_manifest,
+    encode_database_manifest,
+};
 pub use restart_checkpoint_codec::{
     RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,
     RestartCheckpointBaselineEntryOptionalField, decode_restart_checkpoint_baseline,

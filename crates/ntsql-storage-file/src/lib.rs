@@ -128,6 +128,17 @@
 //! `ntsql_database::DatabaseManifest`; it performs no file I/O, publication,
 //! locking, recovery, or live-authority transition.
 //!
+//! ## Database-wide ownership
+//!
+//! [`open_file_database_ownership`] extends the existing fixed
+//! WAL/page-store/completeness lock order with an immutable database-owner
+//! control file and the selected manifest. The owner control is the stable
+//! cooperative lock across later manifest-inode replacement. Opened child
+//! adapters validate exact manifest format and lineage requirements while
+//! retaining their complete unrecovered state. Successful open returns a private
+//! manifest-selected wrapper retaining every lock; exact-composition authority
+//! remains withheld until successor child headers persist every manifest ID.
+//!
 //! ## Filesystem restart checkpoint baseline source
 //!
 //! One caller-selected checkpoint slot directory contains an immutable
@@ -206,6 +217,7 @@ use ntsql_transaction::{
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
 mod database_manifest_codec;
+mod database_ownership;
 mod restart_checkpoint_codec;
 mod restart_checkpoint_completeness_codec;
 mod restart_checkpoint_completeness_file;
@@ -214,6 +226,12 @@ mod restart_checkpoint_file;
 pub use database_manifest_codec::{
     DATABASE_MANIFEST_V1_LENGTH, DatabaseManifestDecodeError, decode_database_manifest,
     encode_database_manifest,
+};
+pub use database_ownership::{
+    DATABASE_OWNER_CONTROL_V1_LENGTH, DatabaseOwnerControlDecodeError, FileDatabaseLayout,
+    FileDatabaseLockRole, FileDatabaseOwnership, FileDatabaseOwnershipIoError,
+    FileDatabaseOwnershipIoStage, FileDatabaseOwnershipOpenError, FileDatabaseOwnershipSelection,
+    decode_database_owner_control, encode_database_owner_control, open_file_database_ownership,
 };
 pub use restart_checkpoint_codec::{
     RestartCheckpointBaselineDecodeError, RestartCheckpointBaselineEncodeError,
@@ -1949,6 +1967,45 @@ pub struct FileCommitLog<const N: usize = 0> {
     poisoned: bool,
 }
 
+pub(crate) struct LockedFileCommitLogOpen<const N: usize> {
+    log: FileCommitLog<N>,
+    repaired_len: Option<u64>,
+}
+
+impl<const N: usize> LockedFileCommitLogOpen<N> {
+    pub(crate) fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.log.file.metadata()
+    }
+
+    pub(crate) const fn persistent_id(&self) -> PersistentLogId {
+        self.log.persistent_id
+    }
+
+    pub(crate) const fn physical_format_version(&self) -> u16 {
+        self.log.format.version()
+    }
+
+    pub(crate) fn finish(mut self) -> Result<FileCommitLog<N>, FileOpenError> {
+        if let Some(repaired_len) = self.repaired_len {
+            self.log.file.set_len(repaired_len).map_err(|source| {
+                FileOpenError::Io(FileIoError::new(
+                    FileIoStage::TruncateIncompleteTail,
+                    source,
+                ))
+            })?;
+            self.log.file.sync_all().map_err(|source| {
+                FileOpenError::Io(FileIoError::new(FileIoStage::SyncTruncatedTail, source))
+            })?;
+        }
+        self.log
+            .file
+            .seek(SeekFrom::End(0))
+            .map_err(|source| FileOpenError::Io(FileIoError::new(FileIoStage::SeekEnd, source)))?;
+        cleanup_reclamation_candidate(&self.log.path, &self.log.file, &self.log.parent_directory)?;
+        Ok(self.log)
+    }
+}
+
 impl FileCommitLog<0> {
     /// Creates a new empty v1 file with one caller-supplied persistent lineage ID.
     pub fn create_new<P>(path: P, persistent_id: PersistentLogId) -> Result<Self, FileCreateError>
@@ -2026,6 +2083,16 @@ impl<const N: usize> FileCommitLog<N> {
         Self::open_internal(path.as_ref(), HeaderExpectation::V3OrV4(layout))
     }
 
+    pub(crate) fn inspect_transaction_page_capable<P>(
+        path: P,
+    ) -> Result<LockedFileCommitLogOpen<N>, FileOpenError>
+    where
+        P: AsRef<Path>,
+    {
+        let layout = PageLayout::for_const::<N>().map_err(FileOpenError::PageWidth)?;
+        Self::inspect_internal(path.as_ref(), HeaderExpectation::V3OrV4(layout))
+    }
+
     fn create_new_internal(
         path: &Path,
         persistent_id: PersistentLogId,
@@ -2081,6 +2148,13 @@ impl<const N: usize> FileCommitLog<N> {
     }
 
     fn open_internal(path: &Path, expectation: HeaderExpectation) -> Result<Self, FileOpenError> {
+        Self::inspect_internal(path, expectation)?.finish()
+    }
+
+    fn inspect_internal(
+        path: &Path,
+        expectation: HeaderExpectation,
+    ) -> Result<LockedFileCommitLogOpen<N>, FileOpenError> {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -2251,17 +2325,6 @@ impl<const N: usize> FileCommitLog<N> {
             }
             None => None,
         };
-        if let Some(repaired_len) = repaired_len {
-            file.set_len(repaired_len).map_err(|source| {
-                FileOpenError::Io(FileIoError::new(
-                    FileIoStage::TruncateIncompleteTail,
-                    source,
-                ))
-            })?;
-            file.sync_all().map_err(|source| {
-                FileOpenError::Io(FileIoError::new(FileIoStage::SyncTruncatedTail, source))
-            })?;
-        }
         if format == LogFormat::V4 {
             let actual_retained_first = open_state
                 .records
@@ -2294,32 +2357,32 @@ impl<const N: usize> FileCommitLog<N> {
                 )));
             }
         }
-        file.seek(SeekFrom::End(0))
-            .map_err(|source| FileOpenError::Io(FileIoError::new(FileIoStage::SeekEnd, source)))?;
         let parent_directory = open_parent_directory_for_open(path)?;
-        cleanup_reclamation_candidate(path, &file, &parent_directory)?;
 
-        Ok(Self {
-            file,
-            reclamation_old_file: None,
-            path: path.to_path_buf(),
-            parent_directory,
-            format,
-            lineage,
-            persistent_id,
-            generation,
-            reclaimed_retained_first: reclaimed_retained_first
-                .map(|position| LogLineage::persistent(persistent_id).position(position)),
-            reclaimed_logical_high_water: reclaimed_logical_high_water
-                .map(|position| LogLineage::persistent(persistent_id).position(position)),
-            reclaimed_allocated_epoch_high_water: allocated_epoch_high_water,
-            selected_checkpoint_anchor,
-            records: open_state.records,
-            durable_len: open_state.durable_len,
-            next_epoch: open_state.next_epoch,
-            next_position: open_state.next_position,
-            armed_fault: None,
-            poisoned: false,
+        Ok(LockedFileCommitLogOpen {
+            log: Self {
+                file,
+                reclamation_old_file: None,
+                path: path.to_path_buf(),
+                parent_directory,
+                format,
+                lineage,
+                persistent_id,
+                generation,
+                reclaimed_retained_first: reclaimed_retained_first
+                    .map(|position| LogLineage::persistent(persistent_id).position(position)),
+                reclaimed_logical_high_water: reclaimed_logical_high_water
+                    .map(|position| LogLineage::persistent(persistent_id).position(position)),
+                reclaimed_allocated_epoch_high_water: allocated_epoch_high_water,
+                selected_checkpoint_anchor,
+                records: open_state.records,
+                durable_len: open_state.durable_len,
+                next_epoch: open_state.next_epoch,
+                next_position: open_state.next_position,
+                armed_fault: None,
+                poisoned: false,
+            },
+            repaired_len,
         })
     }
 
@@ -5855,6 +5918,42 @@ pub struct FilePageStore<const N: usize> {
     poisoned: bool,
 }
 
+pub(crate) struct LockedFilePageStoreOpen<const N: usize> {
+    store: FilePageStore<N>,
+    repaired_len: Option<u64>,
+}
+
+impl<const N: usize> LockedFilePageStoreOpen<N> {
+    pub(crate) fn metadata(&self) -> io::Result<fs::Metadata> {
+        self.store.file.metadata()
+    }
+
+    pub(crate) const fn persistent_id(&self) -> PersistentLogId {
+        self.store.persistent_id
+    }
+
+    pub(crate) fn finish(mut self) -> Result<FilePageStore<N>, PageStoreOpenError> {
+        if let Some(repaired_len) = self.repaired_len {
+            self.store.file.set_len(repaired_len).map_err(|source| {
+                PageStoreOpenError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::TruncateIncompleteTail,
+                    source,
+                ))
+            })?;
+            self.store.file.sync_all().map_err(|source| {
+                PageStoreOpenError::Io(PageStoreIoError::new(
+                    PageStoreIoStage::SyncTruncatedTail,
+                    source,
+                ))
+            })?;
+        }
+        self.store.file.seek(SeekFrom::End(0)).map_err(|source| {
+            PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::SeekEnd, source))
+        })?;
+        Ok(self.store)
+    }
+}
+
 impl<const N: usize> FilePageStore<N> {
     /// Creates a new empty page store file.
     pub fn create_new<P>(
@@ -5912,6 +6011,13 @@ impl<const N: usize> FilePageStore<N> {
 
     /// Opens an existing page store file, validates, scans, and repairs tail.
     pub fn open<P>(path: P) -> Result<Self, PageStoreOpenError>
+    where
+        P: AsRef<Path>,
+    {
+        Self::inspect(path)?.finish()
+    }
+
+    pub(crate) fn inspect<P>(path: P) -> Result<LockedFilePageStoreOpen<N>, PageStoreOpenError>
     where
         P: AsRef<Path>,
     {
@@ -5985,32 +6091,18 @@ impl<const N: usize> FilePageStore<N> {
             }
             None => None,
         };
-        if let Some(repaired_len) = repaired_len {
-            file.set_len(repaired_len).map_err(|source| {
-                PageStoreOpenError::Io(PageStoreIoError::new(
-                    PageStoreIoStage::TruncateIncompleteTail,
-                    source,
-                ))
-            })?;
-            file.sync_all().map_err(|source| {
-                PageStoreOpenError::Io(PageStoreIoError::new(
-                    PageStoreIoStage::SyncTruncatedTail,
-                    source,
-                ))
-            })?;
-        }
-        file.seek(SeekFrom::End(0)).map_err(|source| {
-            PageStoreOpenError::Io(PageStoreIoError::new(PageStoreIoStage::SeekEnd, source))
-        })?;
 
-        Ok(Self {
-            file,
-            lineage,
-            persistent_id,
-            pages: open_state.pages,
-            next_sequence: open_state.next_sequence,
-            armed_fault: None,
-            poisoned: false,
+        Ok(LockedFilePageStoreOpen {
+            store: Self {
+                file,
+                lineage,
+                persistent_id,
+                pages: open_state.pages,
+                next_sequence: open_state.next_sequence,
+                armed_fault: None,
+                poisoned: false,
+            },
+            repaired_len,
         })
     }
 

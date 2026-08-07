@@ -2,6 +2,7 @@ use std::{
     error::Error,
     fmt,
     fs::File,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -492,6 +493,10 @@ impl FileRestartCheckpointCompletenessBaselineSource {
         self.persistent_log_id
     }
 
+    pub(crate) fn control_metadata(&self) -> io::Result<std::fs::Metadata> {
+        self._control_file.metadata()
+    }
+
     /// Returns the caller-selected completeness slot directory.
     #[must_use]
     pub fn slot_directory(&self) -> &Path {
@@ -655,6 +660,17 @@ impl<const N: usize> fmt::Debug
 }
 
 impl<const N: usize> UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint<N> {
+    pub(crate) fn from_locked_parts(
+        log: FileCommitLog<N>,
+        store: FilePageStore<N>,
+        checkpoint: FileRestartCheckpointCompletenessBaselineSource,
+    ) -> Self {
+        Self {
+            storage: UnrecoveredTransactionPageStorage::new(log, store),
+            checkpoint,
+        }
+    }
+
     /// Loads and validates the locked completeness slot before recovery writes.
     pub fn select_restart_checkpoint_completeness(
         self,
@@ -782,10 +798,9 @@ where
     }
 
     Ok(
-        UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint {
-            storage: UnrecoveredTransactionPageStorage::new(log, store),
-            checkpoint,
-        },
+        UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint::from_locked_parts(
+            log, store, checkpoint,
+        ),
     )
 }
 

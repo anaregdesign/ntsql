@@ -56,6 +56,15 @@ use ntsql_transaction::{
 };
 use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, PersistentLogId};
 
+mod database_ownership;
+
+pub use database_ownership::{
+    InMemoryDatabaseFileObservation, InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole,
+    InMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSelection,
+    InMemoryDatabaseOwnershipSlot, InMemoryDatabaseOwnershipSlotError,
+    InMemoryDatabaseOwnershipWorld,
+};
+
 /// One-shot physical-effect boundary for the next matching log operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FaultPoint {

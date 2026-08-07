@@ -4,6 +4,7 @@
 - Date: 2026-08-07
 - Issue: #182
 - Extends: ADR 0001, ADR 0062
+- Extended by: ADR 0064
 - Follows: #181
 
 ## Context

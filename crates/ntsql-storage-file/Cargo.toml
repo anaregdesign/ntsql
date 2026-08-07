@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ntsql-database.workspace = true
 ntsql-page.workspace = true
 ntsql-transaction.workspace = true
 ntsql-wal.workspace = true

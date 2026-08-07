@@ -1,0 +1,14 @@
+[package]
+name = "ntsql-database"
+version = "0.1.0"
+description = "I/O-free database identity and lifecycle ownership invariants for ntsql"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ntsql-wal.workspace = true
+
+[lints]
+workspace = true

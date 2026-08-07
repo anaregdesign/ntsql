@@ -32,6 +32,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ntsql-database"
+version = "0.1.0"
+dependencies = [
+ "ntsql-wal",
+]
+
+[[package]]
 name = "ntsql-diagnostics"
 version = "0.1.0"
 
@@ -50,6 +57,7 @@ version = "0.1.0"
 name = "ntsql-storage-file"
 version = "0.1.0"
 dependencies = [
+ "ntsql-database",
  "ntsql-page",
  "ntsql-recovery-model",
  "ntsql-transaction",
@@ -60,6 +68,7 @@ dependencies = [
 name = "ntsql-storage-memory"
 version = "0.1.0"
 dependencies = [
+ "ntsql-database",
  "ntsql-page",
  "ntsql-recovery-model",
  "ntsql-transaction",

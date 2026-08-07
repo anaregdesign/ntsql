@@ -59,8 +59,11 @@ use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, Persist
 mod database_ownership;
 
 pub use database_ownership::{
-    InMemoryDatabaseFileObservation, InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole,
-    InMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSelection,
+    InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError, InMemoryDatabaseCreateFault,
+    InMemoryDatabaseCreateFaultTiming, InMemoryDatabaseCreateManifestError,
+    InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation,
+    InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole, InMemoryDatabaseOwnership,
+    InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSelection,
     InMemoryDatabaseOwnershipSlot, InMemoryDatabaseOwnershipSlotError,
     InMemoryDatabaseOwnershipWorld, RecoveryRequiredInMemoryDatabase,
 };

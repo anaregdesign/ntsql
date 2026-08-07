@@ -442,6 +442,27 @@ pub struct FileRestartCheckpointCompletenessBaselineSource {
 }
 
 impl FileRestartCheckpointCompletenessBaselineSource {
+    pub(crate) fn sync_for_database_create(&self) -> io::Result<()> {
+        self._control_file.sync_all()?;
+        self.directory.sync_all()?;
+        let parent = match self.slot_directory.parent() {
+            Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+            Some(parent) => parent,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "restart-checkpoint path has no parent directory",
+                ));
+            }
+        };
+        let parent = File::open(parent)?;
+        parent.sync_all()
+    }
+
+    pub(crate) fn rebind_database_selected_slot(&mut self, slot_directory: &Path) {
+        self.slot_directory = slot_directory.to_path_buf();
+    }
+
     /// Creates and locks one new empty completeness checkpoint slot.
     ///
     /// Any error after directory creation may leave a partial slot requiring

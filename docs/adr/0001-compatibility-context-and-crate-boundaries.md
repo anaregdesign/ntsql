@@ -5,7 +5,7 @@
 - Issue: #32
 - Extended by: ADR 0002, ADR 0004, ADR 0005, ADR 0006, ADR 0008, ADR 0009,
   ADR 0010, ADR 0011, ADR 0012, ADR 0013, ADR 0014, ADR 0015, ADR 0016,
-  ADR 0017, ADR 0018, ADR 0019, ADR 0020, ADR 0061
+  ADR 0017, ADR 0018, ADR 0019, ADR 0020, ADR 0061, ADR 0062
 
 ## Context
 
@@ -62,6 +62,8 @@ ntsql-contract --------> ntsql-compatibility
 
 ntsql-testkit ----------> ntsql-contract
 
+ntsql-database ---------> ntsql-wal
+
 ntsql-transaction ------> ntsql-wal
 
 ntsql-page -------------> ntsql-wal
@@ -70,8 +72,8 @@ ntsql-wal --------------> standard library only
 
 ntsql-recovery-model ----> standard library only
 
-ntsql-storage-file -----> ntsql-page, ntsql-transaction, ntsql-wal
-ntsql-storage-memory ---> ntsql-page, ntsql-transaction, ntsql-wal
+ntsql-storage-file -----> ntsql-database, ntsql-page, ntsql-transaction, ntsql-wal
+ntsql-storage-memory ---> ntsql-database, ntsql-page, ntsql-transaction, ntsql-wal
 
 ntsql-storage-file -. development only .-> ntsql-recovery-model
 ntsql-storage-memory -. development only .-> ntsql-recovery-model
@@ -97,6 +99,14 @@ It has no engine, adapter, contract, serialization, randomness, filesystem, or
 network dependency. Memory and filesystem adapters depend on it only from their
 development targets, so concrete runners remain outside the model and production
 adapter graphs remain unchanged.
+
+`ntsql-database` owns only repository-authored logical database identity,
+required file-role identity, exact composition comparison, lifecycle generation,
+and staged database ownership. It depends only on `ntsql-wal` for the existing
+`PersistentLogId` invariant. It owns no paths, handles, locks, bytes, codec,
+recovery effect, global identity allocator, or client diagnostic. Memory and
+filesystem adapters may depend inward on this boundary; the database domain
+never depends back on either adapter.
 
 `ntsql-wal` owns the I/O-free ordering invariant that a commit record is
 appended and its exact assigned position is flushed before a durable
@@ -146,7 +156,9 @@ and unreviewed external dependencies. Its negative self-test proves that a
 `ntsql-compatibility -> ntsql-contract` edge is rejected. Focused tests also
 reject extra `ntsql-page` dependencies, the reverse `ntsql-wal -> ntsql-page`
 edge, production adapter dependencies on `ntsql-recovery-model`, and every
-model-to-adapter edge.
+model-to-adapter edge. It also rejects every database-domain edge except
+`ntsql-wal` and proves that both persistence adapters may depend inward on
+`ntsql-database`.
 
 ## Package Evolution Rules
 
@@ -176,6 +188,11 @@ catch-all package solely to avoid an explicit dependency.
 - `ntsql-recovery-model` unit tests exhaust bounded repository-authored logical
   traces without opening an adapter. Adapter development tests execute the same
   canonical seeds and compare concrete durable observations with model state.
+- `ntsql-database` unit tests validate nonzero identities, exact successor
+  generations, complete distinct file-role sets, stable exact-composition
+  mismatches, and fail-closed staged selection/binding. Compile-fail tests reject
+  identity construction, owner extraction, cloning staged owners, and promotion
+  to live authority.
 - `ntsql-page` tests prove exact WAL-before-page call ordering, lineage
   rejection before either port call, and terminal store-write ambiguity.
   Compile-fail tests reject construction of the private write permit and clean

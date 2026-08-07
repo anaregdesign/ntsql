@@ -1918,13 +1918,16 @@ impl<const N: usize> FileLogRecord<N> {
 #[derive(Debug)]
 pub struct FileCommitLog<const N: usize = 0> {
     file: File,
+    reclamation_old_file: Option<File>,
     path: PathBuf,
     parent_directory: File,
     format: LogFormat,
     lineage: LogLineage,
     persistent_id: PersistentLogId,
     generation: u64,
+    reclaimed_retained_first: Option<LogSequenceNumber>,
     reclaimed_logical_high_water: Option<LogSequenceNumber>,
+    reclaimed_allocated_epoch_high_water: Option<NonZeroU64>,
     selected_checkpoint_anchor: Option<(u16, u128)>,
     records: Vec<FileLogRecord<N>>,
     durable_len: usize,
@@ -2045,13 +2048,16 @@ impl<const N: usize> FileCommitLog<N> {
 
         Ok(Self {
             file,
+            reclamation_old_file: None,
             path: path.to_path_buf(),
             parent_directory,
             format,
             lineage: LogLineage::persistent(persistent_id),
             persistent_id,
             generation: 0,
+            reclaimed_retained_first: None,
             reclaimed_logical_high_water: None,
+            reclaimed_allocated_epoch_high_water: None,
             selected_checkpoint_anchor: None,
             records: Vec::new(),
             durable_len: 0,
@@ -2283,14 +2289,18 @@ impl<const N: usize> FileCommitLog<N> {
 
         Ok(Self {
             file,
+            reclamation_old_file: None,
             path: path.to_path_buf(),
             parent_directory,
             format,
             lineage,
             persistent_id,
             generation,
+            reclaimed_retained_first: reclaimed_retained_first
+                .map(|position| LogLineage::persistent(persistent_id).position(position)),
             reclaimed_logical_high_water: reclaimed_logical_high_water
                 .map(|position| LogLineage::persistent(persistent_id).position(position)),
+            reclaimed_allocated_epoch_high_water: allocated_epoch_high_water,
             selected_checkpoint_anchor,
             records: open_state.records,
             durable_len: open_state.durable_len,
@@ -2320,6 +2330,30 @@ impl<const N: usize> FileCommitLog<N> {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Returns the next logical position without consuming it.
+    #[must_use]
+    pub const fn next_logical_position(&self) -> Option<u64> {
+        self.next_position
+    }
+
+    /// Returns the retained-first value encoded in the selected V4 replacement header.
+    #[must_use]
+    pub const fn replacement_header_retained_first(&self) -> Option<&LogSequenceNumber> {
+        self.reclaimed_retained_first.as_ref()
+    }
+
+    /// Returns the logical high-water encoded in the selected V4 replacement header.
+    #[must_use]
+    pub const fn replacement_header_logical_high_water(&self) -> Option<&LogSequenceNumber> {
+        self.reclaimed_logical_high_water.as_ref()
+    }
+
+    /// Returns the epoch high-water encoded in the selected V4 replacement header.
+    #[must_use]
+    pub const fn replacement_header_allocated_epoch_high_water(&self) -> Option<NonZeroU64> {
+        self.reclaimed_allocated_epoch_high_water
     }
 
     /// Arms one fault without replacing an existing plan.
@@ -3152,7 +3186,8 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
                 FileIoError::new(FileIoStage::RenameReclamationCandidate, source),
             ));
         }
-        self.file = candidate;
+        let old_file = std::mem::replace(&mut self.file, candidate);
+        self.reclamation_old_file = Some(old_file);
         if self.consume_fault(FaultPoint::AfterReclamationRename) {
             self.poisoned = true;
             return Err(FileTransactionRestartWalReclamationError::InjectedFault(
@@ -3171,6 +3206,7 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
                 FileIoError::new(FileIoStage::SyncReclamationDirectory, source),
             ));
         }
+        self.reclamation_old_file = None;
         if let Err(source) = self.file.seek(SeekFrom::End(0)) {
             self.poisoned = true;
             return Err(FileTransactionRestartWalReclamationError::Io(
@@ -3179,7 +3215,9 @@ impl<const N: usize> DurableTransactionRestartWalReclamationSource<N> for FileCo
         }
         self.format = LogFormat::V4;
         self.generation = new_generation;
+        self.reclaimed_retained_first = permit.retained_first_logical_record().cloned();
         self.reclaimed_logical_high_water = current_high_water.clone();
+        self.reclaimed_allocated_epoch_high_water = Some(allocated_epoch_high_water);
         self.selected_checkpoint_anchor = Some(anchor);
         self.records = retained_records;
         self.durable_len = self.records.len();

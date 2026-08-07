@@ -12,55 +12,79 @@ use std::{
 const PACKAGE_POLICIES: &[PackagePolicy] = &[
     PackagePolicy {
         package: "ntsql-architecture-check",
-        allowed_dependencies: &[],
+        normal_dependencies: &[],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
     PackagePolicy {
         package: "ntsql-compatibility",
-        allowed_dependencies: &[],
+        normal_dependencies: &[],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
     PackagePolicy {
         package: "ntsql-diagnostics",
-        allowed_dependencies: &[],
+        normal_dependencies: &[],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
     PackagePolicy {
         package: "ntsql-contract",
-        allowed_dependencies: &["ntsql-compatibility", "serde", "serde_json"],
+        normal_dependencies: &["ntsql-compatibility", "serde", "serde_json"],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
     PackagePolicy {
         package: "ntsql-page",
-        allowed_dependencies: &["ntsql-wal"],
+        normal_dependencies: &["ntsql-wal"],
+        build_dependencies: &[],
+        development_dependencies: &[],
+    },
+    PackagePolicy {
+        package: "ntsql-recovery-model",
+        normal_dependencies: &[],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
     PackagePolicy {
         package: "ntsql-storage-file",
-        allowed_dependencies: &["ntsql-page", "ntsql-transaction", "ntsql-wal"],
+        normal_dependencies: &["ntsql-page", "ntsql-transaction", "ntsql-wal"],
+        build_dependencies: &[],
+        development_dependencies: &["ntsql-recovery-model"],
     },
     PackagePolicy {
         package: "ntsql-storage-memory",
-        allowed_dependencies: &["ntsql-page", "ntsql-transaction", "ntsql-wal"],
+        normal_dependencies: &["ntsql-page", "ntsql-transaction", "ntsql-wal"],
+        build_dependencies: &[],
+        development_dependencies: &["ntsql-recovery-model"],
     },
     PackagePolicy {
         package: "ntsql-testkit",
-        allowed_dependencies: &["ntsql-contract"],
+        normal_dependencies: &["ntsql-contract"],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
     PackagePolicy {
         package: "ntsql-transaction",
-        allowed_dependencies: &["ntsql-page", "ntsql-wal"],
+        normal_dependencies: &["ntsql-page", "ntsql-wal"],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
     PackagePolicy {
         package: "ntsql-wal",
-        allowed_dependencies: &[],
+        normal_dependencies: &[],
+        build_dependencies: &[],
+        development_dependencies: &[],
     },
 ];
 
-const CARGO_TREE_ARGS: &[&str] = &[
+const CARGO_TREE_BASE_ARGS: &[&str] = &[
     "tree",
     "--workspace",
     "--all-features",
     "--no-dedupe",
     "--depth",
     "1",
-    "--edges",
-    "normal,build,dev",
     "--target",
     "all",
     "--prefix",
@@ -68,13 +92,49 @@ const CARGO_TREE_ARGS: &[&str] = &[
     "--format",
     "{p}",
     "--locked",
-    "--manifest-path",
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackagePolicy {
     package: &'static str,
-    allowed_dependencies: &'static [&'static str],
+    normal_dependencies: &'static [&'static str],
+    build_dependencies: &'static [&'static str],
+    development_dependencies: &'static [&'static str],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DependencyKind {
+    Normal,
+    Build,
+    Development,
+}
+
+impl DependencyKind {
+    const ALL: [Self; 3] = [Self::Normal, Self::Build, Self::Development];
+
+    const fn cargo_argument(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Build => "build",
+            Self::Development => "dev",
+        }
+    }
+
+    const fn policy_dependencies(self, policy: &PackagePolicy) -> &'static [&'static str] {
+        match self {
+            Self::Normal => policy.normal_dependencies,
+            Self::Build => policy.build_dependencies,
+            Self::Development => policy.development_dependencies,
+        }
+    }
+
+    const fn diagnostic_qualifier(self) -> &'static str {
+        match self {
+            Self::Normal => "",
+            Self::Build => " build",
+            Self::Development => " development",
+        }
+    }
 }
 
 fn main() {
@@ -88,21 +148,27 @@ fn main() {
 fn check_workspace() -> Result<(), ArchitectureCheckError> {
     let manifest = workspace_manifest()?;
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
-        .args(CARGO_TREE_ARGS)
-        .arg(&manifest)
-        .output()
-        .map_err(ArchitectureCheckError::CargoInvocation)?;
+    let mut violations = Vec::new();
+    for kind in DependencyKind::ALL {
+        let output = Command::new(&cargo)
+            .args(CARGO_TREE_BASE_ARGS)
+            .args(["--edges", kind.cargo_argument(), "--manifest-path"])
+            .arg(&manifest)
+            .output()
+            .map_err(|source| ArchitectureCheckError::CargoInvocation { kind, source })?;
 
-    if !output.status.success() {
-        return Err(ArchitectureCheckError::CargoTreeFailed(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+        if !output.status.success() {
+            return Err(ArchitectureCheckError::CargoTreeFailed {
+                kind,
+                message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+
+        let tree = String::from_utf8(output.stdout)
+            .map_err(|source| ArchitectureCheckError::CargoOutput { kind, source })?;
+        let graph = parse_dependency_tree(&tree)?;
+        violations.extend(validate_graph(&graph, PACKAGE_POLICIES, kind));
     }
-
-    let tree = String::from_utf8(output.stdout).map_err(ArchitectureCheckError::CargoOutput)?;
-    let graph = parse_dependency_tree(&tree)?;
-    let violations = validate_graph(&graph, PACKAGE_POLICIES);
     if violations.is_empty() {
         Ok(())
     } else {
@@ -153,7 +219,11 @@ fn parse_dependency_tree(input: &str) -> Result<DependencyGraph, ArchitectureChe
     Ok(graph)
 }
 
-fn validate_graph(graph: &DependencyGraph, policies: &[PackagePolicy]) -> Vec<String> {
+fn validate_graph(
+    graph: &DependencyGraph,
+    policies: &[PackagePolicy],
+    kind: DependencyKind,
+) -> Vec<String> {
     let policy_by_package = policies
         .iter()
         .map(|policy| (policy.package, policy))
@@ -176,8 +246,8 @@ fn validate_graph(graph: &DependencyGraph, policies: &[PackagePolicy]) -> Vec<St
             ));
             continue;
         };
-        let expected = policy
-            .allowed_dependencies
+        let expected = kind
+            .policy_dependencies(policy)
             .iter()
             .copied()
             .collect::<BTreeSet<_>>();
@@ -185,16 +255,18 @@ fn validate_graph(graph: &DependencyGraph, policies: &[PackagePolicy]) -> Vec<St
         for dependency in actual {
             if !expected.contains(dependency.as_str()) {
                 violations.push(format!(
-                    "package {} has forbidden direct dependency {dependency}",
-                    policy.package
+                    "package {} has forbidden direct{} dependency {dependency}",
+                    policy.package,
+                    kind.diagnostic_qualifier()
                 ));
             }
         }
         for dependency in expected {
             if !actual.contains(dependency) {
                 violations.push(format!(
-                    "package {} is missing required direct dependency {dependency}",
-                    policy.package
+                    "package {} is missing required direct{} dependency {dependency}",
+                    policy.package,
+                    kind.diagnostic_qualifier()
                 ));
             }
         }
@@ -208,9 +280,18 @@ type DependencyGraph = BTreeMap<String, BTreeSet<String>>;
 #[derive(Debug)]
 enum ArchitectureCheckError {
     WorkspaceRootMissing,
-    CargoInvocation(std::io::Error),
-    CargoTreeFailed(String),
-    CargoOutput(std::string::FromUtf8Error),
+    CargoInvocation {
+        kind: DependencyKind,
+        source: std::io::Error,
+    },
+    CargoTreeFailed {
+        kind: DependencyKind,
+        message: String,
+    },
+    CargoOutput {
+        kind: DependencyKind,
+        source: std::string::FromUtf8Error,
+    },
     InvalidTreeLine(String),
     PolicyViolations(Vec<String>),
 }
@@ -219,10 +300,22 @@ impl fmt::Display for ArchitectureCheckError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WorkspaceRootMissing => formatter.write_str("workspace root is unavailable"),
-            Self::CargoInvocation(error) => write!(formatter, "could not run cargo tree: {error}"),
-            Self::CargoTreeFailed(error) => write!(formatter, "cargo tree failed: {error}"),
-            Self::CargoOutput(error) => {
-                write!(formatter, "cargo tree output is not UTF-8: {error}")
+            Self::CargoInvocation { kind, source } => write!(
+                formatter,
+                "could not run cargo tree for {} dependencies: {source}",
+                kind.cargo_argument()
+            ),
+            Self::CargoTreeFailed { kind, message } => write!(
+                formatter,
+                "cargo tree failed for {} dependencies: {message}",
+                kind.cargo_argument()
+            ),
+            Self::CargoOutput { kind, source } => {
+                write!(
+                    formatter,
+                    "cargo tree output for {} dependencies is not UTF-8: {source}",
+                    kind.cargo_argument()
+                )
             }
             Self::InvalidTreeLine(line) => write!(formatter, "invalid cargo tree line: {line}"),
             Self::PolicyViolations(violations) => {
@@ -239,10 +332,10 @@ impl fmt::Display for ArchitectureCheckError {
 impl Error for ArchitectureCheckError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::CargoInvocation(error) => Some(error),
-            Self::CargoOutput(error) => Some(error),
+            Self::CargoInvocation { source, .. } => Some(source),
+            Self::CargoOutput { source, .. } => Some(source),
             Self::WorkspaceRootMissing
-            | Self::CargoTreeFailed(_)
+            | Self::CargoTreeFailed { .. }
             | Self::InvalidTreeLine(_)
             | Self::PolicyViolations(_) => None,
         }
@@ -255,8 +348,8 @@ mod tests {
 
     #[test]
     fn cargo_tree_enables_every_feature() {
-        assert!(CARGO_TREE_ARGS.contains(&"--all-features"));
-        assert!(CARGO_TREE_ARGS.contains(&"--no-dedupe"));
+        assert!(CARGO_TREE_BASE_ARGS.contains(&"--all-features"));
+        assert!(CARGO_TREE_BASE_ARGS.contains(&"--no-dedupe"));
     }
 
     #[test]
@@ -271,6 +364,7 @@ mod tests {
              1serde_json v1.0.0\n\
              0ntsql-page v0.1.0\n\
              1ntsql-wal v0.1.0\n\
+             0ntsql-recovery-model v0.1.0\n\
              0ntsql-storage-file v0.1.0\n\
              1ntsql-page v0.1.0\n\
              1ntsql-transaction v0.1.0\n\
@@ -290,7 +384,116 @@ mod tests {
              0ntsql-wal v0.1.0\n",
         )?;
 
-        assert!(validate_graph(&graph, PACKAGE_POLICIES).is_empty());
+        assert!(validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reviewed_build_and_development_graphs_are_accepted() -> Result<(), ArchitectureCheckError> {
+        let build_graph = parse_dependency_tree(
+            "0ntsql-architecture-check v0.1.0\n\
+             0ntsql-compatibility v0.1.0\n\
+             0ntsql-contract v0.1.0\n\
+             0ntsql-diagnostics v0.1.0\n\
+             0ntsql-page v0.1.0\n\
+             0ntsql-recovery-model v0.1.0\n\
+             0ntsql-storage-file v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             0ntsql-testkit v0.1.0\n\
+             0ntsql-transaction v0.1.0\n\
+             0ntsql-wal v0.1.0\n",
+        )?;
+        assert!(validate_graph(&build_graph, PACKAGE_POLICIES, DependencyKind::Build).is_empty());
+
+        let development_graph = parse_dependency_tree(
+            "0ntsql-architecture-check v0.1.0\n\
+             0ntsql-compatibility v0.1.0\n\
+             0ntsql-contract v0.1.0\n\
+             0ntsql-diagnostics v0.1.0\n\
+             0ntsql-page v0.1.0\n\
+             0ntsql-recovery-model v0.1.0\n\
+             0ntsql-storage-file v0.1.0\n\
+             1ntsql-recovery-model v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-recovery-model v0.1.0\n\
+             0ntsql-testkit v0.1.0\n\
+             0ntsql-transaction v0.1.0\n\
+             0ntsql-wal v0.1.0\n",
+        )?;
+        assert!(
+            validate_graph(
+                &development_graph,
+                PACKAGE_POLICIES,
+                DependencyKind::Development,
+            )
+            .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_model_is_dev_only_for_storage_adapters() -> Result<(), ArchitectureCheckError> {
+        let adapter_development_graph = parse_dependency_tree(
+            "0ntsql-storage-file v0.1.0\n\
+             1ntsql-recovery-model v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-recovery-model v0.1.0\n",
+        )?;
+        let development_violations = validate_graph(
+            &adapter_development_graph,
+            PACKAGE_POLICIES,
+            DependencyKind::Development,
+        );
+        assert!(!development_violations.iter().any(|violation| violation
+            == "package ntsql-storage-file has forbidden direct development dependency ntsql-recovery-model"));
+        assert!(!development_violations.iter().any(|violation| violation
+            == "package ntsql-storage-memory has forbidden direct development dependency ntsql-recovery-model"));
+
+        let adapter_production_graph = parse_dependency_tree(
+            "0ntsql-storage-file v0.1.0\n\
+             1ntsql-recovery-model v0.1.0\n\
+             0ntsql-storage-memory v0.1.0\n\
+             1ntsql-recovery-model v0.1.0\n",
+        )?;
+        for kind in [DependencyKind::Normal, DependencyKind::Build] {
+            let violations = validate_graph(&adapter_production_graph, PACKAGE_POLICIES, kind);
+            assert!(violations.iter().any(|violation| violation
+                == &format!(
+                    "package ntsql-storage-file has forbidden direct{} dependency ntsql-recovery-model",
+                    kind.diagnostic_qualifier()
+                )));
+            assert!(violations.iter().any(|violation| violation
+                == &format!(
+                    "package ntsql-storage-memory has forbidden direct{} dependency ntsql-recovery-model",
+                    kind.diagnostic_qualifier()
+                )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_model_rejects_adapter_dependencies_in_every_kind()
+    -> Result<(), ArchitectureCheckError> {
+        let graph = parse_dependency_tree(
+            "0ntsql-recovery-model v0.1.0\n\
+             1ntsql-storage-file v0.1.0\n\
+             1ntsql-storage-memory v0.1.0\n\
+             1ntsql-transaction v0.1.0\n",
+        )?;
+        for kind in DependencyKind::ALL {
+            let violations = validate_graph(&graph, PACKAGE_POLICIES, kind);
+            for dependency in [
+                "ntsql-storage-file",
+                "ntsql-storage-memory",
+                "ntsql-transaction",
+            ] {
+                assert!(violations.iter().any(|violation| violation
+                    == &format!(
+                        "package ntsql-recovery-model has forbidden direct{} dependency {dependency}",
+                        kind.diagnostic_qualifier()
+                    )));
+            }
+        }
         Ok(())
     }
 
@@ -323,7 +526,7 @@ mod tests {
              0ntsql-wal v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         assert!(violations.iter().any(|violation| violation
             == "package ntsql-compatibility has forbidden direct dependency ntsql-contract"));
@@ -364,7 +567,7 @@ mod tests {
              0ntsql-unreviewed v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         assert!(violations.iter().any(|violation| violation
             == "workspace package ntsql-unreviewed has no reviewed dependency policy"));
@@ -393,7 +596,7 @@ mod tests {
              0ntsql-wal v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         assert!(violations.iter().any(|violation| violation
             == "package ntsql-testkit has forbidden direct dependency ntsql-server"));
@@ -428,7 +631,7 @@ mod tests {
              1ntsql-wal v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         for dependency in [
             "ntsql-contract",
@@ -457,7 +660,7 @@ mod tests {
              0ntsql-wal v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         for dependency in [
             "ntsql-contract",
@@ -496,7 +699,7 @@ mod tests {
              0ntsql-wal v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         for dependency in [
             "ntsql-contract",
@@ -540,7 +743,7 @@ mod tests {
              1ntsql-storage-memory v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         for dependency in ["ntsql-contract", "serde"] {
             assert!(violations.iter().any(|violation| violation
@@ -585,7 +788,7 @@ mod tests {
              1ntsql-storage-file v0.1.0\n",
         )?;
 
-        let violations = validate_graph(&graph, PACKAGE_POLICIES);
+        let violations = validate_graph(&graph, PACKAGE_POLICIES, DependencyKind::Normal);
 
         for dependency in ["ntsql-contract", "serde"] {
             assert!(violations.iter().any(|violation| violation

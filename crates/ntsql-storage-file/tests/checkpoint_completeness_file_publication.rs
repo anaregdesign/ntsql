@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     error::Error,
+    fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
@@ -8,11 +9,19 @@ use std::{
 };
 
 use ntsql_page::{
-    PageAddress, PageImage, PageNumber, PageVersion, StoredPageSnapshotObservation, UnloggedPage,
+    PageAddress, PageImage, PageLog, PageNumber, PageVersion, StoredPageSnapshotObservation,
+    UnloggedPage,
+};
+use ntsql_recovery_model::{
+    Applied as ModelApplied, CandidateEntry as ModelCandidateEntry,
+    CheckpointAnchor as ModelCheckpointAnchor,
+    CheckpointCandidateState as ModelCheckpointCandidateState, LogId as ModelLogId, ModelError,
+    PageId as ModelPageId, PageVersion as ModelPageVersion, RecoveryModel,
+    SelectedEntryState as ModelSelectedEntryState, WalRecordKind as ModelWalRecordKind,
 };
 use ntsql_storage_file::{
-    FaultPoint, FileCommitLog, FileCommittedPageRecoveryObservationError, FilePageStore,
-    FilePageStoreError, FileRestartCheckpointCompletenessBaselinePublicationError,
+    FaultPoint, FileCommitLog, FileCommitLogError, FileCommittedPageRecoveryObservationError,
+    FilePageStore, FilePageStoreError, FileRestartCheckpointCompletenessBaselinePublicationError,
     FileRestartCheckpointCompletenessBaselinePublicationFaultPoint,
     FileRestartCheckpointCompletenessBaselineSource, FileRestartCheckpointPageRepairStoreError,
     FileRestartCheckpointSlotIoStage, FileTransactionRestartAnalysisSourceError,
@@ -32,8 +41,8 @@ use ntsql_transaction::{
     DurableTransactionRestartCompletenessError, DurableTransactionRestartCompletenessEvidenceError,
     DurableTransactionRestartPageState, DurableTransactionRestartWalReclamationError,
     DurableTransactionRestartWalReclamationOutcomeIndeterminateError,
-    RestartAnalyzedTransactionPageStorage, TransactionCoordinator,
-    TransactionPageStorageRestartCheckpointCompletenessSelection,
+    DurableTransactionRestartWalReclamationSource, RestartAnalyzedTransactionPageStorage,
+    TransactionCoordinator, TransactionPageStorageRestartCheckpointCompletenessSelection,
     TransactionPageStorageRestartCheckpointPageRepairExecution,
     TransactionPageStorageRestartCheckpointRepairPreparation,
     TransactionPageStorageRestartCheckpointRestoration,
@@ -59,6 +68,40 @@ type FilePublicationError =
         FileCommittedPageRecoveryObservationError<2>,
         FileRestartCheckpointCompletenessBaselinePublicationError,
     >;
+
+#[derive(Debug, Eq, PartialEq)]
+enum NormalizedRecordKind {
+    TransactionCommit {
+        epoch: u64,
+        sequence: u64,
+    },
+    RawPage {
+        page: u64,
+        version: u64,
+        value: u64,
+    },
+    TransactionPage {
+        epoch: u64,
+        sequence: u64,
+        page: u64,
+        version: u64,
+        value: u64,
+    },
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct NormalizedRecord {
+    position: u64,
+    kind: NormalizedRecordKind,
+}
+
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct NormalizedPage {
+    page: u64,
+    version: u64,
+    value: u64,
+    required_position: u64,
+}
 
 struct OneShotObservationFaultFilePageStore<const N: usize> {
     inner: FilePageStore<N>,
@@ -588,6 +631,127 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
 }
 
 #[test]
+fn filesystem_wal_append_and_flush_faults_match_model_after_reopen() -> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("wal-model-faults")?;
+    for (index, fault) in [
+        FaultPoint::BeforeAppend,
+        FaultPoint::AfterAppend,
+        FaultPoint::BeforeFlush,
+        FaultPoint::AfterFlush,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case_path = directory.path().join(format!("case-{index}"));
+        fs::create_dir(&case_path)?;
+        let persistent_log_id = persistent_log_id(16900 + index as u128)?;
+        let wal_path = case_path.join("wal.bin");
+        let page_store_path = case_path.join("pages.bin");
+        let mut log =
+            FileCommitLog::<2>::create_new_transaction_page_capable(&wal_path, persistent_log_id)?;
+        let store = FilePageStore::<2>::create_new(&page_store_path, persistent_log_id)?;
+        let coordinator = TransactionCoordinator::open(&mut log)?;
+        drop(coordinator);
+        let model_log_id = ModelLogId::new(persistent_log_id.get())
+            .ok_or_else(|| io::Error::other("model persistent log ID is zero"))?;
+        let mut model = RecoveryModel::new(model_log_id);
+        model.allocate_coordinator_epoch()?;
+        let page_number = 169 + index as u64;
+        let bytes = [0x16, index as u8];
+        let model_page = ModelPageId::new(page_number)
+            .ok_or_else(|| io::Error::other("model page number is zero"))?;
+        let page = unlogged_page(log.lineage(), page_number, 1, bytes)?;
+
+        match fault {
+            FaultPoint::BeforeAppend | FaultPoint::AfterAppend => {
+                log.arm_fault(fault)?;
+                let error = PageLog::append_page(&mut log, &page)
+                    .err()
+                    .ok_or_else(|| io::Error::other(format!("fault {fault} reported success")))?;
+                assert_eq!(error, FileCommitLogError::InjectedFault(fault));
+                if fault == FaultPoint::AfterAppend {
+                    model.append_raw_page(
+                        model_page,
+                        model_page_value(bytes),
+                        ModelPageVersion::new(1),
+                    )?;
+                }
+            }
+            FaultPoint::BeforeFlush | FaultPoint::AfterFlush => {
+                let position = PageLog::append_page(&mut log, &page)?;
+                model.append_raw_page(
+                    model_page,
+                    model_page_value(bytes),
+                    ModelPageVersion::new(1),
+                )?;
+                log.arm_fault(fault)?;
+                let error = log
+                    .flush_through(&position)
+                    .err()
+                    .ok_or_else(|| io::Error::other(format!("fault {fault} reported success")))?;
+                assert_eq!(error, FileCommitLogError::InjectedFault(fault));
+                if fault == FaultPoint::AfterFlush {
+                    model.flush_wal()?;
+                }
+            }
+            _ => {
+                return Err(io::Error::other("non-WAL fault entered the WAL model matrix").into());
+            }
+        }
+
+        drop(log);
+        model.crash_preserving_complete_wal_tail()?;
+        model.reopen()?;
+        let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+        assert_file_subject_matches_model(
+            &mut reopened,
+            &store,
+            &model,
+            &format!("WAL fault {fault}"),
+        )?;
+        if fault != FaultPoint::AfterFlush {
+            model.select()?;
+            assert_eq!(model.plan_replay()?, 0);
+            model.repair_pages()?;
+            model.restore_transactions()?;
+            model.complete()?;
+            let coordinator = TransactionCoordinator::open(&mut reopened)?;
+            drop(coordinator);
+
+            let continuation_page_number = page_number + 1_000;
+            let continuation_bytes = [0x26, index as u8];
+            let continuation = unlogged_page(
+                reopened.lineage(),
+                continuation_page_number,
+                2,
+                continuation_bytes,
+            )?;
+            let actual_position = PageLog::append_page(&mut reopened, &continuation)?;
+            let expected_position = model.append_raw_page(
+                ModelPageId::new(continuation_page_number)
+                    .ok_or_else(|| io::Error::other("continuation model page is zero"))?,
+                model_page_value(continuation_bytes),
+                ModelPageVersion::new(2),
+            )?;
+            assert_eq!(actual_position.get(), expected_position.get());
+            reopened.flush_through(&actual_position)?;
+            model.flush_wal()?;
+            drop(reopened);
+            model.crash()?;
+            model.reopen()?;
+            let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+            assert_file_subject_matches_model(
+                &mut reopened,
+                &store,
+                &model,
+                &format!("WAL fault {fault} after continuation flush"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Result<(), Box<dyn Error>>
 {
     let directory = TestDirectory::new("wal-reclamation-generations")?;
@@ -596,6 +760,7 @@ fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Resul
     let page_store_path = directory.path().join("pages.bin");
     let slot_path = directory.path().join("completeness");
     let mut owner = analyzed_owner(directory.path(), persistent_log_id)?;
+    let mut model = reclamation_model(persistent_log_id, Some((170, [0x17, 0x01])))?;
 
     let pruned_position = append_committed_transaction(&mut owner)?;
     assert_eq!(pruned_position, 1);
@@ -654,6 +819,7 @@ fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Resul
     let reclaimed = analyzed
         .reclaim_wal_prefix()
         .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    model.reclaim()?;
     let receipt = reclaimed.reclamation_receipt();
     assert_eq!(receipt.source_physical_format_version(), 3);
     assert_eq!(receipt.replacement_physical_format_version(), 4);
@@ -666,7 +832,8 @@ fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Resul
     );
     assert_eq!(receipt.retained_logical_record_count(), 2);
     assert_file_composition_locked(directory.path(), &slot_path)?;
-    let (coordinator, log, store, evidence) = reclaimed.into_parts();
+    let (coordinator, mut log, store, evidence) = reclaimed.into_parts();
+    assert_file_subject_matches_model(&mut log, &store, &model, "V3-to-V4 reclamation")?;
     assert_eq!(
         log.durable_records()
             .map(|record| record.position().get())
@@ -704,9 +871,18 @@ fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Resul
     };
     assert_eq!(restored.transaction_summary().coordinator_epoch().get(), 4);
     let analyzed = restored.complete_restart()?.analyze_wal_retention()?;
+    model.crash()?;
+    model.reopen()?;
+    model.select()?;
+    model.plan_replay()?;
+    model.repair_pages()?;
+    model.restore_transactions()?;
+    model.complete()?;
+    model.analyze_retention()?;
     let reclaimed = analyzed
         .reclaim_wal_prefix()
         .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    model.reclaim()?;
     let receipt = reclaimed.reclamation_receipt();
     assert_eq!(receipt.source_physical_format_version(), 4);
     assert_eq!(receipt.replacement_physical_format_version(), 4);
@@ -720,6 +896,7 @@ fn wal_reclamation_replaces_v3_and_v4_generations_without_renumbering() -> Resul
     assert_file_composition_locked(directory.path(), &slot_path)?;
 
     let (coordinator, mut log, store, evidence) = reclaimed.into_parts();
+    assert_file_subject_matches_model(&mut log, &store, &model, "V4-to-V4 reclamation")?;
     drop(coordinator);
     let mut next_coordinator = TransactionCoordinator::open(&mut log)?;
     let active = next_coordinator.begin()?;
@@ -749,8 +926,10 @@ fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), B
     let directory = TestDirectory::new("wal-reclamation-empty")?;
     let persistent_log_id = persistent_log_id(17002)?;
     let wal_path = directory.path().join("wal.bin");
+    let page_store_path = directory.path().join("pages.bin");
     let slot_path = directory.path().join("completeness");
     let analyzed = prepare_reclamation_owner(directory.path(), persistent_log_id, None)?;
+    let mut model = reclamation_model(persistent_log_id, None)?;
     assert_eq!(analyzed.retention_analysis().durable_frontier(), Some(1));
     assert_eq!(
         analyzed
@@ -763,6 +942,7 @@ fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), B
     let reclaimed = analyzed
         .reclaim_wal_prefix()
         .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    model.reclaim()?;
     let receipt = reclaimed.reclamation_receipt();
     assert_eq!(receipt.source_physical_format_version(), 3);
     assert_eq!(receipt.replacement_physical_format_version(), 4);
@@ -773,7 +953,8 @@ fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), B
     assert_eq!(receipt.retained_logical_record_count(), 0);
     assert_eq!(receipt.retained_physical_unit_count(), 0);
     assert_file_composition_locked(directory.path(), &slot_path)?;
-    let (coordinator, log, store, evidence) = reclaimed.into_parts();
+    let (coordinator, mut log, store, evidence) = reclaimed.into_parts();
+    assert_file_subject_matches_model(&mut log, &store, &model, "empty-suffix reclamation")?;
     assert!(log.durable_records().next().is_none());
     assert_eq!(
         log.durable_position().map(|position| position.get()),
@@ -781,7 +962,11 @@ fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), B
     );
     drop((coordinator, log, store, evidence));
 
+    model.crash()?;
+    model.reopen()?;
     let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    let store = FilePageStore::<2>::open(&page_store_path)?;
+    assert_file_subject_matches_model(&mut reopened, &store, &model, "empty-suffix fresh reopen")?;
     assert_eq!(reopened.physical_format_version(), 4);
     assert_eq!(reopened.generation(), 1);
     assert!(reopened.durable_records().next().is_none());
@@ -789,6 +974,13 @@ fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), B
         reopened.durable_position().map(|position| position.get()),
         Some(1)
     );
+    model.select()?;
+    assert_eq!(model.plan_replay()?, 0);
+    model.repair_pages()?;
+    let restoration = model.restore_transactions()?;
+    assert_eq!(restoration.fresh_epoch, 3);
+    model.complete()?;
+    drop(store);
     let mut coordinator = TransactionCoordinator::open(&mut reopened)?;
     let active = coordinator.begin()?;
     assert_eq!(active.transaction_id().epoch().get(), 3);
@@ -797,7 +989,21 @@ fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), B
     reopened.flush_through(committed.log_position())?;
     drop((coordinator, reopened));
 
-    let reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    let transaction = model.begin_transaction()?;
+    let committed_position = model.append_transaction_commit(transaction)?;
+    assert_eq!(committed_position.get(), 2);
+    model.flush_wal()?;
+    model.crash()?;
+    model.reopen()?;
+
+    let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    let store = FilePageStore::<2>::open(&page_store_path)?;
+    assert_file_subject_matches_model(
+        &mut reopened,
+        &store,
+        &model,
+        "empty-suffix continuation with divergent V4 header baseline",
+    )?;
     assert_eq!(
         reopened
             .durable_records()
@@ -809,6 +1015,87 @@ fn empty_wal_suffix_preserves_high_water_and_future_allocation() -> Result<(), B
         reopened.durable_position().map(|position| position.get()),
         Some(2)
     );
+    let checkpoint = FileRestartCheckpointCompletenessBaselineSource::open(&slot_path)?;
+    let selection = UnrecoveredTransactionPageStorage::new(reopened, store)
+        .select_generation_aware_restart_checkpoint_completeness(checkpoint);
+    let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(_selected) =
+        selection
+    else {
+        return Err(io::Error::other(
+            "continued V4 generation did not select its anchored checkpoint",
+        )
+        .into());
+    };
+    model.select()?;
+    Ok(())
+}
+
+#[test]
+fn corrupt_selected_v4_rejects_before_candidate_cleanup_and_matches_model()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("corrupt-selected-v4")?;
+    let persistent_log_id = persistent_log_id(17003)?;
+    let wal_path = directory.path().join("wal.bin");
+    let page_store_path = directory.path().join("pages.bin");
+    let candidate_path = directory.path().join("wal.bin.reclaim-candidate");
+    let analyzed = prepare_reclamation_owner(
+        directory.path(),
+        persistent_log_id,
+        Some((173, [0x17, 0x03])),
+    )?;
+    let reclaimed = analyzed
+        .reclaim_wal_prefix()
+        .map_err(|failed| io::Error::other(format!("{:?}", failed.error())))?;
+    let mut model = reclamation_model(persistent_log_id, Some((173, [0x17, 0x03])))?;
+    model.reclaim()?;
+    drop(reclaimed);
+
+    let selected_bytes = fs::read(&wal_path)?;
+    write_synced_new(&candidate_path, &selected_bytes)?;
+    let mut corrupt_bytes = selected_bytes.clone();
+    let first = corrupt_bytes
+        .first_mut()
+        .ok_or_else(|| io::Error::other("selected V4 WAL is unexpectedly empty"))?;
+    *first ^= 0xFF;
+    write_synced_replace(&wal_path, &corrupt_bytes)?;
+
+    model.crash()?;
+    model.set_selected_entries_for_open(
+        ModelSelectedEntryState::Corrupt,
+        ModelSelectedEntryState::Valid,
+    )?;
+    assert!(matches!(
+        model.reopen(),
+        Err(ModelError::InvalidSelectedOnOpen { .. })
+    ));
+    assert!(
+        FileCommitLog::<2>::open_transaction_page_capable(&wal_path).is_err(),
+        "corrupt selected V4 WAL unexpectedly opened"
+    );
+    assert_eq!(
+        fs::read(&candidate_path)?,
+        selected_bytes,
+        "candidate changed before the corrupt selected generation was rejected"
+    );
+
+    write_synced_replace(&wal_path, &selected_bytes)?;
+    model.set_selected_entries_for_open(
+        ModelSelectedEntryState::Valid,
+        ModelSelectedEntryState::Valid,
+    )?;
+    model.reopen()?;
+    let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+    let store = FilePageStore::<2>::open(&page_store_path)?;
+    assert!(
+        !candidate_path.exists(),
+        "fresh open did not clean the unselected candidate"
+    );
+    assert_file_subject_matches_model(
+        &mut reopened,
+        &store,
+        &model,
+        "restored selected V4 after corrupt-open rejection",
+    )?;
     Ok(())
 }
 
@@ -832,10 +1119,16 @@ fn every_wal_reclamation_fault_reopens_one_selected_generation() -> Result<(), B
         fs::create_dir(&case_path)?;
         let persistent_log_id = persistent_log_id(17100 + index as u128)?;
         let wal_path = case_path.join("wal.bin");
+        let old_wal_alias_path = case_path.join("wal-old-inode.bin");
         let slot_path = case_path.join("completeness");
         let candidate_path = case_path.join("wal.bin.reclaim-candidate");
         let mut analyzed = prepare_reclamation_owner(
             &case_path,
+            persistent_log_id,
+            Some((171 + index as u64, [0x17, index as u8])),
+        )?;
+        fs::hard_link(&wal_path, &old_wal_alias_path)?;
+        let mut model = reclamation_model(
             persistent_log_id,
             Some((171 + index as u64, [0x17, index as u8])),
         )?;
@@ -862,9 +1155,27 @@ fn every_wal_reclamation_fault_reopens_one_selected_generation() -> Result<(), B
             FaultPoint::AfterReclamationRename | FaultPoint::DuringReclamationDirectorySync
         );
         assert_eq!(candidate_path.exists(), !renamed);
+        if renamed {
+            assert!(
+                FileCommitLog::<2>::open_transaction_page_capable(&old_wal_alias_path).is_err(),
+                "post-rename failure released the old WAL inode lock at {fault}"
+            );
+        }
         drop(failed);
 
-        let reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+        if renamed {
+            model.reclaim()?;
+        }
+        model.crash()?;
+        model.reopen()?;
+        let mut reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+        let store = FilePageStore::<2>::open(case_path.join("pages.bin"))?;
+        assert_file_subject_matches_model(
+            &mut reopened,
+            &store,
+            &model,
+            &format!("reclamation fault {fault}"),
+        )?;
         assert_eq!(
             reopened.physical_format_version(),
             if renamed { 4 } else { 3 }
@@ -881,7 +1192,7 @@ fn every_wal_reclamation_fault_reopens_one_selected_generation() -> Result<(), B
             !candidate_path.exists(),
             "a candidate survived fresh selected-file open after {fault}"
         );
-        drop(reopened);
+        drop((reopened, store));
         let reopened = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
         assert_eq!(
             reopened.physical_format_version(),
@@ -934,6 +1245,8 @@ fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_lock
             1,
             [0x16, index as u8],
         )?;
+        let mut model =
+            page_repair_model(persistent_log_id, suffix_page.get(), [0x16, index as u8])?;
         let current_frontier = owner
             .parts()
             .0
@@ -986,8 +1299,17 @@ fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_lock
         assert_file_composition_locked(&case_path, &slot_path)?;
         let after_failure = fs::read(&page_store_path)?;
         match fault {
-            PageStoreFaultPoint::BeforeWrite => assert_eq!(after_failure, before_attempt),
-            PageStoreFaultPoint::AfterWrite => assert_ne!(after_failure, before_attempt),
+            PageStoreFaultPoint::BeforeWrite => {
+                assert_eq!(after_failure, before_attempt);
+                assert_eq!(model.repair_pages_fault(), Err(ModelError::RepairFault));
+            }
+            PageStoreFaultPoint::AfterWrite => {
+                assert_ne!(after_failure, before_attempt);
+                assert!(matches!(
+                    model.repair_pages_applied_fault(),
+                    ModelApplied::AppliedThenError { .. }
+                ));
+            }
         }
 
         let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
@@ -1013,7 +1335,12 @@ fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_lock
         assert_ne!(after_retry, before_attempt);
         if fault == PageStoreFaultPoint::AfterWrite {
             assert_eq!(after_retry, after_failure);
+        } else {
+            model.repair_pages()?;
         }
+        model.restore_transactions()?;
+        model.complete()?;
+        model.analyze_retention()?;
         let TransactionPageStorageRestartCheckpointRestoration::Restored(restored) =
             repaired.restore_transaction_state()
         else {
@@ -1033,8 +1360,14 @@ fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_lock
             retained.retention_analysis().allocated_epoch_high_water(),
             2
         );
-        let (coordinator, log, store, completion_evidence, retention_analysis, checkpoint) =
+        let (coordinator, mut log, store, completion_evidence, retention_analysis, checkpoint) =
             retained.into_parts();
+        assert_file_subject_matches_model(
+            &mut log,
+            &store,
+            &model,
+            &format!("page repair fault {fault:?}"),
+        )?;
         assert_file_composition_locked(&case_path, &slot_path)?;
         assert_eq!(
             completion_evidence.current_frontier(),
@@ -1353,6 +1686,11 @@ fn every_completeness_publication_fault_has_exact_effect_then_fresh_success()
         let expected =
             owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
         let expected_bytes = encode_restart_checkpoint_completeness_baseline(&expected)?;
+        let mut model = checkpoint_publication_model(
+            persistent_log_id,
+            300 + index as u64,
+            [0x15, index as u8],
+        )?;
         write_synced_new(&slot_path.join("candidate"), b"stale")?;
 
         checkpoint.arm_publication_fault(point)?;
@@ -1387,6 +1725,7 @@ fn every_completeness_publication_fault_has_exact_effect_then_fresh_success()
         assert!(Error::source(failure).is_some());
         assert!(Error::source(failure.cause()).is_none());
         assert_eq!(checkpoint.armed_publication_fault(), None);
+        advance_checkpoint_publication_model(&mut model, point)?;
 
         let candidate_path = slot_path.join("candidate");
         let current_path = slot_path.join("current");
@@ -1414,6 +1753,30 @@ fn every_completeness_publication_fault_has_exact_effect_then_fresh_success()
                 assert_eq!(fs::read(&current_path)?, expected_bytes);
             }
         }
+        assert_eq!(
+            file_checkpoint_candidate_entry(&candidate_path, &expected_bytes)?,
+            model_checkpoint_candidate_entry(&model),
+            "checkpoint candidate state contradicted the model after {point}"
+        );
+        let loaded = checkpoint
+            .load_restart_checkpoint_completeness_baseline()?
+            .ok_or_else(|| io::Error::other("checkpoint current file disappeared after fault"))?;
+        let model_checkpoint = model
+            .checkpoint_slot()
+            .ok_or_else(|| io::Error::other("model checkpoint current slot disappeared"))?;
+        assert_eq!(
+            loaded.transactions().durable_frontier(),
+            model_checkpoint
+                .frontier
+                .position()
+                .map(|position| position.get()),
+            "checkpoint frontier contradicted the model after {point}"
+        );
+        assert_eq!(
+            loaded.pages().len(),
+            model_checkpoint.pages.len(),
+            "checkpoint page count contradicted the model after {point}"
+        );
 
         let receipt = owner.publish_restart_checkpoint_completeness_baseline_from_current_prefix(
             &mut checkpoint,
@@ -1607,6 +1970,431 @@ fn assert_publication_io_stage(
     Ok(())
 }
 
+fn reclamation_model(
+    persistent_log_id: PersistentLogId,
+    retained_page: Option<(u64, [u8; 2])>,
+) -> Result<RecoveryModel, Box<dyn Error>> {
+    let log_id = ModelLogId::new(persistent_log_id.get())
+        .ok_or_else(|| io::Error::other("model persistent log ID is zero"))?;
+    let mut model = RecoveryModel::new(log_id);
+    let anchor = ModelCheckpointAnchor::new(1, persistent_log_id.get());
+
+    if retained_page.is_none() {
+        model.publish_checkpoint(anchor)?;
+    }
+
+    model.allocate_coordinator_epoch()?;
+    let transaction = model.begin_transaction()?;
+    model.append_transaction_commit(transaction)?;
+    model.flush_wal()?;
+
+    if let Some((page_number, bytes)) = retained_page {
+        model.allocate_coordinator_epoch()?;
+        let transaction = model.begin_transaction()?;
+        let page = ModelPageId::new(page_number)
+            .ok_or_else(|| io::Error::other("model page number is zero"))?;
+        let page_position = model.append_transaction_page(
+            transaction,
+            page,
+            model_page_value(bytes),
+            ModelPageVersion::new(1),
+        )?;
+        model.append_transaction_commit(transaction)?;
+        model.flush_wal()?;
+        model.write_page_store(page_position)?;
+        model.publish_checkpoint(anchor)?;
+    }
+
+    model.crash()?;
+    model.reopen()?;
+    model.select()?;
+    model.plan_replay()?;
+    model.repair_pages()?;
+    model.restore_transactions()?;
+    model.complete()?;
+    model.analyze_retention()?;
+    Ok(model)
+}
+
+fn page_repair_model(
+    persistent_log_id: PersistentLogId,
+    page_number: u64,
+    bytes: [u8; 2],
+) -> Result<RecoveryModel, Box<dyn Error>> {
+    let log_id = ModelLogId::new(persistent_log_id.get())
+        .ok_or_else(|| io::Error::other("model persistent log ID is zero"))?;
+    let mut model = RecoveryModel::new(log_id);
+    model.publish_checkpoint(ModelCheckpointAnchor::new(1, persistent_log_id.get()))?;
+    model.allocate_coordinator_epoch()?;
+    let transaction = model.begin_transaction()?;
+    let page = ModelPageId::new(page_number)
+        .ok_or_else(|| io::Error::other("model page number is zero"))?;
+    model.append_transaction_page(
+        transaction,
+        page,
+        model_page_value(bytes),
+        ModelPageVersion::new(1),
+    )?;
+    model.append_transaction_commit(transaction)?;
+    model.flush_wal()?;
+    model.crash()?;
+    model.reopen()?;
+    model.select()?;
+    model.plan_replay()?;
+    Ok(model)
+}
+
+fn checkpoint_publication_model(
+    persistent_log_id: PersistentLogId,
+    page_number: u64,
+    bytes: [u8; 2],
+) -> Result<RecoveryModel, Box<dyn Error>> {
+    let log_id = ModelLogId::new(persistent_log_id.get())
+        .ok_or_else(|| io::Error::other("model persistent log ID is zero"))?;
+    let mut model = RecoveryModel::new(log_id);
+    model.publish_checkpoint(ModelCheckpointAnchor::new(1, persistent_log_id.get()))?;
+    model.allocate_coordinator_epoch()?;
+    let transaction = model.begin_transaction()?;
+    let page = ModelPageId::new(page_number)
+        .ok_or_else(|| io::Error::other("model page number is zero"))?;
+    let position = model.append_transaction_page(
+        transaction,
+        page,
+        model_page_value(bytes),
+        ModelPageVersion::new(1),
+    )?;
+    model.append_transaction_commit(transaction)?;
+    model.flush_wal()?;
+    model.write_page_store(position)?;
+
+    let mut replacement = model.clone();
+    replacement.publish_checkpoint(ModelCheckpointAnchor::new(
+        1,
+        persistent_log_id
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("model checkpoint anchor overflow"))?,
+    ))?;
+    let snapshot = replacement
+        .checkpoint_slot()
+        .cloned()
+        .ok_or_else(|| io::Error::other("model replacement checkpoint is absent"))?;
+    model.begin_checkpoint_candidate(snapshot)?;
+    Ok(model)
+}
+
+fn advance_checkpoint_publication_model(
+    model: &mut RecoveryModel,
+    point: FileRestartCheckpointCompletenessBaselinePublicationFaultPoint,
+) -> Result<(), Box<dyn Error>> {
+    let steps = match point {
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::BeforeCandidateCleanup => {
+            model.set_checkpoint_candidate_entry(ModelCandidateEntry::Corrupt)?;
+            0
+        }
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateCleanup => 1,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateCreate => 2,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateWrite => 3,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateSync => 5,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCurrentReplace => 7,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterDirectorySync => 9,
+    };
+    for _ in 0..steps {
+        model.advance_checkpoint_candidate()?;
+    }
+    Ok(())
+}
+
+fn model_checkpoint_candidate_entry(model: &RecoveryModel) -> ModelCandidateEntry {
+    match model.checkpoint_candidate() {
+        ModelCheckpointCandidateState::Absent => ModelCandidateEntry::Absent,
+        ModelCheckpointCandidateState::Present { entry, .. } => entry.clone(),
+    }
+}
+
+fn file_checkpoint_candidate_entry(
+    path: &Path,
+    expected_bytes: &[u8],
+) -> Result<ModelCandidateEntry, io::Error> {
+    if !path.exists() {
+        return Ok(ModelCandidateEntry::Absent);
+    }
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        Ok(ModelCandidateEntry::PartialWrite)
+    } else if bytes == expected_bytes {
+        Ok(ModelCandidateEntry::Valid)
+    } else {
+        Ok(ModelCandidateEntry::Corrupt)
+    }
+}
+
+fn assert_file_subject_matches_model(
+    log: &mut FileCommitLog<2>,
+    store: &FilePageStore<2>,
+    model: &RecoveryModel,
+    context: &str,
+) -> Result<(), Box<dyn Error>> {
+    let source =
+        DurableTransactionRestartWalReclamationSource::observe_restart_wal_reclamation_source(log)?;
+    let mut contradictions = Vec::new();
+    let actual_log_id = LogDurability::lineage(log)
+        .persistent_id()
+        .map(PersistentLogId::get);
+    compare_field(
+        &mut contradictions,
+        "persistent_log_id",
+        Some(model.log_id().get()),
+        actual_log_id,
+    );
+    compare_field(
+        &mut contradictions,
+        "physical_format_version",
+        model.wal_format_version(),
+        source.physical_format_version(),
+    );
+    compare_field(
+        &mut contradictions,
+        "generation",
+        model.wal_generation().get(),
+        source.source_generation(),
+    );
+    compare_field(
+        &mut contradictions,
+        "replacement_header_retained_first",
+        model.retained_first().map(|position| position.get()),
+        log.replacement_header_retained_first()
+            .map(|position| position.get()),
+    );
+    compare_field(
+        &mut contradictions,
+        "replacement_header_logical_high_water",
+        model
+            .replacement_logical_high_water()
+            .map(|position| position.get()),
+        log.replacement_header_logical_high_water()
+            .map(|position| position.get()),
+    );
+    compare_field(
+        &mut contradictions,
+        "replacement_header_allocated_epoch_high_water",
+        model.replacement_epoch_high_water(),
+        log.replacement_header_allocated_epoch_high_water()
+            .map(|epoch| epoch.get()),
+    );
+    compare_field(
+        &mut contradictions,
+        "current_retained_first",
+        model
+            .durable_wal_records()
+            .next()
+            .map(|record| record.position.get()),
+        source
+            .retained_first_logical_record()
+            .map(|position| position.get()),
+    );
+    compare_field(
+        &mut contradictions,
+        "logical_high_water",
+        model.logical_high_water().map(|position| position.get()),
+        source
+            .logical_position_high_water()
+            .map(|position| position.get()),
+    );
+    compare_field(
+        &mut contradictions,
+        "next_logical_position",
+        model.next_logical_position(),
+        log.next_logical_position(),
+    );
+    compare_field(
+        &mut contradictions,
+        "allocated_epoch_high_water",
+        model.epoch_high_water(),
+        Some(source.allocated_epoch_high_water().get()),
+    );
+    compare_field(
+        &mut contradictions,
+        "generation_anchor_presence",
+        model.generation_anchor().is_some(),
+        source.selected_checkpoint_anchor_version().is_some()
+            && source.selected_checkpoint_anchor_value().is_some(),
+    );
+
+    let expected_records = normalized_model_records(model)?;
+    let actual_records = normalized_file_records(log)?;
+    compare_field(
+        &mut contradictions,
+        "durable_records",
+        expected_records,
+        actual_records,
+    );
+
+    let expected_pages = normalized_model_pages(model);
+    let actual_pages = normalized_file_pages(store);
+    compare_field(
+        &mut contradictions,
+        "stored_pages",
+        expected_pages,
+        actual_pages,
+    );
+
+    if contradictions.is_empty() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{context} contradicted the recovery model:\n{}",
+            contradictions.join("\n")
+        ))
+        .into())
+    }
+}
+
+fn normalized_model_records(model: &RecoveryModel) -> Result<Vec<NormalizedRecord>, io::Error> {
+    model
+        .durable_wal_records()
+        .map(|record| {
+            let kind = match record.kind {
+                ModelWalRecordKind::TransactionCommit => {
+                    let transaction = record.transaction.ok_or_else(|| {
+                        io::Error::other("model commit has no transaction identity")
+                    })?;
+                    NormalizedRecordKind::TransactionCommit {
+                        epoch: transaction.epoch(),
+                        sequence: transaction.sequence(),
+                    }
+                }
+                ModelWalRecordKind::RawPage => NormalizedRecordKind::RawPage {
+                    page: record
+                        .page
+                        .ok_or_else(|| io::Error::other("model raw page has no page identity"))?
+                        .get(),
+                    version: record
+                        .page_version
+                        .ok_or_else(|| io::Error::other("model raw page has no version"))?
+                        .get(),
+                    value: record
+                        .page_value
+                        .ok_or_else(|| io::Error::other("model raw page has no value"))?,
+                },
+                ModelWalRecordKind::TransactionPage => {
+                    let transaction = record
+                        .transaction
+                        .ok_or_else(|| io::Error::other("model transaction page has no owner"))?;
+                    NormalizedRecordKind::TransactionPage {
+                        epoch: transaction.epoch(),
+                        sequence: transaction.sequence(),
+                        page: record
+                            .page
+                            .ok_or_else(|| {
+                                io::Error::other("model transaction page has no page identity")
+                            })?
+                            .get(),
+                        version: record
+                            .page_version
+                            .ok_or_else(|| {
+                                io::Error::other("model transaction page has no version")
+                            })?
+                            .get(),
+                        value: record.page_value.ok_or_else(|| {
+                            io::Error::other("model transaction page has no value")
+                        })?,
+                    }
+                }
+            };
+            Ok(NormalizedRecord {
+                position: record.position.get(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn normalized_file_records(log: &FileCommitLog<2>) -> Result<Vec<NormalizedRecord>, io::Error> {
+    log.durable_records()
+        .map(|record| {
+            let kind = if let (Some(epoch), Some(sequence)) =
+                (record.transaction_epoch(), record.transaction_sequence())
+            {
+                NormalizedRecordKind::TransactionCommit { epoch, sequence }
+            } else {
+                let page = record
+                    .page_write()
+                    .ok_or_else(|| io::Error::other("filesystem page record has no payload"))?;
+                match (
+                    record.page_owner_transaction_epoch(),
+                    record.page_owner_transaction_sequence(),
+                ) {
+                    (Some(epoch), Some(sequence)) => NormalizedRecordKind::TransactionPage {
+                        epoch,
+                        sequence,
+                        page: page.page_number().get(),
+                        version: page.page_version().get(),
+                        value: model_page_value(*page.bytes()),
+                    },
+                    (None, None) => NormalizedRecordKind::RawPage {
+                        page: page.page_number().get(),
+                        version: page.page_version().get(),
+                        value: model_page_value(*page.bytes()),
+                    },
+                    _ => {
+                        return Err(io::Error::other(
+                            "filesystem page owner identity is incomplete",
+                        ));
+                    }
+                }
+            };
+            Ok(NormalizedRecord {
+                position: record.position().get(),
+                kind,
+            })
+        })
+        .collect()
+}
+
+fn normalized_model_pages(model: &RecoveryModel) -> Vec<NormalizedPage> {
+    model
+        .page_store()
+        .values()
+        .map(|page| NormalizedPage {
+            page: page.page_id.get(),
+            version: page.version.get(),
+            value: page.value,
+            required_position: page.written_at.get(),
+        })
+        .collect()
+}
+
+fn normalized_file_pages(store: &FilePageStore<2>) -> Vec<NormalizedPage> {
+    let mut pages = store
+        .pages()
+        .iter()
+        .map(|page| NormalizedPage {
+            page: page.page_number().get(),
+            version: page.page_version().get(),
+            value: model_page_value(*page.bytes()),
+            required_position: page.required_position().get(),
+        })
+        .collect::<Vec<_>>();
+    pages.sort();
+    pages
+}
+
+fn compare_field<T: fmt::Debug + PartialEq>(
+    contradictions: &mut Vec<String>,
+    field: &str,
+    expected: T,
+    actual: T,
+) {
+    if expected != actual {
+        contradictions.push(format!("{field}: expected {expected:?}, actual {actual:?}"));
+    }
+}
+
+const fn model_page_value(bytes: [u8; 2]) -> u64 {
+    (bytes[0] as u64) << 8 | bytes[1] as u64
+}
+
 fn analyzed_owner(
     directory: &Path,
     persistent_log_id: PersistentLogId,
@@ -1763,6 +2551,12 @@ fn persistent_log_id(value: u128) -> Result<PersistentLogId, io::Error> {
 
 fn write_synced_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+fn write_synced_replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }

@@ -11,11 +11,12 @@ use ntsql_page::{
     PageAddress, PageImage, PageNumber, PageVersion, StoredPageSnapshotObservation, UnloggedPage,
 };
 use ntsql_storage_file::{
-    FileCommitLog, FileCommittedPageRecoveryObservationError, FilePageStore,
+    FileCommitLog, FileCommittedPageRecoveryObservationError, FilePageStore, FilePageStoreError,
     FileRestartCheckpointCompletenessBaselinePublicationError,
     FileRestartCheckpointCompletenessBaselinePublicationFaultPoint,
-    FileRestartCheckpointCompletenessBaselineSource, FileRestartCheckpointSlotIoStage,
-    FileTransactionRestartAnalysisSourceError, encode_restart_checkpoint_completeness_baseline,
+    FileRestartCheckpointCompletenessBaselineSource, FileRestartCheckpointPageRepairStoreError,
+    FileRestartCheckpointSlotIoStage, FileTransactionRestartAnalysisSourceError,
+    PageStoreFaultPoint, encode_restart_checkpoint_completeness_baseline,
     open_transaction_page_storage_with_completeness_checkpoint,
 };
 use ntsql_transaction::{
@@ -30,7 +31,10 @@ use ntsql_transaction::{
     DurableTransactionRestartCompletenessError, DurableTransactionRestartCompletenessEvidenceError,
     DurableTransactionRestartPageState, RestartAnalyzedTransactionPageStorage,
     TransactionCoordinator, TransactionPageStorageRestartCheckpointCompletenessSelection,
-    TransactionPageStorageRestartCheckpointRepairPreparation, UnrecoveredTransactionPageStorage,
+    TransactionPageStorageRestartCheckpointPageRepairExecution,
+    TransactionPageStorageRestartCheckpointRepairPreparation,
+    TransactionRestartCheckpointPageRepairFailureCause,
+    TransactionRestartCheckpointPageRepairOutcome, UnrecoveredTransactionPageStorage,
     flush_committed_page,
 };
 use ntsql_wal::{LogDurability, LogLineage, PersistentLogId};
@@ -354,33 +358,29 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
     assert_eq!(prepared.repair_candidate_count(), 1);
     assert_eq!(fs::read(&page_store_path)?, page_store_before_preparation);
 
-    let uncheckpointed = prepared.decline_page_repairs();
-    assert_file_composition_locked(directory.path(), &slot_path)?;
-    let recovered = uncheckpointed.recover()?;
-    assert_file_composition_locked(directory.path(), &slot_path)?;
-    assert!(recovered.recovery_report().pages().iter().any(|page| {
-        matches!(
-            page,
-            CommittedTransactionPageRecoveryOutcome::Recovered { .. }
-        ) && page.page_number().get() == suffix_page
-    }));
-    let analyzed = recovered.analyze_restart()?;
-    assert_file_composition_locked(directory.path(), &slot_path)?;
-    assert_eq!(
-        analyzed
-            .restart_analysis()
-            .durable_frontier()
-            .map(ntsql_wal::LogSequenceNumber::get),
-        Some(current_frontier.get())
-    );
-
-    let (log, store, _, _, checkpoint) = analyzed.into_parts();
-    assert_file_composition_locked(directory.path(), &slot_path)?;
     let suffix_page =
         PageNumber::new(suffix_page).ok_or_else(|| io::Error::other("suffix page is zero"))?;
+    let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+        prepared.execute_page_repairs()
+    else {
+        return Err(io::Error::other("filesystem replay page repair execution failed").into());
+    };
+    assert_file_composition_locked(directory.path(), &slot_path)?;
+    assert_eq!(
+        repaired.page_outcomes(),
+        [TransactionRestartCheckpointPageRepairOutcome::Repaired {
+            page_number: suffix_page,
+        }]
+    );
+    assert_ne!(fs::read(&page_store_path)?, page_store_before_preparation);
+    drop(repaired);
+
+    let log = FileCommitLog::<2>::open_transaction_page_capable(directory.path().join("wal.bin"))?;
+    let store = FilePageStore::<2>::open(&page_store_path)?;
+    let checkpoint = FileRestartCheckpointCompletenessBaselineSource::open(&slot_path)?;
     let stored = store
         .page(suffix_page)
-        .ok_or_else(|| io::Error::other("planned suffix was not recovered"))?;
+        .ok_or_else(|| io::Error::other("executed suffix repair was not durable"))?;
     assert_eq!(stored.page_version(), PageVersion::new(2));
     assert_eq!(stored.bytes(), &[0x16, 0x12]);
     assert_eq!(checkpoint.persistent_log_id(), persistent_log_id);
@@ -393,6 +393,143 @@ fn selected_checkpoint_plans_suffix_without_releasing_filesystem_locks()
     drop(FileRestartCheckpointCompletenessBaselineSource::open(
         &slot_path,
     )?);
+    Ok(())
+}
+
+#[test]
+fn filesystem_replay_page_repair_faults_retry_from_page_one_under_all_three_locks()
+-> Result<(), Box<dyn Error>> {
+    let directory = TestDirectory::new("replay-repair-faults")?;
+    for (index, fault) in [
+        PageStoreFaultPoint::BeforeWrite,
+        PageStoreFaultPoint::AfterWrite,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case_path = directory.path().join(format!("case-{index}"));
+        fs::create_dir(&case_path)?;
+        let persistent_log_id = persistent_log_id(16600 + index as u128)?;
+        let wal_path = case_path.join("wal.bin");
+        let page_store_path = case_path.join("pages.bin");
+        let slot_path = case_path.join("completeness");
+        let suffix_page = PageNumber::new(166 + index as u64)
+            .ok_or_else(|| io::Error::other("repair fault suffix page is zero"))?;
+
+        let mut owner = analyzed_owner(&case_path, persistent_log_id)?;
+        let baseline =
+            owner.prepare_restart_checkpoint_completeness_baseline_from_current_prefix()?;
+        assert!(baseline.pages().is_empty());
+        let mut checkpoint = FileRestartCheckpointCompletenessBaselineSource::create_new(
+            &slot_path,
+            persistent_log_id,
+        )?;
+        let receipt = owner.publish_restart_checkpoint_completeness_baseline_from_current_prefix(
+            &mut checkpoint,
+        )?;
+        assert_eq!(receipt.durable_frontier(), None);
+        append_committed_page_without_store_flush(
+            &mut owner,
+            suffix_page.get(),
+            1,
+            [0x16, index as u8],
+        )?;
+        let current_frontier = owner
+            .parts()
+            .0
+            .durable_position()
+            .ok_or_else(|| io::Error::other("repair fault suffix is not durable"))?;
+        drop(owner);
+        drop(checkpoint);
+
+        let log = FileCommitLog::<2>::open_transaction_page_capable(&wal_path)?;
+        let mut store = FilePageStore::<2>::open(&page_store_path)?;
+        store.arm_fault(fault)?;
+        let checkpoint = FileRestartCheckpointCompletenessBaselineSource::open(&slot_path)?;
+        let selection = UnrecoveredTransactionPageStorage::new(log, store)
+            .select_restart_checkpoint_completeness(checkpoint);
+        let TransactionPageStorageRestartCheckpointCompletenessSelection::Selected(selected) =
+            selection
+        else {
+            return Err(io::Error::other("repair fault checkpoint was not selected").into());
+        };
+        assert_file_composition_locked(&case_path, &slot_path)?;
+        let planned = selected.plan_replay_window()?;
+        assert_eq!(planned.current_frontier(), Some(current_frontier.get()));
+        assert_eq!(planned.replay_record_count(), 2);
+        let TransactionPageStorageRestartCheckpointRepairPreparation::Prepared(prepared) =
+            planned.prepare_page_repairs()
+        else {
+            return Err(io::Error::other("repair fault preparation failed").into());
+        };
+        assert_eq!(prepared.page_count(), 1);
+        assert_eq!(prepared.repair_candidate_count(), 1);
+        let before_attempt = fs::read(&page_store_path)?;
+
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Failed(failed) =
+            prepared.execute_page_repairs()
+        else {
+            return Err(io::Error::other("filesystem repair fault did not fire").into());
+        };
+        assert!(failed.completed_prefix().is_empty());
+        assert!(failed.has_indeterminate_result());
+        assert!(matches!(
+            failed.cause(),
+            TransactionRestartCheckpointPageRepairFailureCause::StoreWrite {
+                page_number,
+                source:
+                    FileRestartCheckpointPageRepairStoreError::PageStore(
+                        FilePageStoreError::InjectedFault(actual)
+                    ),
+            } if *page_number == suffix_page && *actual == fault
+        ));
+        assert_file_composition_locked(&case_path, &slot_path)?;
+        let after_failure = fs::read(&page_store_path)?;
+        match fault {
+            PageStoreFaultPoint::BeforeWrite => assert_eq!(after_failure, before_attempt),
+            PageStoreFaultPoint::AfterWrite => assert_ne!(after_failure, before_attempt),
+        }
+
+        let TransactionPageStorageRestartCheckpointPageRepairExecution::Repaired(repaired) =
+            failed.retry()
+        else {
+            return Err(io::Error::other("filesystem repair whole-plan retry failed").into());
+        };
+        let expected = match fault {
+            PageStoreFaultPoint::BeforeWrite => {
+                TransactionRestartCheckpointPageRepairOutcome::Repaired {
+                    page_number: suffix_page,
+                }
+            }
+            PageStoreFaultPoint::AfterWrite => {
+                TransactionRestartCheckpointPageRepairOutcome::TargetAlreadyPresent {
+                    page_number: suffix_page,
+                }
+            }
+        };
+        assert_eq!(repaired.page_outcomes(), [expected]);
+        assert_file_composition_locked(&case_path, &slot_path)?;
+        let after_retry = fs::read(&page_store_path)?;
+        assert_ne!(after_retry, before_attempt);
+        if fault == PageStoreFaultPoint::AfterWrite {
+            assert_eq!(after_retry, after_failure);
+        }
+        drop(repaired);
+
+        let store = FilePageStore::<2>::open(&page_store_path)?;
+        let stored = store
+            .page(suffix_page)
+            .ok_or_else(|| io::Error::other("repaired filesystem page is missing after reopen"))?;
+        assert_eq!(stored.page_version(), PageVersion::new(1));
+        assert_eq!(stored.bytes(), &[0x16, index as u8]);
+        drop(store);
+        drop(FileCommitLog::<2>::open_transaction_page_capable(
+            &wal_path,
+        )?);
+        drop(FileRestartCheckpointCompletenessBaselineSource::open(
+            &slot_path,
+        )?);
+    }
     Ok(())
 }
 

@@ -14,10 +14,10 @@ use ntsql_database::{
     DatabaseCleanManifestPublicationReceipt, DatabaseCleanManifestPublicationState,
     DatabaseCleanManifestPublisher, DatabaseCleanManifestPublisherFailure,
     DatabaseCloseSourceManifestOwner, DatabaseCompositionIdentity,
-    DatabaseCompositionIdentityError, DatabaseCompositionIdentityMismatch, DatabaseFileId,
-    DatabaseFileIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleStage, DatabaseManifest,
-    DatabaseManifestSelectionRejection, DatabaseManifestSuccessorError,
-    DatabaseRecoveryFailureCause, DatabaseRecoveryOwner, DatabaseStorageFormatVersion,
+    DatabaseCompositionIdentityError, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
+    DatabaseId, DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
+    DatabaseManifestSuccessorError, DatabaseRecoveryFailureCause, DatabaseRecoveryOwner,
+    DatabaseRecoveryRequiredBindingRejection, DatabaseStorageFormatVersion,
     DatabaseStorageIdentity, FailedDatabaseClosePreparation, FailedDatabaseClosePublication,
     FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase, PreparedDatabaseCloseOwnership,
     PublishedDatabaseCloseOwnership, RecoveredDatabaseOwnership, RecoveryRequiredDatabase,
@@ -1008,13 +1008,7 @@ impl InMemoryDatabaseOwnershipSlot {
         manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
     ) -> Result<InMemoryDatabaseOwnershipSelection, InMemoryDatabaseOwnershipError> {
-        let acquired = self.acquire(
-            expected_database_id,
-            manifest_object_id,
-            manifest,
-            files,
-            false,
-        )?;
+        let acquired = self.acquire(expected_database_id, manifest_object_id, manifest, files)?;
         Ok(InMemoryDatabaseOwnershipSelection {
             selected: acquired.selected,
         })
@@ -1028,13 +1022,7 @@ impl InMemoryDatabaseOwnershipSlot {
         manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
     ) -> Result<RecoveryRequiredInMemoryDatabase, InMemoryDatabaseOwnershipError> {
-        let acquired = self.acquire(
-            expected_database_id,
-            manifest_object_id,
-            manifest,
-            files,
-            true,
-        )?;
+        let acquired = self.acquire(expected_database_id, manifest_object_id, manifest, files)?;
         acquired
             .selected
             .bind_observed_storage(acquired.observed_storage_identity)
@@ -1047,7 +1035,6 @@ impl InMemoryDatabaseOwnershipSlot {
         manifest_object_id: InMemoryDatabaseObjectId,
         manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
-        require_recovery_required: bool,
     ) -> Result<AcquiredInMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError> {
         let mut guard = InMemoryDatabaseOwnershipGuard::new();
         guard.acquire(
@@ -1087,17 +1074,6 @@ impl InMemoryDatabaseOwnershipSlot {
                 manifest: manifest_database_id,
             });
         }
-        if require_recovery_required
-            && !matches!(
-                manifest.lifecycle_state(),
-                ntsql_database::DatabaseManifestLifecycleState::RecoveryRequired
-            )
-        {
-            return Err(InMemoryDatabaseOwnershipError::ManifestLifecycle {
-                actual: manifest.lifecycle_state(),
-            });
-        }
-
         let wal = require_exact_role(files, DatabaseFileRole::Wal)?;
         let page_store = require_exact_role(files, DatabaseFileRole::PageStore)?;
         let restart_checkpoint = require_exact_role(files, DatabaseFileRole::RestartCheckpoint)?;
@@ -1244,7 +1220,7 @@ fn prepare_memory_create_request(
         .require_exact_match(observed_storage_identity)
         .map_err(|source| {
             InMemoryDatabaseCreateError::Ownership(InMemoryDatabaseOwnershipError::StorageBinding(
-                source,
+                DatabaseRecoveryRequiredBindingRejection::StorageIdentity(source),
             ))
         })?;
 
@@ -1386,7 +1362,11 @@ fn finish_in_memory_database_acquisition(
     selected_identity
         .storage_identity()
         .require_exact_match(observed_storage_identity)
-        .map_err(InMemoryDatabaseOwnershipError::StorageBinding)?;
+        .map_err(|source| {
+            InMemoryDatabaseOwnershipError::StorageBinding(
+                DatabaseRecoveryRequiredBindingRejection::StorageIdentity(source),
+            )
+        })?;
     guard.commit_bindings();
     let owner = InMemoryDatabaseOwnership {
         manifest,
@@ -1396,8 +1376,7 @@ fn finish_in_memory_database_acquisition(
         creates,
         _guard: guard,
     };
-    let selected = match UnboundDatabase::new(owner, expected_database_id)
-        .select_manifest(selected_identity)
+    let selected = match UnboundDatabase::new(owner, expected_database_id).select_manifest(manifest)
     {
         Ok(selected) => selected,
         Err(failure) => {
@@ -2546,6 +2525,12 @@ impl InMemoryDatabaseOwnershipSelection {
         self.selected.identity()
     }
 
+    /// Returns the complete selected inert manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.selected.manifest()
+    }
+
     /// Returns the strongest lifecycle stage exposed by this ownership gate.
     #[must_use]
     pub const fn stage(&self) -> DatabaseLifecycleStage {
@@ -2557,7 +2542,7 @@ impl fmt::Debug for InMemoryDatabaseOwnershipSelection {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("InMemoryDatabaseOwnershipSelection")
-            .field("identity", &self.selected.identity())
+            .field("manifest", &self.selected.manifest())
             .finish_non_exhaustive()
     }
 }
@@ -2625,11 +2610,6 @@ pub enum InMemoryDatabaseOwnershipError {
         /// Manifest identity.
         manifest: DatabaseId,
     },
-    /// Recovery-required acquisition received another manifest lifecycle.
-    ManifestLifecycle {
-        /// Exact rejected lifecycle state.
-        actual: ntsql_database::DatabaseManifestLifecycleState,
-    },
     /// One required child role is absent.
     MissingRole {
         /// Missing role.
@@ -2672,7 +2652,7 @@ pub enum InMemoryDatabaseOwnershipError {
     /// The domain manifest-selection gate rejected the modeled owner.
     ManifestSelection(DatabaseManifestSelectionRejection),
     /// Exact comparison rejected the modeled observations.
-    StorageBinding(DatabaseCompositionIdentityMismatch),
+    StorageBinding(DatabaseRecoveryRequiredBindingRejection),
 }
 
 impl fmt::Display for InMemoryDatabaseOwnershipError {
@@ -2728,10 +2708,6 @@ impl fmt::Display for InMemoryDatabaseOwnershipError {
                 "database manifest identity {} does not match owner {}",
                 manifest.get(),
                 owner.get()
-            ),
-            Self::ManifestLifecycle { actual } => write!(
-                formatter,
-                "recovery-required memory open cannot select {actual} manifest"
             ),
             Self::MissingRole { role } => write!(formatter, "database is missing the {role} role"),
             Self::DuplicateRole { role } => {
@@ -2799,7 +2775,6 @@ impl Error for InMemoryDatabaseOwnershipError {
             | Self::SelectedManifestMismatch
             | Self::ObjectAlias { .. }
             | Self::ManifestDatabaseIdMismatch { .. }
-            | Self::ManifestLifecycle { .. }
             | Self::MissingRole { .. }
             | Self::DuplicateRole { .. }
             | Self::FileIdMismatch { .. }

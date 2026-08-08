@@ -6,8 +6,8 @@ use ntsql_database::{
     DatabaseClosePreparationFailureCause, DatabaseClosePreparationPreflightError,
     DatabaseCompositionIdentity, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
     DatabaseId, DatabaseLifecycleGeneration, DatabaseLifecycleStage, DatabaseManifest,
-    DatabaseManifestLifecycleState, DatabaseRequiredFeatures, DatabaseStorageFormatRequirements,
-    DatabaseStorageFormatVersion,
+    DatabaseManifestLifecycleState, DatabaseRecoveryRequiredBindingRejection,
+    DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
 };
 use ntsql_storage_memory::{
     InMemoryCommitLog, InMemoryDatabaseCloseBoundary, InMemoryDatabaseCloseFault,
@@ -1286,13 +1286,18 @@ fn clean_source_manifest_is_rejected_before_recovery_required_authority()
     composition.manifest = composition.manifest.next_clean(certificate)?;
     let mut world = InMemoryDatabaseOwnershipWorld::new();
     let slot = composition.slot(&mut world)?;
+    let selected = composition.acquire(&slot)?;
+    assert_eq!(selected.manifest(), composition.manifest);
+    drop(selected);
     assert_eq!(
         composition
             .acquire_recovery_required(&slot, composition.manifest)
             .err(),
-        Some(InMemoryDatabaseOwnershipError::ManifestLifecycle {
-            actual: DatabaseManifestLifecycleState::Clean(certificate),
-        })
+        Some(InMemoryDatabaseOwnershipError::StorageBinding(
+            DatabaseRecoveryRequiredBindingRejection::ManifestLifecycle {
+                actual: DatabaseManifestLifecycleState::Clean(certificate),
+            }
+        ))
     );
     assert!(!slot.is_owned());
     Ok(())

@@ -13,10 +13,10 @@ use ntsql_database::{
     DatabaseCleanManifestPublicationPermit, DatabaseCleanManifestPublicationReceipt,
     DatabaseCleanManifestPublicationState, DatabaseCleanManifestPublisher,
     DatabaseCleanManifestPublisherFailure, DatabaseCloseSourceManifestOwner,
-    DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
-    DatabaseCompositionIdentityMismatch, DatabaseFileHeaderIdentity, DatabaseFileRole, DatabaseId,
-    DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
-    DatabaseManifestSuccessorError, DatabaseRecoveryFailureCause, DatabaseRecoveryOwner,
+    DatabaseCompositionIdentity, DatabaseCompositionIdentityError, DatabaseFileHeaderIdentity,
+    DatabaseFileRole, DatabaseId, DatabaseLifecycleStage, DatabaseManifest,
+    DatabaseManifestSelectionRejection, DatabaseManifestSuccessorError,
+    DatabaseRecoveryFailureCause, DatabaseRecoveryOwner, DatabaseRecoveryRequiredBindingRejection,
     DatabaseStorageFormatVersion, DatabaseStorageIdentity, FailedDatabaseClosePreparation,
     FailedDatabaseClosePublication, FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase,
     PreparedDatabaseCloseOwnership, PublishedDatabaseCloseOwnership, RecoveredDatabaseOwnership,
@@ -881,7 +881,7 @@ pub enum FileDatabaseCreateError {
     /// Domain manifest selection rejected the retained owner.
     ManifestSelection(DatabaseManifestSelectionRejection),
     /// Domain stable-storage binding rejected the retained observations.
-    StorageBinding(DatabaseCompositionIdentityMismatch),
+    StorageBinding(DatabaseRecoveryRequiredBindingRejection),
 }
 
 /// Exact requested and observed manifests retained by a create mismatch.
@@ -975,7 +975,6 @@ const fn ownership_open_is_outcome_indeterminate(source: &FileDatabaseOwnershipO
         | FileDatabaseOwnershipOpenError::Manifest(_)
         | FileDatabaseOwnershipOpenError::ManifestV2(_)
         | FileDatabaseOwnershipOpenError::ManifestDatabaseIdMismatch { .. }
-        | FileDatabaseOwnershipOpenError::ManifestLifecycle { .. }
         | FileDatabaseOwnershipOpenError::StorageFormatVersionMismatch { .. }
         | FileDatabaseOwnershipOpenError::PersistentLogIdMismatch { .. }
         | FileDatabaseOwnershipOpenError::ChildDatabaseIdMismatch { .. }
@@ -1365,11 +1364,6 @@ pub enum FileDatabaseOwnershipOpenError {
         /// Identity decoded from the manifest.
         manifest: DatabaseId,
     },
-    /// Recovery-required open received another manifest lifecycle.
-    ManifestLifecycle {
-        /// Exact rejected lifecycle state.
-        actual: ntsql_database::DatabaseManifestLifecycleState,
-    },
     /// The selected WAL could not be locked and reconstructed.
     WalOpen(FileOpenError),
     /// The selected page store could not be locked and reconstructed.
@@ -1430,7 +1424,7 @@ pub enum FileDatabaseOwnershipOpenError {
     /// The physically observed role set is internally invalid.
     ObservedStorageIdentity(DatabaseCompositionIdentityError),
     /// The domain storage-binding gate rejected physical evidence.
-    StorageBinding(DatabaseCompositionIdentityMismatch),
+    StorageBinding(DatabaseRecoveryRequiredBindingRejection),
     /// The domain manifest-selection gate rejected the locked owner.
     ManifestSelection(DatabaseManifestSelectionRejection),
 }
@@ -1492,10 +1486,6 @@ impl fmt::Display for FileDatabaseOwnershipOpenError {
                 "database manifest identity {} does not match locked owner {}",
                 manifest.get(),
                 owner.get()
-            ),
-            Self::ManifestLifecycle { actual } => write!(
-                formatter,
-                "recovery-required filesystem open cannot select {actual} manifest"
             ),
             Self::WalOpen(source) => {
                 write!(formatter, "database WAL open failed: {source}")
@@ -1603,7 +1593,6 @@ impl Error for FileDatabaseOwnershipOpenError {
             | Self::CloseCandidatePathCollision { .. }
             | Self::ManifestFileLength { .. }
             | Self::ManifestDatabaseIdMismatch { .. }
-            | Self::ManifestLifecycle { .. }
             | Self::StorageFormatVersionMismatch { .. }
             | Self::PersistentLogIdMismatch { .. }
             | Self::ChildDatabaseIdMismatch { .. }
@@ -2817,6 +2806,12 @@ impl<const N: usize> FileDatabaseOwnershipSelection<N> {
         self.selected.identity()
     }
 
+    /// Returns the complete selected inert manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.selected.manifest()
+    }
+
     /// Returns the strongest lifecycle stage established by current headers.
     #[must_use]
     pub const fn stage(&self) -> DatabaseLifecycleStage {
@@ -2828,7 +2823,7 @@ impl<const N: usize> fmt::Debug for FileDatabaseOwnershipSelection<N> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FileDatabaseOwnershipSelection")
-            .field("identity", &self.selected.identity())
+            .field("manifest", &self.selected.manifest())
             .finish_non_exhaustive()
     }
 }
@@ -3147,17 +3142,6 @@ fn acquire_file_database_ownership<const N: usize>(
             manifest: manifest_database_id,
         });
     }
-    if require_stable_storage
-        && !matches!(
-            manifest.lifecycle_state(),
-            ntsql_database::DatabaseManifestLifecycleState::RecoveryRequired
-        )
-    {
-        return Err(FileDatabaseOwnershipOpenError::ManifestLifecycle {
-            actual: manifest.lifecycle_state(),
-        });
-    }
-
     let wal_probe_metadata = {
         let (_wal_probe, wal_metadata) = open_file(layout.wal(), FileDatabaseLockRole::Wal)?;
         reject_alias(
@@ -3358,7 +3342,6 @@ fn acquire_file_database_ownership<const N: usize>(
             log, store, checkpoint,
         );
 
-    let selected_identity = manifest.composition_identity();
     let owner = FileDatabaseOwnership {
         composition,
         _manifest_file: manifest_file,
@@ -3366,8 +3349,7 @@ fn acquire_file_database_ownership<const N: usize>(
         manifest,
         layout,
     };
-    let selected = match UnboundDatabase::new(owner, expected_database_id)
-        .select_manifest(selected_identity)
+    let selected = match UnboundDatabase::new(owner, expected_database_id).select_manifest(manifest)
     {
         Ok(selected) => selected,
         Err(failure) => {
@@ -5153,7 +5135,7 @@ fn bind_created_file_database<const N: usize>(
         layout,
     };
     let selected = match UnboundDatabase::new(owner, selected_identity.database_id())
-        .select_manifest(selected_identity)
+        .select_manifest(manifest)
     {
         Ok(selected) => selected,
         Err(failure) => {

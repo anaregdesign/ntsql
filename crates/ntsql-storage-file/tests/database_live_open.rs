@@ -12,8 +12,8 @@ use ntsql_database::{
     DatabaseCleanManifestPublicationState, DatabaseClosePreparationFailureCause,
     DatabaseCompositionIdentity, DatabaseFileIdentity, DatabaseFileRole, DatabaseId,
     DatabaseLifecycleGeneration, DatabaseLifecycleStage, DatabaseManifest,
-    DatabaseManifestLifecycleState, DatabaseRequiredFeatures, DatabaseStorageFormatRequirements,
-    DatabaseStorageFormatVersion,
+    DatabaseManifestLifecycleState, DatabaseRecoveryRequiredBindingRejection,
+    DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
 };
 use ntsql_storage_file::{
     DATABASE_MANIFEST_V1_LENGTH, DATABASE_MANIFEST_V2_LENGTH, FileCleanCloseCheckpointFaultPoint,
@@ -194,14 +194,16 @@ fn clean_close_publishes_exact_v2_and_retains_every_lock() -> Result<(), Box<dyn
     drop(closed);
     assert!(matches!(
         open_recovery_required_file_database::<1>(database.database_id, database.layout.clone()),
-        Err(FileDatabaseOwnershipOpenError::ManifestLifecycle {
-            actual: DatabaseManifestLifecycleState::Clean(_),
-        })
+        Err(FileDatabaseOwnershipOpenError::StorageBinding(
+            DatabaseRecoveryRequiredBindingRejection::ManifestLifecycle {
+                actual: DatabaseManifestLifecycleState::Clean(_),
+            }
+        ))
     ));
-    drop(open_file_database_ownership::<1>(
-        database.database_id,
-        database.layout.clone(),
-    )?);
+    let selected =
+        open_file_database_ownership::<1>(database.database_id, database.layout.clone())?;
+    assert_eq!(selected.manifest(), target);
+    drop(selected);
     Ok(())
 }
 
@@ -300,9 +302,11 @@ fn every_manifest_publication_fault_retains_state_and_allows_fresh_open()
                         database.database_id,
                         database.layout.clone()
                     ),
-                    Err(FileDatabaseOwnershipOpenError::ManifestLifecycle {
-                        actual: DatabaseManifestLifecycleState::Clean(_),
-                    })
+                    Err(FileDatabaseOwnershipOpenError::StorageBinding(
+                        DatabaseRecoveryRequiredBindingRejection::ManifestLifecycle {
+                            actual: DatabaseManifestLifecycleState::Clean(_),
+                        }
+                    ))
                 ));
             } else {
                 drop(open_recovery_required_file_database::<1>(

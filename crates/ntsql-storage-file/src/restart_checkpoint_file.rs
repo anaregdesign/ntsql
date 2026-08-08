@@ -1293,6 +1293,20 @@ pub(crate) fn create_locked_database_control_slot(
     let persistent_log_id = storage_identity.persistent_log_id();
     let database_file_identity =
         storage_identity.file_header_identity(ntsql_database::DatabaseFileRole::RestartCheckpoint);
+    create_locked_database_control_slot_from_identity(
+        slot_directory,
+        magic,
+        persistent_log_id,
+        database_file_identity,
+    )
+}
+
+pub(crate) fn create_locked_database_control_slot_from_identity(
+    slot_directory: &Path,
+    magic: [u8; 8],
+    persistent_log_id: PersistentLogId,
+    database_file_identity: DatabaseFileHeaderIdentity,
+) -> Result<(File, File, SlotControlMetadata), FileRestartCheckpointSlotCreateError> {
     let header = build_slot_control_header_v2(magic, persistent_log_id, database_file_identity);
     let (control_file, directory) =
         create_locked_control_slot_with_header(slot_directory, &header)?;

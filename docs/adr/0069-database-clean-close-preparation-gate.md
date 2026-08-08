@@ -4,6 +4,7 @@
 - Date: 2026-08-08
 - Issue: #186
 - Extends: ADR 0062, ADR 0066, ADR 0067, ADR 0068
+- Extended by: ADR 0070
 
 ## Context
 
@@ -148,7 +149,7 @@ The complete preparation order is:
    manifest;
 7. retain source and target manifests with every owner in ClosePending.
 
-Only step 3 can publish the transaction clean-close checkpoint candidate.
+Only step 4 can publish the transaction clean-close checkpoint candidate.
 No step writes a database manifest, advances the selected manifest generation,
 constructs `ClosedDatabase`, releases locks early, or changes stable child
 identity.

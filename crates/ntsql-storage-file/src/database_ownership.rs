@@ -9,12 +9,17 @@ use std::{
 
 use ntsql_compatibility::CompatibilityContext;
 use ntsql_database::{
-    AbandonedDatabase, DatabaseCloseSourceManifestOwner, DatabaseCompositionIdentity,
-    DatabaseCompositionIdentityError, DatabaseCompositionIdentityMismatch,
-    DatabaseFileHeaderIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleStage,
-    DatabaseManifest, DatabaseManifestSelectionRejection, DatabaseRecoveryFailureCause,
-    DatabaseRecoveryOwner, DatabaseStorageFormatVersion, DatabaseStorageIdentity,
-    FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase, RecoveredDatabaseOwnership,
+    AbandonedDatabase, AbandonedDatabaseClosePublication, ClosePendingDatabase, ClosedDatabase,
+    DatabaseCleanManifestPublicationPermit, DatabaseCleanManifestPublicationReceipt,
+    DatabaseCleanManifestPublicationState, DatabaseCleanManifestPublisher,
+    DatabaseCleanManifestPublisherFailure, DatabaseCloseSourceManifestOwner,
+    DatabaseCompositionIdentity, DatabaseCompositionIdentityError,
+    DatabaseCompositionIdentityMismatch, DatabaseFileHeaderIdentity, DatabaseFileRole, DatabaseId,
+    DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestSelectionRejection,
+    DatabaseManifestSuccessorError, DatabaseRecoveryFailureCause, DatabaseRecoveryOwner,
+    DatabaseStorageFormatVersion, DatabaseStorageIdentity, FailedDatabaseClosePreparation,
+    FailedDatabaseClosePublication, FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase,
+    PreparedDatabaseCloseOwnership, PublishedDatabaseCloseOwnership, RecoveredDatabaseOwnership,
     RecoveryRequiredDatabase, UnboundDatabase,
 };
 use ntsql_transaction::{
@@ -26,11 +31,13 @@ use ntsql_transaction::{
 use ntsql_wal::PersistentLogId;
 
 use super::{
-    FileCommitLog, FileCreateError, FileOpenError, FilePageStore, FilePageWidthError,
+    FileCleanCloseCheckpointFaultAlreadyArmed, FileCleanCloseCheckpointFaultPoint, FileCommitLog,
+    FileCreateError, FileOpenError, FilePageStore, FilePageWidthError,
     FileRestartCheckpointCompletenessBaselineSource, PageLayout, PageStoreCreateError,
     PageStoreOpenError, UnrecoveredFileTransactionPageStorageWithCompletenessCheckpoint,
-    checksum_v1, decode_database_manifest, metadata_identifies_same_file, read_u16, read_u32,
-    read_u64, read_u128,
+    checksum_v1, clean_close_checkpoint_slot_directory, decode_database_manifest,
+    decode_database_manifest_v2, encode_database_manifest_v2, metadata_identifies_same_file,
+    read_u16, read_u32, read_u64, read_u128,
     restart_checkpoint_file::{
         CONTROL_FILE_NAME, FileRestartCheckpointSlotCreateError, FileRestartCheckpointSlotOpenError,
     },
@@ -308,6 +315,8 @@ pub enum FileDatabaseCreateEntry {
     Manifest,
     /// Unselected create manifest.
     ManifestCandidate,
+    /// Unselected clean-close manifest.
+    ManifestCloseCandidate,
     /// Selected WAL.
     Wal,
     /// Unselected create WAL.
@@ -324,6 +333,10 @@ pub enum FileDatabaseCreateEntry {
     RestartCheckpointControl,
     /// Unselected restart-checkpoint control file.
     RestartCheckpointCandidateControl,
+    /// Disjoint clean-close restart-checkpoint slot.
+    RestartCheckpointCleanCloseCandidate,
+    /// Control file inside the clean-close restart-checkpoint slot.
+    RestartCheckpointCleanCloseControl,
     /// WAL reclamation candidate derived from the selected WAL.
     WalReclamationCandidate,
     /// WAL reclamation candidate derived from the create WAL.
@@ -336,6 +349,7 @@ impl fmt::Display for FileDatabaseCreateEntry {
             Self::DatabaseOwner => formatter.write_str("database owner"),
             Self::Manifest => formatter.write_str("manifest"),
             Self::ManifestCandidate => formatter.write_str("manifest create candidate"),
+            Self::ManifestCloseCandidate => formatter.write_str("manifest close candidate"),
             Self::Wal => formatter.write_str("WAL"),
             Self::WalCandidate => formatter.write_str("WAL create candidate"),
             Self::PageStore => formatter.write_str("page store"),
@@ -347,6 +361,12 @@ impl fmt::Display for FileDatabaseCreateEntry {
             Self::RestartCheckpointControl => formatter.write_str("restart-checkpoint control"),
             Self::RestartCheckpointCandidateControl => {
                 formatter.write_str("restart-checkpoint create-candidate control")
+            }
+            Self::RestartCheckpointCleanCloseCandidate => {
+                formatter.write_str("restart-checkpoint clean-close candidate")
+            }
+            Self::RestartCheckpointCleanCloseControl => {
+                formatter.write_str("restart-checkpoint clean-close candidate control")
             }
             Self::WalReclamationCandidate => formatter.write_str("WAL reclamation candidate"),
             Self::WalCandidateReclamationCandidate => {
@@ -609,6 +629,9 @@ impl FileDatabaseCreateNamespaceEvidence {
             FileDatabaseCreateEntry::RestartCheckpointCandidate => 8,
             FileDatabaseCreateEntry::RestartCheckpointControl
             | FileDatabaseCreateEntry::RestartCheckpointCandidateControl
+            | FileDatabaseCreateEntry::ManifestCloseCandidate
+            | FileDatabaseCreateEntry::RestartCheckpointCleanCloseCandidate
+            | FileDatabaseCreateEntry::RestartCheckpointCleanCloseControl
             | FileDatabaseCreateEntry::WalReclamationCandidate
             | FileDatabaseCreateEntry::WalCandidateReclamationCandidate => return false,
         };
@@ -938,6 +961,7 @@ const fn ownership_open_is_outcome_indeterminate(source: &FileDatabaseOwnershipO
         FileDatabaseOwnershipOpenError::RestartCheckpointOpen(source) => {
             matches!(source, FileRestartCheckpointSlotOpenError::Io(_))
         }
+        FileDatabaseOwnershipOpenError::CleanCloseCheckpointFault(_) => false,
         FileDatabaseOwnershipOpenError::PageWidth(_)
         | FileDatabaseOwnershipOpenError::DatabaseOwnerControlFileLength { .. }
         | FileDatabaseOwnershipOpenError::DatabaseOwnerControl(_)
@@ -945,9 +969,13 @@ const fn ownership_open_is_outcome_indeterminate(source: &FileDatabaseOwnershipO
         | FileDatabaseOwnershipOpenError::OpenedObjectAlias { .. }
         | FileDatabaseOwnershipOpenError::OpenedObjectChanged { .. }
         | FileDatabaseOwnershipOpenError::WalReclamationCandidateCollision { .. }
+        | FileDatabaseOwnershipOpenError::CloseCandidatePathUnavailable { .. }
+        | FileDatabaseOwnershipOpenError::CloseCandidatePathCollision { .. }
         | FileDatabaseOwnershipOpenError::ManifestFileLength { .. }
         | FileDatabaseOwnershipOpenError::Manifest(_)
+        | FileDatabaseOwnershipOpenError::ManifestV2(_)
         | FileDatabaseOwnershipOpenError::ManifestDatabaseIdMismatch { .. }
+        | FileDatabaseOwnershipOpenError::ManifestLifecycle { .. }
         | FileDatabaseOwnershipOpenError::StorageFormatVersionMismatch { .. }
         | FileDatabaseOwnershipOpenError::PersistentLogIdMismatch { .. }
         | FileDatabaseOwnershipOpenError::ChildDatabaseIdMismatch { .. }
@@ -1309,6 +1337,18 @@ pub enum FileDatabaseOwnershipOpenError {
         /// Protected role selected by the candidate path or opened object.
         role: FileDatabaseLockRole,
     },
+    /// A reserved close candidate cannot be derived from its selected path.
+    CloseCandidatePathUnavailable {
+        /// Exact reserved entry whose sibling path could not be derived.
+        entry: FileDatabaseCreateEntry,
+    },
+    /// Two selected or reserved candidate paths are lexically equal.
+    CloseCandidatePathCollision {
+        /// Earlier role in stable validation order.
+        first: FileDatabaseCreateEntry,
+        /// Later colliding role.
+        second: FileDatabaseCreateEntry,
+    },
     /// The selected manifest file does not have its exact fixed length.
     ManifestFileLength {
         /// Exact opened file length.
@@ -1316,12 +1356,19 @@ pub enum FileDatabaseOwnershipOpenError {
     },
     /// The selected manifest bytes are structurally invalid.
     Manifest(super::DatabaseManifestDecodeError),
+    /// The selected Manifest V2 bytes are structurally invalid.
+    ManifestV2(super::DatabaseManifestV2DecodeError),
     /// The manifest belongs to a database other than the locked owner.
     ManifestDatabaseIdMismatch {
         /// Identity decoded from the stable owner control.
         owner: DatabaseId,
         /// Identity decoded from the manifest.
         manifest: DatabaseId,
+    },
+    /// Recovery-required open received another manifest lifecycle.
+    ManifestLifecycle {
+        /// Exact rejected lifecycle state.
+        actual: ntsql_database::DatabaseManifestLifecycleState,
     },
     /// The selected WAL could not be locked and reconstructed.
     WalOpen(FileOpenError),
@@ -1330,6 +1377,8 @@ pub enum FileDatabaseOwnershipOpenError {
     /// The selected restart-checkpoint completeness slot could not be locked and
     /// reconstructed.
     RestartCheckpointOpen(FileRestartCheckpointSlotOpenError),
+    /// A clean-close checkpoint fault was already armed on a freshly opened source.
+    CleanCloseCheckpointFault(FileCleanCloseCheckpointFaultAlreadyArmed),
     /// One child physical format differs from the selected manifest requirement.
     StorageFormatVersionMismatch {
         /// Child role.
@@ -1417,19 +1466,36 @@ impl fmt::Display for FileDatabaseOwnershipOpenError {
                 formatter,
                 "WAL reclamation candidate collides with database {role}"
             ),
+            Self::CloseCandidatePathUnavailable { entry } => {
+                write!(formatter, "cannot derive reserved {entry} path")
+            }
+            Self::CloseCandidatePathCollision { first, second } => {
+                write!(
+                    formatter,
+                    "reserved database {second} path collides with {first}"
+                )
+            }
             Self::ManifestFileLength { actual } => write!(
                 formatter,
-                "database manifest file length {actual} is not {}",
-                super::DATABASE_MANIFEST_V1_LENGTH
+                "database manifest file length {actual} is neither {} nor {}",
+                super::DATABASE_MANIFEST_V1_LENGTH,
+                super::DATABASE_MANIFEST_V2_LENGTH
             ),
             Self::Manifest(source) => {
                 write!(formatter, "database manifest decode failed: {source}")
+            }
+            Self::ManifestV2(source) => {
+                write!(formatter, "database Manifest V2 decode failed: {source}")
             }
             Self::ManifestDatabaseIdMismatch { owner, manifest } => write!(
                 formatter,
                 "database manifest identity {} does not match locked owner {}",
                 manifest.get(),
                 owner.get()
+            ),
+            Self::ManifestLifecycle { actual } => write!(
+                formatter,
+                "recovery-required filesystem open cannot select {actual} manifest"
             ),
             Self::WalOpen(source) => {
                 write!(formatter, "database WAL open failed: {source}")
@@ -1441,6 +1507,12 @@ impl fmt::Display for FileDatabaseOwnershipOpenError {
                 formatter,
                 "database restart-checkpoint completeness open failed: {source}"
             ),
+            Self::CleanCloseCheckpointFault(source) => {
+                write!(
+                    formatter,
+                    "database clean-close checkpoint fault setup failed: {source}"
+                )
+            }
             Self::StorageFormatVersionMismatch {
                 role,
                 required,
@@ -1514,9 +1586,11 @@ impl Error for FileDatabaseOwnershipOpenError {
             Self::Io(source) => Some(source),
             Self::DatabaseOwnerControl(source) => Some(source),
             Self::Manifest(source) => Some(source),
+            Self::ManifestV2(source) => Some(source),
             Self::WalOpen(source) => Some(source),
             Self::PageStoreOpen(source) => Some(source),
             Self::RestartCheckpointOpen(source) => Some(source),
+            Self::CleanCloseCheckpointFault(source) => Some(source),
             Self::ManifestSelection(source) => Some(source),
             Self::ObservedStorageIdentity(source) => Some(source),
             Self::StorageBinding(source) => Some(source),
@@ -1525,8 +1599,11 @@ impl Error for FileDatabaseOwnershipOpenError {
             | Self::OpenedObjectAlias { .. }
             | Self::OpenedObjectChanged { .. }
             | Self::WalReclamationCandidateCollision { .. }
+            | Self::CloseCandidatePathUnavailable { .. }
+            | Self::CloseCandidatePathCollision { .. }
             | Self::ManifestFileLength { .. }
             | Self::ManifestDatabaseIdMismatch { .. }
+            | Self::ManifestLifecycle { .. }
             | Self::StorageFormatVersionMismatch { .. }
             | Self::PersistentLogIdMismatch { .. }
             | Self::ChildDatabaseIdMismatch { .. }
@@ -1590,10 +1667,397 @@ impl<const N: usize> fmt::Debug for FileDatabaseOwnership<N> {
     }
 }
 
+/// Ordered physical boundary in filesystem clean-manifest publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDatabaseCloseBoundary {
+    /// Remove one stale manifest close candidate.
+    CandidateCleanup,
+    /// Create and lock the new candidate descriptor.
+    CandidateCreate,
+    /// Write the exact Manifest V2 frame.
+    CandidateWrite,
+    /// Synchronize the candidate descriptor.
+    CandidateSynchronization,
+    /// Atomically replace the selected manifest path.
+    ManifestReplacement,
+    /// Verify selected inode and exact decoded target.
+    SelectedManifestVerification,
+    /// Synchronize the selected manifest's containing directory.
+    ParentDirectorySynchronization,
+}
+
+/// Deterministic timing for one filesystem close-publication fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDatabaseCloseFaultTiming {
+    /// Report a definite failure before the boundary effect.
+    BeforeEffect,
+    /// Apply the boundary effect and report a definite failure.
+    AfterEffect,
+    /// Report an indeterminate outcome without applying the effect.
+    OutcomeIndeterminateBeforeEffect,
+    /// Apply the effect and report an indeterminate outcome.
+    OutcomeIndeterminateAfterEffect,
+}
+
+impl FileDatabaseCloseFaultTiming {
+    const fn is_before(self) -> bool {
+        matches!(
+            self,
+            Self::BeforeEffect | Self::OutcomeIndeterminateBeforeEffect
+        )
+    }
+
+    const fn is_after(self) -> bool {
+        matches!(
+            self,
+            Self::AfterEffect | Self::OutcomeIndeterminateAfterEffect
+        )
+    }
+
+    /// Returns whether the injected report hides its physical outcome.
+    #[must_use]
+    pub const fn is_outcome_indeterminate(self) -> bool {
+        matches!(
+            self,
+            Self::OutcomeIndeterminateBeforeEffect | Self::OutcomeIndeterminateAfterEffect
+        )
+    }
+}
+
+/// One exact filesystem clean-manifest publication fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileDatabaseCloseFault {
+    boundary: FileDatabaseCloseBoundary,
+    timing: FileDatabaseCloseFaultTiming,
+}
+
+impl FileDatabaseCloseFault {
+    /// Arms one exact physical boundary and timing.
+    #[must_use]
+    pub const fn new(
+        boundary: FileDatabaseCloseBoundary,
+        timing: FileDatabaseCloseFaultTiming,
+    ) -> Self {
+        Self { boundary, timing }
+    }
+
+    /// Returns the armed physical boundary.
+    #[must_use]
+    pub const fn boundary(self) -> FileDatabaseCloseBoundary {
+        self.boundary
+    }
+
+    /// Returns the armed timing.
+    #[must_use]
+    pub const fn timing(self) -> FileDatabaseCloseFaultTiming {
+        self.timing
+    }
+
+    const fn publication_state(self) -> DatabaseCleanManifestPublicationState {
+        match (self.boundary, self.timing) {
+            (
+                FileDatabaseCloseBoundary::CandidateCleanup
+                | FileDatabaseCloseBoundary::CandidateCreate
+                | FileDatabaseCloseBoundary::CandidateWrite
+                | FileDatabaseCloseBoundary::CandidateSynchronization,
+                _,
+            ) => DatabaseCleanManifestPublicationState::SourceSelected,
+            (
+                FileDatabaseCloseBoundary::ManifestReplacement,
+                FileDatabaseCloseFaultTiming::BeforeEffect,
+            ) => DatabaseCleanManifestPublicationState::SourceSelected,
+            (
+                FileDatabaseCloseBoundary::ManifestReplacement,
+                FileDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+                | FileDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+            ) => DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+            (
+                FileDatabaseCloseBoundary::ManifestReplacement,
+                FileDatabaseCloseFaultTiming::AfterEffect,
+            )
+            | (FileDatabaseCloseBoundary::SelectedManifestVerification, _)
+            | (
+                FileDatabaseCloseBoundary::ParentDirectorySynchronization,
+                FileDatabaseCloseFaultTiming::BeforeEffect
+                | FileDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+                | FileDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+            ) => DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+            (
+                FileDatabaseCloseBoundary::ParentDirectorySynchronization,
+                FileDatabaseCloseFaultTiming::AfterEffect,
+            ) => DatabaseCleanManifestPublicationState::TargetDurable,
+        }
+    }
+}
+
+impl fmt::Display for FileDatabaseCloseFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?} at {:?}", self.boundary, self.timing)
+    }
+}
+
+/// Exact filesystem operation that failed during clean-manifest publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FileDatabaseClosePublicationIoStage {
+    /// Inspecting a stale close-candidate entry.
+    InspectCandidate,
+    /// Removing a stale close-candidate entry.
+    RemoveCandidate,
+    /// Creating a fresh close-candidate file.
+    CreateCandidate,
+    /// Locking the fresh candidate descriptor.
+    LockCandidate,
+    /// Writing the exact Manifest V2 frame.
+    WriteCandidate,
+    /// Synchronizing the candidate descriptor.
+    SyncCandidate,
+    /// Replacing the selected manifest path.
+    ReplaceManifest,
+    /// Reading selected-path metadata after replacement.
+    ReadSelectedMetadata,
+    /// Reading retained candidate-descriptor metadata.
+    ReadCandidateMetadata,
+    /// Seeking the retained candidate descriptor.
+    SeekCandidate,
+    /// Reading the retained candidate descriptor.
+    ReadCandidate,
+    /// Opening the selected manifest's parent directory.
+    OpenParentDirectory,
+    /// Synchronizing the selected manifest's parent directory.
+    SyncParentDirectory,
+}
+
+impl fmt::Display for FileDatabaseClosePublicationIoStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InspectCandidate => formatter.write_str("inspecting manifest close candidate"),
+            Self::RemoveCandidate => formatter.write_str("removing manifest close candidate"),
+            Self::CreateCandidate => formatter.write_str("creating manifest close candidate"),
+            Self::LockCandidate => formatter.write_str("locking manifest close candidate"),
+            Self::WriteCandidate => formatter.write_str("writing Manifest V2 close candidate"),
+            Self::SyncCandidate => formatter.write_str("synchronizing Manifest V2 close candidate"),
+            Self::ReplaceManifest => formatter.write_str("replacing selected database manifest"),
+            Self::ReadSelectedMetadata => formatter.write_str("reading selected manifest metadata"),
+            Self::ReadCandidateMetadata => {
+                formatter.write_str("reading retained manifest candidate metadata")
+            }
+            Self::SeekCandidate => formatter.write_str("seeking retained manifest candidate"),
+            Self::ReadCandidate => formatter.write_str("reading retained manifest candidate"),
+            Self::OpenParentDirectory => {
+                formatter.write_str("opening selected manifest parent directory")
+            }
+            Self::SyncParentDirectory => {
+                formatter.write_str("synchronizing selected manifest parent directory")
+            }
+        }
+    }
+}
+
+/// Stage-specific filesystem cause retained by failed close publication.
+#[derive(Debug)]
+pub struct FileDatabaseClosePublicationIoError {
+    stage: FileDatabaseClosePublicationIoStage,
+    source: io::Error,
+}
+
+impl FileDatabaseClosePublicationIoError {
+    fn new(stage: FileDatabaseClosePublicationIoStage, source: io::Error) -> Self {
+        Self { stage, source }
+    }
+
+    /// Returns the exact failed filesystem stage.
+    #[must_use]
+    pub const fn stage(&self) -> FileDatabaseClosePublicationIoStage {
+        self.stage
+    }
+
+    /// Returns the retained operating-system cause.
+    #[must_use]
+    pub const fn io_source(&self) -> &io::Error {
+        &self.source
+    }
+}
+
+impl fmt::Display for FileDatabaseClosePublicationIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.stage, self.source)
+    }
+}
+
+impl Error for FileDatabaseClosePublicationIoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// Filesystem-adapter cause for a clean-manifest publication failure.
+#[derive(Debug)]
+pub enum FileDatabaseClosePublicationError {
+    /// The permit target is not an exact lifecycle successor.
+    TargetManifest(DatabaseManifestSuccessorError),
+    /// The selected manifest path has no sibling candidate path.
+    CandidatePathUnavailable {
+        /// Exact selected manifest path.
+        selected: PathBuf,
+    },
+    /// A stale candidate is a directory and cannot be reconciled as a file.
+    CandidateIsDirectory {
+        /// Exact rejected candidate path.
+        path: PathBuf,
+    },
+    /// The retained candidate descriptor disappeared from private owner state.
+    CandidateDescriptorMissing,
+    /// The selected manifest's containing directory cannot be derived.
+    ParentDirectoryUnavailable {
+        /// Exact selected manifest path.
+        selected: PathBuf,
+    },
+    /// Selected path and retained candidate descriptor identify different files.
+    SelectedObjectChanged,
+    /// The selected Manifest V2 descriptor has a noncanonical length.
+    SelectedManifestFileLength {
+        /// Exact observed byte length.
+        actual: u64,
+    },
+    /// The selected descriptor changed length during exact verification.
+    SelectedManifestLengthChanged {
+        /// Length before reading.
+        before: u64,
+        /// Length after reading.
+        after: u64,
+    },
+    /// The selected Manifest V2 frame is structurally invalid.
+    SelectedManifestDecode(super::DatabaseManifestV2DecodeError),
+    /// The freshly decoded selected manifest differs from the permit target.
+    SelectedManifestMismatch,
+    /// One deterministic fault fired.
+    InjectedFault(FileDatabaseCloseFault),
+    /// One exact filesystem operation failed.
+    Io(FileDatabaseClosePublicationIoError),
+}
+
+impl fmt::Display for FileDatabaseClosePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TargetManifest(source) => {
+                write!(
+                    formatter,
+                    "filesystem clean-manifest target is invalid: {source}"
+                )
+            }
+            Self::CandidatePathUnavailable { selected } => write!(
+                formatter,
+                "selected manifest path {} has no close-candidate sibling",
+                selected.display()
+            ),
+            Self::CandidateIsDirectory { path } => write!(
+                formatter,
+                "manifest close candidate {} is a directory",
+                path.display()
+            ),
+            Self::CandidateDescriptorMissing => {
+                formatter.write_str("retained manifest close-candidate descriptor is missing")
+            }
+            Self::ParentDirectoryUnavailable { selected } => write!(
+                formatter,
+                "selected manifest path {} has no parent directory",
+                selected.display()
+            ),
+            Self::SelectedObjectChanged => formatter.write_str(
+                "selected manifest path does not identify the retained candidate descriptor",
+            ),
+            Self::SelectedManifestFileLength { actual } => write!(
+                formatter,
+                "selected clean manifest length {actual} is not {}",
+                super::DATABASE_MANIFEST_V2_LENGTH
+            ),
+            Self::SelectedManifestLengthChanged { before, after } => write!(
+                formatter,
+                "selected clean manifest length changed while reading: {before} to {after}"
+            ),
+            Self::SelectedManifestDecode(source) => {
+                write!(formatter, "selected clean manifest decode failed: {source}")
+            }
+            Self::SelectedManifestMismatch => {
+                formatter.write_str("selected clean manifest differs from the exact permit target")
+            }
+            Self::InjectedFault(fault) => {
+                write!(
+                    formatter,
+                    "injected filesystem database close fault {fault}"
+                )
+            }
+            Self::Io(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl Error for FileDatabaseClosePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::TargetManifest(source) => Some(source),
+            Self::SelectedManifestDecode(source) => Some(source),
+            Self::Io(source) => Some(source),
+            Self::CandidatePathUnavailable { .. }
+            | Self::CandidateIsDirectory { .. }
+            | Self::CandidateDescriptorMissing
+            | Self::ParentDirectoryUnavailable { .. }
+            | Self::SelectedObjectChanged
+            | Self::SelectedManifestFileLength { .. }
+            | Self::SelectedManifestLengthChanged { .. }
+            | Self::SelectedManifestMismatch
+            | Self::InjectedFault(_) => None,
+        }
+    }
+}
+
+struct FileDatabaseCloseFaultController {
+    armed: Option<FileDatabaseCloseFault>,
+}
+
+impl FileDatabaseCloseFaultController {
+    const fn new(armed: Option<FileDatabaseCloseFault>) -> Self {
+        Self { armed }
+    }
+
+    fn before(
+        &mut self,
+        boundary: FileDatabaseCloseBoundary,
+    ) -> Result<(), DatabaseCleanManifestPublisherFailure<FileDatabaseClosePublicationError>> {
+        self.fire(boundary, FileDatabaseCloseFaultTiming::is_before)
+    }
+
+    fn after(
+        &mut self,
+        boundary: FileDatabaseCloseBoundary,
+    ) -> Result<(), DatabaseCleanManifestPublisherFailure<FileDatabaseClosePublicationError>> {
+        self.fire(boundary, FileDatabaseCloseFaultTiming::is_after)
+    }
+
+    fn fire(
+        &mut self,
+        boundary: FileDatabaseCloseBoundary,
+        matches_timing: fn(FileDatabaseCloseFaultTiming) -> bool,
+    ) -> Result<(), DatabaseCleanManifestPublisherFailure<FileDatabaseClosePublicationError>> {
+        if let Some(fault) = self.armed
+            && fault.boundary() == boundary
+            && matches_timing(fault.timing())
+        {
+            self.armed = None;
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                fault.publication_state(),
+                FileDatabaseClosePublicationError::InjectedFault(fault),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Filesystem database/manifest locks retained after transaction recovery.
 #[must_use = "live filesystem database ownership must remain inside its database typestate"]
 pub struct RecoveredFileDatabaseOuterOwnership {
     _manifest_file: File,
+    _close_manifest_file: Option<File>,
     _database_owner_file: File,
     manifest: DatabaseManifest,
     layout: FileDatabaseLayout,
@@ -1623,6 +2087,256 @@ impl RecoveredFileDatabaseOuterOwnership {
 impl DatabaseCloseSourceManifestOwner for RecoveredFileDatabaseOuterOwnership {
     fn close_source_manifest(&self) -> DatabaseManifest {
         self.manifest()
+    }
+}
+
+fn file_database_close_io_failure(
+    state: DatabaseCleanManifestPublicationState,
+    stage: FileDatabaseClosePublicationIoStage,
+    source: io::Error,
+) -> DatabaseCleanManifestPublisherFailure<FileDatabaseClosePublicationError> {
+    DatabaseCleanManifestPublisherFailure::new(
+        state,
+        FileDatabaseClosePublicationError::Io(FileDatabaseClosePublicationIoError::new(
+            stage, source,
+        )),
+    )
+}
+
+impl DatabaseCleanManifestPublisher for RecoveredFileDatabaseOuterOwnership {
+    type Input = Option<FileDatabaseCloseFault>;
+    type Error = FileDatabaseClosePublicationError;
+
+    fn publish_clean_manifest(
+        &mut self,
+        input: Self::Input,
+        permit: DatabaseCleanManifestPublicationPermit<'_>,
+    ) -> Result<
+        DatabaseCleanManifestPublicationReceipt,
+        DatabaseCleanManifestPublisherFailure<Self::Error>,
+    > {
+        let source_manifest = self.manifest;
+        let target_manifest = permit.target_manifest();
+        target_manifest
+            .require_successor_of(source_manifest)
+            .map_err(|source| {
+                DatabaseCleanManifestPublisherFailure::new(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    FileDatabaseClosePublicationError::TargetManifest(source),
+                )
+            })?;
+        let candidate_path = database_manifest_close_candidate_path(self.layout.manifest())
+            .ok_or_else(|| {
+                DatabaseCleanManifestPublisherFailure::new(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    FileDatabaseClosePublicationError::CandidatePathUnavailable {
+                        selected: self.layout.manifest().to_path_buf(),
+                    },
+                )
+            })?;
+        let encoded = encode_database_manifest_v2(&target_manifest);
+        let mut fault = FileDatabaseCloseFaultController::new(input);
+
+        fault.before(FileDatabaseCloseBoundary::CandidateCleanup)?;
+        match fs::symlink_metadata(&candidate_path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {
+                return Err(DatabaseCleanManifestPublisherFailure::new(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    FileDatabaseClosePublicationError::CandidateIsDirectory {
+                        path: candidate_path,
+                    },
+                ));
+            }
+            Ok(_) => fs::remove_file(&candidate_path).map_err(|source| {
+                file_database_close_io_failure(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    FileDatabaseClosePublicationIoStage::RemoveCandidate,
+                    source,
+                )
+            })?,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(file_database_close_io_failure(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    FileDatabaseClosePublicationIoStage::InspectCandidate,
+                    source,
+                ));
+            }
+        }
+        fault.after(FileDatabaseCloseBoundary::CandidateCleanup)?;
+
+        fault.before(FileDatabaseCloseBoundary::CandidateCreate)?;
+        let candidate_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&candidate_path)
+            .map_err(|source| {
+                file_database_close_io_failure(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    FileDatabaseClosePublicationIoStage::CreateCandidate,
+                    source,
+                )
+            })?;
+        candidate_file.try_lock().map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                FileDatabaseClosePublicationIoStage::LockCandidate,
+                source.into(),
+            )
+        })?;
+        self._close_manifest_file = Some(candidate_file);
+        fault.after(FileDatabaseCloseBoundary::CandidateCreate)?;
+
+        fault.before(FileDatabaseCloseBoundary::CandidateWrite)?;
+        let candidate_file = self._close_manifest_file.as_mut().ok_or_else(|| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                FileDatabaseClosePublicationError::CandidateDescriptorMissing,
+            )
+        })?;
+        candidate_file.write_all(&encoded).map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                FileDatabaseClosePublicationIoStage::WriteCandidate,
+                source,
+            )
+        })?;
+        fault.after(FileDatabaseCloseBoundary::CandidateWrite)?;
+
+        fault.before(FileDatabaseCloseBoundary::CandidateSynchronization)?;
+        candidate_file.sync_all().map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                FileDatabaseClosePublicationIoStage::SyncCandidate,
+                source,
+            )
+        })?;
+        fault.after(FileDatabaseCloseBoundary::CandidateSynchronization)?;
+
+        fault.before(FileDatabaseCloseBoundary::ManifestReplacement)?;
+        fs::rename(&candidate_path, self.layout.manifest()).map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                FileDatabaseClosePublicationIoStage::ReplaceManifest,
+                source,
+            )
+        })?;
+        fault.after(FileDatabaseCloseBoundary::ManifestReplacement)?;
+
+        fault.before(FileDatabaseCloseBoundary::SelectedManifestVerification)?;
+        let selected_metadata = fs::metadata(self.layout.manifest()).map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationIoStage::ReadSelectedMetadata,
+                source,
+            )
+        })?;
+        let candidate_metadata = candidate_file.metadata().map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationIoStage::ReadCandidateMetadata,
+                source,
+            )
+        })?;
+        if !metadata_identifies_same_file(&selected_metadata, &candidate_metadata) {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                FileDatabaseClosePublicationError::SelectedObjectChanged,
+            ));
+        }
+        let before = candidate_metadata.len();
+        if before != super::DATABASE_MANIFEST_V2_LENGTH as u64 {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationError::SelectedManifestFileLength { actual: before },
+            ));
+        }
+        candidate_file.seek(SeekFrom::Start(0)).map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationIoStage::SeekCandidate,
+                source,
+            )
+        })?;
+        let mut selected_bytes = [0_u8; super::DATABASE_MANIFEST_V2_LENGTH];
+        candidate_file
+            .read_exact(&mut selected_bytes)
+            .map_err(|source| {
+                file_database_close_io_failure(
+                    DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                    FileDatabaseClosePublicationIoStage::ReadCandidate,
+                    source,
+                )
+            })?;
+        let after = candidate_file
+            .metadata()
+            .map_err(|source| {
+                file_database_close_io_failure(
+                    DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                    FileDatabaseClosePublicationIoStage::ReadCandidateMetadata,
+                    source,
+                )
+            })?
+            .len();
+        if before != after {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationError::SelectedManifestLengthChanged { before, after },
+            ));
+        }
+        let selected_manifest = decode_database_manifest_v2(&selected_bytes).map_err(|source| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationError::SelectedManifestDecode(source),
+            )
+        })?;
+        if selected_manifest != target_manifest {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationError::SelectedManifestMismatch,
+            ));
+        }
+        fault.after(FileDatabaseCloseBoundary::SelectedManifestVerification)?;
+
+        let parent = match self.layout.manifest().parent() {
+            Some(parent) if parent.as_os_str().is_empty() => Path::new("."),
+            Some(parent) => parent,
+            None => {
+                return Err(DatabaseCleanManifestPublisherFailure::new(
+                    DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                    FileDatabaseClosePublicationError::ParentDirectoryUnavailable {
+                        selected: self.layout.manifest().to_path_buf(),
+                    },
+                ));
+            }
+        };
+        fault.before(FileDatabaseCloseBoundary::ParentDirectorySynchronization)?;
+        let parent_directory = File::open(parent).map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationIoStage::OpenParentDirectory,
+                source,
+            )
+        })?;
+        parent_directory.sync_all().map_err(|source| {
+            file_database_close_io_failure(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                FileDatabaseClosePublicationIoStage::SyncParentDirectory,
+                source,
+            )
+        })?;
+        fault.after(FileDatabaseCloseBoundary::ParentDirectorySynchronization)?;
+
+        let selected_file = self._close_manifest_file.take().ok_or_else(|| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetDurable,
+                FileDatabaseClosePublicationError::CandidateDescriptorMissing,
+            )
+        })?;
+        drop(std::mem::replace(&mut self._manifest_file, selected_file));
+        self.manifest = target_manifest;
+        Ok(permit.complete(selected_manifest, target_manifest))
     }
 }
 
@@ -1725,6 +2439,7 @@ where
         } = input;
         let outer_owner = RecoveredFileDatabaseOuterOwnership {
             _manifest_file,
+            _close_manifest_file: None,
             _database_owner_file,
             manifest,
             layout,
@@ -1826,6 +2541,15 @@ impl<const N: usize> LiveFileDatabase<N> {
         self.database.owner().transaction()
     }
 
+    /// Consumes Live and binds fresh transaction close evidence to this database.
+    pub fn prepare_close(
+        self,
+    ) -> Result<ClosePendingFileDatabase<N>, FailedFileDatabaseClosePreparation<N>> {
+        self.database
+            .prepare_close()
+            .map(|database| ClosePendingFileDatabase { database })
+    }
+
     /// Relinquishes live ownership without publishing any clean state.
     pub fn abandon(self) -> AbandonedDatabase {
         self.database.abandon()
@@ -1844,6 +2568,160 @@ impl<const N: usize> fmt::Debug for LiveFileDatabase<N> {
             .finish_non_exhaustive()
     }
 }
+
+type PreparedFileDatabaseCloseOwnership<const N: usize> = PreparedDatabaseCloseOwnership<
+    RecoveredFileDatabaseOuterOwnership,
+    FileCommitLog<N>,
+    FilePageStore<N>,
+    FileRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+type PublishedFileDatabaseCloseOwnership<const N: usize> = PublishedDatabaseCloseOwnership<
+    RecoveredFileDatabaseOuterOwnership,
+    FileCommitLog<N>,
+    FilePageStore<N>,
+    FileRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+/// Terminal filesystem owner retained when close preparation fails.
+pub type FailedFileDatabaseClosePreparation<const N: usize> = FailedDatabaseClosePreparation<
+    RecoveredFileDatabaseOuterOwnership,
+    FileCommitLog<N>,
+    FilePageStore<N>,
+    FileRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+/// Terminal filesystem owner retained when manifest publication fails.
+pub type FailedFileDatabaseClosePublication<const N: usize> = FailedDatabaseClosePublication<
+    RecoveredFileDatabaseOuterOwnership,
+    FileCommitLog<N>,
+    FilePageStore<N>,
+    FileRestartCheckpointCompletenessBaselineSource,
+    FileDatabaseClosePublicationError,
+    N,
+>;
+
+/// Filesystem database whose exact clean manifest awaits publication.
+#[must_use = "close-pending filesystem database must publish or be explicitly abandoned"]
+pub struct ClosePendingFileDatabase<const N: usize> {
+    database: ClosePendingDatabase<PreparedFileDatabaseCloseOwnership<N>>,
+}
+
+impl<const N: usize> ClosePendingFileDatabase<N> {
+    /// Returns the recovery-required source composition.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.database.identity()
+    }
+
+    /// Returns the adjacent clean composition targeted by publication.
+    #[must_use]
+    pub const fn target_identity(&self) -> DatabaseCompositionIdentity {
+        self.database.prepared().target_identity()
+    }
+
+    /// Returns the exact adjacent clean target manifest.
+    #[must_use]
+    pub const fn target_manifest(&self) -> DatabaseManifest {
+        self.database.prepared().target_manifest()
+    }
+
+    /// Returns the database lifecycle stage.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        self.database.stage()
+    }
+
+    /// Publishes and synchronizes the exact clean manifest.
+    pub fn close(self) -> Result<ClosedFileDatabase<N>, FailedFileDatabaseClosePublication<N>> {
+        self.database
+            .close(None)
+            .map(|database| ClosedFileDatabase { database })
+    }
+
+    /// Publishes with one deterministic filesystem fault.
+    pub fn close_with_fault(
+        self,
+        fault: FileDatabaseCloseFault,
+    ) -> Result<ClosedFileDatabase<N>, FailedFileDatabaseClosePublication<N>> {
+        self.database
+            .close(Some(fault))
+            .map(|database| ClosedFileDatabase { database })
+    }
+
+    /// Relinquishes close-pending ownership without manifest publication.
+    pub fn abandon(self) -> AbandonedDatabase {
+        self.database.abandon()
+    }
+}
+
+impl<const N: usize> fmt::Debug for ClosePendingFileDatabase<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClosePendingFileDatabase")
+            .field("identity", &self.identity())
+            .field("target_identity", &self.target_identity())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Filesystem database retained after exact clean-manifest durability.
+#[must_use = "closed filesystem database ownership must remain retained or be dropped"]
+pub struct ClosedFileDatabase<const N: usize> {
+    database: ClosedDatabase<PublishedFileDatabaseCloseOwnership<N>>,
+}
+
+impl<const N: usize> ClosedFileDatabase<N> {
+    /// Returns the exact selected clean composition.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.database.identity()
+    }
+
+    /// Returns the exact selected and synchronized clean manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.database.published().manifest()
+    }
+
+    /// Returns the retained selected layout.
+    #[must_use]
+    pub const fn layout(&self) -> &FileDatabaseLayout {
+        self.database.published().prepared().outer_owner().layout()
+    }
+
+    /// Returns the immutable exact-target context.
+    #[must_use]
+    pub const fn compatibility_context(&self) -> &CompatibilityContext {
+        self.database
+            .published()
+            .prepared()
+            .outer_owner()
+            .compatibility_context()
+    }
+
+    /// Returns the database lifecycle stage.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        self.database.stage()
+    }
+}
+
+impl<const N: usize> fmt::Debug for ClosedFileDatabase<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClosedFileDatabase")
+            .field("identity", &self.identity())
+            .field("manifest", &self.manifest())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Terminal inert result after relinquishing a failed filesystem publication.
+pub type AbandonedFileDatabaseClosePublication = AbandonedDatabaseClosePublication;
 
 /// Failure before or during fail-closed filesystem database open.
 #[must_use = "failed filesystem database open may retain every database owner"]
@@ -1989,7 +2867,7 @@ pub fn open_file_database_ownership<const N: usize>(
     expected_database_id: DatabaseId,
     layout: FileDatabaseLayout,
 ) -> Result<FileDatabaseOwnershipSelection<N>, FileDatabaseOwnershipOpenError> {
-    let acquired = acquire_file_database_ownership(expected_database_id, layout, false)?;
+    let acquired = acquire_file_database_ownership(expected_database_id, layout, false, None)?;
     Ok(FileDatabaseOwnershipSelection {
         selected: acquired.selected,
     })
@@ -2003,7 +2881,16 @@ pub fn open_recovery_required_file_database<const N: usize>(
     expected_database_id: DatabaseId,
     layout: FileDatabaseLayout,
 ) -> Result<RecoveryRequiredFileDatabase<N>, FileDatabaseOwnershipOpenError> {
-    let acquired = acquire_file_database_ownership(expected_database_id, layout, true)?;
+    open_recovery_required_file_database_with_checkpoint_fault(expected_database_id, layout, None)
+}
+
+fn open_recovery_required_file_database_with_checkpoint_fault<const N: usize>(
+    expected_database_id: DatabaseId,
+    layout: FileDatabaseLayout,
+    checkpoint_fault: Option<FileCleanCloseCheckpointFaultPoint>,
+) -> Result<RecoveryRequiredFileDatabase<N>, FileDatabaseOwnershipOpenError> {
+    let acquired =
+        acquire_file_database_ownership(expected_database_id, layout, true, checkpoint_fault)?;
     let observed_storage_identity = match acquired.stable_storage_observation {
         StableStorageObservation::Complete(identity) => identity,
         StableStorageObservation::Missing(role) => {
@@ -2028,6 +2915,29 @@ pub fn open_live_file_database<const N: usize>(
         compatibility_context,
         |_| {},
     )
+}
+
+/// Opens through recovery with one deterministic clean-close checkpoint fault.
+pub fn open_live_file_database_with_close_checkpoint_fault<const N: usize>(
+    expected_database_id: DatabaseId,
+    layout: FileDatabaseLayout,
+    compatibility_context: CompatibilityContext,
+    checkpoint_fault: FileCleanCloseCheckpointFaultPoint,
+) -> Result<LiveFileDatabase<N>, FileDatabaseLiveOpenError<N>> {
+    let recovery_required = open_recovery_required_file_database_with_checkpoint_fault(
+        expected_database_id,
+        layout,
+        Some(checkpoint_fault),
+    )
+    .map_err(FileDatabaseLiveOpenError::Ownership)?;
+    let mut observer = |_| {};
+    let database = recovery_required
+        .complete_recovery::<_, N>(FileDatabaseRecoveryInput {
+            compatibility_context,
+            observer: &mut observer,
+        })
+        .map_err(FileDatabaseLiveOpenError::Recovery)?;
+    Ok(LiveFileDatabase { database })
 }
 
 /// Opens through recovery while reporting each completed owning phase.
@@ -2056,12 +2966,158 @@ where
     Ok(LiveFileDatabase { database })
 }
 
+/// Derives the sibling file reserved for one clean-manifest publication.
+#[must_use]
+pub fn database_manifest_close_candidate_path(selected_manifest: &Path) -> Option<PathBuf> {
+    suffixed_sibling_path(selected_manifest, ".close-candidate")
+}
+
+fn suffixed_sibling_path(path: &Path, suffix: &str) -> Option<PathBuf> {
+    let file_name = path.file_name()?;
+    let mut candidate_name = OsString::from(file_name);
+    candidate_name.push(suffix);
+    Some(path.with_file_name(candidate_name))
+}
+
+fn validate_close_candidate_paths(
+    layout: &FileDatabaseLayout,
+) -> Result<(), FileDatabaseOwnershipOpenError> {
+    let derive = |path: &Path, suffix: &str, entry| {
+        suffixed_sibling_path(path, suffix)
+            .ok_or(FileDatabaseOwnershipOpenError::CloseCandidatePathUnavailable { entry })
+    };
+    let manifest_create = derive(
+        layout.manifest(),
+        ".create-candidate",
+        FileDatabaseCreateEntry::ManifestCandidate,
+    )?;
+    let wal_create = derive(
+        layout.wal(),
+        ".create-candidate",
+        FileDatabaseCreateEntry::WalCandidate,
+    )?;
+    let page_store_create = derive(
+        layout.page_store(),
+        ".create-candidate",
+        FileDatabaseCreateEntry::PageStoreCandidate,
+    )?;
+    let restart_checkpoint_create = derive(
+        layout.restart_checkpoint(),
+        ".create-candidate",
+        FileDatabaseCreateEntry::RestartCheckpointCandidate,
+    )?;
+    let manifest_close = database_manifest_close_candidate_path(layout.manifest()).ok_or(
+        FileDatabaseOwnershipOpenError::CloseCandidatePathUnavailable {
+            entry: FileDatabaseCreateEntry::ManifestCloseCandidate,
+        },
+    )?;
+    let restart_checkpoint_clean =
+        clean_close_checkpoint_slot_directory(layout.restart_checkpoint()).ok_or(
+            FileDatabaseOwnershipOpenError::CloseCandidatePathUnavailable {
+                entry: FileDatabaseCreateEntry::RestartCheckpointCleanCloseCandidate,
+            },
+        )?;
+    let wal_reclamation = super::reclamation_candidate_path(layout.wal()).ok_or(
+        FileDatabaseOwnershipOpenError::CloseCandidatePathUnavailable {
+            entry: FileDatabaseCreateEntry::WalReclamationCandidate,
+        },
+    )?;
+    let wal_create_reclamation = super::reclamation_candidate_path(&wal_create).ok_or(
+        FileDatabaseOwnershipOpenError::CloseCandidatePathUnavailable {
+            entry: FileDatabaseCreateEntry::WalCandidateReclamationCandidate,
+        },
+    )?;
+    let paths = [
+        (
+            FileDatabaseCreateEntry::DatabaseOwner,
+            layout.database_owner().to_path_buf(),
+        ),
+        (
+            FileDatabaseCreateEntry::Manifest,
+            layout.manifest().to_path_buf(),
+        ),
+        (FileDatabaseCreateEntry::ManifestCandidate, manifest_create),
+        (
+            FileDatabaseCreateEntry::ManifestCloseCandidate,
+            manifest_close,
+        ),
+        (FileDatabaseCreateEntry::Wal, layout.wal().to_path_buf()),
+        (FileDatabaseCreateEntry::WalCandidate, wal_create),
+        (
+            FileDatabaseCreateEntry::WalReclamationCandidate,
+            wal_reclamation,
+        ),
+        (
+            FileDatabaseCreateEntry::WalCandidateReclamationCandidate,
+            wal_create_reclamation,
+        ),
+        (
+            FileDatabaseCreateEntry::PageStore,
+            layout.page_store().to_path_buf(),
+        ),
+        (
+            FileDatabaseCreateEntry::PageStoreCandidate,
+            page_store_create,
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpoint,
+            layout.restart_checkpoint().to_path_buf(),
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpointControl,
+            layout.restart_checkpoint().join(CONTROL_FILE_NAME),
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpointCandidate,
+            restart_checkpoint_create.clone(),
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpointCandidateControl,
+            restart_checkpoint_create.join(CONTROL_FILE_NAME),
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpointCleanCloseCandidate,
+            restart_checkpoint_clean.clone(),
+        ),
+        (
+            FileDatabaseCreateEntry::RestartCheckpointCleanCloseControl,
+            restart_checkpoint_clean.join(CONTROL_FILE_NAME),
+        ),
+    ];
+    for (index, (second_entry, second_path)) in paths.iter().enumerate() {
+        for (first_entry, first_path) in &paths[..index] {
+            let is_close_entry = |entry| {
+                matches!(
+                    entry,
+                    FileDatabaseCreateEntry::ManifestCloseCandidate
+                        | FileDatabaseCreateEntry::RestartCheckpointCleanCloseCandidate
+                        | FileDatabaseCreateEntry::RestartCheckpointCleanCloseControl
+                )
+            };
+            if !is_close_entry(*first_entry) && !is_close_entry(*second_entry) {
+                continue;
+            }
+            if first_path == second_path {
+                return Err(
+                    FileDatabaseOwnershipOpenError::CloseCandidatePathCollision {
+                        first: *first_entry,
+                        second: *second_entry,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn acquire_file_database_ownership<const N: usize>(
     expected_database_id: DatabaseId,
     layout: FileDatabaseLayout,
     require_stable_storage: bool,
+    clean_close_checkpoint_fault: Option<FileCleanCloseCheckpointFaultPoint>,
 ) -> Result<AcquiredFileDatabaseOwnership<N>, FileDatabaseOwnershipOpenError> {
     PageLayout::for_const::<N>().map_err(FileDatabaseOwnershipOpenError::PageWidth)?;
+    validate_close_candidate_paths(&layout)?;
 
     let (mut database_owner_file, database_owner_metadata) =
         open_file(layout.database_owner(), FileDatabaseLockRole::DatabaseOwner)?;
@@ -2089,6 +3145,16 @@ fn acquire_file_database_ownership<const N: usize>(
         return Err(FileDatabaseOwnershipOpenError::ManifestDatabaseIdMismatch {
             owner: owner_database_id,
             manifest: manifest_database_id,
+        });
+    }
+    if require_stable_storage
+        && !matches!(
+            manifest.lifecycle_state(),
+            ntsql_database::DatabaseManifestLifecycleState::RecoveryRequired
+        )
+    {
+        return Err(FileDatabaseOwnershipOpenError::ManifestLifecycle {
+            actual: manifest.lifecycle_state(),
         });
     }
 
@@ -2226,9 +3292,14 @@ fn acquire_file_database_ownership<const N: usize>(
     )?;
     let page_store_database_file_identity = pending_store.database_file_identity();
 
-    let checkpoint =
+    let mut checkpoint =
         FileRestartCheckpointCompletenessBaselineSource::open(layout.restart_checkpoint())
             .map_err(FileDatabaseOwnershipOpenError::RestartCheckpointOpen)?;
+    if let Some(fault) = clean_close_checkpoint_fault {
+        checkpoint
+            .arm_clean_close_fault(fault)
+            .map_err(FileDatabaseOwnershipOpenError::CleanCloseCheckpointFault)?;
+    }
     require_same_opened_object(
         FileDatabaseLockRole::RestartCheckpoint,
         &checkpoint_probe_metadata,
@@ -2429,14 +3500,21 @@ fn read_manifest(file: &mut File) -> Result<DatabaseManifest, FileDatabaseOwners
             source,
         )
     })?;
-    if length.len() != super::DATABASE_MANIFEST_V1_LENGTH as u64 {
-        return Err(FileDatabaseOwnershipOpenError::ManifestFileLength {
+    match usize::try_from(length.len()) {
+        Ok(super::DATABASE_MANIFEST_V1_LENGTH) => {
+            let mut bytes = [0_u8; super::DATABASE_MANIFEST_V1_LENGTH];
+            read_exact(file, FileDatabaseLockRole::Manifest, &mut bytes)?;
+            decode_database_manifest(&bytes).map_err(FileDatabaseOwnershipOpenError::Manifest)
+        }
+        Ok(super::DATABASE_MANIFEST_V2_LENGTH) => {
+            let mut bytes = [0_u8; super::DATABASE_MANIFEST_V2_LENGTH];
+            read_exact(file, FileDatabaseLockRole::Manifest, &mut bytes)?;
+            decode_database_manifest_v2(&bytes).map_err(FileDatabaseOwnershipOpenError::ManifestV2)
+        }
+        Ok(_) | Err(_) => Err(FileDatabaseOwnershipOpenError::ManifestFileLength {
             actual: length.len(),
-        });
+        }),
     }
-    let mut bytes = [0_u8; super::DATABASE_MANIFEST_V1_LENGTH];
-    read_exact(file, FileDatabaseLockRole::Manifest, &mut bytes)?;
-    decode_database_manifest(&bytes).map_err(FileDatabaseOwnershipOpenError::Manifest)
 }
 
 fn validate_child_observation(

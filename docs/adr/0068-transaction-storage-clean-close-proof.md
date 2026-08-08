@@ -5,7 +5,7 @@
 - Issue: #186
 - Extends: ADR 0020, ADR 0047, ADR 0048, ADR 0051, ADR 0058, ADR 0059,
   ADR 0060, ADR 0066, ADR 0067
-- Extended by: ADR 0069
+- Extended by: ADR 0069, ADR 0071
 
 ## Context
 

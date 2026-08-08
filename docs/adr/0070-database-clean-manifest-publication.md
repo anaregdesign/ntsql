@@ -4,6 +4,7 @@
 - Date: 2026-08-08
 - Issue: #186
 - Extends: ADR 0067, ADR 0068, ADR 0069
+- Extended by: ADR 0071
 
 ## Context
 

@@ -1439,16 +1439,17 @@ impl<Owner> UnboundDatabase<Owner> {
         DatabaseLifecycleStage::Unbound
     }
 
-    /// Selects one validated inert manifest identity for the expected database.
+    /// Selects one complete validated inert manifest for the expected database.
     pub fn select_manifest(
         self,
-        selected_identity: DatabaseCompositionIdentity,
+        selected_manifest: DatabaseManifest,
     ) -> Result<ManifestSelectedDatabase<Owner>, Box<DatabaseManifestSelectionError<Owner>>> {
+        let selected_identity = selected_manifest.composition_identity();
         if self.expected_database_id != selected_identity.database_id {
             let expected = self.expected_database_id;
             return Err(Box::new(DatabaseManifestSelectionError {
                 database: self,
-                selected_identity,
+                selected_manifest,
                 reason: DatabaseManifestSelectionRejection::ForeignDatabaseId {
                     expected,
                     actual: selected_identity.database_id,
@@ -1457,7 +1458,7 @@ impl<Owner> UnboundDatabase<Owner> {
         }
         Ok(ManifestSelectedDatabase {
             owner: self.owner,
-            identity: selected_identity,
+            manifest: selected_manifest,
         })
     }
 }
@@ -1502,7 +1503,7 @@ impl Error for DatabaseManifestSelectionRejection {}
 #[must_use = "failed manifest selection retains the unbound database owner"]
 pub struct DatabaseManifestSelectionError<Owner> {
     database: UnboundDatabase<Owner>,
-    selected_identity: DatabaseCompositionIdentity,
+    selected_manifest: DatabaseManifest,
     reason: DatabaseManifestSelectionRejection,
 }
 
@@ -1513,15 +1514,21 @@ impl<Owner> DatabaseManifestSelectionError<Owner> {
         &self.reason
     }
 
-    /// Returns the rejected inert manifest identity.
+    /// Returns the rejected inert manifest's composition identity.
     #[must_use]
     pub const fn selected_identity(&self) -> DatabaseCompositionIdentity {
-        self.selected_identity
+        self.selected_manifest.composition_identity()
     }
 
-    /// Releases the retained unbound owner and rejected inert identity together.
-    pub fn into_parts(self) -> (UnboundDatabase<Owner>, DatabaseCompositionIdentity) {
-        (self.database, self.selected_identity)
+    /// Returns the complete rejected inert manifest.
+    #[must_use]
+    pub const fn selected_manifest(&self) -> DatabaseManifest {
+        self.selected_manifest
+    }
+
+    /// Releases the retained unbound owner and rejected inert manifest together.
+    pub fn into_parts(self) -> (UnboundDatabase<Owner>, DatabaseManifest) {
+        (self.database, self.selected_manifest)
     }
 }
 
@@ -1529,7 +1536,7 @@ impl<Owner> fmt::Debug for DatabaseManifestSelectionError<Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("DatabaseManifestSelectionError")
-            .field("selected_identity", &self.selected_identity)
+            .field("selected_manifest", &self.selected_manifest)
             .field("reason", &self.reason)
             .finish_non_exhaustive()
     }
@@ -1568,14 +1575,20 @@ impl<Owner> Error for DatabaseManifestSelectionError<Owner> {}
 #[must_use = "selected manifest ownership must bind exact storage or be dropped"]
 pub struct ManifestSelectedDatabase<Owner> {
     owner: Owner,
-    identity: DatabaseCompositionIdentity,
+    manifest: DatabaseManifest,
 }
 
 impl<Owner> ManifestSelectedDatabase<Owner> {
     /// Returns the selected inert composition identity.
     #[must_use]
     pub const fn identity(&self) -> DatabaseCompositionIdentity {
-        self.identity
+        self.manifest.composition_identity()
+    }
+
+    /// Returns the complete selected inert manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.manifest
     }
 
     /// Returns this owner's lifecycle stage.
@@ -1591,21 +1604,34 @@ impl<Owner> ManifestSelectedDatabase<Owner> {
     pub fn bind_observed_storage(
         self,
         observed_identity: DatabaseStorageIdentity,
-    ) -> Result<RecoveryRequiredDatabase<Owner>, Box<DatabaseStorageBindingError<Owner>>> {
+    ) -> Result<RecoveryRequiredDatabase<Owner>, Box<DatabaseRecoveryRequiredBindingError<Owner>>>
+    {
+        if !matches!(
+            self.manifest.lifecycle_state(),
+            DatabaseManifestLifecycleState::RecoveryRequired
+        ) {
+            let actual = self.manifest.lifecycle_state();
+            return Err(Box::new(DatabaseRecoveryRequiredBindingError {
+                database: self,
+                observed_identity,
+                reason: DatabaseRecoveryRequiredBindingRejection::ManifestLifecycle { actual },
+            }));
+        }
         if let Err(reason) = self
-            .identity
+            .manifest
+            .composition_identity()
             .storage_identity()
             .require_exact_match(observed_identity)
         {
-            return Err(Box::new(DatabaseStorageBindingError {
+            return Err(Box::new(DatabaseRecoveryRequiredBindingError {
                 database: self,
                 observed_identity,
-                reason,
+                reason: DatabaseRecoveryRequiredBindingRejection::StorageIdentity(reason),
             }));
         }
         Ok(RecoveryRequiredDatabase {
             _owner: self.owner,
-            identity: self.identity,
+            identity: self.manifest.composition_identity(),
         })
     }
 }
@@ -1614,23 +1640,56 @@ impl<Owner> fmt::Debug for ManifestSelectedDatabase<Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ManifestSelectedDatabase")
-            .field("identity", &self.identity)
+            .field("manifest", &self.manifest)
             .finish_non_exhaustive()
     }
 }
 
-/// Failed storage-identity binding retaining selected ownership and evidence.
-#[must_use = "failed storage binding retains the selected database owner"]
-pub struct DatabaseStorageBindingError<Owner> {
-    database: ManifestSelectedDatabase<Owner>,
-    observed_identity: DatabaseStorageIdentity,
-    reason: DatabaseCompositionIdentityMismatch,
+/// Reason a selected manifest cannot cross the recovery-required binding gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseRecoveryRequiredBindingRejection {
+    /// The complete selected manifest describes another lifecycle state.
+    ManifestLifecycle {
+        /// Exact rejected lifecycle state.
+        actual: DatabaseManifestLifecycleState,
+    },
+    /// The physical child identity differs from the selected manifest.
+    StorageIdentity(DatabaseCompositionIdentityMismatch),
 }
 
-impl<Owner> DatabaseStorageBindingError<Owner> {
-    /// Returns the first stable storage contradiction.
+impl fmt::Display for DatabaseRecoveryRequiredBindingRejection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ManifestLifecycle { actual } => write!(
+                formatter,
+                "recovery-required binding cannot consume a {actual} manifest"
+            ),
+            Self::StorageIdentity(source) => write!(formatter, "{source}"),
+        }
+    }
+}
+
+impl Error for DatabaseRecoveryRequiredBindingRejection {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StorageIdentity(source) => Some(source),
+            Self::ManifestLifecycle { .. } => None,
+        }
+    }
+}
+
+/// Failed recovery-required binding retaining selected ownership and evidence.
+#[must_use = "failed recovery-required binding retains the selected database owner"]
+pub struct DatabaseRecoveryRequiredBindingError<Owner> {
+    database: ManifestSelectedDatabase<Owner>,
+    observed_identity: DatabaseStorageIdentity,
+    reason: DatabaseRecoveryRequiredBindingRejection,
+}
+
+impl<Owner> DatabaseRecoveryRequiredBindingError<Owner> {
+    /// Returns the lifecycle or stable-storage contradiction.
     #[must_use]
-    pub const fn reason(&self) -> &DatabaseCompositionIdentityMismatch {
+    pub const fn reason(&self) -> &DatabaseRecoveryRequiredBindingRejection {
         &self.reason
     }
 
@@ -1646,27 +1705,27 @@ impl<Owner> DatabaseStorageBindingError<Owner> {
     }
 }
 
-impl<Owner> fmt::Debug for DatabaseStorageBindingError<Owner> {
+impl<Owner> fmt::Debug for DatabaseRecoveryRequiredBindingError<Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DatabaseStorageBindingError")
+            .debug_struct("DatabaseRecoveryRequiredBindingError")
             .field("observed_identity", &self.observed_identity)
             .field("reason", &self.reason)
             .finish_non_exhaustive()
     }
 }
 
-impl<Owner> fmt::Display for DatabaseStorageBindingError<Owner> {
+impl<Owner> fmt::Display for DatabaseRecoveryRequiredBindingError<Owner> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "database storage binding failed: {}",
+            "database recovery-required binding failed: {}",
             self.reason
         )
     }
 }
 
-impl<Owner> Error for DatabaseStorageBindingError<Owner> {}
+impl<Owner> Error for DatabaseRecoveryRequiredBindingError<Owner> {}
 
 macro_rules! define_owned_database_state {
     ($(#[$attribute:meta])* $name:ident, $stage:expr) => {
@@ -4047,8 +4106,22 @@ mod tests {
 
     #[test]
     fn staged_owner_rejects_foreign_manifest_and_composition() -> Result<(), TestValueError> {
-        let expected = composition(1, 2, 3, 4, 5, 6)?;
-        let foreign_database = composition(9, 2, 3, 4, 5, 6)?;
+        let formats = DatabaseStorageFormatRequirements::new(
+            format_version(1)?,
+            format_version(1)?,
+            format_version(1)?,
+        );
+        let expected_identity = composition(1, 2, 3, 4, 5, 6)?;
+        let expected = DatabaseManifest::recovery_required(
+            expected_identity,
+            formats,
+            DatabaseRequiredFeatures::NONE,
+        );
+        let foreign_database = DatabaseManifest::recovery_required(
+            composition(9, 2, 3, 4, 5, 6)?,
+            formats,
+            DatabaseRequiredFeatures::NONE,
+        );
         let unbound = UnboundDatabase::new("database-owner", database_id(1)?);
 
         let selection_error = match unbound.select_manifest(foreign_database) {
@@ -4077,23 +4150,53 @@ mod tests {
         };
         assert_eq!(
             binding_error.reason(),
-            &DatabaseCompositionIdentityMismatch::FileId {
-                role: DatabaseFileRole::Wal,
-                expected: file_id(3)?,
-                actual: file_id(9)?,
-            }
+            &DatabaseRecoveryRequiredBindingRejection::StorageIdentity(
+                DatabaseCompositionIdentityMismatch::FileId {
+                    role: DatabaseFileRole::Wal,
+                    expected: file_id(3)?,
+                    actual: file_id(9)?,
+                }
+            )
         );
         let (selected, rejected) = (*binding_error).into_parts();
         assert_eq!(rejected, foreign_wal);
 
         let recovery_required = selected
-            .bind_observed_storage(expected.storage_identity())
+            .bind_observed_storage(expected_identity.storage_identity())
             .map_err(|_| TestValueError("exact storage must bind"))?;
         assert_eq!(
             recovery_required.stage(),
             DatabaseLifecycleStage::RecoveryRequired
         );
-        assert_eq!(recovery_required.identity(), expected);
+        assert_eq!(recovery_required.identity(), expected_identity);
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_required_binding_rejects_a_selected_clean_manifest() -> Result<(), TestValueError> {
+        let source = manifest(1, 2, 3, 1)?;
+        let certificate = certificate(generation(2)?, None, 5, 6, 7, 8, 9)
+            .map_err(|_| TestValueError("certificate must construct"))?;
+        let clean = source
+            .next_clean(certificate)
+            .map_err(|_| TestValueError("clean manifest must construct"))?;
+        let selected = UnboundDatabase::new("database-owner", database_id(1)?)
+            .select_manifest(clean)
+            .map_err(|_| TestValueError("clean manifest must remain observable"))?;
+        assert_eq!(selected.manifest(), clean);
+
+        let failure = selected
+            .bind_observed_storage(clean.composition_identity().storage_identity())
+            .err()
+            .ok_or(TestValueError(
+                "clean manifest must not acquire recovery-required authority",
+            ))?;
+        assert_eq!(
+            failure.reason(),
+            &DatabaseRecoveryRequiredBindingRejection::ManifestLifecycle {
+                actual: DatabaseManifestLifecycleState::Clean(certificate),
+            }
+        );
         Ok(())
     }
 }

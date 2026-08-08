@@ -9,14 +9,19 @@ use std::{
 
 use ntsql_compatibility::CompatibilityContext;
 use ntsql_database::{
-    AbandonedDatabase, ClosePendingDatabase, DatabaseCleanCloseCertificate,
+    AbandonedDatabase, AbandonedDatabaseClosePublication, ClosePendingDatabase, ClosedDatabase,
+    DatabaseCleanCloseCertificate, DatabaseCleanManifestPublicationPermit,
+    DatabaseCleanManifestPublicationReceipt, DatabaseCleanManifestPublicationState,
+    DatabaseCleanManifestPublisher, DatabaseCleanManifestPublisherFailure,
     DatabaseCloseSourceManifestOwner, DatabaseCompositionIdentity,
     DatabaseCompositionIdentityError, DatabaseCompositionIdentityMismatch, DatabaseFileId,
     DatabaseFileIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleStage, DatabaseManifest,
-    DatabaseManifestSelectionRejection, DatabaseRecoveryFailureCause, DatabaseRecoveryOwner,
-    DatabaseStorageFormatVersion, DatabaseStorageIdentity, FailedDatabaseClosePreparation,
+    DatabaseManifestSelectionRejection, DatabaseManifestSuccessorError,
+    DatabaseRecoveryFailureCause, DatabaseRecoveryOwner, DatabaseStorageFormatVersion,
+    DatabaseStorageIdentity, FailedDatabaseClosePreparation, FailedDatabaseClosePublication,
     FailedDatabaseRecovery, LiveDatabase, ManifestSelectedDatabase, PreparedDatabaseCloseOwnership,
-    RecoveredDatabaseOwnership, RecoveryRequiredDatabase, UnboundDatabase,
+    PublishedDatabaseCloseOwnership, RecoveredDatabaseOwnership, RecoveryRequiredDatabase,
+    UnboundDatabase,
 };
 use ntsql_transaction::{
     FailedTransactionPageStorageRecoveryHandoff, TransactionCoordinator,
@@ -347,6 +352,9 @@ struct InMemoryDatabaseCreateRecord {
     database_id: DatabaseId,
     phase: InMemoryDatabaseCreatePhase,
     request: Option<InMemoryDatabaseCreateRequest>,
+    selected_manifest: Option<DatabaseManifest>,
+    close_candidate_manifest: Option<DatabaseManifest>,
+    synchronized_manifest: Option<DatabaseManifest>,
 }
 
 impl InMemoryDatabaseFileObservation {
@@ -701,6 +709,27 @@ impl InMemoryDatabaseOwnershipSlot {
             .map_or(InMemoryDatabaseCreatePhase::Absent, |record| record.phase)
     }
 
+    /// Returns the manifest currently selected by the durable memory model.
+    #[must_use]
+    pub fn selected_manifest(&self) -> Option<DatabaseManifest> {
+        self.create_record()
+            .and_then(|record| record.selected_manifest)
+    }
+
+    /// Returns the separately published clean-close manifest candidate.
+    #[must_use]
+    pub fn close_candidate_manifest(&self) -> Option<DatabaseManifest> {
+        self.create_record()
+            .and_then(|record| record.close_candidate_manifest)
+    }
+
+    /// Returns the manifest covered by the modeled publication barrier.
+    #[must_use]
+    pub fn synchronized_manifest(&self) -> Option<DatabaseManifest> {
+        self.create_record()
+            .and_then(|record| record.synchronized_manifest)
+    }
+
     /// Creates or resumes one exact deterministic successor-format composition.
     pub fn try_create_recovery_required(
         &self,
@@ -883,10 +912,12 @@ impl InMemoryDatabaseOwnershipSlot {
 
         let acquired = finish_in_memory_database_acquisition(
             self.database_id,
+            self.object_id,
             request.manifest_object_id,
             request.manifest,
             request.files,
             guard,
+            Rc::clone(&self.creates),
         )
         .map_err(InMemoryDatabaseCreateError::Ownership)?;
         let database = acquired
@@ -909,12 +940,26 @@ impl InMemoryDatabaseOwnershipSlot {
         phase: InMemoryDatabaseCreatePhase,
         request: Option<InMemoryDatabaseCreateRequest>,
     ) {
+        let previous = self.create_record();
+        let selected_manifest = previous
+            .and_then(|record| record.selected_manifest)
+            .or_else(|| {
+                if phase == InMemoryDatabaseCreatePhase::Published {
+                    request.map(|request| request.manifest)
+                } else {
+                    None
+                }
+            });
         self.creates.borrow_mut().insert(
             self.object_id,
             InMemoryDatabaseCreateRecord {
                 database_id: self.database_id,
                 phase,
                 request,
+                selected_manifest,
+                close_candidate_manifest: previous
+                    .and_then(|record| record.close_candidate_manifest),
+                synchronized_manifest: previous.and_then(|record| record.synchronized_manifest),
             },
         );
     }
@@ -932,10 +977,11 @@ impl InMemoryDatabaseOwnershipSlot {
     fn require_memory_create_publication(
         &self,
         manifest_object_id: InMemoryDatabaseObjectId,
+        manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
     ) -> Result<(), InMemoryDatabaseOwnershipError> {
         if let Some(record) = self.create_record() {
-            require_published_memory_selection(record, manifest_object_id, files)?;
+            require_published_memory_selection(record, manifest_object_id, manifest, files)?;
         }
         for (owner_object_id, record) in self.creates.borrow().iter() {
             if *owner_object_id == self.object_id || record.database_id != self.database_id {
@@ -962,7 +1008,13 @@ impl InMemoryDatabaseOwnershipSlot {
         manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
     ) -> Result<InMemoryDatabaseOwnershipSelection, InMemoryDatabaseOwnershipError> {
-        let acquired = self.acquire(expected_database_id, manifest_object_id, manifest, files)?;
+        let acquired = self.acquire(
+            expected_database_id,
+            manifest_object_id,
+            manifest,
+            files,
+            false,
+        )?;
         Ok(InMemoryDatabaseOwnershipSelection {
             selected: acquired.selected,
         })
@@ -976,7 +1028,13 @@ impl InMemoryDatabaseOwnershipSlot {
         manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
     ) -> Result<RecoveryRequiredInMemoryDatabase, InMemoryDatabaseOwnershipError> {
-        let acquired = self.acquire(expected_database_id, manifest_object_id, manifest, files)?;
+        let acquired = self.acquire(
+            expected_database_id,
+            manifest_object_id,
+            manifest,
+            files,
+            true,
+        )?;
         acquired
             .selected
             .bind_observed_storage(acquired.observed_storage_identity)
@@ -989,6 +1047,7 @@ impl InMemoryDatabaseOwnershipSlot {
         manifest_object_id: InMemoryDatabaseObjectId,
         manifest: DatabaseManifest,
         files: &[InMemoryDatabaseFileObservation],
+        require_recovery_required: bool,
     ) -> Result<AcquiredInMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError> {
         let mut guard = InMemoryDatabaseOwnershipGuard::new();
         guard.acquire(
@@ -1006,7 +1065,7 @@ impl InMemoryDatabaseOwnershipSlot {
                 actual: self.database_id,
             });
         }
-        self.require_memory_create_publication(manifest_object_id, files)?;
+        self.require_memory_create_publication(manifest_object_id, manifest, files)?;
         reject_object_alias(
             InMemoryDatabaseObjectRole::DatabaseOwner,
             self.object_id,
@@ -1026,6 +1085,16 @@ impl InMemoryDatabaseOwnershipSlot {
             return Err(InMemoryDatabaseOwnershipError::ManifestDatabaseIdMismatch {
                 owner: self.database_id,
                 manifest: manifest_database_id,
+            });
+        }
+        if require_recovery_required
+            && !matches!(
+                manifest.lifecycle_state(),
+                ntsql_database::DatabaseManifestLifecycleState::RecoveryRequired
+            )
+        {
+            return Err(InMemoryDatabaseOwnershipError::ManifestLifecycle {
+                actual: manifest.lifecycle_state(),
             });
         }
 
@@ -1087,10 +1156,12 @@ impl InMemoryDatabaseOwnershipSlot {
 
         finish_in_memory_database_acquisition(
             expected_database_id,
+            self.object_id,
             manifest_object_id,
             manifest,
             [wal, page_store, restart_checkpoint],
             guard,
+            Rc::clone(&self.creates),
         )
     }
 }
@@ -1240,6 +1311,7 @@ fn require_memory_create_request(
 fn require_published_memory_selection(
     record: InMemoryDatabaseCreateRecord,
     manifest_object_id: InMemoryDatabaseObjectId,
+    manifest: DatabaseManifest,
     files: &[InMemoryDatabaseFileObservation],
 ) -> Result<(), InMemoryDatabaseOwnershipError> {
     if record.phase != InMemoryDatabaseCreatePhase::Published {
@@ -1259,6 +1331,15 @@ fn require_published_memory_selection(
     ];
     if manifest_object_id != stored.manifest_object_id || observed != stored.files {
         return Err(InMemoryDatabaseOwnershipError::PublishedCreateSelectionMismatch);
+    }
+    let selected_manifest =
+        record
+            .selected_manifest
+            .ok_or(InMemoryDatabaseOwnershipError::CreateStateCorrupt {
+                phase: record.phase,
+            })?;
+    if manifest != selected_manifest {
+        return Err(InMemoryDatabaseOwnershipError::SelectedManifestMismatch);
     }
     Ok(())
 }
@@ -1283,10 +1364,12 @@ fn acquire_memory_create_object(
 
 fn finish_in_memory_database_acquisition(
     expected_database_id: DatabaseId,
+    owner_object_id: InMemoryDatabaseObjectId,
     manifest_object_id: InMemoryDatabaseObjectId,
     manifest: DatabaseManifest,
     files: [InMemoryDatabaseFileObservation; 3],
     guard: InMemoryDatabaseOwnershipGuard,
+    creates: Rc<RefCell<BTreeMap<InMemoryDatabaseObjectId, InMemoryDatabaseCreateRecord>>>,
 ) -> Result<AcquiredInMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError> {
     let observed_files = [
         DatabaseFileIdentity::new(files[0].role, files[0].file_id),
@@ -1307,8 +1390,10 @@ fn finish_in_memory_database_acquisition(
     guard.commit_bindings();
     let owner = InMemoryDatabaseOwnership {
         manifest,
+        owner_object_id,
         manifest_object_id,
         files,
+        creates,
         _guard: guard,
     };
     let selected = match UnboundDatabase::new(owner, expected_database_id)
@@ -1348,8 +1433,10 @@ struct AcquiredInMemoryDatabaseOwnership {
 #[must_use = "database ownership must remain inside its lifecycle typestate"]
 pub struct InMemoryDatabaseOwnership {
     manifest: DatabaseManifest,
+    owner_object_id: InMemoryDatabaseObjectId,
     manifest_object_id: InMemoryDatabaseObjectId,
     files: [InMemoryDatabaseFileObservation; 3],
+    creates: Rc<RefCell<BTreeMap<InMemoryDatabaseObjectId, InMemoryDatabaseCreateRecord>>>,
     _guard: InMemoryDatabaseOwnershipGuard,
 }
 
@@ -1371,6 +1458,16 @@ impl InMemoryDatabaseOwnership {
     pub const fn files(&self) -> &[InMemoryDatabaseFileObservation; 3] {
         &self.files
     }
+
+    fn create_record(&self) -> Option<InMemoryDatabaseCreateRecord> {
+        self.creates.borrow().get(&self.owner_object_id).copied()
+    }
+
+    fn set_close_record(&mut self, record: InMemoryDatabaseCreateRecord) {
+        self.creates
+            .borrow_mut()
+            .insert(self.owner_object_id, record);
+    }
 }
 
 impl fmt::Debug for InMemoryDatabaseOwnership {
@@ -1378,6 +1475,7 @@ impl fmt::Debug for InMemoryDatabaseOwnership {
         formatter
             .debug_struct("InMemoryDatabaseOwnership")
             .field("manifest", &self.manifest)
+            .field("owner_object_id", &self.owner_object_id)
             .field("manifest_object_id", &self.manifest_object_id)
             .field("files", &self.files)
             .finish_non_exhaustive()
@@ -1418,6 +1516,236 @@ impl<const N: usize> fmt::Debug for InMemoryDatabaseRecoveryStorage<N> {
     }
 }
 
+/// One ordered memory clean-manifest publication boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryDatabaseCloseBoundary {
+    /// Publish the candidate without changing selected state.
+    CandidatePublication,
+    /// Atomically replace the selected manifest.
+    ManifestPublication,
+    /// Reobserve the selected manifest after replacement.
+    SelectedManifestVerification,
+    /// Record the modeled durability barrier.
+    PublicationSynchronization,
+}
+
+/// Deterministic timing for one memory clean-manifest publication fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryDatabaseCloseFaultTiming {
+    /// Report a definite failure before the boundary effect.
+    BeforeEffect,
+    /// Apply the effect and then report a definite failure.
+    AfterEffect,
+    /// Report an outcome-indeterminate failure without applying the effect.
+    OutcomeIndeterminateBeforeEffect,
+    /// Apply the effect and then report an outcome-indeterminate failure.
+    OutcomeIndeterminateAfterEffect,
+}
+
+impl InMemoryDatabaseCloseFaultTiming {
+    const fn is_before(self) -> bool {
+        matches!(
+            self,
+            Self::BeforeEffect | Self::OutcomeIndeterminateBeforeEffect
+        )
+    }
+
+    const fn is_after(self) -> bool {
+        matches!(
+            self,
+            Self::AfterEffect | Self::OutcomeIndeterminateAfterEffect
+        )
+    }
+
+    /// Returns whether the injected report hides the physical outcome.
+    #[must_use]
+    pub const fn is_outcome_indeterminate(self) -> bool {
+        matches!(
+            self,
+            Self::OutcomeIndeterminateBeforeEffect | Self::OutcomeIndeterminateAfterEffect
+        )
+    }
+}
+
+/// One deterministic memory clean-manifest publication fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InMemoryDatabaseCloseFault {
+    boundary: InMemoryDatabaseCloseBoundary,
+    timing: InMemoryDatabaseCloseFaultTiming,
+}
+
+impl InMemoryDatabaseCloseFault {
+    /// Arms one exact publication boundary and timing.
+    #[must_use]
+    pub const fn new(
+        boundary: InMemoryDatabaseCloseBoundary,
+        timing: InMemoryDatabaseCloseFaultTiming,
+    ) -> Self {
+        Self { boundary, timing }
+    }
+
+    /// Returns the armed boundary.
+    #[must_use]
+    pub const fn boundary(self) -> InMemoryDatabaseCloseBoundary {
+        self.boundary
+    }
+
+    /// Returns the armed timing.
+    #[must_use]
+    pub const fn timing(self) -> InMemoryDatabaseCloseFaultTiming {
+        self.timing
+    }
+
+    const fn publication_state(self) -> DatabaseCleanManifestPublicationState {
+        match (self.boundary, self.timing) {
+            (InMemoryDatabaseCloseBoundary::CandidatePublication, _) => {
+                DatabaseCleanManifestPublicationState::SourceSelected
+            }
+            (
+                InMemoryDatabaseCloseBoundary::ManifestPublication,
+                InMemoryDatabaseCloseFaultTiming::BeforeEffect,
+            ) => DatabaseCleanManifestPublicationState::SourceSelected,
+            (
+                InMemoryDatabaseCloseBoundary::ManifestPublication,
+                InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+                | InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+            ) => DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+            (
+                InMemoryDatabaseCloseBoundary::ManifestPublication,
+                InMemoryDatabaseCloseFaultTiming::AfterEffect,
+            )
+            | (InMemoryDatabaseCloseBoundary::SelectedManifestVerification, _)
+            | (
+                InMemoryDatabaseCloseBoundary::PublicationSynchronization,
+                InMemoryDatabaseCloseFaultTiming::BeforeEffect
+                | InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+                | InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+            ) => DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+            (
+                InMemoryDatabaseCloseBoundary::PublicationSynchronization,
+                InMemoryDatabaseCloseFaultTiming::AfterEffect,
+            ) => DatabaseCleanManifestPublicationState::TargetDurable,
+        }
+    }
+}
+
+impl fmt::Display for InMemoryDatabaseCloseFault {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{:?} at {:?}", self.boundary, self.timing)
+    }
+}
+
+/// Memory-adapter cause for a clean-manifest publication failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InMemoryDatabaseClosePublicationError {
+    /// The selected memory model was not created through the durable create path.
+    MissingCreateRecord,
+    /// The durable create protocol has not selected a manifest.
+    CreateNotPublished {
+        /// Exact create phase retained by the model.
+        phase: InMemoryDatabaseCreatePhase,
+    },
+    /// The modeled selected source changed before candidate publication.
+    SourceManifestMismatch,
+    /// The permit target is not an exact lifecycle successor.
+    TargetManifest(DatabaseManifestSuccessorError),
+    /// Fresh selected-manifest verification contradicted the target.
+    SelectedManifestMismatch,
+    /// The modeled durability barrier did not cover the exact target.
+    SynchronizedManifestMismatch,
+    /// One deterministic fault fired.
+    InjectedFault(InMemoryDatabaseCloseFault),
+}
+
+impl fmt::Display for InMemoryDatabaseClosePublicationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingCreateRecord => formatter
+                .write_str("memory clean-manifest publication has no durable create record"),
+            Self::CreateNotPublished { phase } => write!(
+                formatter,
+                "memory clean-manifest publication found create phase {phase}, not published"
+            ),
+            Self::SourceManifestMismatch => formatter
+                .write_str("memory clean-manifest source differs from modeled selected state"),
+            Self::TargetManifest(source) => {
+                write!(
+                    formatter,
+                    "memory clean-manifest target is invalid: {source}"
+                )
+            }
+            Self::SelectedManifestMismatch => {
+                formatter.write_str("memory selected-manifest verification contradicted the target")
+            }
+            Self::SynchronizedManifestMismatch => {
+                formatter.write_str("memory publication barrier did not cover the target")
+            }
+            Self::InjectedFault(fault) => {
+                write!(formatter, "injected memory database close fault {fault}")
+            }
+        }
+    }
+}
+
+impl Error for InMemoryDatabaseClosePublicationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::TargetManifest(source) => Some(source),
+            Self::MissingCreateRecord
+            | Self::CreateNotPublished { .. }
+            | Self::SourceManifestMismatch
+            | Self::SelectedManifestMismatch
+            | Self::SynchronizedManifestMismatch
+            | Self::InjectedFault(_) => None,
+        }
+    }
+}
+
+struct InMemoryDatabaseCloseFaultController {
+    armed: Option<InMemoryDatabaseCloseFault>,
+}
+
+impl InMemoryDatabaseCloseFaultController {
+    const fn new(armed: Option<InMemoryDatabaseCloseFault>) -> Self {
+        Self { armed }
+    }
+
+    fn before(
+        &mut self,
+        boundary: InMemoryDatabaseCloseBoundary,
+    ) -> Result<(), DatabaseCleanManifestPublisherFailure<InMemoryDatabaseClosePublicationError>>
+    {
+        self.fire(boundary, InMemoryDatabaseCloseFaultTiming::is_before)
+    }
+
+    fn after(
+        &mut self,
+        boundary: InMemoryDatabaseCloseBoundary,
+    ) -> Result<(), DatabaseCleanManifestPublisherFailure<InMemoryDatabaseClosePublicationError>>
+    {
+        self.fire(boundary, InMemoryDatabaseCloseFaultTiming::is_after)
+    }
+
+    fn fire(
+        &mut self,
+        boundary: InMemoryDatabaseCloseBoundary,
+        matches_timing: fn(InMemoryDatabaseCloseFaultTiming) -> bool,
+    ) -> Result<(), DatabaseCleanManifestPublisherFailure<InMemoryDatabaseClosePublicationError>>
+    {
+        if let Some(fault) = self.armed
+            && fault.boundary() == boundary
+            && matches_timing(fault.timing())
+        {
+            self.armed = None;
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                fault.publication_state(),
+                InMemoryDatabaseClosePublicationError::InjectedFault(fault),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Modeled database-wide ownership retained after transaction recovery.
 #[must_use = "live memory database ownership must remain inside its database typestate"]
 pub struct RecoveredInMemoryDatabaseOuterOwnership {
@@ -1442,6 +1770,118 @@ impl RecoveredInMemoryDatabaseOuterOwnership {
 impl DatabaseCloseSourceManifestOwner for RecoveredInMemoryDatabaseOuterOwnership {
     fn close_source_manifest(&self) -> DatabaseManifest {
         self.manifest()
+    }
+}
+
+impl DatabaseCleanManifestPublisher for RecoveredInMemoryDatabaseOuterOwnership {
+    type Input = Option<InMemoryDatabaseCloseFault>;
+    type Error = InMemoryDatabaseClosePublicationError;
+
+    fn publish_clean_manifest(
+        &mut self,
+        input: Self::Input,
+        permit: DatabaseCleanManifestPublicationPermit<'_>,
+    ) -> Result<
+        DatabaseCleanManifestPublicationReceipt,
+        DatabaseCleanManifestPublisherFailure<Self::Error>,
+    > {
+        let source_manifest = self.ownership.manifest;
+        let target_manifest = permit.target_manifest();
+        target_manifest
+            .require_successor_of(source_manifest)
+            .map_err(|source| {
+                DatabaseCleanManifestPublisherFailure::new(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    InMemoryDatabaseClosePublicationError::TargetManifest(source),
+                )
+            })?;
+
+        let mut record = self.ownership.create_record().ok_or_else(|| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                InMemoryDatabaseClosePublicationError::MissingCreateRecord,
+            )
+        })?;
+        if record.phase != InMemoryDatabaseCreatePhase::Published {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                InMemoryDatabaseClosePublicationError::CreateNotPublished {
+                    phase: record.phase,
+                },
+            ));
+        }
+        if record.selected_manifest != Some(source_manifest) {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                InMemoryDatabaseClosePublicationError::SourceManifestMismatch,
+            ));
+        }
+
+        let mut fault = InMemoryDatabaseCloseFaultController::new(input);
+        fault.before(InMemoryDatabaseCloseBoundary::CandidatePublication)?;
+        record.close_candidate_manifest = Some(target_manifest);
+        record.synchronized_manifest = None;
+        self.ownership.set_close_record(record);
+        fault.after(InMemoryDatabaseCloseBoundary::CandidatePublication)?;
+
+        fault.before(InMemoryDatabaseCloseBoundary::ManifestPublication)?;
+        record.selected_manifest = Some(target_manifest);
+        self.ownership.manifest = target_manifest;
+        self.ownership.set_close_record(record);
+        fault.after(InMemoryDatabaseCloseBoundary::ManifestPublication)?;
+
+        fault.before(InMemoryDatabaseCloseBoundary::SelectedManifestVerification)?;
+        record = self.ownership.create_record().ok_or_else(|| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                InMemoryDatabaseClosePublicationError::MissingCreateRecord,
+            )
+        })?;
+        if record.selected_manifest != Some(target_manifest) {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                InMemoryDatabaseClosePublicationError::SelectedManifestMismatch,
+            ));
+        }
+        fault.after(InMemoryDatabaseCloseBoundary::SelectedManifestVerification)?;
+
+        fault.before(InMemoryDatabaseCloseBoundary::PublicationSynchronization)?;
+        record.synchronized_manifest = Some(target_manifest);
+        self.ownership.set_close_record(record);
+        fault.after(InMemoryDatabaseCloseBoundary::PublicationSynchronization)?;
+
+        let synchronized = self.ownership.create_record().ok_or_else(|| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                InMemoryDatabaseClosePublicationError::MissingCreateRecord,
+            )
+        })?;
+        let selected_manifest = synchronized.selected_manifest.ok_or_else(|| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                InMemoryDatabaseClosePublicationError::SelectedManifestMismatch,
+            )
+        })?;
+        if selected_manifest != target_manifest {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                InMemoryDatabaseClosePublicationError::SelectedManifestMismatch,
+            ));
+        }
+        let synchronized_manifest = synchronized.synchronized_manifest.ok_or_else(|| {
+            DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                InMemoryDatabaseClosePublicationError::SynchronizedManifestMismatch,
+            )
+        })?;
+        if synchronized_manifest != target_manifest {
+            return Err(DatabaseCleanManifestPublisherFailure::new(
+                DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                InMemoryDatabaseClosePublicationError::SynchronizedManifestMismatch,
+            ));
+        }
+
+        Ok(permit.complete(selected_manifest, synchronized_manifest))
     }
 }
 
@@ -1679,12 +2119,30 @@ type PreparedInMemoryDatabaseCloseOwnership<const N: usize> = PreparedDatabaseCl
     N,
 >;
 
+type PublishedInMemoryDatabaseCloseOwnership<const N: usize> = PublishedDatabaseCloseOwnership<
+    RecoveredInMemoryDatabaseOuterOwnership,
+    InMemoryCommitLog<N>,
+    InMemoryPageStore<N>,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
 /// Terminal memory-database owner retained when close preparation fails.
 pub type FailedInMemoryDatabaseClosePreparation<const N: usize> = FailedDatabaseClosePreparation<
     RecoveredInMemoryDatabaseOuterOwnership,
     InMemoryCommitLog<N>,
     InMemoryPageStore<N>,
     InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    N,
+>;
+
+/// Terminal memory-database owner retained when manifest publication fails.
+pub type FailedInMemoryDatabaseClosePublication<const N: usize> = FailedDatabaseClosePublication<
+    RecoveredInMemoryDatabaseOuterOwnership,
+    InMemoryCommitLog<N>,
+    InMemoryPageStore<N>,
+    InMemoryTransactionRestartCheckpointCompletenessBaselineSource,
+    InMemoryDatabaseClosePublicationError,
     N,
 >;
 
@@ -1740,6 +2198,25 @@ impl<const N: usize> ClosePendingInMemoryDatabase<N> {
         self.database.stage()
     }
 
+    /// Publishes and synchronizes the exact clean manifest.
+    pub fn close(
+        self,
+    ) -> Result<ClosedInMemoryDatabase<N>, FailedInMemoryDatabaseClosePublication<N>> {
+        self.database
+            .close(None)
+            .map(|database| ClosedInMemoryDatabase { database })
+    }
+
+    /// Publishes with one deterministic memory fault.
+    pub fn close_with_fault(
+        self,
+        fault: InMemoryDatabaseCloseFault,
+    ) -> Result<ClosedInMemoryDatabase<N>, FailedInMemoryDatabaseClosePublication<N>> {
+        self.database
+            .close(Some(fault))
+            .map(|database| ClosedInMemoryDatabase { database })
+    }
+
     /// Relinquishes close-pending ownership without publishing clean state.
     pub fn abandon(self) -> AbandonedDatabase {
         self.database.abandon()
@@ -1756,6 +2233,55 @@ impl<const N: usize> fmt::Debug for ClosePendingInMemoryDatabase<N> {
             .finish_non_exhaustive()
     }
 }
+
+/// Memory database retained after exact clean-manifest durability.
+#[must_use = "closed memory database ownership must remain retained or be dropped"]
+pub struct ClosedInMemoryDatabase<const N: usize> {
+    database: ClosedDatabase<PublishedInMemoryDatabaseCloseOwnership<N>>,
+}
+
+impl<const N: usize> ClosedInMemoryDatabase<N> {
+    /// Returns the exact selected clean composition.
+    #[must_use]
+    pub const fn identity(&self) -> DatabaseCompositionIdentity {
+        self.database.identity()
+    }
+
+    /// Returns the exact selected and synchronized clean manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.database.published().manifest()
+    }
+
+    /// Returns the database lifecycle stage.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        self.database.stage()
+    }
+
+    /// Returns the retained immutable exact-target context.
+    #[must_use]
+    pub const fn compatibility_context(&self) -> &CompatibilityContext {
+        self.database
+            .published()
+            .prepared()
+            .outer_owner()
+            .compatibility_context()
+    }
+}
+
+impl<const N: usize> fmt::Debug for ClosedInMemoryDatabase<N> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClosedInMemoryDatabase")
+            .field("identity", &self.identity())
+            .field("manifest", &self.manifest())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Terminal inert result after relinquishing a failed memory close publication.
+pub type AbandonedInMemoryDatabaseClosePublication = AbandonedDatabaseClosePublication;
 
 /// Failure before or during fail-closed memory database open.
 #[must_use = "failed memory database open may retain every database owner"]
@@ -2083,6 +2609,8 @@ pub enum InMemoryDatabaseOwnershipError {
     },
     /// Supplied objects differ from the objects selected by published create.
     PublishedCreateSelectionMismatch,
+    /// The supplied manifest differs from the manifest selected by the model.
+    SelectedManifestMismatch,
     /// Two roles reuse one modeled opened object.
     ObjectAlias {
         /// Earlier role in acquisition order.
@@ -2096,6 +2624,11 @@ pub enum InMemoryDatabaseOwnershipError {
         owner: DatabaseId,
         /// Manifest identity.
         manifest: DatabaseId,
+    },
+    /// Recovery-required acquisition received another manifest lifecycle.
+    ManifestLifecycle {
+        /// Exact rejected lifecycle state.
+        actual: ntsql_database::DatabaseManifestLifecycleState,
     },
     /// One required child role is absent.
     MissingRole {
@@ -2184,6 +2717,9 @@ impl fmt::Display for InMemoryDatabaseOwnershipError {
             }
             Self::PublishedCreateSelectionMismatch => formatter
                 .write_str("modeled objects differ from the published database create selection"),
+            Self::SelectedManifestMismatch => {
+                formatter.write_str("supplied manifest differs from the selected memory manifest")
+            }
             Self::ObjectAlias { first, second } => {
                 write!(formatter, "modeled database {second} aliases {first}")
             }
@@ -2192,6 +2728,10 @@ impl fmt::Display for InMemoryDatabaseOwnershipError {
                 "database manifest identity {} does not match owner {}",
                 manifest.get(),
                 owner.get()
+            ),
+            Self::ManifestLifecycle { actual } => write!(
+                formatter,
+                "recovery-required memory open cannot select {actual} manifest"
             ),
             Self::MissingRole { role } => write!(formatter, "database is missing the {role} role"),
             Self::DuplicateRole { role } => {
@@ -2256,8 +2796,10 @@ impl Error for InMemoryDatabaseOwnershipError {
             | Self::UnpublishedCreate { .. }
             | Self::CreateStateCorrupt { .. }
             | Self::PublishedCreateSelectionMismatch
+            | Self::SelectedManifestMismatch
             | Self::ObjectAlias { .. }
             | Self::ManifestDatabaseIdMismatch { .. }
+            | Self::ManifestLifecycle { .. }
             | Self::MissingRole { .. }
             | Self::DuplicateRole { .. }
             | Self::FileIdMismatch { .. }

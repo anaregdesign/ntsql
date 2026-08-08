@@ -62,17 +62,21 @@ use ntsql_wal::{CommitLog, LogDurability, LogLineage, LogSequenceNumber, Persist
 mod database_ownership;
 
 pub use database_ownership::{
-    ClosePendingInMemoryDatabase, FailedInMemoryDatabaseClosePreparation,
-    InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError, InMemoryDatabaseCreateFault,
-    InMemoryDatabaseCreateFaultTiming, InMemoryDatabaseCreateManifestError,
-    InMemoryDatabaseCreateOutcome, InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation,
-    InMemoryDatabaseLiveOpenError, InMemoryDatabaseLiveOpenRequest, InMemoryDatabaseObjectId,
-    InMemoryDatabaseObjectRole, InMemoryDatabaseOpenPhase, InMemoryDatabaseOwnership,
-    InMemoryDatabaseOwnershipError, InMemoryDatabaseOwnershipSelection,
-    InMemoryDatabaseOwnershipSlot, InMemoryDatabaseOwnershipSlotError,
-    InMemoryDatabaseOwnershipWorld, InMemoryDatabaseRecoveryStorage, LiveInMemoryDatabase,
-    RecoveredInMemoryDatabaseOuterOwnership, RecoveryRequiredInMemoryDatabase,
-    open_live_in_memory_database, open_live_in_memory_database_with_observer,
+    AbandonedInMemoryDatabaseClosePublication, ClosePendingInMemoryDatabase,
+    ClosedInMemoryDatabase, FailedInMemoryDatabaseClosePreparation,
+    FailedInMemoryDatabaseClosePublication, InMemoryDatabaseCloseBoundary,
+    InMemoryDatabaseCloseFault, InMemoryDatabaseCloseFaultTiming,
+    InMemoryDatabaseClosePublicationError, InMemoryDatabaseCreateBoundary,
+    InMemoryDatabaseCreateError, InMemoryDatabaseCreateFault, InMemoryDatabaseCreateFaultTiming,
+    InMemoryDatabaseCreateManifestError, InMemoryDatabaseCreateOutcome,
+    InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation, InMemoryDatabaseLiveOpenError,
+    InMemoryDatabaseLiveOpenRequest, InMemoryDatabaseObjectId, InMemoryDatabaseObjectRole,
+    InMemoryDatabaseOpenPhase, InMemoryDatabaseOwnership, InMemoryDatabaseOwnershipError,
+    InMemoryDatabaseOwnershipSelection, InMemoryDatabaseOwnershipSlot,
+    InMemoryDatabaseOwnershipSlotError, InMemoryDatabaseOwnershipWorld,
+    InMemoryDatabaseRecoveryStorage, LiveInMemoryDatabase, RecoveredInMemoryDatabaseOuterOwnership,
+    RecoveryRequiredInMemoryDatabase, open_live_in_memory_database,
+    open_live_in_memory_database_with_observer,
 };
 
 /// One-shot physical-effect boundary for the next matching log operation.

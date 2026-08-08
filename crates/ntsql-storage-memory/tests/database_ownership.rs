@@ -2,14 +2,16 @@ use std::{error::Error, io};
 
 use ntsql_compatibility::{CompatibilityContext, CompatibilityProfile};
 use ntsql_database::{
-    DatabaseCleanCloseCertificate, DatabaseClosePreparationFailureCause,
-    DatabaseClosePreparationPreflightError, DatabaseCompositionIdentity, DatabaseFileId,
-    DatabaseFileIdentity, DatabaseFileRole, DatabaseId, DatabaseLifecycleGeneration,
-    DatabaseLifecycleStage, DatabaseManifest, DatabaseManifestLifecycleState,
-    DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
+    DatabaseCleanCloseCertificate, DatabaseCleanManifestPublicationState,
+    DatabaseClosePreparationFailureCause, DatabaseClosePreparationPreflightError,
+    DatabaseCompositionIdentity, DatabaseFileId, DatabaseFileIdentity, DatabaseFileRole,
+    DatabaseId, DatabaseLifecycleGeneration, DatabaseLifecycleStage, DatabaseManifest,
+    DatabaseManifestLifecycleState, DatabaseRequiredFeatures, DatabaseStorageFormatRequirements,
+    DatabaseStorageFormatVersion,
 };
 use ntsql_storage_memory::{
-    InMemoryCommitLog, InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError,
+    InMemoryCommitLog, InMemoryDatabaseCloseBoundary, InMemoryDatabaseCloseFault,
+    InMemoryDatabaseCloseFaultTiming, InMemoryDatabaseCreateBoundary, InMemoryDatabaseCreateError,
     InMemoryDatabaseCreateFault, InMemoryDatabaseCreateFaultTiming,
     InMemoryDatabaseCreateManifestError, InMemoryDatabaseCreateOutcome,
     InMemoryDatabaseCreatePhase, InMemoryDatabaseFileObservation, InMemoryDatabaseLiveOpenRequest,
@@ -881,6 +883,223 @@ fn committed_nonempty_live_close_binds_fresh_frontier_and_transaction_count()
 }
 
 #[test]
+fn clean_manifest_publication_reaches_closed_with_exact_memory_selection()
+-> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(80, 180)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+    let mut live = open_empty_live(
+        &composition,
+        &slot,
+        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+        "memory-clean-publication",
+    )?;
+    let active = live.transaction_parts_mut().0.begin()?;
+    let (coordinator, log, _) = live.transaction_parts_mut();
+    coordinator.commit(active, log)?;
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("memory close preparation failed"))?;
+    let target = pending.target_manifest();
+
+    let closed = pending
+        .close()
+        .map_err(|_| io::Error::other("memory clean-manifest publication failed"))?;
+
+    assert_eq!(closed.stage(), DatabaseLifecycleStage::Closed);
+    assert_eq!(closed.identity(), target.composition_identity());
+    assert_eq!(closed.manifest(), target);
+    assert_eq!(
+        closed.compatibility_context().target_id().as_str(),
+        "memory-clean-publication"
+    );
+    assert_eq!(slot.close_candidate_manifest(), Some(target));
+    assert_eq!(slot.selected_manifest(), Some(target));
+    assert_eq!(slot.synchronized_manifest(), Some(target));
+    assert!(slot.is_owned());
+    assert_eq!(
+        composition.acquire(&slot).err(),
+        Some(InMemoryDatabaseOwnershipError::Contended {
+            database_id: composition.database_id,
+        })
+    );
+
+    drop(closed);
+    assert!(!slot.is_owned());
+    assert_eq!(
+        composition.acquire(&slot).err(),
+        Some(InMemoryDatabaseOwnershipError::SelectedManifestMismatch)
+    );
+    drop(slot.try_acquire(
+        composition.database_id,
+        composition.manifest_object_id,
+        target,
+        &composition.files,
+    )?);
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
+fn every_memory_clean_manifest_fault_is_terminal_and_freshly_reopenable()
+-> Result<(), Box<dyn Error>> {
+    let boundaries = [
+        InMemoryDatabaseCloseBoundary::CandidatePublication,
+        InMemoryDatabaseCloseBoundary::ManifestPublication,
+        InMemoryDatabaseCloseBoundary::SelectedManifestVerification,
+        InMemoryDatabaseCloseBoundary::PublicationSynchronization,
+    ];
+    let timings = [
+        InMemoryDatabaseCloseFaultTiming::BeforeEffect,
+        InMemoryDatabaseCloseFaultTiming::AfterEffect,
+        InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect,
+        InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+    ];
+
+    for (boundary_index, boundary) in boundaries.into_iter().enumerate() {
+        for (timing_index, timing) in timings.into_iter().enumerate() {
+            let offset = (boundary_index * timings.len() + timing_index) as u128;
+            let composition = TestComposition::new_create(800 + offset, 900 + offset)?;
+            let mut world = InMemoryDatabaseOwnershipWorld::new();
+            let slot = composition.slot(&mut world)?;
+            drop(composition.create(&slot, None)?);
+            let live = open_empty_live(
+                &composition,
+                &slot,
+                InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
+                "memory-clean-fault",
+            )?;
+            let pending = live
+                .prepare_close()
+                .map_err(|_| io::Error::other("memory close preparation failed"))?;
+            let target = pending.target_manifest();
+            let fault = InMemoryDatabaseCloseFault::new(boundary, timing);
+
+            let failure = pending
+                .close_with_fault(fault)
+                .err()
+                .ok_or_else(|| io::Error::other("armed memory close fault did not fire"))?;
+
+            let expected_state = match (boundary, timing) {
+                (InMemoryDatabaseCloseBoundary::CandidatePublication, _) => {
+                    DatabaseCleanManifestPublicationState::SourceSelected
+                }
+                (
+                    InMemoryDatabaseCloseBoundary::ManifestPublication,
+                    InMemoryDatabaseCloseFaultTiming::BeforeEffect,
+                ) => DatabaseCleanManifestPublicationState::SourceSelected,
+                (
+                    InMemoryDatabaseCloseBoundary::ManifestPublication,
+                    InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+                    | InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+                ) => DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                (
+                    InMemoryDatabaseCloseBoundary::ManifestPublication,
+                    InMemoryDatabaseCloseFaultTiming::AfterEffect,
+                )
+                | (InMemoryDatabaseCloseBoundary::SelectedManifestVerification, _)
+                | (
+                    InMemoryDatabaseCloseBoundary::PublicationSynchronization,
+                    InMemoryDatabaseCloseFaultTiming::BeforeEffect
+                    | InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+                    | InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+                ) => DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+                (
+                    InMemoryDatabaseCloseBoundary::PublicationSynchronization,
+                    InMemoryDatabaseCloseFaultTiming::AfterEffect,
+                ) => DatabaseCleanManifestPublicationState::TargetDurable,
+            };
+            assert_eq!(failure.state(), expected_state);
+            assert_eq!(
+                failure.source_identity(),
+                composition.manifest.composition_identity()
+            );
+            assert_eq!(failure.target_identity(), target.composition_identity());
+            assert!(slot.is_owned());
+
+            let effect_applied = matches!(
+                timing,
+                InMemoryDatabaseCloseFaultTiming::AfterEffect
+                    | InMemoryDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect
+            );
+            let candidate_selected = !matches!(
+                boundary,
+                InMemoryDatabaseCloseBoundary::CandidatePublication
+            ) || effect_applied;
+            let target_selected =
+                matches!(
+                    boundary,
+                    InMemoryDatabaseCloseBoundary::SelectedManifestVerification
+                        | InMemoryDatabaseCloseBoundary::PublicationSynchronization
+                ) || (matches!(boundary, InMemoryDatabaseCloseBoundary::ManifestPublication)
+                    && effect_applied);
+            let target_synchronized = matches!(
+                boundary,
+                InMemoryDatabaseCloseBoundary::PublicationSynchronization
+            ) && effect_applied;
+            assert_eq!(
+                slot.close_candidate_manifest(),
+                candidate_selected.then_some(target)
+            );
+            assert_eq!(
+                slot.selected_manifest(),
+                Some(if target_selected {
+                    target
+                } else {
+                    composition.manifest
+                })
+            );
+            assert_eq!(
+                slot.synchronized_manifest(),
+                target_synchronized.then_some(target)
+            );
+
+            let abandoned = failure.abandon();
+            assert_eq!(abandoned.state(), expected_state);
+            assert_eq!(abandoned.stage(), DatabaseLifecycleStage::Abandoned);
+            assert!(!slot.is_owned());
+
+            let selected_manifest = if target_selected {
+                target
+            } else {
+                composition.manifest
+            };
+            drop(slot.try_acquire(
+                composition.database_id,
+                composition.manifest_object_id,
+                selected_manifest,
+                &composition.files,
+            )?);
+            assert!(!slot.is_owned());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn published_memory_create_rejects_a_nonselected_manifest() -> Result<(), Box<dyn Error>> {
+    let composition = TestComposition::new_create(81, 181)?;
+    let mut world = InMemoryDatabaseOwnershipWorld::new();
+    let slot = composition.slot(&mut world)?;
+    drop(composition.create(&slot, None)?);
+    let unselected = composition.manifest.next_recovery_required()?;
+
+    assert_eq!(
+        slot.try_acquire(
+            composition.database_id,
+            composition.manifest_object_id,
+            unselected,
+            &composition.files,
+        )
+        .err(),
+        Some(InMemoryDatabaseOwnershipError::SelectedManifestMismatch)
+    );
+    assert!(!slot.is_owned());
+    Ok(())
+}
+
+#[test]
 fn active_transaction_close_failure_is_terminal_until_explicit_abandon()
 -> Result<(), Box<dyn Error>> {
     let composition = TestComposition::new_create(74, 174)?;
@@ -1049,7 +1268,7 @@ fn lifecycle_generation_exhaustion_precedes_transaction_close_effect() -> Result
 }
 
 #[test]
-fn clean_source_manifest_is_rejected_before_transaction_close_publication()
+fn clean_source_manifest_is_rejected_before_recovery_required_authority()
 -> Result<(), Box<dyn Error>> {
     let mut composition = TestComposition::new_create(78, 178)?;
     let certificate = DatabaseCleanCloseCertificate::new(
@@ -1067,27 +1286,14 @@ fn clean_source_manifest_is_rejected_before_transaction_close_publication()
     composition.manifest = composition.manifest.next_clean(certificate)?;
     let mut world = InMemoryDatabaseOwnershipWorld::new();
     let slot = composition.slot(&mut world)?;
-    let live = open_empty_live(
-        &composition,
-        &slot,
-        InMemoryTransactionRestartCheckpointCompletenessBaselineSource::empty(),
-        "memory-clean-source-close",
-    )?;
-
-    let failure = live
-        .prepare_close()
-        .err()
-        .ok_or_else(|| io::Error::other("clean source manifest prepared another clean close"))?;
-    match failure.cause() {
-        DatabaseClosePreparationFailureCause::Preflight(
-            DatabaseClosePreparationPreflightError::SourceManifestLifecycle {
-                actual: DatabaseManifestLifecycleState::Clean(actual),
-            },
-        ) => assert_eq!(*actual, certificate),
-        _ => return Err(io::Error::other("clean source manifest returned wrong cause").into()),
-    }
-    assert!(slot.is_owned());
-    drop(failure.abandon());
+    assert_eq!(
+        composition
+            .acquire_recovery_required(&slot, composition.manifest)
+            .err(),
+        Some(InMemoryDatabaseOwnershipError::ManifestLifecycle {
+            actual: DatabaseManifestLifecycleState::Clean(certificate),
+        })
+    );
     assert!(!slot.is_owned());
     Ok(())
 }

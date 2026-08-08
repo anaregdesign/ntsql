@@ -9,14 +9,22 @@ use std::{
 
 use ntsql_compatibility::{CompatibilityContext, CompatibilityProfile};
 use ntsql_database::{
+    DatabaseCleanManifestPublicationState, DatabaseClosePreparationFailureCause,
     DatabaseCompositionIdentity, DatabaseFileIdentity, DatabaseFileRole, DatabaseId,
     DatabaseLifecycleGeneration, DatabaseLifecycleStage, DatabaseManifest,
-    DatabaseRequiredFeatures, DatabaseStorageFormatRequirements, DatabaseStorageFormatVersion,
+    DatabaseManifestLifecycleState, DatabaseRequiredFeatures, DatabaseStorageFormatRequirements,
+    DatabaseStorageFormatVersion,
 };
 use ntsql_storage_file::{
-    FileDatabaseCreateOutcome, FileDatabaseLayout, FileDatabaseLiveOpenError,
-    FileDatabaseOpenPhase, FileDatabaseOwnershipOpenError, create_file_database,
-    open_live_file_database, open_live_file_database_with_observer,
+    DATABASE_MANIFEST_V1_LENGTH, DATABASE_MANIFEST_V2_LENGTH, FileCleanCloseCheckpointFaultPoint,
+    FileDatabaseCloseBoundary, FileDatabaseCloseFault, FileDatabaseCloseFaultTiming,
+    FileDatabaseCreateEntry, FileDatabaseCreateOutcome, FileDatabaseLayout,
+    FileDatabaseLiveOpenError, FileDatabaseOpenPhase, FileDatabaseOwnershipOpenError,
+    FileRestartCheckpointCompletenessBaselinePublicationFaultPoint,
+    clean_close_checkpoint_slot_directory, create_file_database,
+    database_manifest_close_candidate_path, decode_database_manifest, decode_database_manifest_v2,
+    open_file_database_ownership, open_live_file_database,
+    open_live_file_database_with_close_checkpoint_fault, open_live_file_database_with_observer,
     open_recovery_required_file_database,
 };
 use ntsql_transaction::TransactionPageStorageRecoveryHandoffPhase;
@@ -135,6 +143,432 @@ fn rejected_selected_checkpoint_never_falls_back_and_failure_retains_all_locks()
     Ok(())
 }
 
+#[test]
+fn clean_close_publishes_exact_v2_and_retains_every_lock() -> Result<(), Box<dyn Error>> {
+    let database = TestDatabase::create("clean-close", 4)?;
+    let live = open_live_file_database::<1>(
+        database.database_id,
+        database.layout.clone(),
+        compatibility_context("file-clean-close")?,
+    )?;
+    let selected_checkpoint = database.layout.restart_checkpoint().join("current");
+    let selected_checkpoint_before = fs::read(&selected_checkpoint)?;
+
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("filesystem close preparation failed"))?;
+    let target = pending.target_manifest();
+    let clean_checkpoint =
+        clean_close_checkpoint_slot_directory(database.layout.restart_checkpoint())
+            .ok_or_else(|| io::Error::other("clean-close checkpoint path is unavailable"))?;
+    assert!(clean_checkpoint.join("current").is_file());
+    assert_eq!(fs::read(&selected_checkpoint)?, selected_checkpoint_before);
+
+    let closed = pending
+        .close()
+        .map_err(|_| io::Error::other("filesystem clean-manifest publication failed"))?;
+
+    assert_eq!(closed.stage(), DatabaseLifecycleStage::Closed);
+    assert_eq!(closed.identity(), target.composition_identity());
+    assert_eq!(closed.manifest(), target);
+    assert_eq!(
+        closed.compatibility_context().target_id().as_str(),
+        "file-clean-close"
+    );
+    let selected_bytes = fs::read(database.layout.manifest())?;
+    assert_eq!(selected_bytes.len(), DATABASE_MANIFEST_V2_LENGTH);
+    assert_eq!(decode_database_manifest_v2(&selected_bytes)?, target);
+    assert!(
+        !database_manifest_close_candidate_path(database.layout.manifest())
+            .ok_or_else(|| io::Error::other("manifest close-candidate path is unavailable"))?
+            .exists()
+    );
+    assert_eq!(fs::read(&selected_checkpoint)?, selected_checkpoint_before);
+    assert_all_database_files_locked(&database.layout)?;
+    assert_file_locked(&clean_checkpoint.join("control"))?;
+    assert!(matches!(
+        open_recovery_required_file_database::<1>(database.database_id, database.layout.clone()),
+        Err(FileDatabaseOwnershipOpenError::Io(_))
+    ));
+
+    drop(closed);
+    assert!(matches!(
+        open_recovery_required_file_database::<1>(database.database_id, database.layout.clone()),
+        Err(FileDatabaseOwnershipOpenError::ManifestLifecycle {
+            actual: DatabaseManifestLifecycleState::Clean(_),
+        })
+    ));
+    drop(open_file_database_ownership::<1>(
+        database.database_id,
+        database.layout.clone(),
+    )?);
+    Ok(())
+}
+
+#[test]
+fn every_manifest_publication_fault_retains_state_and_allows_fresh_open()
+-> Result<(), Box<dyn Error>> {
+    let boundaries = [
+        FileDatabaseCloseBoundary::CandidateCleanup,
+        FileDatabaseCloseBoundary::CandidateCreate,
+        FileDatabaseCloseBoundary::CandidateWrite,
+        FileDatabaseCloseBoundary::CandidateSynchronization,
+        FileDatabaseCloseBoundary::ManifestReplacement,
+        FileDatabaseCloseBoundary::SelectedManifestVerification,
+        FileDatabaseCloseBoundary::ParentDirectorySynchronization,
+    ];
+    let timings = [
+        FileDatabaseCloseFaultTiming::BeforeEffect,
+        FileDatabaseCloseFaultTiming::AfterEffect,
+        FileDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect,
+        FileDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+    ];
+
+    for (boundary_index, boundary) in boundaries.into_iter().enumerate() {
+        for (timing_index, timing) in timings.into_iter().enumerate() {
+            let database = TestDatabase::create(
+                "close-fault",
+                1000 + (boundary_index * timings.len() + timing_index) as u128,
+            )?;
+            let live = open_live_file_database::<1>(
+                database.database_id,
+                database.layout.clone(),
+                compatibility_context("file-close-fault")?,
+            )?;
+            let selected_checkpoint = database.layout.restart_checkpoint().join("current");
+            let selected_checkpoint_before = fs::read(&selected_checkpoint)?;
+            let pending = live
+                .prepare_close()
+                .map_err(|_| io::Error::other("filesystem close preparation failed"))?;
+            let target = pending.target_manifest();
+            let fault = FileDatabaseCloseFault::new(boundary, timing);
+
+            let failure = pending
+                .close_with_fault(fault)
+                .err()
+                .ok_or_else(|| io::Error::other("armed filesystem close fault did not fire"))?;
+
+            let expected_state = expected_close_fault_state(boundary, timing);
+            assert_eq!(failure.state(), expected_state);
+            assert_eq!(
+                failure.source_identity(),
+                database.manifest.composition_identity()
+            );
+            assert_eq!(failure.target_identity(), target.composition_identity());
+            assert_all_database_files_locked(&database.layout)?;
+            let clean_checkpoint =
+                clean_close_checkpoint_slot_directory(database.layout.restart_checkpoint())
+                    .ok_or_else(|| {
+                        io::Error::other("clean-close checkpoint path is unavailable")
+                    })?;
+            assert_file_locked(&clean_checkpoint.join("control"))?;
+            assert_eq!(fs::read(&selected_checkpoint)?, selected_checkpoint_before);
+
+            let effect_applied = matches!(
+                timing,
+                FileDatabaseCloseFaultTiming::AfterEffect
+                    | FileDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect
+            );
+            let target_selected = matches!(
+                boundary,
+                FileDatabaseCloseBoundary::SelectedManifestVerification
+                    | FileDatabaseCloseBoundary::ParentDirectorySynchronization
+            ) || (boundary == FileDatabaseCloseBoundary::ManifestReplacement
+                && effect_applied);
+            let selected_bytes = fs::read(database.layout.manifest())?;
+            if target_selected {
+                assert_eq!(selected_bytes.len(), DATABASE_MANIFEST_V2_LENGTH);
+                assert_eq!(decode_database_manifest_v2(&selected_bytes)?, target);
+            } else {
+                assert_eq!(selected_bytes.len(), DATABASE_MANIFEST_V1_LENGTH);
+                assert_eq!(
+                    decode_database_manifest(&selected_bytes)?,
+                    database.manifest
+                );
+            }
+
+            let abandoned = failure.abandon();
+            assert_eq!(abandoned.state(), expected_state);
+            assert_eq!(abandoned.stage(), DatabaseLifecycleStage::Abandoned);
+            drop(open_file_database_ownership::<1>(
+                database.database_id,
+                database.layout.clone(),
+            )?);
+            if target_selected {
+                assert!(matches!(
+                    open_recovery_required_file_database::<1>(
+                        database.database_id,
+                        database.layout.clone()
+                    ),
+                    Err(FileDatabaseOwnershipOpenError::ManifestLifecycle {
+                        actual: DatabaseManifestLifecycleState::Clean(_),
+                    })
+                ));
+            } else {
+                drop(open_recovery_required_file_database::<1>(
+                    database.database_id,
+                    database.layout.clone(),
+                )?);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn stale_manifest_candidate_is_reconciled_by_a_fresh_close() -> Result<(), Box<dyn Error>> {
+    let database = TestDatabase::create("close-retry", 5)?;
+    let live = open_live_file_database::<1>(
+        database.database_id,
+        database.layout.clone(),
+        compatibility_context("file-close-retry-first")?,
+    )?;
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("first filesystem close preparation failed"))?;
+    let failure = pending
+        .close_with_fault(FileDatabaseCloseFault::new(
+            FileDatabaseCloseBoundary::CandidateWrite,
+            FileDatabaseCloseFaultTiming::AfterEffect,
+        ))
+        .err()
+        .ok_or_else(|| io::Error::other("candidate-write fault did not fire"))?;
+    let candidate = database_manifest_close_candidate_path(database.layout.manifest())
+        .ok_or_else(|| io::Error::other("manifest close-candidate path is unavailable"))?;
+    assert!(candidate.is_file());
+    drop(failure.abandon());
+
+    let live = open_live_file_database::<1>(
+        database.database_id,
+        database.layout.clone(),
+        compatibility_context("file-close-retry-second")?,
+    )?;
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("second filesystem close preparation failed"))?;
+    let target = pending.target_manifest();
+    let closed = pending
+        .close()
+        .map_err(|_| io::Error::other("fresh filesystem close publication failed"))?;
+    assert_eq!(closed.manifest(), target);
+    assert!(!candidate.exists());
+    Ok(())
+}
+
+#[test]
+fn every_clean_checkpoint_fault_preserves_restart_selection_and_requires_fresh_open()
+-> Result<(), Box<dyn Error>> {
+    let publication_faults = [
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::BeforeCandidateCleanup,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateCleanup,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateCreate,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateWrite,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCandidateSync,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterCurrentReplace,
+        FileRestartCheckpointCompletenessBaselinePublicationFaultPoint::AfterDirectorySync,
+    ];
+    let faults = publication_faults
+        .map(FileCleanCloseCheckpointFaultPoint::Publication)
+        .into_iter()
+        .chain([FileCleanCloseCheckpointFaultPoint::BeforeLoad]);
+
+    for (index, fault) in faults.enumerate() {
+        let database = TestDatabase::create("checkpoint-close-fault", 2000 + index as u128)?;
+        let live = open_live_file_database_with_close_checkpoint_fault::<1>(
+            database.database_id,
+            database.layout.clone(),
+            compatibility_context("file-checkpoint-close-fault")?,
+            fault,
+        )?;
+        let selected_checkpoint = database.layout.restart_checkpoint().join("current");
+        let selected_checkpoint_before = fs::read(&selected_checkpoint)?;
+
+        let failure = live
+            .prepare_close()
+            .err()
+            .ok_or_else(|| io::Error::other("armed clean-close checkpoint fault did not fire"))?;
+
+        match failure.cause() {
+            DatabaseClosePreparationFailureCause::Transaction(transaction) => {
+                assert!(transaction.error().outcome_is_indeterminate());
+            }
+            _ => {
+                return Err(
+                    io::Error::other("clean-close checkpoint fault returned wrong cause").into(),
+                );
+            }
+        }
+        assert_eq!(fs::read(&selected_checkpoint)?, selected_checkpoint_before);
+        assert_eq!(
+            decode_database_manifest(&fs::read(database.layout.manifest())?)?,
+            database.manifest
+        );
+        assert_all_database_files_locked(&database.layout)?;
+        let clean_checkpoint =
+            clean_close_checkpoint_slot_directory(database.layout.restart_checkpoint())
+                .ok_or_else(|| io::Error::other("clean-close checkpoint path is unavailable"))?;
+        assert_file_locked(&clean_checkpoint.join("control"))?;
+        drop(failure.abandon());
+
+        let live = open_live_file_database::<1>(
+            database.database_id,
+            database.layout.clone(),
+            compatibility_context("file-checkpoint-close-retry")?,
+        )?;
+        let pending = live
+            .prepare_close()
+            .map_err(|_| io::Error::other("fresh checkpoint close preparation failed"))?;
+        let target = pending.target_manifest();
+        let closed = pending
+            .close()
+            .map_err(|_| io::Error::other("fresh checkpoint close publication failed"))?;
+        assert_eq!(closed.manifest(), target);
+        assert_eq!(fs::read(&selected_checkpoint)?, selected_checkpoint_before);
+    }
+    Ok(())
+}
+
+#[test]
+fn partial_clean_checkpoint_directory_is_reconciled_before_publication()
+-> Result<(), Box<dyn Error>> {
+    let database = TestDatabase::create("partial-clean-checkpoint", 6)?;
+    let clean_checkpoint =
+        clean_close_checkpoint_slot_directory(database.layout.restart_checkpoint())
+            .ok_or_else(|| io::Error::other("clean-close checkpoint path is unavailable"))?;
+    fs::create_dir(&clean_checkpoint)?;
+    let live = open_live_file_database::<1>(
+        database.database_id,
+        database.layout.clone(),
+        compatibility_context("file-partial-clean-checkpoint")?,
+    )?;
+
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("partial clean checkpoint was not reconciled"))?;
+
+    assert!(clean_checkpoint.join("control").is_file());
+    assert!(clean_checkpoint.join("current").is_file());
+    drop(
+        pending
+            .close()
+            .map_err(|_| io::Error::other("clean publication failed after reconciliation"))?,
+    );
+    Ok(())
+}
+
+#[test]
+fn manifest_close_candidate_directory_fails_before_selection() -> Result<(), Box<dyn Error>> {
+    let database = TestDatabase::create("manifest-close-directory", 7)?;
+    let live = open_live_file_database::<1>(
+        database.database_id,
+        database.layout.clone(),
+        compatibility_context("file-manifest-close-directory")?,
+    )?;
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("filesystem close preparation failed"))?;
+    let candidate = database_manifest_close_candidate_path(database.layout.manifest())
+        .ok_or_else(|| io::Error::other("manifest close-candidate path is unavailable"))?;
+    fs::create_dir(&candidate)?;
+
+    let failure = pending
+        .close()
+        .err()
+        .ok_or_else(|| io::Error::other("manifest candidate directory was accepted"))?;
+
+    assert_eq!(
+        failure.state(),
+        DatabaseCleanManifestPublicationState::SourceSelected
+    );
+    assert_eq!(
+        decode_database_manifest(&fs::read(database.layout.manifest())?)?,
+        database.manifest
+    );
+    assert_all_database_files_locked(&database.layout)?;
+    drop(failure.abandon());
+    fs::remove_dir(&candidate)?;
+
+    let live = open_live_file_database::<1>(
+        database.database_id,
+        database.layout.clone(),
+        compatibility_context("file-manifest-close-directory-retry")?,
+    )?;
+    let pending = live
+        .prepare_close()
+        .map_err(|_| io::Error::other("fresh filesystem close preparation failed"))?;
+    drop(
+        pending
+            .close()
+            .map_err(|_| io::Error::other("fresh filesystem close publication failed"))?,
+    );
+    Ok(())
+}
+
+#[test]
+fn close_candidate_path_collision_is_rejected_before_open() -> Result<(), Box<dyn Error>> {
+    let database = TestDatabase::create("close-path-collision", 8)?;
+    let clean_checkpoint =
+        clean_close_checkpoint_slot_directory(database.layout.restart_checkpoint())
+            .ok_or_else(|| io::Error::other("clean-close checkpoint path is unavailable"))?;
+    let colliding_layout = FileDatabaseLayout::new(
+        database.layout.database_owner(),
+        clean_checkpoint,
+        database.layout.wal(),
+        database.layout.page_store(),
+        database.layout.restart_checkpoint(),
+    );
+
+    assert!(matches!(
+        open_file_database_ownership::<1>(database.database_id, colliding_layout),
+        Err(
+            FileDatabaseOwnershipOpenError::CloseCandidatePathCollision {
+                first: FileDatabaseCreateEntry::Manifest,
+                second: FileDatabaseCreateEntry::RestartCheckpointCleanCloseCandidate,
+            }
+        )
+    ));
+    Ok(())
+}
+
+const fn expected_close_fault_state(
+    boundary: FileDatabaseCloseBoundary,
+    timing: FileDatabaseCloseFaultTiming,
+) -> DatabaseCleanManifestPublicationState {
+    match (boundary, timing) {
+        (
+            FileDatabaseCloseBoundary::CandidateCleanup
+            | FileDatabaseCloseBoundary::CandidateCreate
+            | FileDatabaseCloseBoundary::CandidateWrite
+            | FileDatabaseCloseBoundary::CandidateSynchronization,
+            _,
+        ) => DatabaseCleanManifestPublicationState::SourceSelected,
+        (
+            FileDatabaseCloseBoundary::ManifestReplacement,
+            FileDatabaseCloseFaultTiming::BeforeEffect,
+        ) => DatabaseCleanManifestPublicationState::SourceSelected,
+        (
+            FileDatabaseCloseBoundary::ManifestReplacement,
+            FileDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+            | FileDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+        ) => DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+        (
+            FileDatabaseCloseBoundary::ManifestReplacement,
+            FileDatabaseCloseFaultTiming::AfterEffect,
+        )
+        | (FileDatabaseCloseBoundary::SelectedManifestVerification, _)
+        | (
+            FileDatabaseCloseBoundary::ParentDirectorySynchronization,
+            FileDatabaseCloseFaultTiming::BeforeEffect
+            | FileDatabaseCloseFaultTiming::OutcomeIndeterminateBeforeEffect
+            | FileDatabaseCloseFaultTiming::OutcomeIndeterminateAfterEffect,
+        ) => DatabaseCleanManifestPublicationState::TargetSelectedDurabilityIndeterminate,
+        (
+            FileDatabaseCloseBoundary::ParentDirectorySynchronization,
+            FileDatabaseCloseFaultTiming::AfterEffect,
+        ) => DatabaseCleanManifestPublicationState::TargetDurable,
+    }
+}
+
 fn absent_checkpoint_phases() -> [FileDatabaseOpenPhase; 13] {
     [
         FileDatabaseOpenPhase::CompositionValidated,
@@ -182,16 +616,21 @@ fn assert_all_database_files_locked(layout: &FileDatabaseLayout) -> Result<(), B
         layout.restart_checkpoint().join("control"),
     ];
     for path in paths {
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let Err(error) = file.try_lock() else {
-            return Err(io::Error::other(format!("{} was not locked", path.display())).into());
-        };
-        assert!(
-            matches!(error, std::fs::TryLockError::WouldBlock),
-            "{} returned unexpected lock error: {error}",
-            path.display()
-        );
+        assert_file_locked(&path)?;
     }
+    Ok(())
+}
+
+fn assert_file_locked(path: &Path) -> Result<(), Box<dyn Error>> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let Err(error) = file.try_lock() else {
+        return Err(io::Error::other(format!("{} was not locked", path.display())).into());
+    };
+    assert!(
+        matches!(error, std::fs::TryLockError::WouldBlock),
+        "{} returned unexpected lock error: {error}",
+        path.display()
+    );
     Ok(())
 }
 

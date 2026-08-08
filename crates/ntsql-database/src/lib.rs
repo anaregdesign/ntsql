@@ -3,6 +3,7 @@
 use std::{
     error::Error,
     fmt,
+    marker::PhantomData,
     num::{NonZeroU16, NonZeroU64, NonZeroU128},
 };
 
@@ -2214,6 +2215,7 @@ pub struct PreparedDatabaseCloseOwnership<
 {
     outer_owner: OuterOwner,
     transaction: PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N>,
+    source_manifest: DatabaseManifest,
     certificate: DatabaseCleanCloseCertificate,
     target_manifest: DatabaseManifest,
 }
@@ -2235,6 +2237,12 @@ where
         &self,
     ) -> &PreparedTransactionPageStorageCleanClose<Source, Store, CheckpointSource, N> {
         &self.transaction
+    }
+
+    /// Returns the exact recovery-required manifest retained at preparation.
+    #[must_use]
+    pub const fn source_manifest(&self) -> DatabaseManifest {
+        self.source_manifest
     }
 
     /// Returns the exact database clean-close certificate.
@@ -2265,6 +2273,7 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedDatabaseCloseOwnership")
+            .field("source_manifest", &self.source_manifest)
             .field("certificate", &self.certificate)
             .field("target_manifest", &self.target_manifest)
             .field("outer_owner", &format_args!("<retained>"))
@@ -2584,6 +2593,7 @@ where
             _owner: PreparedDatabaseCloseOwnership {
                 outer_owner,
                 transaction,
+                source_manifest,
                 certificate,
                 target_manifest,
             },
@@ -2608,6 +2618,696 @@ where
     }
 }
 
+/// Durable selection knowledge after a clean-manifest publication attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseCleanManifestPublicationState {
+    /// The recovery-required source manifest is still selected.
+    SourceSelected,
+    /// The caller cannot determine whether the source or target is selected.
+    SelectionIndeterminate,
+    /// The clean target is selected, but its durability barrier is unresolved.
+    TargetSelectedDurabilityIndeterminate,
+    /// The exact clean target and its publication barrier are durable.
+    TargetDurable,
+}
+
+/// One-use authority to publish one exact clean manifest.
+///
+/// Construction is private and the attempt brand prevents a publisher from
+/// retaining authority for a later close attempt.
+///
+/// ```compile_fail
+/// use ntsql_database::{
+///     DatabaseCleanManifestPublicationPermit, DatabaseManifest,
+/// };
+///
+/// fn cannot_forge(
+///     target_manifest: DatabaseManifest,
+/// ) -> DatabaseCleanManifestPublicationPermit<'static> {
+///     DatabaseCleanManifestPublicationPermit {
+///         target_manifest,
+///         attempt_brand: core::marker::PhantomData,
+///     }
+/// }
+/// ```
+pub struct DatabaseCleanManifestPublicationPermit<'attempt> {
+    target_manifest: DatabaseManifest,
+    attempt_brand: PhantomData<&'attempt mut &'attempt ()>,
+}
+
+impl DatabaseCleanManifestPublicationPermit<'_> {
+    /// Returns the only manifest this attempt may publish.
+    #[must_use]
+    pub const fn target_manifest(&self) -> DatabaseManifest {
+        self.target_manifest
+    }
+
+    /// Completes this one-use authority with fresh publisher observations.
+    #[must_use]
+    pub fn complete(
+        self,
+        selected_manifest: DatabaseManifest,
+        synchronized_manifest: DatabaseManifest,
+    ) -> DatabaseCleanManifestPublicationReceipt {
+        DatabaseCleanManifestPublicationReceipt {
+            selected_manifest,
+            synchronized_manifest,
+        }
+    }
+}
+
+fn with_database_clean_manifest_publication_permit<Output, Operation>(
+    target_manifest: DatabaseManifest,
+    operation: Operation,
+) -> Output
+where
+    Operation: for<'attempt> FnOnce(DatabaseCleanManifestPublicationPermit<'attempt>) -> Output,
+{
+    operation(DatabaseCleanManifestPublicationPermit {
+        target_manifest,
+        attempt_brand: PhantomData,
+    })
+}
+
+/// Private-field evidence returned by a clean-manifest publisher.
+///
+/// ```compile_fail
+/// use ntsql_database::{
+///     DatabaseCleanManifestPublicationReceipt, DatabaseManifest,
+/// };
+///
+/// fn cannot_forge(
+///     manifest: DatabaseManifest,
+/// ) -> DatabaseCleanManifestPublicationReceipt {
+///     DatabaseCleanManifestPublicationReceipt {
+///         selected_manifest: manifest,
+///         synchronized_manifest: manifest,
+///     }
+/// }
+/// ```
+pub struct DatabaseCleanManifestPublicationReceipt {
+    selected_manifest: DatabaseManifest,
+    synchronized_manifest: DatabaseManifest,
+}
+
+impl DatabaseCleanManifestPublicationReceipt {
+    /// Returns the manifest freshly observed at the selected location.
+    #[must_use]
+    pub const fn selected_manifest(&self) -> DatabaseManifest {
+        self.selected_manifest
+    }
+
+    /// Returns the manifest covered by the publisher's durability barrier.
+    #[must_use]
+    pub const fn synchronized_manifest(&self) -> DatabaseManifest {
+        self.synchronized_manifest
+    }
+}
+
+impl fmt::Debug for DatabaseCleanManifestPublicationReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DatabaseCleanManifestPublicationReceipt")
+            .field("selected_manifest", &self.selected_manifest)
+            .field("synchronized_manifest", &self.synchronized_manifest)
+            .finish()
+    }
+}
+
+/// Adapter-reported clean-manifest publication failure and durable-state class.
+pub struct DatabaseCleanManifestPublisherFailure<PublisherError> {
+    state: DatabaseCleanManifestPublicationState,
+    error: PublisherError,
+}
+
+impl<PublisherError> DatabaseCleanManifestPublisherFailure<PublisherError> {
+    /// Constructs a typed publisher failure with exact durable-state knowledge.
+    #[must_use]
+    pub const fn new(state: DatabaseCleanManifestPublicationState, error: PublisherError) -> Self {
+        Self { state, error }
+    }
+
+    /// Returns the durable selection knowledge at the failure boundary.
+    #[must_use]
+    pub const fn state(&self) -> DatabaseCleanManifestPublicationState {
+        self.state
+    }
+
+    /// Borrows the adapter-specific publication cause.
+    #[must_use]
+    pub const fn error(&self) -> &PublisherError {
+        &self.error
+    }
+
+    fn into_parts(self) -> (DatabaseCleanManifestPublicationState, PublisherError) {
+        (self.state, self.error)
+    }
+}
+
+impl<PublisherError: fmt::Debug> fmt::Debug
+    for DatabaseCleanManifestPublisherFailure<PublisherError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DatabaseCleanManifestPublisherFailure")
+            .field("state", &self.state)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl<PublisherError: fmt::Display> fmt::Display
+    for DatabaseCleanManifestPublisherFailure<PublisherError>
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "database clean-manifest publication failed with {:?} state: {}",
+            self.state, self.error
+        )
+    }
+}
+
+impl<PublisherError> Error for DatabaseCleanManifestPublisherFailure<PublisherError>
+where
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// Trusted adapter port for publishing one exact clean manifest.
+pub trait DatabaseCleanManifestPublisher: DatabaseCloseSourceManifestOwner {
+    /// Adapter-specific input, such as one deterministic fault plan.
+    type Input;
+    /// Adapter-specific publication cause.
+    type Error;
+
+    /// Publishes and synchronizes the permit's exact target manifest.
+    fn publish_clean_manifest(
+        &mut self,
+        input: Self::Input,
+        permit: DatabaseCleanManifestPublicationPermit<'_>,
+    ) -> Result<
+        DatabaseCleanManifestPublicationReceipt,
+        DatabaseCleanManifestPublisherFailure<Self::Error>,
+    >;
+}
+
+/// Contradiction found immediately before clean-manifest publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseClosePublicationPreflightError {
+    /// The selected manifest changed after close preparation.
+    SourceManifestChanged {
+        /// Exact recovery-required manifest retained during preparation.
+        expected: DatabaseManifest,
+        /// Fresh manifest observation made immediately before publication.
+        actual: DatabaseManifest,
+    },
+    /// The retained source no longer identifies the source composition.
+    SourceManifestIdentity(DatabaseCompositionIdentityMismatch),
+    /// The retained source is not recovery-required.
+    SourceManifestLifecycle {
+        /// Rejected source lifecycle state.
+        actual: DatabaseManifestLifecycleState,
+    },
+    /// The retained certificate cannot produce an adjacent clean successor.
+    TargetManifest(DatabaseManifestCleanSuccessorError),
+    /// Recalculation did not reproduce the retained exact target manifest.
+    TargetManifestChanged {
+        /// Target retained during close preparation.
+        expected: DatabaseManifest,
+        /// Target freshly recalculated from source and certificate.
+        actual: DatabaseManifest,
+    },
+}
+
+impl fmt::Display for DatabaseClosePublicationPreflightError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SourceManifestChanged { .. } => formatter
+                .write_str("selected database close source manifest changed after preparation"),
+            Self::SourceManifestIdentity(source) => write!(
+                formatter,
+                "database close publication source identity mismatch: {source}"
+            ),
+            Self::SourceManifestLifecycle { actual } => write!(
+                formatter,
+                "database close publication source lifecycle is {actual}, not recovery required"
+            ),
+            Self::TargetManifest(source) => write!(
+                formatter,
+                "database close publication target manifest is invalid: {source}"
+            ),
+            Self::TargetManifestChanged { .. } => {
+                formatter.write_str("database close publication target changed after preparation")
+            }
+        }
+    }
+}
+
+impl Error for DatabaseClosePublicationPreflightError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::SourceManifestIdentity(source) => Some(source),
+            Self::TargetManifest(source) => Some(source),
+            Self::SourceManifestChanged { .. }
+            | Self::SourceManifestLifecycle { .. }
+            | Self::TargetManifestChanged { .. } => None,
+        }
+    }
+}
+
+/// Invalid exact receipt returned after an effectful publication attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseCleanManifestPublicationReceiptError {
+    /// The freshly observed selected manifest is not the retained target.
+    SelectedManifest {
+        /// Exact clean target retained before publication.
+        expected: DatabaseManifest,
+        /// Publisher-reported selected manifest.
+        actual: DatabaseManifest,
+    },
+    /// The synchronized manifest is not the retained target.
+    SynchronizedManifest {
+        /// Exact clean target retained before publication.
+        expected: DatabaseManifest,
+        /// Publisher-reported synchronized manifest.
+        actual: DatabaseManifest,
+    },
+}
+
+impl fmt::Display for DatabaseCleanManifestPublicationReceiptError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SelectedManifest { .. } => formatter.write_str(
+                "database clean-manifest receipt selected manifest does not equal the target",
+            ),
+            Self::SynchronizedManifest { .. } => formatter.write_str(
+                "database clean-manifest receipt synchronized manifest does not equal the target",
+            ),
+        }
+    }
+}
+
+impl Error for DatabaseCleanManifestPublicationReceiptError {}
+
+/// Typed cause retained after close publication cannot produce Closed.
+#[derive(Debug)]
+pub enum DatabaseClosePublicationError<PublisherError> {
+    /// Final source/target revalidation failed before the permit was issued.
+    Preflight(DatabaseClosePublicationPreflightError),
+    /// The adapter returned an effectful publication failure.
+    Publisher(PublisherError),
+    /// The adapter returned a receipt that did not prove the exact target.
+    Receipt(DatabaseCleanManifestPublicationReceiptError),
+}
+
+impl<PublisherError: fmt::Display> fmt::Display for DatabaseClosePublicationError<PublisherError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Preflight(source) => source.fmt(formatter),
+            Self::Publisher(source) => source.fmt(formatter),
+            Self::Receipt(source) => source.fmt(formatter),
+        }
+    }
+}
+
+impl<PublisherError> Error for DatabaseClosePublicationError<PublisherError>
+where
+    PublisherError: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Preflight(source) => Some(source),
+            Self::Publisher(source) => Some(source),
+            Self::Receipt(source) => Some(source),
+        }
+    }
+}
+
+/// Exact owners and receipt retained after synchronized clean publication.
+#[must_use = "published database close ownership must remain inside Closed"]
+pub struct PublishedDatabaseCloseOwnership<
+    OuterOwner,
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    prepared: PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+    receipt: DatabaseCleanManifestPublicationReceipt,
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    PublishedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Borrows the complete prepared owner set retained through Closed.
+    pub const fn prepared(
+        &self,
+    ) -> &PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N> {
+        &self.prepared
+    }
+
+    /// Returns the exact selected and synchronized clean manifest.
+    #[must_use]
+    pub const fn manifest(&self) -> DatabaseManifest {
+        self.receipt.synchronized_manifest
+    }
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize> fmt::Debug
+    for PublishedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedDatabaseCloseOwnership")
+            .field("prepared", &self.prepared)
+            .field("receipt", &self.receipt)
+            .finish()
+    }
+}
+
+/// Terminal owner-retaining failure of clean-manifest publication.
+#[must_use = "failed database close publication retains every owner until abandoned or dropped"]
+pub struct FailedDatabaseClosePublication<
+    OuterOwner,
+    Source,
+    Store,
+    CheckpointSource,
+    PublisherError,
+    const N: usize,
+> where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    state: DatabaseCleanManifestPublicationState,
+    error: Box<DatabaseClosePublicationError<PublisherError>>,
+    ownership: Box<PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>>,
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, PublisherError, const N: usize>
+    FailedDatabaseClosePublication<OuterOwner, Source, Store, CheckpointSource, PublisherError, N>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    fn new(
+        state: DatabaseCleanManifestPublicationState,
+        error: DatabaseClosePublicationError<PublisherError>,
+        ownership: PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+    ) -> Self {
+        Self {
+            state,
+            error: Box::new(error),
+            ownership: Box::new(ownership),
+        }
+    }
+
+    /// Returns the recovery-required source composition.
+    #[must_use]
+    pub const fn source_identity(&self) -> DatabaseCompositionIdentity {
+        self.ownership.source_manifest().composition_identity()
+    }
+
+    /// Returns the proposed adjacent clean composition.
+    #[must_use]
+    pub const fn target_identity(&self) -> DatabaseCompositionIdentity {
+        self.ownership.target_identity()
+    }
+
+    /// Returns the durable selection knowledge at the failure boundary.
+    #[must_use]
+    pub const fn state(&self) -> DatabaseCleanManifestPublicationState {
+        self.state
+    }
+
+    /// Borrows the exact typed failure cause.
+    #[must_use]
+    pub const fn error(&self) -> &DatabaseClosePublicationError<PublisherError> {
+        &self.error
+    }
+
+    /// Returns the exact recovery-required source manifest.
+    #[must_use]
+    pub const fn source_manifest(&self) -> DatabaseManifest {
+        self.ownership.source_manifest()
+    }
+
+    /// Returns the exact clean target manifest.
+    #[must_use]
+    pub const fn target_manifest(&self) -> DatabaseManifest {
+        self.ownership.target_manifest()
+    }
+
+    /// Relinquishes every retained owner without making a selection claim.
+    pub fn abandon(self) -> AbandonedDatabaseClosePublication {
+        let source_identity = self.source_identity();
+        let target_identity = self.ownership.target_identity();
+        let state = self.state;
+        drop(self);
+        AbandonedDatabaseClosePublication {
+            source_identity,
+            target_identity,
+            state,
+        }
+    }
+}
+
+impl<OuterOwner, Source, Store, CheckpointSource, PublisherError, const N: usize> fmt::Debug
+    for FailedDatabaseClosePublication<
+        OuterOwner,
+        Source,
+        Store,
+        CheckpointSource,
+        PublisherError,
+        N,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    PublisherError: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FailedDatabaseClosePublication")
+            .field("source_identity", &self.source_identity())
+            .field("target_identity", &self.target_identity())
+            .field("state", &self.state)
+            .field("error", &self.error)
+            .field("ownership", &format_args!("<retained>"))
+            .finish()
+    }
+}
+
+/// Closed owner or terminal owner-retaining publication failure.
+pub type DatabaseClosePublicationResult<
+    OuterOwner,
+    Source,
+    Store,
+    CheckpointSource,
+    const N: usize,
+> = Result<
+    ClosedDatabase<PublishedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>>,
+    FailedDatabaseClosePublication<
+        OuterOwner,
+        Source,
+        Store,
+        CheckpointSource,
+        <OuterOwner as DatabaseCleanManifestPublisher>::Error,
+        N,
+    >,
+>;
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    ClosePendingDatabase<
+        PreparedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>,
+    >
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+    OuterOwner: DatabaseCleanManifestPublisher,
+{
+    /// Consumes ClosePending and publishes the exact clean manifest.
+    pub fn close(
+        self,
+        input: OuterOwner::Input,
+    ) -> DatabaseClosePublicationResult<OuterOwner, Source, Store, CheckpointSource, N> {
+        let Self {
+            _owner: mut ownership,
+            identity: source_identity,
+        } = self;
+        let expected_source = ownership.source_manifest;
+        let actual_source = ownership.outer_owner.close_source_manifest();
+        if actual_source != expected_source {
+            return Err(FailedDatabaseClosePublication::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                DatabaseClosePublicationError::Preflight(
+                    DatabaseClosePublicationPreflightError::SourceManifestChanged {
+                        expected: expected_source,
+                        actual: actual_source,
+                    },
+                ),
+                ownership,
+            ));
+        }
+        if let Err(source) = actual_source
+            .composition_identity()
+            .require_exact_match(source_identity)
+        {
+            return Err(FailedDatabaseClosePublication::new(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                DatabaseClosePublicationError::Preflight(
+                    DatabaseClosePublicationPreflightError::SourceManifestIdentity(source),
+                ),
+                ownership,
+            ));
+        }
+        if !matches!(
+            actual_source.lifecycle_state(),
+            DatabaseManifestLifecycleState::RecoveryRequired
+        ) {
+            return Err(FailedDatabaseClosePublication::new(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                DatabaseClosePublicationError::Preflight(
+                    DatabaseClosePublicationPreflightError::SourceManifestLifecycle {
+                        actual: actual_source.lifecycle_state(),
+                    },
+                ),
+                ownership,
+            ));
+        }
+        let actual_target = match actual_source.next_clean(ownership.certificate) {
+            Ok(target) => target,
+            Err(source) => {
+                return Err(FailedDatabaseClosePublication::new(
+                    DatabaseCleanManifestPublicationState::SourceSelected,
+                    DatabaseClosePublicationError::Preflight(
+                        DatabaseClosePublicationPreflightError::TargetManifest(source),
+                    ),
+                    ownership,
+                ));
+            }
+        };
+        let expected_target = ownership.target_manifest;
+        if actual_target != expected_target {
+            return Err(FailedDatabaseClosePublication::new(
+                DatabaseCleanManifestPublicationState::SourceSelected,
+                DatabaseClosePublicationError::Preflight(
+                    DatabaseClosePublicationPreflightError::TargetManifestChanged {
+                        expected: expected_target,
+                        actual: actual_target,
+                    },
+                ),
+                ownership,
+            ));
+        }
+
+        let publication =
+            with_database_clean_manifest_publication_permit(expected_target, |permit| {
+                ownership.outer_owner.publish_clean_manifest(input, permit)
+            });
+        let receipt = match publication {
+            Ok(receipt) => receipt,
+            Err(failure) => {
+                let (state, error) = failure.into_parts();
+                return Err(FailedDatabaseClosePublication::new(
+                    state,
+                    DatabaseClosePublicationError::Publisher(error),
+                    ownership,
+                ));
+            }
+        };
+        if receipt.selected_manifest != expected_target {
+            return Err(FailedDatabaseClosePublication::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                DatabaseClosePublicationError::Receipt(
+                    DatabaseCleanManifestPublicationReceiptError::SelectedManifest {
+                        expected: expected_target,
+                        actual: receipt.selected_manifest,
+                    },
+                ),
+                ownership,
+            ));
+        }
+        if receipt.synchronized_manifest != expected_target {
+            return Err(FailedDatabaseClosePublication::new(
+                DatabaseCleanManifestPublicationState::SelectionIndeterminate,
+                DatabaseClosePublicationError::Receipt(
+                    DatabaseCleanManifestPublicationReceiptError::SynchronizedManifest {
+                        expected: expected_target,
+                        actual: receipt.synchronized_manifest,
+                    },
+                ),
+                ownership,
+            ));
+        }
+
+        Ok(ClosedDatabase {
+            _owner: PublishedDatabaseCloseOwnership {
+                prepared: ownership,
+                receipt,
+            },
+            identity: expected_target.composition_identity(),
+        })
+    }
+}
+
+/// Terminal record of relinquished authority after an effectful close attempt.
+#[must_use]
+pub struct AbandonedDatabaseClosePublication {
+    source_identity: DatabaseCompositionIdentity,
+    target_identity: DatabaseCompositionIdentity,
+    state: DatabaseCleanManifestPublicationState,
+}
+
+impl AbandonedDatabaseClosePublication {
+    /// Returns the recovery-required source composition.
+    #[must_use]
+    pub const fn source_identity(&self) -> DatabaseCompositionIdentity {
+        self.source_identity
+    }
+
+    /// Returns the clean composition targeted by the publication attempt.
+    #[must_use]
+    pub const fn target_identity(&self) -> DatabaseCompositionIdentity {
+        self.target_identity
+    }
+
+    /// Returns the final durable selection knowledge.
+    #[must_use]
+    pub const fn state(&self) -> DatabaseCleanManifestPublicationState {
+        self.state
+    }
+
+    /// Returns this terminal in-process lifecycle outcome.
+    #[must_use]
+    pub const fn stage(&self) -> DatabaseLifecycleStage {
+        DatabaseLifecycleStage::Abandoned
+    }
+}
+
+impl fmt::Debug for AbandonedDatabaseClosePublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AbandonedDatabaseClosePublication")
+            .field("source_identity", &self.source_identity)
+            .field("target_identity", &self.target_identity)
+            .field("state", &self.state)
+            .finish()
+    }
+}
+
 impl<Owner> ClosePendingDatabase<Owner> {
     /// Relinquishes close-pending authority without publishing clean state.
     pub fn abandon(self) -> AbandonedDatabase {
@@ -2629,6 +3329,20 @@ define_owned_database_state!(
     ClosedDatabase,
     DatabaseLifecycleStage::Closed
 );
+
+impl<OuterOwner, Source, Store, CheckpointSource, const N: usize>
+    ClosedDatabase<PublishedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N>>
+where
+    Source: DurableTransactionRestartAnalysisSource<N>,
+    Store: DurablePageStoreSnapshotSource<N>,
+{
+    /// Borrows the exact published owner set and receipt retained by Closed.
+    pub const fn published(
+        &self,
+    ) -> &PublishedDatabaseCloseOwnership<OuterOwner, Source, Store, CheckpointSource, N> {
+        &self._owner
+    }
+}
 
 /// Terminal inert record of authority relinquished without clean publication.
 ///
